@@ -6,7 +6,7 @@ set -euo pipefail
 #   CUDA_VISIBLE_DEVICES=6,7 MODEL_PATH=/models/Wan2.1-T2V-1.3B-Diffusers bash scripts/run_v01_world_r1_baseline.sh
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORLD_R1_DIR="${WORLD_R1_DIR:-${REPO_DIR}/World-R1-main}"
+WORLD_R1_DIR="${WORLD_R1_DIR:-${REPO_DIR}/reference_code/World-R1-main}"
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a local Wan2.1 diffusers checkpoint path}"
 TRAIN_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${TRAIN_VISIBLE_DEVICES:-6,7}}"
 NUM_PROCESSES="${NUM_PROCESSES:-$(python - <<PY
@@ -32,4 +32,3 @@ export OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/runs/world_r1_v01}"
 
 cd "${WORLD_R1_DIR}"
 bash scripts/run_training.sh
-

@@ -3,7 +3,7 @@ seed: 42
 output_dir: runs/world_r1_wan_v01_server
 
 legacy:
-  world_r1_root: World-R1-main
+  world_r1_root: reference_code/World-R1-main
   train_script: scripts/run_training.sh
   train_config: config/world_r1.py:world_r1_small
 
@@ -24,4 +24,3 @@ rollout:
 rewards:
   weights:
     mock: 1.0
-

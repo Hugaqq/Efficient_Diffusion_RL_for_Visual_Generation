@@ -1,7 +1,8 @@
 # Plan Evaluation After Adding GenRL
 
-The revised direction is sound: `GenRL-main` should become the training-runtime
-reference, while `visual_rl` remains the integration and abstraction layer.
+The revised direction is sound: `reference_code/GenRL-main` should become the
+training-runtime reference, while `visual_rl` remains the integration and
+abstraction layer.
 
 ## What Changed
 
@@ -42,6 +43,7 @@ Implemented now:
 - media-aware reward cache keys
 - mock trainer kept as the smoke-test path
 - World-R1 plan generation remains local/dry-run only
+- Wan runtime plan generation through `visual-rl wan-plan`
 
 Deferred:
 
@@ -61,10 +63,10 @@ Deferred:
 
 ## Inferix / BlockVid Note
 
-For future work, the main thing to learn from `Inferix-main` is its BlockVid /
-semi-autoregressive block-diffusion design: diffusion blocks, segment-level
-long-video scheduling, KV cache management, `PER_BLOCK` streaming decode, and
-`NO_DECODE` latent-only paths.
+For future work, the main thing to learn from `reference_code/Inferix-main` is
+its BlockVid / semi-autoregressive block-diffusion design: diffusion blocks,
+segment-level long-video scheduling, KV cache management, `PER_BLOCK` streaming
+decode, and `NO_DECODE` latent-only paths.
 
 Treat BlockVid as the relevant systems idea. Do not treat Inferix as a
 replacement for the GenRL-style training runtime unless it later exposes a clean

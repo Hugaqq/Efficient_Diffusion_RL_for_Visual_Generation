@@ -8,9 +8,35 @@ from pathlib import Path
 from typing import Iterator
 
 
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_legacy_repo(repo_root: str | Path) -> Path:
+    """Resolve a legacy/reference repo path.
+
+    The preferred layout is `reference_code/<repo>`, but older configs may still
+    pass `<repo>` from the workspace root. Keep both forms working.
+    """
+
+    raw = Path(repo_root).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates = [
+        Path.cwd() / raw,
+        project_root() / raw,
+        project_root() / "reference_code" / raw,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[-1].resolve()
+
+
 @contextlib.contextmanager
 def legacy_repo_path(repo_root: str | Path, purge_flow_grpo: bool = True) -> Iterator[Path]:
-    root = Path(repo_root).resolve()
+    root = resolve_legacy_repo(repo_root)
     if not root.exists():
         raise FileNotFoundError(f"Legacy repo root does not exist: {root}")
 
@@ -32,4 +58,3 @@ def legacy_repo_path(repo_root: str | Path, purge_flow_grpo: bool = True) -> Ite
             if module_file and str(root) in module_file and (name == "flow_grpo" or name.startswith("flow_grpo.")):
                 sys.modules.pop(name, None)
         sys.modules.update(purged)
-

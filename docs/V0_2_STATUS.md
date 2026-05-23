@@ -2,7 +2,7 @@
 
 Implemented locally:
 
-- `visual_rl` version bumped to `0.2.0`.
+- `visual_rl` version bumped to `0.2.1`.
 - Typed config dataclasses inspired by GenRL:
   - `ModelConfig`
   - `DatasetConfig`
@@ -15,6 +15,7 @@ Implemented locally:
   - `ProjectPaths`
 - `BaseTrainer` with config validation, deterministic output paths, optimizer setup,
   gradient accumulation calculation, and resolved config logging.
+- `WanTrainer` planning shell for the GenRL-style Wan baseline.
 - `AdvantageComputer` and `PerPromptStatTracker` with:
   - per-prompt advantages
   - per-reward advantages
@@ -31,6 +32,7 @@ Implemented locally:
   - reward version in cache key
 - Epoch-aware repeat sampler utility.
 - v0.2 mock preset: `visual_rl/configs/presets/world_r1_wan_v02_mock.yaml`.
+- Wan runtime plan preset: `visual_rl/configs/presets/wan_runtime_v02_plan.yaml`.
 
 Validation:
 
@@ -38,6 +40,7 @@ Validation:
 conda run -n visual-rl visual-rl smoke-imports
 conda run -n visual-rl visual-rl smoke-mock --output-dir runs/smoke_v02_mock --steps 2
 conda run -n visual-rl visual-rl world-r1-plan --model-path /models/Wan2.1-T2V-1.3B-Diffusers --gpus 6,7
+conda run -n visual-rl visual-rl wan-plan --output-dir runs/wan_runtime_plan
 conda run -n visual-rl python -m pytest -q tests
 conda run -n visual-rl python -m ruff check visual_rl tests
 ```
@@ -47,4 +50,3 @@ Not run:
 - Any server command.
 - Any SSH/GPU probe.
 - Any real Wan2.1 checkpoint or reward model.
-

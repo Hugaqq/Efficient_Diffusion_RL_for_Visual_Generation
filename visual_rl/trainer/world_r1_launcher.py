@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from visual_rl.third_party.legacy import resolve_legacy_repo
+
 
 @dataclass
 class WorldR1LaunchPlan:
@@ -52,18 +54,19 @@ class WorldR1LaunchPlan:
 
 def build_world_r1_launch_plan(
     model_path: str,
-    repo_dir: str | Path = "World-R1-main",
+    repo_dir: str | Path = "reference_code/World-R1-main",
     train_visible_devices: str = "6,7",
     output_root: str = "runs/world_r1_v01",
     smoke: bool = True,
 ) -> WorldR1LaunchPlan:
+    resolved_repo_dir = resolve_legacy_repo(repo_dir)
     devices = [item for item in train_visible_devices.split(",") if item.strip()]
     if not devices:
         raise ValueError("train_visible_devices must contain at least one GPU index")
 
     if smoke:
         return WorldR1LaunchPlan(
-            repo_dir=str(repo_dir),
+            repo_dir=str(resolved_repo_dir),
             model_path=model_path,
             train_visible_devices=train_visible_devices,
             num_processes=len(devices),
@@ -71,7 +74,7 @@ def build_world_r1_launch_plan(
         )
 
     return WorldR1LaunchPlan(
-        repo_dir=str(repo_dir),
+        repo_dir=str(resolved_repo_dir),
         model_path=model_path,
         train_visible_devices=train_visible_devices,
         num_processes=len(devices),
@@ -83,4 +86,3 @@ def build_world_r1_launch_plan(
         train_width=832,
         train_frames=81,
     )
-

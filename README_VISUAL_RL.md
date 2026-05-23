@@ -2,10 +2,11 @@
 
 VisualRL is the integration layer for the four local projects:
 
-- `World-R1-main`: v0.1 trunk for Wan/CogVideoX video RL, camera-aware latents, 3D/general rewards.
-- `Flash-GRPO-main`: future Flash single-step GRPO algorithm plugin.
-- `TempFlow-GRPO-main`: future branching GRPO algorithm plugin for SD3/FLUX/QwenImage.
-- `Inferix-main`: future eval, preview, serving, and profiling backend.
+- `reference_code/World-R1-main`: world/video specialization for Wan/CogVideoX video RL, camera-aware latents, 3D/general rewards.
+- `reference_code/GenRL-main`: training runtime reference for typed config, trainer lifecycle, sampling, rewards, and checkpointing.
+- `reference_code/Flash-GRPO-main`: future Flash single-step GRPO algorithm plugin.
+- `reference_code/TempFlow-GRPO-main`: future branching GRPO algorithm plugin for SD3/FLUX/QwenImage.
+- `reference_code/Inferix-main`: BlockVid-oriented eval, preview, serving, and profiling backend.
 
 v0.2 keeps the v0.1 isolation and adds a GenRL-inspired runtime layer:
 typed config, BaseTrainer lifecycle, epoch-aware sampler utilities, per-reward
@@ -19,6 +20,7 @@ pip install -e ".[dev]"
 visual-rl smoke-imports
 visual-rl smoke-mock --output-dir runs/smoke --steps 2
 visual-rl world-r1-plan --model-path /path/to/Wan2.1-T2V-1.3B-Diffusers --gpus 6,7
+visual-rl wan-plan --output-dir runs/wan_runtime_plan
 ```
 
 ## Server Safety

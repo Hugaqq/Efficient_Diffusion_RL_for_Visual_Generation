@@ -19,6 +19,10 @@ checkpoints/
 wandb/
 tmp/
 
+# Local third-party paper/source snapshots.
+# Keep these on disk for inspection, but do not commit them to this repo.
+reference_code/
+
 # Large model/data caches
 hf_cache/
 *.safetensors
@@ -28,4 +32,3 @@ hf_cache/
 *.mp4
 *.mov
 *.avi
-

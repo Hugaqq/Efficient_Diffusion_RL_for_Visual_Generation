@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from visual_rl.core.registry import MODEL_ADAPTERS
 from visual_rl.core.types import RolloutBatch
 from visual_rl.model_adapters.base import ModelAdapter
-from visual_rl.third_party.legacy import legacy_repo_path
+from visual_rl.third_party.legacy import legacy_repo_path, resolve_legacy_repo
 
 
 class WorldR1WanLegacyAdapter(ModelAdapter):
@@ -22,7 +21,7 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.repo_root = Path(config.get("repo_root", "World-R1-main"))
+        self.repo_root = resolve_legacy_repo(config.get("repo_root", "reference_code/World-R1-main"))
         self.pipeline = None
         self.transformer = None
 
@@ -46,7 +45,7 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
         del prompts, metadata, rollout_config
         raise NotImplementedError(
             "v0.1 exposes the legacy Wan adapter and launcher, but full heavy rollout "
-            "is delegated to World-R1-main/scripts/run_training.sh until GPU smoke is run."
+            "is delegated to reference_code/World-R1-main/scripts/run_training.sh until GPU smoke is run."
         )
 
     def recompute_log_probs(self, batch: RolloutBatch) -> Any:
@@ -55,4 +54,3 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
 
 
 MODEL_ADAPTERS.register("world_r1_wan_legacy", WorldR1WanLegacyAdapter)
-

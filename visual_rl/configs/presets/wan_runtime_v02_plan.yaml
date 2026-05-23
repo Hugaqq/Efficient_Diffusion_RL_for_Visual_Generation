@@ -1,0 +1,55 @@
+run_name: wan_runtime_v02_plan
+seed: 42
+output_dir: runs/wan_runtime_v02_plan
+
+model:
+  name: world_r1_wan_legacy
+  model_family: wan
+  model_path: ""
+
+dataset:
+  prompts:
+    - "a cinematic camera move through a clean indoor scene"
+    - "a wide shot of a robot walking across a small workshop"
+  repeat_per_prompt: 1
+
+sample:
+  name: full_trajectory
+  batch_size: 1
+  num_batches_per_epoch: 1
+  num_steps: 2
+  eval_num_steps: 2
+  samples_per_prompt: 2
+  num_video_per_prompt: 2
+  same_latent: true
+  noise_level: 0.7
+  sde_window_size: 1
+  sde_window_range: [0, 2]
+
+algorithm:
+  name: grpo
+  clip_range: 0.001
+  beta: 0.0
+  advantage_mode: grpo
+  weight_advantages: false
+
+rewards:
+  weights:
+    mock: 1.0
+  clients:
+    mock:
+      name: mock
+      version: v1
+  fail_policy: invalid
+
+train:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  timestep_fraction: 1.0
+  learning_rate: 1.0e-4
+  max_steps: 1
+  save_every: 1
+
+legacy:
+  genrl_root: reference_code/GenRL-main
+  world_r1_root: reference_code/World-R1-main

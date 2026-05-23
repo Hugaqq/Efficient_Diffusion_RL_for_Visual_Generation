@@ -42,6 +42,23 @@ def smoke_mock(args: argparse.Namespace) -> int:
     return 0
 
 
+def wan_plan(args: argparse.Namespace) -> int:
+    _register_builtin_plugins()
+    from visual_rl.configs.schema import load_config
+    from visual_rl.trainer.wan_trainer import WanTrainer
+
+    default_config = Path(__file__).parent / "configs" / "presets" / "wan_runtime_v02_plan.yaml"
+    config = load_config(args.config or default_config)
+    if args.model_path is not None:
+        config.model.model_path = args.model_path
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.paths.output_dir = args.output_dir
+    trainer = WanTrainer(config)
+    print(json.dumps(trainer.build_runtime_plan().to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
 def world_r1_plan(args: argparse.Namespace) -> int:
     from visual_rl.trainer.world_r1_launcher import build_world_r1_launch_plan
 
@@ -71,11 +88,17 @@ def main(argv: list[str] | None = None) -> int:
 
     plan_parser = subparsers.add_parser("world-r1-plan")
     plan_parser.add_argument("--model-path", required=True)
-    plan_parser.add_argument("--repo-dir", default="World-R1-main")
+    plan_parser.add_argument("--repo-dir", default="reference_code/World-R1-main")
     plan_parser.add_argument("--gpus", default="6,7")
     plan_parser.add_argument("--output-root", default="runs/world_r1_v01")
     plan_parser.add_argument("--full", action="store_true")
     plan_parser.set_defaults(func=world_r1_plan)
+
+    wan_parser = subparsers.add_parser("wan-plan")
+    wan_parser.add_argument("--config", default=None)
+    wan_parser.add_argument("--model-path", default=None)
+    wan_parser.add_argument("--output-dir", default=None)
+    wan_parser.set_defaults(func=wan_plan)
 
     args = parser.parse_args(argv)
     return args.func(args)

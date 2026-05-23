@@ -8,4 +8,4 @@ def test_world_r1_plan_smoke_defaults():
     assert plan.num_processes == 2
     assert plan.train_num_steps == 2
     assert plan.as_env()["MODEL_PATH"] == "/models/wan"
-
+    assert plan.repo_dir.endswith("reference_code/World-R1-main")
