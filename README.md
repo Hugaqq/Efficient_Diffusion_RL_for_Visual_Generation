@@ -74,9 +74,12 @@ Latest verified state:
 - Local Flash tiny smoke: passed
 - Server CPU-only TempFlow tiny smoke: passed
 - Server CPU-only Flash tiny smoke: passed
+- Server two-GPU TempFlow correctness probe: passed
 
 Server smoke tests were run with `CUDA_VISIBLE_DEVICES=""`, so they did not
 consume shared GPUs.
+The two-GPU TempFlow correctness probe used GPU0 and GPU1 only, while GPU2-7
+were already occupied by other jobs.
 
 ## Near-Term Tasks
 

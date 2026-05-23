@@ -7,9 +7,9 @@ pretending the tiny smoke tests prove full training correctness.
 ## Near-Term Tiny Checks
 
 - Run `tiny_diffusion` for 20-50 steps and assert reward improves against a
-  fixed-seed baseline.
+  fixed-seed baseline. TempFlow completed on 2026-05-23.
 - Assert trainable parameters change after GRPO, Flash-GRPO, and TempFlow-GRPO
-  updates.
+  updates. TempFlow completed on 2026-05-23.
 - Add deterministic golden tests for rollout expansion, selected timesteps,
   branch IDs, advantage masks, and cache filenames.
 - Compare full-trajectory GRPO, Flash single-step GRPO, and TempFlow branching
@@ -27,9 +27,9 @@ pretending the tiny smoke tests prove full training correctness.
 ## Server Checks
 
 - Repeat tiny smoke on the server with CPU-only execution after each major
-  feature addition.
+  feature addition. TempFlow and Flash completed.
 - Add a one-GPU memory probe for small image models, pinned to an explicitly
-  idle GPU only.
+  idle GPU only. TempFlow two-GPU isolated probe completed on GPU0/GPU1.
 - Record GPU ID, visible devices, VRAM before/after, package versions, and
   commit hash for every server run.
 

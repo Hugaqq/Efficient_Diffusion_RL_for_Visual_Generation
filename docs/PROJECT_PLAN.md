@@ -42,12 +42,14 @@ conda run -n visual-rl python -m visual_rl.cli wan-plan --output-dir runs/wan_ru
 ```
 
 Local tests, ruff, local TempFlow tiny smoke, local Flash tiny smoke, CPU-only
-server TempFlow tiny smoke, and CPU-only server Flash tiny smoke pass. Real GPU
-training, real Wan checkpoint loading, reward server calls, and Inferix eval are
-not wired yet.
+server TempFlow tiny smoke, CPU-only server Flash tiny smoke, and a two-GPU
+TempFlow correctness probe pass. Real Wan checkpoint loading, reward server
+calls, and Inferix eval are not wired yet.
 
 Known validation gaps are tracked in
 [`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](EXPERIMENT_VALIDATION_BACKLOG.md).
+The latest TempFlow GPU validation is recorded in
+[`docs/TEMPFLOW_GPU_VALIDATION_2026_05_23.md`](TEMPFLOW_GPU_VALIDATION_2026_05_23.md).
 
 ## Reference Code Policy
 

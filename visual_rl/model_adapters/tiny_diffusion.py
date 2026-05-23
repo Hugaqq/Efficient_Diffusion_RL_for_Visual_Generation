@@ -17,11 +17,13 @@ class TinyDiffusionAdapter(ModelAdapter):
         import torch
 
         self.config = config
+        extra = config.get("extra", {})
         self.image_size = int(config.get("image_size", config.get("extra", {}).get("image_size", 16)))
         self.channels = int(config.get("channels", config.get("extra", {}).get("channels", 3)))
         if self.channels != 3:
             raise ValueError("TinyDiffusionAdapter currently expects 3 channels for prompt_color reward.")
-        self.color_bias = torch.nn.Parameter(torch.zeros(self.channels))
+        self.device = torch.device(config.get("device", extra.get("device", "cpu")))
+        self.color_bias = torch.nn.Parameter(torch.zeros(self.channels, device=self.device))
 
     def parameters(self):
         return [self.color_bias]
@@ -32,10 +34,11 @@ class TinyDiffusionAdapter(ModelAdapter):
         batch_size = len(prompts)
         num_steps = int(rollout_config.get("num_steps", 4))
         seed = rollout_config.get("seed")
-        generator = torch.Generator().manual_seed(int(seed)) if seed is not None else None
+        generator_device = self.device if self.device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=generator_device).manual_seed(int(seed)) if seed is not None else None
         shape = (batch_size, num_steps, self.channels, self.image_size, self.image_size)
-        latents = torch.randn(shape, generator=generator) * 0.25
-        noise = torch.randn(shape, generator=generator) * 0.05
+        latents = torch.randn(shape, generator=generator, device=self.device) * 0.25
+        noise = torch.randn(shape, generator=generator, device=self.device) * 0.05
         bias = self.color_bias.detach().view(1, 1, self.channels, 1, 1)
         next_latents = latents + noise + bias
         old_log_probs = -((next_latents - latents - bias) ** 2).mean(dim=(2, 3, 4)).detach()
