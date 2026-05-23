@@ -1,0 +1,11 @@
+name: visual-rl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - pyyaml
+  - pytest
+  - pip:
+      - -e .

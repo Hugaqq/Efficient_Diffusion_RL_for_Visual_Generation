@@ -1,0 +1,27 @@
+name: visual-rl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - pyyaml
+  - pytest
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu128
+      - --extra-index-url https://pypi.org/simple
+      - torch
+      - torchvision
+      - accelerate>=1.4
+      - diffusers>=0.33
+      - transformers>=4.40
+      - peft>=0.10
+      - ml-collections>=0.1
+      - wandb>=0.18
+      - requests>=2.32
+      - pillow>=10
+      - imageio>=2.34
+      - einops>=0.8
+      - omegaconf>=2.3
+      - -e .
+

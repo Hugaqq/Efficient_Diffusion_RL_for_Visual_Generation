@@ -1,0 +1,41 @@
+run_name: world_r1_wan_v01_mock
+seed: 42
+output_dir: runs/world_r1_wan_v01_mock
+
+model:
+  name: mock_wan
+  latent_shape: [4, 2, 2, 2]
+  media_shape: [4, 3, 16, 16]
+
+dataset:
+  prompts:
+    - "orbit left around a ceramic vase on a table"
+    - "push in toward a red toy car"
+    - "pan right across a small kitchen"
+  repeat_per_prompt: 2
+
+rollout:
+  name: full_trajectory
+  num_steps: 2
+  batch_size: 2
+
+algorithm:
+  name: grpo
+  clip_range: 0.001
+  adv_clip_max: 5.0
+  beta: 0.0
+
+rewards:
+  normalize: per_batch
+  weights:
+    mock: 1.0
+  clients:
+    mock:
+      name: mock
+      mode: prompt_media
+
+trainer:
+  max_steps: 2
+  learning_rate: 0.001
+  save_every: 1
+  resume_from: null

@@ -1,0 +1,27 @@
+run_name: world_r1_wan_v01_server
+seed: 42
+output_dir: runs/world_r1_wan_v01_server
+
+legacy:
+  world_r1_root: World-R1-main
+  train_script: scripts/run_training.sh
+  train_config: config/world_r1.py:world_r1_small
+
+model:
+  name: world_r1_wan_legacy
+  model_path: /path/to/Wan2.1-T2V-1.3B-Diffusers
+  model_family: wan
+
+rollout:
+  num_steps: 2
+  eval_num_steps: 2
+  height: 256
+  width: 448
+  frames: 17
+  train_batch_size: 1
+  num_batches_per_epoch: 1
+
+rewards:
+  weights:
+    mock: 1.0
+
