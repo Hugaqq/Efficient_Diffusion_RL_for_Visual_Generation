@@ -13,6 +13,7 @@ The initial target is not to merge every codebase mechanically. The goal is to e
 - `v0.1`: created the first `visual_rl` skeleton with `RolloutBatch`, `RewardRouter`, mock rollout/training, cache, CLI, and local smoke tests.
 - `v0.2`: upgraded toward a GenRL-style runtime with typed config, `BaseTrainer`, reward raw/weighted scoring, per-prompt/per-reward advantage computation, epoch-aware sampler, and safer local validation.
 - `v0.3`: added the first TempFlow path with `tiny_diffusion`, prompt-color image reward, branching rollout, branch/timestep credit assignment, noise-aware TempFlow-GRPO loss, lazy SD3/FLUX/QwenImage bridges, and local/server tiny smoke tests.
+- `v0.4`: added the first Flash-GRPO path with single-step rollout, iso-temporal prompt grouping, selected timestep metadata, scheduler-style rectification weights, and tiny smoke tests.
 
 Heavy server-side experiments are not part of the committed state. The repo now supports safe CPU-only server smoke validation before using any shared GPUs.
 
@@ -171,6 +172,7 @@ The current safe local checks are:
 conda run -n visual-rl visual-rl smoke-imports
 conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke_v02_mock --steps 2
 conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
+conda run -n visual-rl python -m visual_rl.cli flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
 conda run -n visual-rl visual-rl wan-plan --output-dir runs/wan_runtime_plan
 conda run -n visual-rl python -m pytest -q tests
 conda run -n visual-rl python -m ruff check visual_rl tests
@@ -180,9 +182,9 @@ No server access is required for these checks. The server smoke path can run wit
 
 ## Near-Term Roadmap
 
-1. Stabilize `visual_rl` v0.3 as the local abstraction/runtime layer.
-2. Extend TempFlow from tiny branching to SD1.5, then SD3/FLUX/QwenImage.
-3. Add Flash-GRPO as `single_step` rollout plus algorithm plugin.
+1. Stabilize `visual_rl` v0.4 as the local abstraction/runtime layer.
+2. Run the validation backlog for tiny GRPO/Flash/TempFlow reward trends.
+3. Extend TempFlow and Flash from tiny diffusion to SD1.5.
 4. Add a GenRL-style `WanTrainer` behind `visual_rl.trainer`.
 5. Move World-R1 reward/camera features into specialization modules.
 6. Use Inferix primarily for BlockVid-style eval, streaming preview, profiling, and latent-only `NO_DECODE` flows.
