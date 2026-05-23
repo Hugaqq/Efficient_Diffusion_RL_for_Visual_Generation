@@ -1,29 +1,26 @@
-# VisualRL
+# Enfficient Diffusion RL infra for Visual Generaion
 
-VisualRL is the integration layer for the four local projects:
+`visual_rl` is the implementation package for a unified diffusion RL training
+infra targeting image, video, and world-generation experiments.
 
-- `reference_code/World-R1-main`: world/video specialization for Wan/CogVideoX video RL, camera-aware latents, 3D/general rewards.
-- `reference_code/GenRL-main`: training runtime reference for typed config, trainer lifecycle, sampling, rewards, and checkpointing.
-- `reference_code/Flash-GRPO-main`: single-step GRPO reference for low-cost tiny image RL first, then video.
-- `reference_code/TempFlow-GRPO-main`: branching GRPO algorithm reference for tiny image RL first, then SD3/FLUX/QwenImage.
-- `reference_code/Inferix-main`: BlockVid-oriented eval, preview, serving, and profiling backend.
+The project integrates ideas from World-R1, Flash-GRPO, TempFlow-GRPO, Inferix
+/ BlockVid, and GenRL. The goal is not to copy these repositories into one
+environment, but to extract common contracts for rollouts, rewards, algorithms,
+training, caching, and evaluation.
 
-v0.2 keeps the v0.1 isolation and adds a GenRL-inspired runtime layer:
-typed config, BaseTrainer lifecycle, epoch-aware sampler utilities, per-reward
-advantages, raw/weighted reward logging, and media-aware reward cache.
+## Current Progress
 
-v0.3 adds the first TempFlow implementation: tiny diffusion image rollout,
-prompt-color reward, branching rollout expansion, TempFlow-GRPO
-branch/timestep credit assignment, noise-aware weighting, lazy SD3/FLUX/QwenImage
-bridges, and CPU-only smoke coverage.
+- `v0.1`: core package skeleton, `RolloutBatch`, `RewardRouter`, mock trainer,
+  CLI, cache, and smoke tests.
+- `v0.2`: typed config, trainer lifecycle, advantage utilities, reward
+  raw/weighted logging, and safer local validation.
+- `v0.3`: TempFlow tiny branching path with prompt-color reward and
+  branch/timestep credit assignment.
+- `v0.4`: Flash-GRPO tiny single-step path with iso-temporal grouping and
+  scheduler-style rectification.
 
-v0.4 adds the first Flash-GRPO implementation: single-step rollout,
-iso-temporal prompt grouping, selected timestep metadata, scheduler-style
-rectification weights, and a tiny diffusion smoke path.
-
-The canonical current roadmap is [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
-It treats GenRL as an engineering reference only, while the actual integration
-targets are World-R1, Flash-GRPO, TempFlow-GRPO, and Inferix.
+Current smoke tests validate infra wiring on cheap workloads. Real SD3, FLUX,
+QwenImage, Wan, and World-R1 training are still pending.
 
 ## Quick Smoke
 
@@ -34,22 +31,13 @@ visual-rl smoke-imports
 visual-rl smoke-mock --output-dir runs/smoke --steps 2
 visual-rl tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
 visual-rl flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
-visual-rl world-r1-plan --model-path /path/to/Wan2.1-T2V-1.3B-Diffusers --gpus 6,7
-visual-rl wan-plan --output-dir runs/wan_runtime_plan
+python -m pytest -q tests
+python -m ruff check visual_rl tests
 ```
 
-## Server Safety
+Use `CUDA_VISIBLE_DEVICES=""` for CPU-only server smoke tests on shared
+machines.
 
-Use the GPU probe before running anything on the shared 8x5090 server:
-
-```bash
-bash scripts/server_gpu_probe.sh v-qiaoqifan@10.130.140.73
-```
-
-The v0.1 launcher is conservative by default and accepts explicit `CUDA_VISIBLE_DEVICES`.
-
-For TempFlow tiny smoke on the shared server, prefer CPU-only execution first:
-
-```bash
-CUDA_VISIBLE_DEVICES="" python -m visual_rl.cli tempflow-smoke --output-dir runs/server_tempflow_tiny_smoke --steps 2
-```
+See [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) and
+[`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](docs/EXPERIMENT_VALIDATION_BACKLOG.md)
+for the roadmap and known validation gaps.

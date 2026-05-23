@@ -1,190 +1,93 @@
-# Visual RL Infra for Diffusion Generation
+# Enfficient Diffusion RL infra for Visual Generaion
 
-This repository is a local integration workspace for building a unified diffusion RL training infrastructure for visual generation.
+This repository builds a unified reinforcement-learning infrastructure for
+diffusion-based visual generation. The goal is to make image, video, and
+world-generation RL experiments share the same training contracts instead of
+living as isolated research scripts.
 
-The current direction is:
+The implementation package is still named `visual_rl`. It provides common
+interfaces for rollout batches, reward routing, algorithm plugins, checkpointing,
+logging, and cheap smoke tests. The legacy research projects remain reference
+material and are not vendored into the Python package.
 
-> `visual_rl` provides the unified abstraction layer, `reference_code/GenRL-main` provides the production-style training runtime reference, and the four research systems below are integrated as specialization modules.
+## What This Project Is For
 
-The initial target is not to merge every codebase mechanically. The goal is to extract stable contracts, trainer/runtime patterns, reward interfaces, rollout formats, and evaluation backends into one maintainable infra.
+- Train diffusion models with GRPO-style objectives for visual generation.
+- Compare full-trajectory, Flash single-step, and TempFlow branching rollouts
+  under one trainer interface.
+- Route local or remote visual rewards through a shared `RewardRouter`.
+- Cache rollouts and reward results so failed or expensive runs can be resumed
+  or replayed.
+- Start with tiny and small image models, then move toward SD3/FLUX/QwenImage,
+  Wan/World-R1 video, and Inferix/BlockVid eval.
 
-## Current Status
+## Integrated Directions
 
-- `v0.1`: created the first `visual_rl` skeleton with `RolloutBatch`, `RewardRouter`, mock rollout/training, cache, CLI, and local smoke tests.
-- `v0.2`: upgraded toward a GenRL-style runtime with typed config, `BaseTrainer`, reward raw/weighted scoring, per-prompt/per-reward advantage computation, epoch-aware sampler, and safer local validation.
-- `v0.3`: added the first TempFlow path with `tiny_diffusion`, prompt-color image reward, branching rollout, branch/timestep credit assignment, noise-aware TempFlow-GRPO loss, lazy SD3/FLUX/QwenImage bridges, and local/server tiny smoke tests.
-- `v0.4`: added the first Flash-GRPO path with single-step rollout, iso-temporal prompt grouping, selected timestep metadata, scheduler-style rectification weights, and tiny smoke tests.
+- **World-R1**: video/world-generation specialization, including 3D rewards,
+  general rewards, camera-aware latents, and future Wan/CogVideoX paths.
+- **Flash-GRPO**: low-cost selected-timestep training with iso-temporal prompt
+  grouping and temporal rectification.
+- **TempFlow-GRPO**: image diffusion RL with branching rollouts and
+  timestep-level credit assignment.
+- **Inferix / BlockVid**: future eval, preview, profiling, long-video serving,
+  and latent-only/no-decode workflows.
+- **GenRL**: engineering reference for typed config, trainer lifecycle,
+  sampling, rewards, checkpointing, and distributed training patterns.
 
-Heavy server-side experiments are not part of the committed state. The repo now supports safe CPU-only server smoke validation before using any shared GPUs.
+## Current Progress
 
-## Project Roles
+- **v0.1**: created the first `visual_rl` skeleton with `RolloutBatch`,
+  `RewardRouter`, mock training, rollout cache, CLI, and local smoke tests.
+- **v0.2**: added typed config, `BaseTrainer`, per-prompt/per-reward advantages,
+  raw/weighted reward logging, epoch-aware sampling, and safer validation.
+- **v0.3**: added TempFlow tiny branching support with `tiny_diffusion`,
+  prompt-color reward, branch metadata, branch/timestep credit assignment, and
+  lazy SD3/FLUX/QwenImage bridges.
+- **v0.4**: added Flash-GRPO tiny single-step support with selected timestep
+  rollout, iso-temporal grouping, scheduler-style rectification weights, and
+  CLI/tests.
 
-| Component | Role in This Repo | What We Reuse | What We Avoid |
-| --- | --- | --- | --- |
-| `visual_rl/` | Our integration layer | Stable dataclasses, config, trainer API, reward router, rollout cache, algorithm plugins | One-off script coupling |
-| `reference_code/GenRL-main/` | Training runtime reference | Typed config, FSDP/checkpoint/resume design, Wan training loop structure, sampler, reward offload, advantage logic | Treating it as a black-box dependency |
-| `reference_code/World-R1-main/` | World/video specialization | 3D reward, general reward, camera-aware latent initialization, camera trajectory metadata, dynamic prompt phase | Making World-R1 the global trainer trunk |
-| `reference_code/Flash-GRPO-main/` | Low-cost video RL plugin | Single-step selected rollout, iso-temporal grouping, temporal gradient rectification | Duplicating trainer/runtime code |
-| `reference_code/TempFlow-GRPO-main/` | Image flow RL plugin | Branching rollout, timestep credit assignment, noise-aware weighting for SD3/FLUX/QwenImage | Polluting Wan-specific trainer logic |
-| `reference_code/Inferix-main/` | BlockVid/inference/eval backend | Block-diffusion serving, semi-autoregressive block scheduling, KV cache ideas, streaming preview, profiling, `NO_DECODE` latent paths | Using it as the online RL trainer until logprob/recompute contracts exist |
+The current implementation proves the infra plumbing on cheap toy workloads.
+It does **not** yet prove real SD3/FLUX/QwenImage/Wan training quality or
+paper-level algorithm parity.
 
-## Four Works Taxonomy
+## Validation
 
-### 1. World-R1: 3D-Constrained Video/World RL
-
-World-R1 is the best source for world-generation specialization.
-
-Key ideas to keep:
-
-- 3D-aware rewards for geometry consistency.
-- General visual reward paired with 3D reward to avoid quality collapse.
-- Camera-aware latent initialization from camera trajectory metadata.
-- Dynamic-scene prompt phase for motion diversity.
-
-Integration target:
-
-- `visual_rl.model_adapters.wan`
-- `visual_rl.rewards.world_r1_rewards`
-- future `visual_rl.rollout.full_trajectory`
-- future world-generation eval presets
-
-World-R1 should become a specialization layer on top of a stronger runtime, not the root trainer architecture.
-
-### 2. Flash-GRPO: Efficient Single-Step Video RL
-
-Flash-GRPO is the low-cost GRPO route for video diffusion.
-
-Key ideas to keep:
-
-- Selected single-step rollout instead of full trajectory rollout.
-- Prompt-wise same-timestep grouping to remove timestep-confounded variance.
-- Temporal gradient rectification for scheduler/timestep-dependent scale.
-- Wan video RL ablation path with much lower sampling cost.
-
-Integration target:
-
-- `visual_rl.rollout.single_step`
-- `visual_rl.algorithms.flash_grpo`
-- shared `visual_rl.trainer.BaseTrainer`
-- shared `visual_rl.rewards.RewardRouter`
-
-Flash should be an algorithm plugin, not a copied trainer.
-
-### 3. TempFlow-GRPO: Branching Credit Assignment for Image Flow Models
-
-TempFlow-GRPO is the image/flow RL branch of the infra.
-
-Key ideas to keep:
-
-- Trajectory branching at selected timesteps.
-- Branch-level process rewards without a separate intermediate reward model.
-- Noise-aware weighting to focus learning on high-impact timesteps.
-- SD3, FLUX, and QwenImage adapters.
-
-Integration target:
-
-- `visual_rl.rollout.branching`
-- `visual_rl.algorithms.tempflow_grpo`
-- `visual_rl.model_adapters.sd3`
-- `visual_rl.model_adapters.flux`
-- `visual_rl.model_adapters.qwenimage`
-
-TempFlow should not leak image-specific branching assumptions into the Wan trainer.
-
-### 4. Inferix / BlockVid: Semi-AR Block-Diffusion Inference for Eval and Serving
-
-Inferix is now treated primarily as the source for BlockVid-style inference architecture.
-
-The important part is its semi-autoregressive block-diffusion design:
-
-- Diffusion block: model-level generation unit, such as 3 frames per block in Self-Forcing.
-- Segment: framework-level long-video generation unit composed of multiple blocks.
-- KV cache management across generated blocks.
-- Decode timing modes:
-  - `AFTER_ALL`: decode after all diffusion blocks are produced.
-  - `PER_BLOCK`: decode each generated block immediately for streaming preview.
-  - `NO_DECODE`: keep latent-only outputs for profiling or integration.
-- Long-video generation through block/segment scheduling and overlap.
-- Profiling for diffusion time, VAE time, memory, and block-level latency.
-
-Integration target:
-
-- `visual_rl.eval.inferix_backend`
-- preview generation after checkpoint export
-- long-video eval
-- profiling-guided cost analysis
-- future rollout acceleration only after a clean `sample_with_logprob` / `recompute_logprob` contract exists
-
-Important policy for future work:
-
-> For Inferix, prioritize learning and adapting BlockVid / semi-autoregressive block-diffusion ideas. Do not treat Inferix as the main RL training runtime.
-
-## Target Architecture
-
-```text
-visual_rl
-  core/
-    types.py
-    registry.py
-
-  configs/
-    schema.py
-    presets/
-
-  trainer/
-    base.py
-    trainer.py
-    wan_trainer.py
-    image_flow_trainer.py
-
-  rollout/
-    full_trajectory.py
-    single_step.py
-    branching.py
-    cache.py
-
-  algorithms/
-    grpo.py
-    flow_grpo.py
-    flash_grpo.py
-    tempflow_grpo.py
-    longcat.py
-
-  rewards/
-    router.py
-    local_models.py
-    remote_clients.py
-    cache.py
-
-  data/
-    prompts.py
-    samplers.py
-
-  eval/
-    inferix_backend.py
-```
-
-## Local Validation
-
-The current safe local checks are:
+Safe local checks:
 
 ```bash
-conda run -n visual-rl visual-rl smoke-imports
-conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke_v02_mock --steps 2
-conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
-conda run -n visual-rl python -m visual_rl.cli flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
-conda run -n visual-rl visual-rl wan-plan --output-dir runs/wan_runtime_plan
-conda run -n visual-rl python -m pytest -q tests
-conda run -n visual-rl python -m ruff check visual_rl tests
+conda activate visual-rl
+pip install -e ".[dev]"
+visual-rl smoke-imports
+visual-rl smoke-mock --output-dir runs/smoke --steps 2
+visual-rl tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
+visual-rl flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
+python -m pytest -q tests
+python -m ruff check visual_rl tests
 ```
 
-No server access is required for these checks. The server smoke path can run with `CUDA_VISIBLE_DEVICES=""` to avoid GPU allocation.
+Latest verified state:
 
-## Near-Term Roadmap
+- Local tests: `15 passed`
+- Local ruff: passed
+- Local TempFlow tiny smoke: passed
+- Local Flash tiny smoke: passed
+- Server CPU-only TempFlow tiny smoke: passed
+- Server CPU-only Flash tiny smoke: passed
 
-1. Stabilize `visual_rl` v0.4 as the local abstraction/runtime layer.
-2. Run the validation backlog for tiny GRPO/Flash/TempFlow reward trends.
-3. Extend TempFlow and Flash from tiny diffusion to SD1.5.
-4. Add a GenRL-style `WanTrainer` behind `visual_rl.trainer`.
-5. Move World-R1 reward/camera features into specialization modules.
-6. Use Inferix primarily for BlockVid-style eval, streaming preview, profiling, and latent-only `NO_DECODE` flows.
+Server smoke tests were run with `CUDA_VISIBLE_DEVICES=""`, so they did not
+consume shared GPUs.
+
+## Near-Term Tasks
+
+- Run the validation backlog: reward trends, parameter updates, deterministic
+  golden tests, cache/resume behavior, and failure-path tests.
+- Extend tiny Flash/TempFlow paths to SD1.5 LoRA.
+- Implement real SD3/FLUX/QwenImage adapters after SD1.5 is stable.
+- Add World-R1 reward/camera probes before any real Wan RL training.
+- Build Inferix/BlockVid as an eval and profiling backend, not as the online RL
+  trainer until clean logprob contracts exist.
+
+See [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) for the detailed roadmap and
+[`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](docs/EXPERIMENT_VALIDATION_BACKLOG.md)
+for known validation gaps.

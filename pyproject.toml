@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "visual-rl"
 version = "0.4.0"
-description = "Unified Diffusion RL training infra for visual generation."
+description = "Enfficient Diffusion RL infra for Visual Generaion."
 readme = "README_VISUAL_RL.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
