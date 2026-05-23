@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from visual_rl.advantages import AdvantageComputer
-from visual_rl.algorithms.grpo import GRPOAlgorithm
+from visual_rl.algorithms import build_algorithm
 from visual_rl.configs.schema import VisualRLConfig, section_to_dict
 from visual_rl.core.registry import MODEL_ADAPTERS
 from visual_rl.datasets.prompt_dataset import PromptDataset
@@ -30,7 +30,7 @@ class VisualRLTrainer(BaseTrainer):
         self.rollout = build_rollout_engine(rollout_config)
         self.reward_router = RewardRouter(config.rewards, cache_dir=self.output_dir / "reward_cache")
         self.rollout_cache = RolloutCache(self.output_dir / "rollouts")
-        self.algorithm = GRPOAlgorithm.from_config(config.algorithm)
+        self.algorithm = build_algorithm(config.algorithm)
         self.advantage_computer = AdvantageComputer(
             reward_weights=config.rewards.weights,
             per_prompt=config.per_prompt_stat_tracking,
@@ -72,6 +72,15 @@ class VisualRLTrainer(BaseTrainer):
             loss.backward()
             optimizer.step()
 
+            extra_loss_metrics = {}
+            for key, value in loss_info.items():
+                if key in {"approx_kl", "clipfrac", "policy_loss"}:
+                    continue
+                if hasattr(value, "detach"):
+                    extra_loss_metrics[key] = float(value.detach().cpu())
+                elif isinstance(value, (int, float)):
+                    extra_loss_metrics[key] = float(value)
+
             metrics = {
                 "step": step,
                 "loss": float(loss.detach().cpu()),
@@ -79,6 +88,7 @@ class VisualRLTrainer(BaseTrainer):
                 "reward_std": float(rewards.weighted_total.std(unbiased=False).cpu()),
                 "approx_kl": float(loss_info["approx_kl"].detach().cpu()),
                 "clipfrac": float(loss_info["clipfrac"].detach().cpu()),
+                **extra_loss_metrics,
                 **advantage_result.metrics,
             }
             self.logger.log(metrics)

@@ -87,6 +87,9 @@ class AlgorithmConfig:
     beta: float = 0.0
     advantage_mode: str = "grpo"
     weight_advantages: bool = False
+    credit_assignment: str = "all"
+    noise_weighting: dict[str, Any] = field(default_factory=dict)
+    branch: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

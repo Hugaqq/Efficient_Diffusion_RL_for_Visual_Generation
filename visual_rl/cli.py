@@ -9,8 +9,13 @@ from pathlib import Path
 
 def _register_builtin_plugins() -> None:
     import visual_rl.model_adapters.mock  # noqa: F401
+    import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
     import visual_rl.model_adapters.wan  # noqa: F401
+    import visual_rl.model_adapters.sd3  # noqa: F401
+    import visual_rl.model_adapters.flux  # noqa: F401
+    import visual_rl.model_adapters.qwenimage  # noqa: F401
     import visual_rl.rewards.clients  # noqa: F401
+    import visual_rl.rewards.image_rewards  # noqa: F401
 
 
 def smoke_imports(args: argparse.Namespace) -> int:
@@ -36,6 +41,22 @@ def smoke_mock(args: argparse.Namespace) -> int:
     config = load_config(args.config or default_config)
     if args.output_dir:
         config.output_dir = args.output_dir
+    trainer = VisualRLTrainer(config)
+    metrics = trainer.train(max_steps=args.steps)
+    print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
+    return 0
+
+
+def tempflow_smoke(args: argparse.Namespace) -> int:
+    _register_builtin_plugins()
+    from visual_rl.configs.schema import load_config
+    from visual_rl.trainer.trainer import VisualRLTrainer
+
+    default_config = Path(__file__).parent / "configs" / "presets" / "tempflow_tiny_branching.yaml"
+    config = load_config(args.config or default_config)
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.paths.output_dir = args.output_dir
     trainer = VisualRLTrainer(config)
     metrics = trainer.train(max_steps=args.steps)
     print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
@@ -85,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
     mock_parser.add_argument("--output-dir", default=None)
     mock_parser.add_argument("--steps", type=int, default=2)
     mock_parser.set_defaults(func=smoke_mock)
+
+    tempflow_parser = subparsers.add_parser("tempflow-smoke")
+    tempflow_parser.add_argument("--config", default=None)
+    tempflow_parser.add_argument("--output-dir", default=None)
+    tempflow_parser.add_argument("--steps", type=int, default=2)
+    tempflow_parser.set_defaults(func=tempflow_smoke)
 
     plan_parser = subparsers.add_parser("world-r1-plan")
     plan_parser.add_argument("--model-path", required=True)
