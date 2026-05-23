@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-rl"
-version = "0.4.0"
+version = "0.5.0"
 description = "Enfficient Diffusion RL infra for Visual Generaion."
 readme = "README_VISUAL_RL.md"
 requires-python = ">=3.10,<3.12"
@@ -40,3 +40,7 @@ include = ["visual_rl*"]
 
 [tool.setuptools.package-data]
 "visual_rl.configs.presets" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["reference_code", "third_party", ".git", ".venv", "runs"]

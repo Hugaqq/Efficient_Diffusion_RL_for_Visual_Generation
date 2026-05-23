@@ -22,13 +22,18 @@ class VisualRLTrainer(BaseTrainer):
         super().__init__(config)
 
         model_config = section_to_dict(config.model)
+        model_config.setdefault("use_lora", config.use_lora)
+        model_config.setdefault("lora_path", config.train.lora_path)
+        if config.paths.pretrained_model and not model_config.get("model_path"):
+            model_config["model_path"] = config.paths.pretrained_model
         adapter_cls = MODEL_ADAPTERS.get(model_config.get("name", "mock_wan"))
         self.adapter = adapter_cls(model_config)
         self.dataset = PromptDataset.from_config(config.dataset)
         rollout_config = section_to_dict(config.sample)
         rollout_config.update(config.rollout)
         self.rollout = build_rollout_engine(rollout_config)
-        self.reward_router = RewardRouter(config.rewards, cache_dir=self.output_dir / "reward_cache")
+        reward_cache_dir = config.rewards.cache_dir or self.output_dir / "reward_cache"
+        self.reward_router = RewardRouter(config.rewards, cache_dir=reward_cache_dir)
         self.rollout_cache = RolloutCache(self.output_dir / "rollouts")
         self.algorithm = build_algorithm(config.algorithm)
         self.advantage_computer = AdvantageComputer(
@@ -54,7 +59,7 @@ class VisualRLTrainer(BaseTrainer):
             self.rollout.config["epoch_tag"] = epoch_tag
             self.rollout.config["seed"] = self.config.seed + step
             batch = self.rollout.sample(self.adapter, prompts, metadata)
-            batch.validate_lightweight()
+            batch.validate_lightweight(strict=bool(self.config.trainer.get("strict_rollout_validation", False)))
             rewards = self.reward_router.score(batch.media, batch.prompts, batch.metadata)
             if not rewards.valid_mask.all():
                 raise RuntimeError(f"Reward failure at step {step}: {rewards.metadata}")
@@ -62,7 +67,7 @@ class VisualRLTrainer(BaseTrainer):
             advantage_result = self.advantage_computer.compute(
                 batch.prompts,
                 rewards.raw,
-                rewards.weighted_total,
+                rewards.normalized_total,
             )
 
             new_log_probs = self.adapter.recompute_log_probs(batch)

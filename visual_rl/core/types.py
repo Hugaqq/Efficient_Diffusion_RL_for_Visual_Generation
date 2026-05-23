@@ -21,10 +21,56 @@ class RolloutBatch:
     epoch_tag: int | None = None
     seed: int | None = None
     model_metadata: dict[str, Any] = field(default_factory=dict)
+    model_tensors: dict[str, Any] = field(default_factory=dict)
 
-    def validate_lightweight(self) -> None:
+    def validate_lightweight(self, strict: bool = False) -> None:
         if len(self.prompts) != len(self.metadata):
             raise ValueError("prompts and metadata must have the same length")
+        if strict:
+            self.validate_strict()
+
+    def validate_strict(self) -> None:
+        """Validate batch dimensions before expensive model/reward work."""
+
+        batch_size = len(self.prompts)
+        self._check_batch_axis("media", self.media, batch_size, allow_scalar=False)
+        self._check_batch_axis("latents", self.latents, batch_size, allow_scalar=False)
+        self._check_batch_axis("next_latents", self.next_latents, batch_size, allow_scalar=False)
+        self._check_batch_axis("timesteps", self.timesteps, batch_size, allow_scalar=False)
+        self._check_batch_axis("old_log_probs", self.old_log_probs, batch_size, allow_scalar=False)
+        self._check_batch_axis("kl", self.kl, batch_size, allow_scalar=True)
+        self._check_batch_axis("branch_ids", self.branch_ids, batch_size, allow_scalar=True)
+
+        old_shape = getattr(self.old_log_probs, "shape", None)
+        timestep_shape = getattr(self.timesteps, "shape", None)
+        if old_shape is not None and timestep_shape is not None and len(old_shape) >= 2 and len(timestep_shape) >= 2:
+            if old_shape[:2] != timestep_shape[:2]:
+                raise ValueError(
+                    "old_log_probs and timesteps must share [batch, steps] dimensions: "
+                    f"{old_shape[:2]} != {timestep_shape[:2]}"
+                )
+
+        latent_shape = getattr(self.latents, "shape", None)
+        next_shape = getattr(self.next_latents, "shape", None)
+        if latent_shape is not None and next_shape is not None and latent_shape != next_shape:
+            raise ValueError(f"latents and next_latents must have the same shape: {latent_shape} != {next_shape}")
+
+    @staticmethod
+    def _check_batch_axis(name: str, value: Any, batch_size: int, allow_scalar: bool) -> None:
+        if value is None:
+            return
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+                if len(value) != batch_size:
+                    raise ValueError(f"{name} length must match batch size {batch_size}, got {len(value)}")
+            return
+        if len(shape) == 0:
+            if allow_scalar:
+                return
+            raise ValueError(f"{name} must have a batch dimension")
+        if int(shape[0]) != batch_size:
+            raise ValueError(f"{name} batch dimension must be {batch_size}, got {shape[0]}")
 
 
 @dataclass

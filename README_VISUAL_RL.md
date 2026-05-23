@@ -18,9 +18,12 @@ training, caching, and evaluation.
   branch/timestep credit assignment.
 - `v0.4`: Flash-GRPO tiny single-step path with iso-temporal grouping and
   scheduler-style rectification.
+- `v0.5`: SD1.5 LoRA image adapter, image trainer entry point, SD3.5 TempFlow
+  reference adapter, FLUX/QwenImage TempFlow adapter entries, and stricter
+  rollout/reward/cache contracts.
 
-Current smoke tests validate infra wiring on cheap workloads. Real SD3, FLUX,
-QwenImage, Wan, and World-R1 training are still pending.
+Current smoke tests validate infra wiring on cheap workloads. Real SD1.5/SD3,
+FLUX, QwenImage, Wan, and World-R1 reward-improvement runs are still pending.
 
 ## Quick Smoke
 
@@ -31,7 +34,7 @@ visual-rl smoke-imports
 visual-rl smoke-mock --output-dir runs/smoke --steps 2
 visual-rl tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
 visual-rl flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
-python -m pytest -q tests
+python -m pytest -q
 python -m ruff check visual_rl tests
 ```
 

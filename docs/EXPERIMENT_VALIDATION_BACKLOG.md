@@ -18,6 +18,8 @@ pretending the tiny smoke tests prove full training correctness.
 ## Infra Checks
 
 - Verify reward cache hit/miss behavior with media hash and reward version.
+  Numpy/PIL/tensor content hashing has unit coverage; end-to-end reward-cache
+  replay is still pending.
 - Verify resume from checkpoint restores model state and keeps metrics/logging
   append behavior sane.
 - Add failure-path tests for reward timeout, invalid mask, and strict unknown
@@ -35,15 +37,20 @@ pretending the tiny smoke tests prove full training correctness.
 
 ## Real-Model Checks
 
-- Add SD1.5 LoRA adapter contract tests before SD3/FLUX/QwenImage.
+- Add SD1.5 LoRA adapter contract tests before SD3/FLUX/QwenImage. Deferred
+  adapter registration tests are complete; loaded-model numeric tests are still
+  pending.
 - Validate real model `sample()` and `recompute_log_probs()` numerics on a tiny
   batch before any reward optimization run. SD3.5 reference script path passed
-  a minimal TempFlow smoke on 2026-05-23; `visual_rl` adapter path is pending.
+  a minimal TempFlow smoke on 2026-05-23; `visual_rl` SD3 adapter path is
+  implemented but not yet server-validated.
 - Compare Flash selected-step loss against full-trajectory loss on a controlled
   toy scheduler.
 - Validate TempFlow branch reward alignment on SD1.5 before moving to SD3. The
   SD3.5 reference script now has a smoke pass, but adapter-level parity is still
   pending.
+- Validate FLUX and QwenImage adapters with low-resolution smoke batches after
+  SD3.5 adapter parity is confirmed.
 
 ## Video/Inferix Checks
 

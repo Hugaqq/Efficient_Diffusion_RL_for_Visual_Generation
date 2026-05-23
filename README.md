@@ -46,10 +46,14 @@ material and are not vendored into the Python package.
 - **v0.4**: added Flash-GRPO tiny single-step support with selected timestep
   rollout, iso-temporal grouping, scheduler-style rectification weights, and
   CLI/tests.
+- **v0.5**: hardened trainer contracts for real image models, added SD1.5 LoRA
+  adapter and `ImageRLTrainer`, wrapped the SD3.5 TempFlow reference path behind
+  `visual_rl` adapters, and added FLUX/QwenImage TempFlow adapter entries.
 
 The current implementation proves the infra plumbing on cheap toy workloads.
-It does **not** yet prove real SD3/FLUX/QwenImage/Wan training quality or
-paper-level algorithm parity.
+The SD1.5/SD3/FLUX/QwenImage adapters now have code-level contracts and deferred
+adapter probes, but real-model reward-improvement runs through `VisualRLTrainer`
+are still pending.
 
 ## Validation
 
@@ -62,14 +66,16 @@ visual-rl smoke-imports
 visual-rl smoke-mock --output-dir runs/smoke --steps 2
 visual-rl tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
 visual-rl flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
-python -m pytest -q tests
+python -m pytest -q
 python -m ruff check visual_rl tests
 ```
 
 Latest verified state:
 
-- Local tests: `15 passed`
+- Local tests: `21 passed`
 - Local ruff: passed
+- Local adapter probes for SD1.5, SD3.5, FLUX, and QwenImage: passed in
+  deferred-load mode
 - Local TempFlow tiny smoke: passed
 - Local Flash tiny smoke: passed
 - Server CPU-only TempFlow tiny smoke: passed
@@ -82,16 +88,16 @@ consume shared GPUs.
 The two-GPU TempFlow correctness probe used GPU0 and GPU1 only, while GPU2-7
 were already occupied by other jobs.
 The SD3.5-medium probe used GPU1 only and exercised the reference TempFlow SD3
-path; the `visual_rl` SD3 adapter is still pending.
+script. The next server check should rerun that path through the new
+`visual_rl` SD3 TempFlow adapter.
 
 ## Near-Term Tasks
 
 - Run the validation backlog: reward trends, parameter updates, deterministic
   golden tests, cache/resume behavior, and failure-path tests.
-- Extend tiny Flash/TempFlow paths to SD1.5 LoRA.
-- Wrap the verified SD3.5 TempFlow reference path behind the `visual_rl` adapter
-  contract.
-- Implement FLUX/QwenImage adapters after SD3.5 is stable inside `visual_rl`.
+- Run SD1.5 LoRA and SD3.5 TempFlow adapter-level numeric probes on one idle GPU.
+- Validate FLUX/QwenImage adapters with tiny low-resolution smoke batches after
+  SD3.5 adapter parity is confirmed.
 - Add World-R1 reward/camera probes before any real Wan RL training.
 - Build Inferix/BlockVid as an eval and profiling backend, not as the online RL
   trainer until clean logprob contracts exist.

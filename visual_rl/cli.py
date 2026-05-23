@@ -9,6 +9,7 @@ from pathlib import Path
 
 def _register_builtin_plugins() -> None:
     import visual_rl.model_adapters.mock  # noqa: F401
+    import visual_rl.model_adapters.sd15  # noqa: F401
     import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
     import visual_rl.model_adapters.wan  # noqa: F401
     import visual_rl.model_adapters.sd3  # noqa: F401
@@ -83,6 +84,54 @@ def flash_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def image_train(args: argparse.Namespace) -> int:
+    _register_builtin_plugins()
+    from visual_rl.configs.schema import load_config
+    from visual_rl.trainer.image_trainer import ImageRLTrainer
+
+    default_config = Path(__file__).parent / "configs" / "presets" / "sd15_lora_rl.yaml"
+    config = load_config(args.config or default_config)
+    if args.model_path:
+        config.model.model_path = args.model_path
+        config.paths.pretrained_model = args.model_path
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.paths.output_dir = args.output_dir
+    trainer = ImageRLTrainer(config)
+    metrics = trainer.train(max_steps=args.steps)
+    print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
+    return 0
+
+
+def adapter_probe(args: argparse.Namespace) -> int:
+    _register_builtin_plugins()
+    from visual_rl.configs.schema import load_config, section_to_dict
+    from visual_rl.core.registry import MODEL_ADAPTERS
+
+    if args.config:
+        config = load_config(args.config)
+        model_config = section_to_dict(config.model)
+        model_config.setdefault("use_lora", config.use_lora)
+        model_config.setdefault("lora_path", config.train.lora_path)
+    else:
+        model_config = {"name": args.adapter, "model_path": args.model_path or "", "model_family": "image", "extra": {}}
+    model_config.setdefault("extra", {})
+    if args.device:
+        model_config["extra"]["device"] = args.device
+    if not args.load:
+        model_config["extra"]["defer_load"] = True
+
+    adapter_cls = MODEL_ADAPTERS.get(model_config["name"])
+    adapter = adapter_cls(model_config)
+    payload = {"adapter": adapter.name, "loaded": bool(args.load), "model_path": model_config.get("model_path", "")}
+    if args.load:
+        params = list(adapter.parameters())
+        payload["trainable_parameter_tensors"] = len(params)
+        payload["trainable_parameters"] = int(sum(parameter.numel() for parameter in params))
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def wan_plan(args: argparse.Namespace) -> int:
     _register_builtin_plugins()
     from visual_rl.configs.schema import load_config
@@ -138,6 +187,21 @@ def main(argv: list[str] | None = None) -> int:
     flash_parser.add_argument("--output-dir", default=None)
     flash_parser.add_argument("--steps", type=int, default=2)
     flash_parser.set_defaults(func=flash_smoke)
+
+    image_parser = subparsers.add_parser("image-train")
+    image_parser.add_argument("--config", default=None)
+    image_parser.add_argument("--model-path", default=None)
+    image_parser.add_argument("--output-dir", default=None)
+    image_parser.add_argument("--steps", type=int, default=1)
+    image_parser.set_defaults(func=image_train)
+
+    adapter_parser = subparsers.add_parser("adapter-probe")
+    adapter_parser.add_argument("--config", default=None)
+    adapter_parser.add_argument("--adapter", default="sd15_lora")
+    adapter_parser.add_argument("--model-path", default=None)
+    adapter_parser.add_argument("--device", default=None)
+    adapter_parser.add_argument("--load", action="store_true")
+    adapter_parser.set_defaults(func=adapter_probe)
 
     plan_parser = subparsers.add_parser("world-r1-plan")
     plan_parser.add_argument("--model-path", required=True)

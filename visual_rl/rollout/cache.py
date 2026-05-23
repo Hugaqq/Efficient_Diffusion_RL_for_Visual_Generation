@@ -26,6 +26,7 @@ class RolloutCache:
             "old_log_probs": batch.old_log_probs,
             "kl": batch.kl,
             "branch_ids": batch.branch_ids,
+            "model_tensors": batch.model_tensors,
         }
         torch.save(tensor_payload, base.with_suffix(".pt"))
         media_path = base.with_suffix(".media.pt")
@@ -41,5 +42,4 @@ class RolloutCache:
             metadata["reward_metadata"] = rewards.metadata
             metadata["weighted_total"] = rewards.weighted_total.detach().cpu().tolist()
         with base.with_suffix(".json").open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2, sort_keys=True)
-
+            json.dump(metadata, handle, indent=2, sort_keys=True, default=str)

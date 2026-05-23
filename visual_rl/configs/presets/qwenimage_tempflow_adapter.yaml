@@ -1,0 +1,66 @@
+run_name: qwenimage_tempflow_adapter
+seed: 31
+output_dir: runs/qwenimage_tempflow_adapter
+use_lora: true
+
+model:
+  name: qwenimage_tempflow
+  model_family: qwenimage
+  model_path: ""
+  extra:
+    repo_root: reference_code/TempFlow-GRPO-main
+    resolution: 256
+    dtype: bfloat16
+    lora_rank: 64
+    lora_alpha: 128
+
+dataset:
+  prompts:
+    - "a red square"
+  repeat_per_prompt: 1
+
+sample:
+  name: branching
+  batch_size: 1
+  num_steps: 3
+  guidance_scale: 4.0
+  num_batches_per_epoch: 1
+
+rollout:
+  branch_count: 1
+  exploration_k: 2
+  include_main: true
+  branch_timesteps: auto
+  branch_timestep_strategy: cycle
+  output_type: pt
+
+algorithm:
+  name: tempflow_grpo
+  clip_range: 0.01
+  adv_clip_max: 5.0
+  beta: 0.0
+  advantage_mode: grpo
+  credit_assignment: branch_timestep
+  noise_weighting:
+    enabled: true
+    mode: std_dev_t
+
+rewards:
+  weights:
+    prompt_color: 1.0
+  clients:
+    prompt_color:
+      name: prompt_color
+      version: v1
+  normalize: per_batch
+  fail_policy: raise
+
+train:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.00001
+  max_steps: 1
+  save_every: 1
+
+trainer:
+  strict_rollout_validation: true
