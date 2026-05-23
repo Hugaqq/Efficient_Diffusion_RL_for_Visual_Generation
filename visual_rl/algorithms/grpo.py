@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from visual_rl.core.types import RolloutBatch
+from visual_rl.core.registry import ALGORITHMS
 
 
 @dataclass
@@ -43,3 +44,6 @@ class GRPOAlgorithm:
         if batch.kl is not None and self.beta > 0:
             policy_loss = policy_loss + self.beta * batch.kl.mean()
         return policy_loss, {"approx_kl": approx_kl, "clipfrac": clipfrac, "policy_loss": policy_loss.detach()}
+
+
+ALGORITHMS.register("grpo", GRPOAlgorithm)

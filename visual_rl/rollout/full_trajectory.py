@@ -16,6 +16,10 @@ class FullTrajectoryRollout(RolloutEngine):
 
 def build_rollout_engine(config: dict[str, Any]) -> RolloutEngine:
     name = config.get("name", "full_trajectory")
+    if name == "branching":
+        from visual_rl.rollout.branching import BranchingRollout
+
+        return BranchingRollout(config)
     if name != "full_trajectory":
-        raise ValueError(f"v0.1 supports full_trajectory rollout, got {name!r}")
+        raise ValueError(f"Unsupported rollout engine: {name!r}")
     return FullTrajectoryRollout(config)
