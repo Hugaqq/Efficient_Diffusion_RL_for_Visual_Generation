@@ -90,6 +90,7 @@ class AlgorithmConfig:
     credit_assignment: str = "all"
     noise_weighting: dict[str, Any] = field(default_factory=dict)
     branch: dict[str, Any] = field(default_factory=dict)
+    rectification: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

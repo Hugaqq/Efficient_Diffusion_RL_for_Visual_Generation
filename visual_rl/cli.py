@@ -14,6 +14,9 @@ def _register_builtin_plugins() -> None:
     import visual_rl.model_adapters.sd3  # noqa: F401
     import visual_rl.model_adapters.flux  # noqa: F401
     import visual_rl.model_adapters.qwenimage  # noqa: F401
+    import visual_rl.algorithms.flash_grpo  # noqa: F401
+    import visual_rl.algorithms.grpo  # noqa: F401
+    import visual_rl.algorithms.tempflow_grpo  # noqa: F401
     import visual_rl.rewards.clients  # noqa: F401
     import visual_rl.rewards.image_rewards  # noqa: F401
 
@@ -21,10 +24,11 @@ def _register_builtin_plugins() -> None:
 def smoke_imports(args: argparse.Namespace) -> int:
     _register_builtin_plugins()
     import visual_rl
-    from visual_rl.core.registry import MODEL_ADAPTERS, REWARD_CLIENTS
+    from visual_rl.core.registry import ALGORITHMS, MODEL_ADAPTERS, REWARD_CLIENTS
 
     payload = {
         "visual_rl_version": visual_rl.__version__,
+        "algorithms": ALGORITHMS.keys(),
         "model_adapters": MODEL_ADAPTERS.keys(),
         "reward_clients": REWARD_CLIENTS.keys(),
     }
@@ -53,6 +57,22 @@ def tempflow_smoke(args: argparse.Namespace) -> int:
     from visual_rl.trainer.trainer import VisualRLTrainer
 
     default_config = Path(__file__).parent / "configs" / "presets" / "tempflow_tiny_branching.yaml"
+    config = load_config(args.config or default_config)
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.paths.output_dir = args.output_dir
+    trainer = VisualRLTrainer(config)
+    metrics = trainer.train(max_steps=args.steps)
+    print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
+    return 0
+
+
+def flash_smoke(args: argparse.Namespace) -> int:
+    _register_builtin_plugins()
+    from visual_rl.configs.schema import load_config
+    from visual_rl.trainer.trainer import VisualRLTrainer
+
+    default_config = Path(__file__).parent / "configs" / "presets" / "flash_tiny_single_step.yaml"
     config = load_config(args.config or default_config)
     if args.output_dir:
         config.output_dir = args.output_dir
@@ -112,6 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     tempflow_parser.add_argument("--output-dir", default=None)
     tempflow_parser.add_argument("--steps", type=int, default=2)
     tempflow_parser.set_defaults(func=tempflow_smoke)
+
+    flash_parser = subparsers.add_parser("flash-smoke")
+    flash_parser.add_argument("--config", default=None)
+    flash_parser.add_argument("--output-dir", default=None)
+    flash_parser.add_argument("--steps", type=int, default=2)
+    flash_parser.set_defaults(func=flash_smoke)
 
     plan_parser = subparsers.add_parser("world-r1-plan")
     plan_parser.add_argument("--model-path", required=True)

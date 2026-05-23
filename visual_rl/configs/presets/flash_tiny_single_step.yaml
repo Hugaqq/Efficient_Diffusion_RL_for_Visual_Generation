@@ -1,0 +1,54 @@
+run_name: flash_tiny_single_step
+seed: 11
+output_dir: runs/flash_tiny_single_step
+
+model:
+  name: tiny_diffusion
+  model_family: image
+  extra:
+    image_size: 16
+
+dataset:
+  prompts:
+    - "a red square"
+    - "a blue square"
+  repeat_per_prompt: 1
+
+sample:
+  name: single_step
+  batch_size: 1
+  num_steps: 4
+  samples_per_prompt: 4
+  num_batches_per_epoch: 1
+
+rollout:
+  selected_step_strategy: iso_temporal
+  timestep_range: [0, 3]
+  rectification_mode: scheduler_formula
+
+algorithm:
+  name: flash_grpo
+  clip_range: 0.01
+  adv_clip_max: 5.0
+  beta: 0.0
+  advantage_mode: grpo
+  rectification:
+    enabled: true
+    mode: scheduler_formula
+    normalize: true
+
+rewards:
+  weights:
+    prompt_color: 1.0
+  clients:
+    prompt_color:
+      name: prompt_color
+      version: v1
+  fail_policy: raise
+
+train:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.05
+  max_steps: 2
+  save_every: 1

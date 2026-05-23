@@ -1,0 +1,50 @@
+# Experiment Validation Backlog
+
+These are validation gaps discovered during the v0.3 TempFlow smoke review.
+They are intentionally deferred so feature integration can continue without
+pretending the tiny smoke tests prove full training correctness.
+
+## Near-Term Tiny Checks
+
+- Run `tiny_diffusion` for 20-50 steps and assert reward improves against a
+  fixed-seed baseline.
+- Assert trainable parameters change after GRPO, Flash-GRPO, and TempFlow-GRPO
+  updates.
+- Add deterministic golden tests for rollout expansion, selected timesteps,
+  branch IDs, advantage masks, and cache filenames.
+- Compare full-trajectory GRPO, Flash single-step GRPO, and TempFlow branching
+  on the same prompt/reward set.
+
+## Infra Checks
+
+- Verify reward cache hit/miss behavior with media hash and reward version.
+- Verify resume from checkpoint restores model state and keeps metrics/logging
+  append behavior sane.
+- Add failure-path tests for reward timeout, invalid mask, and strict unknown
+  reward names.
+- Add config validation for incompatible rollout/algorithm pairs.
+
+## Server Checks
+
+- Repeat tiny smoke on the server with CPU-only execution after each major
+  feature addition.
+- Add a one-GPU memory probe for small image models, pinned to an explicitly
+  idle GPU only.
+- Record GPU ID, visible devices, VRAM before/after, package versions, and
+  commit hash for every server run.
+
+## Real-Model Checks
+
+- Add SD1.5 LoRA adapter contract tests before SD3/FLUX/QwenImage.
+- Validate real model `sample()` and `recompute_log_probs()` numerics on a tiny
+  batch before any reward optimization run.
+- Compare Flash selected-step loss against full-trajectory loss on a controlled
+  toy scheduler.
+- Validate TempFlow branch reward alignment on SD1.5 before moving to SD3.
+
+## Video/Inferix Checks
+
+- Keep Wan/World-R1 runs as smoke-only until small image RL curves are stable.
+- Validate World-R1 reward server clients independently before online training.
+- For Inferix, validate BlockVid preview/profiling/no-decode paths first; do
+  not use it for online RL until logprob/recompute contracts exist.

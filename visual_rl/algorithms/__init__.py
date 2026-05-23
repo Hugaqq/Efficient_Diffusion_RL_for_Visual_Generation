@@ -13,6 +13,7 @@ def build_algorithm(config: Any):
 
         config = asdict(config)
     import visual_rl.algorithms.grpo  # noqa: F401
+    import visual_rl.algorithms.flash_grpo  # noqa: F401
     import visual_rl.algorithms.tempflow_grpo  # noqa: F401
 
     name = config.get("name", "grpo")

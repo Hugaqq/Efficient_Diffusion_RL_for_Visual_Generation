@@ -27,6 +27,7 @@ reference project. The current package already has:
 - prompt-color image reward
 - TempFlow branching rollout and branch/timestep credit assignment
 - lazy TempFlow SD3/FLUX/QwenImage adapter bridges
+- Flash-GRPO single-step rollout and selected-timestep loss on tiny diffusion
 
 Current validation status:
 
@@ -36,12 +37,17 @@ conda run -n visual-rl python -m ruff check visual_rl tests
 conda run -n visual-rl python -m visual_rl.cli smoke-imports
 conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
+conda run -n visual-rl python -m visual_rl.cli flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli wan-plan --output-dir runs/wan_runtime_plan
 ```
 
-Local tests, ruff, local TempFlow tiny smoke, and CPU-only server TempFlow tiny
-smoke pass. Real GPU training, real Wan checkpoint loading, reward server calls,
-and Inferix eval are not wired yet.
+Local tests, ruff, local TempFlow tiny smoke, local Flash tiny smoke, CPU-only
+server TempFlow tiny smoke, and CPU-only server Flash tiny smoke pass. Real GPU
+training, real Wan checkpoint loading, reward server calls, and Inferix eval are
+not wired yet.
+
+Known validation gaps are tracked in
+[`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](EXPERIMENT_VALIDATION_BACKLOG.md).
 
 ## Reference Code Policy
 
@@ -198,6 +204,8 @@ This is the lowest-cost end-to-end testbed for the whole infra.
 
 ### Phase B: Flash-GRPO Abstraction
 
+Status: first tiny-diffusion implementation complete.
+
 Implement low-cost single-step training before touching Wan.
 
 Files to complete:
@@ -211,10 +219,10 @@ visual_rl/integrations/flash_grpo/rectification.py
 
 Start on `tiny_diffusion`, then move to SD1.5. Required features:
 
-- selected timestep rollout
-- iso-temporal grouping
-- scheduler-aware timestep weights
-- temporal gradient rectification
+- selected timestep rollout: implemented for tiny diffusion
+- iso-temporal grouping: implemented
+- scheduler-aware timestep weights: implemented as a tiny scheduler formula
+- temporal gradient rectification: implemented in `flash_grpo`
 - sequential group rollout for 32 GB cards
 
 ### Phase C: TempFlow Branching Abstraction
@@ -364,6 +372,7 @@ Purpose: prove low-cost single-step optimization.
 
 - selected timestep
 - iso-temporal grouping
+- tiny implementation complete
 - compare speed/reward curve against full-trajectory GRPO
 
 ### Experiment 2: Tiny TempFlow Branching

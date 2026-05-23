@@ -20,6 +20,10 @@ def build_rollout_engine(config: dict[str, Any]) -> RolloutEngine:
         from visual_rl.rollout.branching import BranchingRollout
 
         return BranchingRollout(config)
+    if name in {"single_step", "flash_single_step"}:
+        from visual_rl.rollout.single_step import SingleStepRollout
+
+        return SingleStepRollout(config)
     if name != "full_trajectory":
         raise ValueError(f"Unsupported rollout engine: {name!r}")
     return FullTrajectoryRollout(config)
