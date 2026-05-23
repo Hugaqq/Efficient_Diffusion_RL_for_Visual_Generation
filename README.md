@@ -82,6 +82,7 @@ Latest verified state:
 - Server CPU-only Flash tiny smoke: passed
 - Server two-GPU TempFlow correctness probe: passed
 - Server SD3.5-medium TempFlow reference probe: passed
+- Server SD3.5-medium TempFlow guarded 200-epoch reference run: passed
 
 Server smoke tests were run with `CUDA_VISIBLE_DEVICES=""`, so they did not
 consume shared GPUs.

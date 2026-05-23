@@ -32,6 +32,8 @@ pretending the tiny smoke tests prove full training correctness.
   feature addition. TempFlow and Flash completed.
 - Add a one-GPU memory probe for small image models, pinned to an explicitly
   idle GPU only. TempFlow two-GPU isolated probe completed on GPU0/GPU1.
+- SD3.5-medium TempFlow guarded 5/20/200-epoch staged run completed on one idle
+  GPU1 on 2026-05-24.
 - Record GPU ID, visible devices, VRAM before/after, package versions, and
   commit hash for every server run.
 
