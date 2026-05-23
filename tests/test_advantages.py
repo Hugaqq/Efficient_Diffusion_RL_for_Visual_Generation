@@ -18,4 +18,5 @@ def test_weighted_advantages_shape_and_metrics():
     )
     assert tuple(result.advantages.shape) == (4,)
     assert "zero_std_ratio" in result.metrics
-
+    assert result.metrics["group_size"] == 2.0
+    assert result.metrics["trained_prompt_num"] == 2.0

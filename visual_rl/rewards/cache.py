@@ -21,15 +21,75 @@ def stable_hash_json(data: Any) -> str:
 
 
 def stable_hash_media(media: Any) -> str:
+    if media is None:
+        return stable_hash_text("none")
+    if isinstance(media, bytes | bytearray):
+        return stable_hash_bytes(bytes(media))
+    if isinstance(media, str):
+        return stable_hash_text(media)
+    if isinstance(media, Path):
+        return stable_hash_text(str(media))
+    if isinstance(media, list | tuple):
+        return stable_hash_json([stable_hash_media(item) for item in media])
+    if isinstance(media, dict):
+        return stable_hash_json({str(key): stable_hash_media(value) for key, value in sorted(media.items())})
     try:
         import torch
 
         if isinstance(media, torch.Tensor):
             tensor = media.detach().cpu().contiguous()
-            return stable_hash_bytes(tensor.numpy().tobytes())
+            return stable_hash_json(
+                {
+                    "kind": "torch",
+                    "dtype": str(tensor.dtype),
+                    "shape": list(tensor.shape),
+                    "bytes": stable_hash_bytes(tensor.numpy().tobytes()),
+                }
+            )
     except Exception:  # noqa: BLE001 - hashing should degrade gracefully
         pass
-    return stable_hash_text(repr(type(media)) + repr(getattr(media, "shape", "")))
+    try:
+        import numpy as np
+
+        if isinstance(media, np.ndarray):
+            array = np.ascontiguousarray(media)
+            return stable_hash_json(
+                {
+                    "kind": "numpy",
+                    "dtype": str(array.dtype),
+                    "shape": list(array.shape),
+                    "bytes": stable_hash_bytes(array.tobytes()),
+                }
+            )
+    except Exception:  # noqa: BLE001 - numpy is optional
+        pass
+    try:
+        from PIL import Image
+
+        if isinstance(media, Image.Image):
+            image = media.convert(media.mode)
+            return stable_hash_json(
+                {
+                    "kind": "pil",
+                    "mode": image.mode,
+                    "size": image.size,
+                    "bytes": stable_hash_bytes(image.tobytes()),
+                }
+            )
+    except Exception:  # noqa: BLE001 - pillow is optional
+        pass
+    if hasattr(media, "tobytes"):
+        try:
+            return stable_hash_json(
+                {
+                    "kind": type(media).__name__,
+                    "shape": list(getattr(media, "shape", [])),
+                    "bytes": stable_hash_bytes(media.tobytes()),
+                }
+            )
+        except Exception:  # noqa: BLE001 - fall back below
+            pass
+    return stable_hash_text(repr(type(media)) + repr(getattr(media, "shape", "")) + repr(media))
 
 
 class RewardCache:

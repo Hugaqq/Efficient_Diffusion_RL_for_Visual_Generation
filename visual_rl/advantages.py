@@ -141,10 +141,19 @@ class AdvantageComputer:
             advantages = torch.as_tensor(normalize_rewards(np.asarray(total_np)), dtype=torch.float32)
 
         if self.per_prompt:
-            group_size, trained_prompt_num = self.total_tracker.get_stats()
+            if self.weight_advantages:
+                tracker_stats = [tracker.get_stats() for tracker in self.reward_trackers.values()]
+                non_empty = [(group, count) for group, count in tracker_stats if count > 0]
+                if non_empty:
+                    group_size = float(np.mean([group for group, _count in non_empty]))
+                    trained_prompt_num = float(max(count for _group, count in non_empty))
+                else:
+                    group_size = 0.0
+                    trained_prompt_num = 0.0
+            else:
+                group_size, trained_prompt_num = self.total_tracker.get_stats()
             metrics.update({"group_size": float(group_size), "trained_prompt_num": float(trained_prompt_num)})
             self.total_tracker.clear()
             for tracker in self.reward_trackers.values():
                 tracker.clear()
         return AdvantageResult(advantages=advantages, metrics=metrics)
-

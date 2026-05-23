@@ -11,6 +11,8 @@ older GenRL-centered planning note and uses the latest principle:
 
 ## Current Position
 
+Current milestone: `visual_rl` v0.5.0.
+
 `visual_rl` is the integration infra. It should not become a copy of any single
 reference project. The current package already has:
 
@@ -25,27 +27,68 @@ reference project. The current package already has:
 - Wan runtime plan shell
 - tiny diffusion image adapter
 - prompt-color image reward
-- TempFlow branching rollout and branch/timestep credit assignment
-- lazy TempFlow SD3/FLUX/QwenImage adapter bridges
+- TempFlow branching rollout and branch/timestep credit assignment on tiny diffusion
 - Flash-GRPO single-step rollout and selected-timestep loss on tiny diffusion
+- SD1.5 LoRA adapter and image trainer entry point
+- SD3.5 TempFlow reference adapter
+- FLUX/QwenImage TempFlow adapter entries
+- CLI smoke commands for mock, TempFlow tiny, Flash tiny, image training,
+  adapter probes, World-R1 plan, and Wan plan
+
+Current implementation status:
+
+| Area | Status |
+| --- | --- |
+| Core contracts/config/trainer shell | implemented for local smoke |
+| TinyDiffusion adapter | implemented |
+| Prompt-color reward | implemented |
+| Full-trajectory GRPO | implemented for mock/tiny paths |
+| TempFlow branching | implemented for tiny diffusion |
+| Flash-GRPO single-step | implemented for tiny diffusion |
+| SD1.5 | LoRA adapter implemented; real GPU numeric probe pending |
+| SD3 | TempFlow reference adapter implemented; adapter-level server parity pending |
+| FLUX/QwenImage | TempFlow adapter entries implemented; low-resolution smoke pending |
+| World-R1 | dry-run launcher and reward client stubs; real integration pending |
+| Wan | runtime plan shell only; real checkpoint/logprob training pending |
+| Inferix | eval placeholder only |
 
 Current validation status:
 
 ```bash
-conda run -n visual-rl python -m pytest -q tests
+conda run -n visual-rl python -m pytest -q
 conda run -n visual-rl python -m ruff check visual_rl tests
 conda run -n visual-rl python -m visual_rl.cli smoke-imports
+conda run -n visual-rl python -m visual_rl.cli adapter-probe --adapter sd15_lora
+conda run -n visual-rl python -m visual_rl.cli adapter-probe --adapter sd3_tempflow
 conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli flash-smoke --output-dir runs/flash_tiny_smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli wan-plan --output-dir runs/wan_runtime_plan
 ```
 
-Local tests, ruff, local TempFlow tiny smoke, local Flash tiny smoke, CPU-only
-server TempFlow tiny smoke, CPU-only server Flash tiny smoke, and a two-GPU
-TempFlow correctness probe pass. A real SD3.5-medium TempFlow reference probe
-also passes through the legacy TempFlow script. Real Wan checkpoint loading,
-reward server calls, and Inferix eval are not wired yet.
+Latest local validation:
+
+- `pytest`: 21 tests pass.
+- `ruff`: passes.
+- `smoke-imports`: registers `grpo`, `flash_grpo`, `tempflow_grpo`,
+  `mock_wan`, `tiny_diffusion`, SD1.5, SD3, FLUX, QwenImage,
+  `world_r1_wan_legacy`, `mock`, `prompt_color`, and `remote_pickle`.
+- `adapter-probe`: passes for SD1.5, SD3.5, FLUX, and QwenImage in
+  deferred-load mode.
+- `tempflow-smoke`: passes locally on tiny diffusion.
+- `flash-smoke`: passes locally on tiny diffusion.
+- `wan-plan`: still reports empty `model.model_path` and mock rewards by default.
+
+Server validation completed so far:
+
+- CPU-only server TempFlow tiny smoke.
+- CPU-only server Flash tiny smoke.
+- Two-GPU TempFlow tiny correctness probe on 5090 GPUs.
+- Real SD3.5-medium TempFlow reference-script smoke on one 5090 GPU.
+
+Real Wan checkpoint loading, World-R1 reward server calls, real SD1.5/SD3/FLUX/
+QwenImage reward-improvement runs through `VisualRLTrainer`, and Inferix eval
+are not validated yet.
 
 Known validation gaps are tracked in
 [`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](EXPERIMENT_VALIDATION_BACKLOG.md).
@@ -176,44 +219,44 @@ visual_rl/
 ```
 
 The current `WanTrainer` should remain a planning shell until small-model and
-image-model training loops are stable.
+image-model adapter loops are stable.
 
 ## Code Plan
 
 ### Phase A: Tiny Diffusion RL
 
-Status: first implementation complete for the TempFlow smoke path.
+Status: complete for the current local smoke target.
 
-Implement a tiny, cheap training loop that proves the RL circuit works.
-
-Files to add:
+Implemented files:
 
 ```text
 visual_rl/model_adapters/tiny_diffusion.py
 visual_rl/rewards/image_rewards.py
-visual_rl/configs/presets/tiny_diffusion_rl.yaml
-tests/test_tiny_diffusion_rl.py
+visual_rl/configs/presets/tempflow_tiny_branching.yaml
+visual_rl/configs/presets/flash_tiny_single_step.yaml
+tests/test_tempflow_branching.py
+tests/test_flash_grpo.py
 ```
 
-Requirements:
+Implemented behavior:
 
 - CPU or single-GPU runnable
-- 32x32 or 64x64 image output
-- prompt-color reward such as red/green/blue matching
+- tiny RGB image output
+- prompt-color reward
 - real `sample()` and `recompute_log_probs()` contract
-- GRPO update changes trainable parameters
-- reward trend can improve in a short run
+- GRPO-style update changes trainable parameters in validation probes
+- TempFlow reward trend improved in two 100-step 5090 correctness probes
 - rollout cache and checkpoint path are exercised
 
 This is the lowest-cost end-to-end testbed for the whole infra.
 
 ### Phase B: Flash-GRPO Abstraction
 
-Status: first tiny-diffusion implementation complete.
+Status: complete for the tiny-diffusion smoke target.
 
 Implement low-cost single-step training before touching Wan.
 
-Files to complete:
+Implemented files:
 
 ```text
 visual_rl/rollout/single_step.py
@@ -222,21 +265,28 @@ visual_rl/integrations/flash_grpo/timestep_sampler.py
 visual_rl/integrations/flash_grpo/rectification.py
 ```
 
-Start on `tiny_diffusion`, then move to SD1.5. Required features:
+Implemented features:
 
 - selected timestep rollout: implemented for tiny diffusion
 - iso-temporal grouping: implemented
 - scheduler-aware timestep weights: implemented as a tiny scheduler formula
 - temporal gradient rectification: implemented in `flash_grpo`
-- sequential group rollout for 32 GB cards
+- prompt-wise sample expansion for low-cost groups
+
+Still pending before real-model use:
+
+- 20-50 step reward-trend validation for Flash tiny.
+- Controlled comparison against full-trajectory GRPO and TempFlow branching.
+- Scheduler-specific rectification parity against Flash-GRPO reference code.
+- SD1.5 single-step LoRA path.
 
 ### Phase C: TempFlow Branching Abstraction
 
-Status: first tiny-diffusion implementation complete.
+Status: complete for the tiny-diffusion smoke target.
 
 Implement branching/process-reward mechanics on small models first.
 
-Files to complete:
+Implemented files:
 
 ```text
 visual_rl/rollout/branching.py
@@ -244,13 +294,19 @@ visual_rl/algorithms/tempflow_grpo.py
 visual_rl/integrations/tempflow_grpo/branching.py
 ```
 
-Start with tiny diffusion, then SD1.5, then SD3. Required features:
+Implemented features:
 
 - main trajectory plus branch samples: implemented for tiny diffusion
 - branch IDs in `RolloutBatch`: implemented
 - branch/timestep-level reward assignment: implemented in `tempflow_grpo`
 - branch-level advantage computation: implemented through shared GRPO advantages
-- sequential branch execution for low VRAM
+- 100-step reward-improvement probes on two 5090 GPUs: completed
+
+Still pending before real-model use:
+
+- sequential branch execution for large models under 32 GB VRAM
+- adapter-level parity with the SD3.5 reference script
+- SD1.5/SD3 real `sample()` and `recompute_log_probs()` contracts
 
 ### Phase D: Real Small Image Model
 
@@ -276,6 +332,10 @@ Suggested experiment config:
 - single-step or small SDE window
 - cheap image reward first
 
+This is now the next main engineering phase. The purpose is to move from
+tiny-diffusion correctness to a real Diffusers image model while keeping the
+same `RolloutBatch`/`RewardBatch`/algorithm contracts.
+
 ### Phase E: TempFlow Model Expansion
 
 After SD1.5 is stable, integrate models from the TempFlow path:
@@ -295,6 +355,11 @@ save_pretrained()
 
 Each model needs a tiny config, adapter contract test, and at least one
 low-resolution smoke path.
+
+Important update: the legacy TempFlow SD3.5-medium reference script already
+passes a minimal server smoke on one 5090 GPU. The next step is not to prove the
+reference script again; it is to wrap that working behavior behind the
+`visual_rl` adapter contract and run it through `VisualRLTrainer`.
 
 ### Phase F: World-R1 Integration
 
@@ -365,20 +430,23 @@ visual_rl/eval/inferix_backend.py
 Purpose: prove the base infra.
 
 - model: tiny diffusion adapter
-- resolution: 32x32 or 64x64
+- resolution: tiny RGB output
 - reward: prompt color match
 - group size: 4 or 8
 - algorithm: GRPO
 - expected result: reward rises, loss/clip/approx KL are logged, checkpoint saves
+- status: base tiny adapter path is implemented; long reward-trend comparison
+  across GRPO/Flash/TempFlow is still pending
 
 ### Experiment 1: Tiny Flash-GRPO
 
 Purpose: prove low-cost single-step optimization.
 
-- selected timestep
-- iso-temporal grouping
-- tiny implementation complete
-- compare speed/reward curve against full-trajectory GRPO
+- selected timestep: implemented
+- iso-temporal grouping: implemented
+- tiny smoke: passes
+- next: 20-50 step reward-trend validation
+- next: compare speed/reward curve against full-trajectory GRPO
 
 ### Experiment 2: Tiny TempFlow Branching
 
@@ -386,7 +454,8 @@ Purpose: prove branch credit assignment.
 
 - main path plus branch samples: implemented
 - reward assigned to branch timestep: implemented
-- compare full GRPO, single-step GRPO, and branching GRPO
+- two-GPU 5090 correctness probe: passed
+- next: compare full GRPO, single-step GRPO, and branching GRPO
 
 ### Experiment 3: SD1.5 LoRA RL
 
@@ -397,6 +466,7 @@ Purpose: first real image diffusion RL curve.
 - group size 4 sequential
 - cheap reward
 - 1x 5090 runnable
+- status: next main implementation target
 
 ### Experiment 4: SD3 TempFlow-Style RL
 
@@ -407,6 +477,7 @@ Purpose: begin real TempFlow integration.
 - small group
 - reward cache
 - no large multi-reward setup initially
+- status: reference TempFlow SD3.5 smoke passed; `visual_rl` adapter is pending
 
 ### Experiment 5: Wan Low-VRAM Smoke
 
@@ -456,6 +527,20 @@ Add these utilities before running expensive experiments:
 - frame subsampling for video rewards
 - heavy reward as eval first, online later
 
+Already available or partially available:
+
+- reward cache with media hash and reward version
+- rollout cache for smoke/debug runs
+- strict `fail_policy: raise` path for configured rewards
+- tiny smoke commands for Flash and TempFlow
+
+Still missing as CLI tools:
+
+- `visual-rl validate-config`
+- `visual-rl rollout-probe`
+- `visual-rl reward-probe`
+- `visual-rl adapter-probe`
+
 ## Dependency and Environment Notes
 
 Local smoke environment:
@@ -481,27 +566,26 @@ Non-Wan support now has one complete tiny path plus lazy bridges:
 
 | Model | Status |
 | --- | --- |
-| Tiny diffusion | implemented for GRPO/TempFlow tiny smoke |
-| SD1.5 | planned after tiny diffusion |
-| SD3 | lazy TempFlow bridge; SD3.5 reference script smoke passed |
-| FLUX | lazy TempFlow bridge, real adapter pending |
-| QwenImage | lazy TempFlow bridge, real adapter pending |
+| Tiny diffusion | implemented for GRPO/TempFlow/Flash tiny smoke |
+| SD1.5 | LoRA adapter and image trainer path implemented; GPU numeric probe pending |
+| SD3 | TempFlow reference adapter implemented; SD3.5 reference script smoke passed; adapter parity pending |
+| FLUX | TempFlow adapter implemented; low-resolution smoke pending |
+| QwenImage | TempFlow adapter implemented; low-resolution smoke pending |
 | CogVideoX | placeholder, World-R1 path later |
 | Inferix | eval placeholder |
 
 ## Priority Summary
 
-The new priority order is:
+The current priority order is:
 
 ```text
-1. TinyDiffusion RL
-2. TempFlow branching on tiny/small image models
-3. Flash-GRPO single-step on tiny/small image models
-4. SD1.5 LoRA RL
-5. SD3/FLUX/QwenImage integration
-6. Wan low-VRAM smoke
-7. World-R1 reward/camera/video extensions
-8. Inferix eval/preview/profiling
+1. Run SD1.5 LoRA adapter numeric smoke on one idle GPU
+2. Run SD3.5 TempFlow adapter parity smoke through `VisualRLTrainer`
+3. Validate FLUX and QwenImage low-resolution adapter smoke paths
+4. Finish tiny benchmark comparison: GRPO vs Flash-GRPO vs TempFlow-GRPO
+5. Add World-R1 reward/camera probes
+6. Run Wan low-VRAM smoke only after image model contracts are stable
+7. Add Inferix eval/preview/profiling backend
 ```
 
 The core project identity is:
@@ -510,3 +594,92 @@ The core project identity is:
 VisualRL is an integration infra for World-R1, Flash-GRPO, TempFlow-GRPO,
 and Inferix. GenRL is a reference for good engineering patterns only.
 ```
+
+## Static Review Notes - 2026-05-23
+
+Scope: local logic and syntax review only. No server was started and no runtime
+training service was contacted.
+
+Checks run:
+
+```bash
+conda run -n visual-rl python -m compileall -q visual_rl tests
+conda run -n visual-rl python -m ruff check visual_rl tests
+conda run -n visual-rl python -m pytest -q tests
+conda run -n visual-rl python -m visual_rl.cli smoke-imports
+conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir /tmp/visual_rl_review_smoke_mock --steps 1
+conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir /tmp/visual_rl_review_tempflow --steps 1
+conda run -n visual-rl python -m visual_rl.cli flash-smoke --output-dir /tmp/visual_rl_review_flash --steps 1
+conda run -n visual-rl python -m visual_rl.cli wan-plan --output-dir /tmp/visual_rl_review_wan_plan
+```
+
+Results:
+
+- Syntax compile: passed.
+- Ruff: passed.
+- Project tests under `tests/`: 15 passed.
+- Local CLI smoke commands: passed.
+- Direct `conda run -n visual-rl python -m pytest -q` currently fails because
+  pytest also collects `reference_code/Inferix-main/tests`, which imports the
+  uninstalled `inferix` package.
+
+Findings to fix before the next real-model phase:
+
+1. Pytest discovery leaks into vendored reference code.
+   `pyproject.toml` has no pytest `testpaths` or `norecursedirs`, so running
+   plain `pytest` collects tests under `reference_code/`. This breaks local
+   validation on `reference_code/Inferix-main/tests/unit/test_profiling.py`.
+   Add pytest config that limits collection to `tests/` or ignores
+   `reference_code/`.
+
+2. Full-trajectory `GRPOAlgorithm` is not device-safe for GPU adapters.
+   `visual_rl/algorithms/grpo.py` uses CPU advantages from
+   `AdvantageComputer` directly with `new_log_probs`. Flash and TempFlow move
+   rewards to `new_log_probs.device`, but GRPO does not. A CUDA image/video
+   adapter can hit a CPU/CUDA tensor mismatch. At loss entry, coerce
+   advantages and `batch.old_log_probs` to `new_log_probs.device` and dtype.
+
+3. Reward normalization is computed but not used for training.
+   `RewardRouter.score()` returns `normalized_total`, but
+   `VisualRLTrainer.train()` passes `rewards.weighted_total` into
+   `AdvantageComputer`. As a result, `rewards.normalize: per_batch` currently
+   affects the returned `RewardBatch` only, not the optimization signal. Decide
+   whether trainer advantages should use `normalized_total`, or remove/rename
+   the config to avoid a false control knob.
+
+4. Reward cache media hashing collides for non-tensor media.
+   `stable_hash_media()` hashes tensor bytes, but for numpy arrays, PIL images,
+   lists, or decoded frame containers it falls back to type and shape only.
+   Same-shape different images therefore share a reward cache key. This is
+   safe for the current tensor-based tiny path, but unsafe for SD/FLUX/QwenImage
+   adapters if they return non-tensor media. Add content hashing for numpy/PIL
+   media or disable caching for unknown media types.
+
+5. `weight_advantages=True` reports misleading prompt stats.
+   In `AdvantageComputer.compute()`, weighted-advantage mode updates
+   `reward_trackers`, but the emitted `group_size` and `trained_prompt_num`
+   metrics are read from `total_tracker`, which stays empty. The advantages are
+   shaped, but the metrics report `0.0`. Aggregate stats from reward trackers
+   or update `total_tracker` consistently.
+
+6. `RolloutBatch.validate_lightweight()` only checks prompt/metadata length.
+   It does not verify that media, latents, timesteps, logprobs, KL, and branch
+   IDs have compatible batch dimensions. This lets adapter mistakes surface
+   later inside loss computation. Add a stricter optional validation path for
+   `visual-rl rollout-probe`, `adapter-probe`, and smoke tests before wiring
+   real SD1.5/SD3 adapters.
+
+Fix status after v0.5 implementation:
+
+- Plain `pytest` is scoped to `tests/` and ignores `reference_code/`.
+- GRPO, Flash-GRPO, and TempFlow-GRPO move old logprobs/KL to the new-logprob
+  device and dtype before loss math.
+- `VisualRLTrainer` now feeds `rewards.normalized_total` into advantage
+  computation, so `rewards.normalize` affects the optimization signal.
+- Reward media hashing includes tensor dtype/shape/content, numpy content, PIL
+  content, lists, tuples, and dicts.
+- Weighted-advantage prompt metrics are aggregated from the per-reward trackers.
+- `RolloutBatch.validate_lightweight(strict=True)` checks media, latent,
+  timestep, logprob, KL, and branch batch dimensions.
+- Adapter probes pass for SD1.5, SD3.5, FLUX, and QwenImage in deferred-load
+  mode. Real model numeric probes remain pending.

@@ -38,15 +38,16 @@ class TempFlowGRPOAlgorithm:
         advantages = advantages.clamp(-self.adv_clip_max, self.adv_clip_max)
         weights = self._noise_weights(batch, new_log_probs).to(new_log_probs.device)
         advantages = advantages * weights
+        old_log_probs = batch.old_log_probs.to(new_log_probs.device, dtype=new_log_probs.dtype)
 
-        ratio = torch.exp(new_log_probs - batch.old_log_probs)
+        ratio = torch.exp(new_log_probs - old_log_probs)
         unclipped = -advantages * ratio
         clipped = -advantages * ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
         policy_loss = torch.maximum(unclipped, clipped).mean()
-        approx_kl = 0.5 * ((new_log_probs - batch.old_log_probs) ** 2).mean()
+        approx_kl = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean()
         clipfrac = ((ratio - 1.0).abs() > self.clip_range).float().mean()
         if batch.kl is not None and self.beta > 0:
-            policy_loss = policy_loss + self.beta * batch.kl.mean()
+            policy_loss = policy_loss + self.beta * batch.kl.to(new_log_probs.device, dtype=new_log_probs.dtype).mean()
         return policy_loss, {
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
