@@ -4,7 +4,7 @@ This repository is a local integration workspace for building a unified diffusio
 
 The current direction is:
 
-> `visual_rl` provides the unified abstraction layer, `GenRL-main` provides the production-style training runtime reference, and the four research systems below are integrated as specialization modules.
+> `visual_rl` provides the unified abstraction layer, `reference_code/GenRL-main` provides the production-style training runtime reference, and the four research systems below are integrated as specialization modules.
 
 The initial target is not to merge every codebase mechanically. The goal is to extract stable contracts, trainer/runtime patterns, reward interfaces, rollout formats, and evaluation backends into one maintainable infra.
 
@@ -20,11 +20,11 @@ Server-side experiments are intentionally not part of the current committed stat
 | Component | Role in This Repo | What We Reuse | What We Avoid |
 | --- | --- | --- | --- |
 | `visual_rl/` | Our integration layer | Stable dataclasses, config, trainer API, reward router, rollout cache, algorithm plugins | One-off script coupling |
-| `GenRL-main/` | Training runtime reference | Typed config, FSDP/checkpoint/resume design, Wan training loop structure, sampler, reward offload, advantage logic | Treating it as a black-box dependency |
-| `World-R1-main/` | World/video specialization | 3D reward, general reward, camera-aware latent initialization, camera trajectory metadata, dynamic prompt phase | Making World-R1 the global trainer trunk |
-| `Flash-GRPO-main/` | Low-cost video RL plugin | Single-step selected rollout, iso-temporal grouping, temporal gradient rectification | Duplicating trainer/runtime code |
-| `TempFlow-GRPO-main/` | Image flow RL plugin | Branching rollout, timestep credit assignment, noise-aware weighting for SD3/FLUX/QwenImage | Polluting Wan-specific trainer logic |
-| `Inferix-main/` | BlockVid/inference/eval backend | Block-diffusion serving, semi-autoregressive block scheduling, KV cache ideas, streaming preview, profiling, `NO_DECODE` latent paths | Using it as the online RL trainer until logprob/recompute contracts exist |
+| `reference_code/GenRL-main/` | Training runtime reference | Typed config, FSDP/checkpoint/resume design, Wan training loop structure, sampler, reward offload, advantage logic | Treating it as a black-box dependency |
+| `reference_code/World-R1-main/` | World/video specialization | 3D reward, general reward, camera-aware latent initialization, camera trajectory metadata, dynamic prompt phase | Making World-R1 the global trainer trunk |
+| `reference_code/Flash-GRPO-main/` | Low-cost video RL plugin | Single-step selected rollout, iso-temporal grouping, temporal gradient rectification | Duplicating trainer/runtime code |
+| `reference_code/TempFlow-GRPO-main/` | Image flow RL plugin | Branching rollout, timestep credit assignment, noise-aware weighting for SD3/FLUX/QwenImage | Polluting Wan-specific trainer logic |
+| `reference_code/Inferix-main/` | BlockVid/inference/eval backend | Block-diffusion serving, semi-autoregressive block scheduling, KV cache ideas, streaming preview, profiling, `NO_DECODE` latent paths | Using it as the online RL trainer until logprob/recompute contracts exist |
 
 ## Four Works Taxonomy
 
@@ -169,6 +169,7 @@ The current safe local checks are:
 ```bash
 conda run -n visual-rl visual-rl smoke-imports
 conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke_v02_mock --steps 2
+conda run -n visual-rl visual-rl wan-plan --output-dir runs/wan_runtime_plan
 conda run -n visual-rl python -m pytest -q tests
 conda run -n visual-rl python -m ruff check visual_rl tests
 ```
