@@ -75,18 +75,23 @@ Latest verified state:
 - Server CPU-only TempFlow tiny smoke: passed
 - Server CPU-only Flash tiny smoke: passed
 - Server two-GPU TempFlow correctness probe: passed
+- Server SD3.5-medium TempFlow reference probe: passed
 
 Server smoke tests were run with `CUDA_VISIBLE_DEVICES=""`, so they did not
 consume shared GPUs.
 The two-GPU TempFlow correctness probe used GPU0 and GPU1 only, while GPU2-7
 were already occupied by other jobs.
+The SD3.5-medium probe used GPU1 only and exercised the reference TempFlow SD3
+path; the `visual_rl` SD3 adapter is still pending.
 
 ## Near-Term Tasks
 
 - Run the validation backlog: reward trends, parameter updates, deterministic
   golden tests, cache/resume behavior, and failure-path tests.
 - Extend tiny Flash/TempFlow paths to SD1.5 LoRA.
-- Implement real SD3/FLUX/QwenImage adapters after SD1.5 is stable.
+- Wrap the verified SD3.5 TempFlow reference path behind the `visual_rl` adapter
+  contract.
+- Implement FLUX/QwenImage adapters after SD3.5 is stable inside `visual_rl`.
 - Add World-R1 reward/camera probes before any real Wan RL training.
 - Build Inferix/BlockVid as an eval and profiling backend, not as the online RL
   trainer until clean logprob contracts exist.

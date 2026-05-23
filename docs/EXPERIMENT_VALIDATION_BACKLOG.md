@@ -37,10 +37,13 @@ pretending the tiny smoke tests prove full training correctness.
 
 - Add SD1.5 LoRA adapter contract tests before SD3/FLUX/QwenImage.
 - Validate real model `sample()` and `recompute_log_probs()` numerics on a tiny
-  batch before any reward optimization run.
+  batch before any reward optimization run. SD3.5 reference script path passed
+  a minimal TempFlow smoke on 2026-05-23; `visual_rl` adapter path is pending.
 - Compare Flash selected-step loss against full-trajectory loss on a controlled
   toy scheduler.
-- Validate TempFlow branch reward alignment on SD1.5 before moving to SD3.
+- Validate TempFlow branch reward alignment on SD1.5 before moving to SD3. The
+  SD3.5 reference script now has a smoke pass, but adapter-level parity is still
+  pending.
 
 ## Video/Inferix Checks
 
