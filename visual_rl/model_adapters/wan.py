@@ -7,6 +7,7 @@ from typing import Any
 from visual_rl.core.registry import MODEL_ADAPTERS
 from visual_rl.core.types import RolloutBatch
 from visual_rl.model_adapters.base import ModelAdapter
+from visual_rl.model_adapters.diffusers_common import require_model_path, resolve_torch_dtype
 from visual_rl.third_party.legacy import legacy_repo_path, resolve_legacy_repo
 
 
@@ -31,13 +32,23 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
         return self.transformer.parameters()
 
     def load(self):
-        model_path = self.config.get("model_path")
-        if not model_path:
-            raise ValueError("model.model_path is required for world_r1_wan_legacy")
+        model_path = require_model_path(self.config, self.name)
+        from_pretrained_kwargs: dict[str, Any] = {
+            "local_files_only": bool(self.config.get("local_files_only", True)),
+        }
+        dtype = resolve_torch_dtype(self.config.get("torch_dtype") or self.config.get("dtype"))
+        if dtype is not None:
+            from_pretrained_kwargs["torch_dtype"] = dtype
+        if "low_cpu_mem_usage" in self.config:
+            from_pretrained_kwargs["low_cpu_mem_usage"] = bool(self.config["low_cpu_mem_usage"])
+
         with legacy_repo_path(self.repo_root):
             from diffusers import WanPipeline
 
-            self.pipeline = WanPipeline.from_pretrained(model_path)
+            self.pipeline = WanPipeline.from_pretrained(model_path, **from_pretrained_kwargs)
+            device = str(self.config.get("device", "")).strip()
+            if device:
+                self.pipeline = self.pipeline.to(device)
             self.transformer = self.pipeline.transformer
         return self
 

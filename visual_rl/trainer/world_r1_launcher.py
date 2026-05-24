@@ -60,7 +60,14 @@ def build_world_r1_launch_plan(
     smoke: bool = True,
 ) -> WorldR1LaunchPlan:
     resolved_repo_dir = resolve_legacy_repo(repo_dir)
-    devices = [item for item in train_visible_devices.split(",") if item.strip()]
+    model_path = str(model_path).strip()
+    output_root = str(output_root).strip()
+    devices = [item.strip() for item in train_visible_devices.split(",") if item.strip()]
+    train_visible_devices = ",".join(devices)
+    if not model_path:
+        raise ValueError("model_path must be set before building a World-R1 launch plan")
+    if not output_root:
+        raise ValueError("output_root must not be empty")
     if not devices:
         raise ValueError("train_visible_devices must contain at least one GPU index")
 

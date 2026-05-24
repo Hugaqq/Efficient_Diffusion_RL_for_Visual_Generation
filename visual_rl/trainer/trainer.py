@@ -34,7 +34,10 @@ class VisualRLTrainer(BaseTrainer):
         self.rollout = build_rollout_engine(rollout_config)
         reward_cache_dir = config.rewards.cache_dir or self.output_dir / "reward_cache"
         self.reward_router = RewardRouter(config.rewards, cache_dir=reward_cache_dir)
-        self.rollout_cache = RolloutCache(self.output_dir / "rollouts")
+        rollout_cache_dir = None
+        if not bool(config.trainer.get("disable_rollout_cache", False)):
+            rollout_cache_dir = config.trainer.get("rollout_cache_dir") or self.output_dir / "rollouts"
+        self.rollout_cache = RolloutCache(rollout_cache_dir)
         self.algorithm = build_algorithm(config.algorithm)
         self.advantage_computer = AdvantageComputer(
             reward_weights=config.rewards.weights,
@@ -45,6 +48,25 @@ class VisualRLTrainer(BaseTrainer):
             mode=config.algorithm.advantage_mode,
         )
         self.logger = JsonlLogger(self.output_dir / "metrics.jsonl")
+
+    @staticmethod
+    def _logprob_metrics(batch, new_log_probs) -> dict[str, float]:
+        import torch
+
+        new_log_probs = new_log_probs.detach().float()
+        old_log_probs = torch.as_tensor(batch.old_log_probs, device=new_log_probs.device).detach().float()
+        delta = new_log_probs - old_log_probs
+        metrics = {
+            "old_logprob_mean": float(old_log_probs.mean().cpu()),
+            "new_logprob_mean": float(new_log_probs.mean().cpu()),
+            "logprob_delta_mean": float(delta.mean().cpu()),
+            "logprob_delta_abs_max": float(delta.abs().max().cpu()),
+        }
+        if batch.kl is not None:
+            kl = torch.as_tensor(batch.kl, device=new_log_probs.device).detach().float()
+            metrics["rollout_kl_mean"] = float(kl.mean().cpu())
+            metrics["rollout_kl_abs_max"] = float(kl.abs().max().cpu())
+        return metrics
 
     def train(self, max_steps: int | None = None) -> list[dict[str, Any]]:
         max_steps = int(max_steps or self.config.train.max_steps)
@@ -72,6 +94,7 @@ class VisualRLTrainer(BaseTrainer):
 
             new_log_probs = self.adapter.recompute_log_probs(batch)
             loss, loss_info = self.algorithm.compute_loss(batch, advantage_result.advantages, new_log_probs)
+            logprob_metrics = self._logprob_metrics(batch, new_log_probs)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -93,6 +116,7 @@ class VisualRLTrainer(BaseTrainer):
                 "reward_std": float(rewards.weighted_total.std(unbiased=False).cpu()),
                 "approx_kl": float(loss_info["approx_kl"].detach().cpu()),
                 "clipfrac": float(loss_info["clipfrac"].detach().cpu()),
+                **logprob_metrics,
                 **extra_loss_metrics,
                 **advantage_result.metrics,
             }

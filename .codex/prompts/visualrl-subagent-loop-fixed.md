@@ -12,6 +12,11 @@ CRITICAL SUBAGENT SPAWN RULES:
 Project root:
 - /Users/qvanium/Desktop/Efficient_Diffusion_RL_for_Visual_Generation/framecode
 
+Language and logging:
+- Use Chinese for all user-facing progress logs, subagent summaries, evaluator reports, plan-worker reports, and final coordinator output.
+- Keep commands, file paths, config keys, JSON keys, Python exception names, package names, and raw tool/terminal output in their original language.
+- When reporting command results, summarize them in Chinese and include the exact command/result status.
+
 Canonical plan:
 - docs/PROJECT_PLAN.md
 
@@ -21,7 +26,7 @@ Backlog:
 Important project principle:
 - GenRL-main is only an engineering reference.
 - The four integration targets are World-R1-main, Flash-GRPO-main, TempFlow-GRPO-main, and Inferix-main.
-- Prioritize small/tiny/image model correctness before Wan/World-R1 heavy video training.
+- Tiny correctness is now a regression gate, not the mainline. Prioritize a complete SD3.5 mini end-to-end loop: real adapter sample, PNG preview artifacts, reward routing, bounded trainer step, LoRA/checkpoint, and before/after metrics.
 - Expected hardware for remote experiments is 1-2 idle 32GB RTX 5090 GPUs.
 - Never use busy GPUs.
 - Never kill other users' processes.
@@ -46,6 +51,7 @@ Task:
 - Make small, scoped code edits.
 - Add or update tests for changed behavior.
 - Do not run heavy GPU experiments.
+- Do not add new tiny-only features unless they protect a real-model regression.
 - Do not start Wan/World-R1 heavy video training.
 - Do not merge reference_code packages into the main namespace.
 - Keep GenRL as reference only.
@@ -72,8 +78,8 @@ Evaluation order:
    conda run -n visual-rl python -m pytest -q
 3. Do a logic review against docs/PROJECT_PLAN.md.
 4. Design the smallest experiment that can demonstrate correctness.
-5. Prefer local smoke first.
-6. Use remote server v-qiaoqifan@10.130.140.73 only if the experiment needs GPU.
+5. Prefer local smoke first, but do not substitute tiny-only success for the current SD3.5 mainline gate.
+6. Use remote server v-qiaoqifan@10.130.140.73 for SD3.5 preview/numeric/trainer smokes when an idle GPU is available.
 
 Remote GPU rules:
 - First run nvidia-smi.
@@ -87,12 +93,12 @@ Remote GPU rules:
 - Record commands, GPU ids, env, outputs, failures, and missing experiments.
 
 Return:
-- pass/fail summary
-- syntax/test results
-- logic risks
+- 中文 pass/fail summary
+- 中文 syntax/test results summary
+- 中文 logic risks
 - exact experiment commands/results
-- blockers
-- concrete fixes for the next code worker
+- 中文 blockers
+- 中文 concrete fixes for the next code worker
 
 PLAN WORKER PROMPT:
 You are the planning worker for VisualRL.
@@ -108,9 +114,9 @@ Task:
 - Return the next one bounded coding task.
 
 Coordinator final output:
-- Current cycle completed
-- Agents spawned and conclusions
-- Code changes
-- Tests and experiments run
-- Remaining blockers
-- Exact command to resume if not complete
+- 当前循环完成情况
+- 已启动的 agents 和结论
+- 代码改动
+- 已运行的测试和实验
+- 剩余 blocker
+- 如果未完成，给出继续推进的精确命令

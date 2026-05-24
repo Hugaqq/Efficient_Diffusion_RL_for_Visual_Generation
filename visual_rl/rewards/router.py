@@ -60,11 +60,12 @@ class RewardRouter:
             )
             cached = self.cache.get(cache_key)
             if cached is not None:
-                values = np.asarray(cached["values"], dtype=np.float32)
+                values = self._coerce_reward_values(reward_name, cached["values"], expected=len(prompts))
                 reward_meta = cached.get("metadata", {})
             else:
                 try:
                     values, reward_meta = self.clients[reward_name].score(media, prompts, metadata)
+                    values = self._coerce_reward_values(reward_name, values, expected=len(prompts))
                     self.cache.set(cache_key, {"values": values.tolist(), "metadata": reward_meta})
                 except Exception as exc:  # noqa: BLE001 - failure is represented in valid_mask
                     values = np.zeros(len(prompts), dtype=np.float32)
@@ -103,3 +104,14 @@ class RewardRouter:
         payload_hash = stable_hash_json({"prompts": prompts, "metadata": metadata})
         media_hash = stable_hash_media(media)
         return f"{reward_name}-{reward_version}-{payload_hash}-{media_hash}"
+
+    @staticmethod
+    def _coerce_reward_values(reward_name: str, values: Any, *, expected: int) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float32)
+        if array.shape != (expected,):
+            raise ValueError(
+                f"Reward client {reward_name!r} returned shape {array.shape}; expected shape ({expected},)."
+            )
+        if not np.isfinite(array).all():
+            raise ValueError(f"Reward client {reward_name!r} returned non-finite values.")
+        return array

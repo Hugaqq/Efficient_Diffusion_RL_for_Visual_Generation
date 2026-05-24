@@ -81,10 +81,10 @@ class BaseTrainer(ABC):
         optimizer_cls = torch.optim.AdamW
         return optimizer_cls(
             parameters,
-            lr=self.config.train.learning_rate,
-            betas=(self.config.train.adam_beta1, self.config.train.adam_beta2),
-            weight_decay=self.config.train.adam_weight_decay,
-            eps=self.config.train.adam_epsilon,
+            lr=float(self.config.train.learning_rate),
+            betas=(float(self.config.train.adam_beta1), float(self.config.train.adam_beta2)),
+            weight_decay=float(self.config.train.adam_weight_decay),
+            eps=float(self.config.train.adam_epsilon),
         )
 
     @abstractmethod

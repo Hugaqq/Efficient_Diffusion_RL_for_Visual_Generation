@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -125,8 +126,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         with torch.no_grad():
             prompt_embeds, pooled_prompt_embeds = self._encode_text(prompts)
             neg_prompt_embeds, neg_pooled_prompt_embeds = self._encode_text([""] * len(prompts))
-            images, latents, log_probs, kls = self._pipeline_with_logprob(
-                self.pipeline,
+            result = self._call_pipeline_with_logprob(
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 negative_prompt_embeds=neg_prompt_embeds,
@@ -135,11 +135,17 @@ class SD3TempFlowAdapter(ModelAdapter):
                 guidance_scale=guidance_scale,
                 generator=generator,
                 output_type=output_type,
-                return_dict=False,
                 height=self.resolution,
                 width=self.resolution,
                 kl_reward=float(rollout_config.get("kl_reward", 0.0)),
             )
+            if len(result) == 4:
+                images, latents, log_probs, kls = result
+            elif len(result) == 3:
+                images, latents, log_probs = result
+                kls = []
+            else:
+                raise ValueError(f"Unexpected SD3 TempFlow pipeline result length: {len(result)}")
             latents = stack_steps(latents, dim=1)
             log_probs = stack_steps(log_probs, dim=1)
             kls = stack_steps(kls, dim=1) if kls else torch.zeros_like(log_probs)
@@ -182,9 +188,11 @@ class SD3TempFlowAdapter(ModelAdapter):
         timesteps = batch.timesteps.to(self.device)
         log_probs = []
         transformer = module_or_self(self.transformer)
+        transformer_dtype = self._transformer_dtype()
         for index in range(latents.shape[1]):
+            latent_step = latents[:, index].to(dtype=transformer_dtype)
             if guidance_scale > 1.0:
-                hidden_states = torch.cat([latents[:, index]] * 2)
+                hidden_states = torch.cat([latent_step] * 2)
                 timestep = torch.cat([timesteps[:, index]] * 2)
                 embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
                 pooled = torch.cat([neg_pooled_prompt_embeds, pooled_prompt_embeds])
@@ -199,7 +207,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             else:
                 noise_pred = transformer(
-                    hidden_states=latents[:, index],
+                    hidden_states=latent_step,
                     timestep=timesteps[:, index],
                     encoder_hidden_states=prompt_embeds,
                     pooled_projections=pooled_prompt_embeds,
@@ -226,6 +234,14 @@ class SD3TempFlowAdapter(ModelAdapter):
 
             torch.save(self.transformer.state_dict(), path / "sd3_transformer.pt")
 
+    def _call_pipeline_with_logprob(self, **kwargs):
+        signature = inspect.signature(self._pipeline_with_logprob)
+        supported = set(signature.parameters)
+        call_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        if "return_dict" in supported:
+            call_kwargs["return_dict"] = False
+        return self._pipeline_with_logprob(self.pipeline, **call_kwargs)
+
     def _encode_text(self, prompts: list[str]):
         embeds, pooled = self._encode_prompt(
             [self.pipeline.text_encoder, self.pipeline.text_encoder_2, self.pipeline.text_encoder_3],
@@ -234,6 +250,11 @@ class SD3TempFlowAdapter(ModelAdapter):
             self.max_sequence_length,
         )
         return embeds.to(self.device), pooled.to(self.device)
+
+    def _transformer_dtype(self):
+        import torch
+
+        return next(self.transformer.parameters(), torch.empty((), dtype=torch.float32)).dtype
 
     def _batch_embeddings(self, batch: RolloutBatch, *, positive: bool):
         if positive:

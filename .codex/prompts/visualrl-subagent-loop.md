@@ -5,13 +5,18 @@ Use Codex subagents explicitly. Work in sequential cycles, not parallel code edi
 Project root:
 - /Users/qvanium/Desktop/Efficient_Diffusion_RL_for_Visual_Generation/framecode
 
+Language and logging:
+- Use Chinese for all user-facing progress logs, subagent summaries, evaluator reports, plan-worker reports, and final coordinator output.
+- Keep commands, file paths, config keys, JSON keys, Python exception names, package names, and raw terminal output in their original language.
+- When reporting command results, summarize them in Chinese and include the exact command/result status.
+
 Canonical plan:
 - docs/PROJECT_PLAN.md
 
 Important principle:
 - GenRL-main is only an engineering reference.
 - The four integration targets are World-R1-main, Flash-GRPO-main, TempFlow-GRPO-main, and Inferix-main.
-- Prioritize small/tiny/image model correctness before Wan/World-R1 heavy video training.
+- Tiny correctness is now a regression gate, not the mainline. Prioritize the SD3.5 complete mini-loop: real adapter sample, saved PNG previews, reward routing, bounded trainer step, LoRA/checkpoint, and before/after metrics.
 - Expected hardware is 1-2 idle 32GB RTX 5090 GPUs when remote experiments are needed.
 
 Cycle:
@@ -27,15 +32,16 @@ Cycle:
 Hard stop conditions:
 - Do not use busy GPUs.
 - Do not run paper-scale experiments before smoke tests pass.
+- Do not add new tiny-only features unless a shared infra change requires a regression guard.
 - Do not silently skip failed tests.
 - Do not overwrite unrelated user changes.
 - Do not merge the reference projects' flow_grpo packages into one import namespace.
 - Stop and summarize if the next action needs human approval, credentials, or model checkpoint paths.
 
 Final output:
-- Current phase completed
-- Agents spawned and their conclusions
-- Code changes
-- Tests and experiments run
-- Remaining blockers
-- Next command to resume, if not complete
+- 当前阶段完成情况
+- 已启动的 agents 和结论
+- 代码改动
+- 已运行的测试和实验
+- 剩余 blocker
+- 如果未完成，给出继续推进的精确命令

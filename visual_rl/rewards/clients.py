@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.request import Request, urlopen
 
 import numpy as np
 
@@ -54,8 +55,8 @@ class MockRewardClient:
 class RemotePickleRewardClient:
     """Generic pickle-over-HTTP reward client used by the legacy projects."""
 
-    name: str
     url: str
+    name: str = "remote_pickle"
     payload_kind: str = "images"
     timeout: float = 1000.0
     retries: int = 2
@@ -63,19 +64,38 @@ class RemotePickleRewardClient:
     def score(self, media: Any, prompts: list[str], metadata: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
         del metadata
         import pickle
-        import requests
 
         payload = {self.payload_kind: media, "prompts": prompts}
+        payload_bytes = pickle.dumps(payload)
         last_error: Exception | None = None
         for _ in range(self.retries + 1):
             try:
-                response = requests.post(self.url, data=pickle.dumps(payload), timeout=self.timeout)
-                response.raise_for_status()
-                data = pickle.loads(response.content)
+                data = pickle.loads(_post_bytes(self.url, payload_bytes, timeout=self.timeout))
                 return np.asarray(data["outputs"], dtype=np.float32), data.get("metadata", {})
             except Exception as exc:  # noqa: BLE001 - attach final error to metadata
                 last_error = exc
         raise RuntimeError(f"Reward client {self.name} failed: {last_error}") from last_error
+
+
+def _post_bytes(url: str, payload: bytes, *, timeout: float) -> bytes:
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        if exc.name != "requests":
+            raise
+    else:
+        response = requests.post(url, data=payload, timeout=timeout)
+        response.raise_for_status()
+        return bytes(response.content)
+
+    request = Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        return response.read()
 
 
 REWARD_CLIENTS.register("mock", MockRewardClient)
