@@ -15,6 +15,7 @@ from visual_rl.advantages import AdvantageComputer
 from visual_rl.configs.schema import VisualRLConfig, section_to_dict
 from visual_rl.datasets.prompt_dataset import PromptDataset
 from visual_rl.rewards.router import RewardRouter
+from visual_rl.rewards.world_r1_rewards import WORLD_R1_REWARD_CLIENT_NAMES, validate_reward_server_url
 from visual_rl.rollout.cache import RolloutCache
 from visual_rl.third_party.legacy import resolve_legacy_repo
 from visual_rl.trainer.base import BaseTrainer
@@ -34,6 +35,7 @@ class WanRuntimePlan:
     train: dict[str, Any]
     algorithm: dict[str, Any]
     reward_weights: dict[str, float]
+    reward_servers: dict[str, Any]
     train_timesteps: list[int]
     gradient_accumulation_steps: int
     effective_gradient_accumulation_steps: int
@@ -71,12 +73,57 @@ class WanTrainer(BaseTrainer):
         world_r1_root = self.config.legacy.get("world_r1_root", "reference_code/World-R1-main")
         return resolve_legacy_repo(genrl_root), resolve_legacy_repo(world_r1_root)
 
+    def _reward_server_plan(self) -> tuple[dict[str, Any], list[str]]:
+        reward_clients = self.config.rewards.clients or {}
+        required_clients: list[str] = []
+        urls: dict[str, str] = {}
+        missing_urls: list[str] = []
+        invalid_urls: dict[str, str] = {}
+
+        for reward_name in sorted(self.config.rewards.weights):
+            client_config = dict(reward_clients.get(reward_name, {}))
+            client_name = str(client_config.get("name", reward_name))
+            uses_remote_server = client_name == "remote_pickle" or reward_name in WORLD_R1_REWARD_CLIENT_NAMES
+            if not uses_remote_server:
+                continue
+
+            required_clients.append(reward_name)
+            params = dict(client_config.get("params", {}))
+            raw_url = client_config.get("url", params.get("url", ""))
+            if not raw_url:
+                missing_urls.append(reward_name)
+                continue
+            try:
+                urls[reward_name] = validate_reward_server_url(str(raw_url), reward_name=reward_name)
+            except ValueError as exc:
+                invalid_urls[reward_name] = str(exc)
+
+        valid = not missing_urls and not invalid_urls
+        reward_servers = {
+            "required_clients": required_clients,
+            "urls": urls,
+            "missing_urls": missing_urls,
+            "invalid_urls": invalid_urls,
+            "valid": valid,
+        }
+
+        warnings: list[str] = []
+        for reward_name in missing_urls:
+            warnings.append(
+                f"reward server URL is missing for {reward_name!r}; set rewards.clients.{reward_name}.url "
+                "before real Wan training."
+            )
+        for message in invalid_urls.values():
+            warnings.append(message)
+        return reward_servers, warnings
+
     def build_runtime_plan(self) -> WanRuntimePlan:
         sample = section_to_dict(self.config.sample)
         train = section_to_dict(self.config.train)
         algorithm = section_to_dict(self.config.algorithm)
         model = section_to_dict(self.config.model)
         genrl_root, world_r1_root = self._reference_roots()
+        reward_servers, reward_server_warnings = self._reward_server_plan()
 
         num_train_timesteps = max(1, int(self.config.sample.num_steps * self.config.train.timestep_fraction))
         gas, effective_gas = self.calculate_gradient_accumulation_steps(num_train_timesteps)
@@ -87,12 +134,20 @@ class WanTrainer(BaseTrainer):
             "world_r1_root_exists": world_r1_root.exists(),
             "model_path_set": bool(self.config.model.model_path),
             "mock_rewards_only": set(self.config.rewards.weights) == {"mock"},
+            "reward_server_required": bool(reward_servers["required_clients"]),
+            "reward_server_urls_valid": bool(reward_servers["valid"]),
         }
         warnings: list[str] = []
         if not readiness["model_path_set"]:
             warnings.append("model.model_path is empty; this plan is local-only and cannot launch real Wan training.")
         if readiness["mock_rewards_only"]:
             warnings.append("only mock reward is configured; replace rewards before real training.")
+        elif not readiness["reward_server_required"]:
+            warnings.append(
+                "non-mock rewards are configured without World-R1/remote_pickle reward servers; "
+                "verify they are local and video-compatible before real Wan training."
+            )
+        warnings.extend(reward_server_warnings)
         if not readiness["genrl_root_exists"]:
             warnings.append(f"GenRL reference root is missing: {genrl_root}")
         if not readiness["world_r1_root_exists"]:
@@ -111,6 +166,7 @@ class WanTrainer(BaseTrainer):
             train=train,
             algorithm=algorithm,
             reward_weights=dict(self.config.rewards.weights),
+            reward_servers=reward_servers,
             train_timesteps=train_timesteps,
             gradient_accumulation_steps=gas,
             effective_gradient_accumulation_steps=effective_gas,
