@@ -22,6 +22,39 @@ def test_single_step_rollout_expands_same_timestep_group():
     assert all(item["rollout_kind"] == "flash_single_step" for item in batch.metadata)
 
 
+def test_single_step_rollout_metadata_is_deterministic_across_prompts():
+    import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
+    from visual_rl.configs.schema import load_config, section_to_dict
+    from visual_rl.core.registry import MODEL_ADAPTERS
+    from visual_rl.rollout.full_trajectory import build_rollout_engine
+
+    cfg = load_config("visual_rl/configs/presets/flash_tiny_single_step.yaml")
+    adapter = MODEL_ADAPTERS.get("tiny_diffusion")(section_to_dict(cfg.model))
+    rollout_config = section_to_dict(cfg.sample)
+    rollout_config.update(cfg.rollout)
+    rollout_config["samples_per_prompt"] = 2
+    rollout_config["seed"] = 123
+    rollout_config["epoch_tag"] = 2
+
+    batch = build_rollout_engine(rollout_config).sample(
+        adapter,
+        ["a red square", "a blue square"],
+        [{"tag": "red"}, {"tag": "blue"}],
+    )
+
+    assert batch.prompts == ["a red square", "a red square", "a blue square", "a blue square"]
+    assert batch.model_metadata["selected_timestep_indices"] == [2, 2, 3, 3]
+    assert batch.model_metadata["selected_timesteps"] == [2, 2, 3, 3]
+    assert batch.model_metadata["parent_prompt_indices"] == [0, 0, 1, 1]
+    assert batch.model_metadata["timestep_candidates"] == [0, 1, 2, 3]
+    assert [item["selected_timestep"] for item in batch.metadata] == [2, 2, 3, 3]
+    assert [item["selected_timestep_index"] for item in batch.metadata] == [2, 2, 3, 3]
+    assert [item["parent_prompt_index"] for item in batch.metadata] == [0, 0, 1, 1]
+    assert [item["sample_index"] for item in batch.metadata] == [0, 1, 0, 1]
+    assert [item["tag"] for item in batch.metadata] == ["red", "red", "blue", "blue"]
+    assert batch.timesteps.squeeze(1).tolist() == [2, 2, 3, 3]
+
+
 def test_flash_rectification_uses_rollout_weights():
     import torch
 
