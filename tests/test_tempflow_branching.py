@@ -21,6 +21,56 @@ def test_branching_rollout_expands_main_and_branches():
     assert tuple(batch.old_log_probs.shape) == (4, 4)
 
 
+def test_branching_rollout_metadata_is_deterministic_across_prompts():
+    import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
+    from visual_rl.configs.schema import load_config, section_to_dict
+    from visual_rl.core.registry import MODEL_ADAPTERS
+    from visual_rl.rollout.full_trajectory import build_rollout_engine
+
+    cfg = load_config("visual_rl/configs/presets/tempflow_tiny_branching.yaml")
+    adapter = MODEL_ADAPTERS.get("tiny_diffusion")(section_to_dict(cfg.model))
+    rollout_config = section_to_dict(cfg.sample)
+    rollout_config.update(cfg.rollout)
+    rollout_config["seed"] = 123
+    rollout_config["epoch_tag"] = 3
+
+    batch = build_rollout_engine(rollout_config).sample(
+        adapter,
+        ["a red square", "a blue square"],
+        [{"tag": "red"}, {"tag": "blue"}],
+    )
+
+    assert batch.prompts == [
+        "a red square",
+        "a red square",
+        "a red square",
+        "a red square",
+        "a blue square",
+        "a blue square",
+        "a blue square",
+        "a blue square",
+    ]
+    assert batch.branch_ids.tolist() == [-1, 0, 1, 2, -1, 0, 1, 2]
+    assert batch.model_metadata["branch_timestep"] == 3
+    assert batch.model_metadata["branch_timesteps"] == [0, 1, 2, 3]
+    assert batch.model_metadata["branch_ids"] == [-1, 0, 1, 2, -1, 0, 1, 2]
+    assert batch.model_metadata["parent_prompt_indices"] == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert [item["branch_id"] for item in batch.metadata] == [-1, 0, 1, 2, -1, 0, 1, 2]
+    assert [item["branch_timestep"] for item in batch.metadata] == [3] * 8
+    assert [item["parent_prompt_index"] for item in batch.metadata] == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert [item["is_main_branch"] for item in batch.metadata] == [
+        True,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert [item["tag"] for item in batch.metadata] == ["red", "red", "red", "red", "blue", "blue", "blue", "blue"]
+
+
 def test_tempflow_loss_uses_branch_timestep_only():
     import torch
 

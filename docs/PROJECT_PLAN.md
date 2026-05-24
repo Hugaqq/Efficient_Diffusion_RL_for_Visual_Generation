@@ -32,6 +32,7 @@ reference project. The current package already has:
 - SD1.5 LoRA adapter and image trainer entry point
 - SD3.5 TempFlow reference adapter
 - FLUX/QwenImage TempFlow adapter entries
+- config validation for incompatible rollout/algorithm pairs
 - CLI smoke commands for mock, TempFlow tiny, Flash tiny, image training,
   adapter probes, World-R1 plan, and Wan plan
 
@@ -45,8 +46,8 @@ Current implementation status:
 | Full-trajectory GRPO | implemented for mock/tiny paths |
 | TempFlow branching | implemented for tiny diffusion |
 | Flash-GRPO single-step | implemented for tiny diffusion |
-| SD1.5 | LoRA adapter implemented; real GPU numeric probe pending |
-| SD3 | TempFlow reference adapter implemented; adapter-level server parity pending |
+| SD1.5 | LoRA adapter and numeric-smoke CLI implemented; real GPU numeric probe deferred because no checkpoint path is available |
+| SD3 | TempFlow reference adapter implemented; adapter-level server parity is now the next active real-model target |
 | FLUX/QwenImage | TempFlow adapter entries implemented; low-resolution smoke pending |
 | World-R1 | dry-run launcher and reward client stubs; real integration pending |
 | Wan | runtime plan shell only; real checkpoint/logprob training pending |
@@ -59,6 +60,7 @@ conda run -n visual-rl python -m pytest -q
 conda run -n visual-rl python -m ruff check visual_rl tests
 conda run -n visual-rl python -m visual_rl.cli smoke-imports
 conda run -n visual-rl python -m visual_rl.cli adapter-probe --adapter sd15_lora
+conda run -n visual-rl python -m visual_rl.cli sd15-numeric-smoke --help
 conda run -n visual-rl python -m visual_rl.cli adapter-probe --adapter sd3_tempflow
 conda run -n visual-rl python -m visual_rl.cli smoke-mock --output-dir runs/smoke --steps 2
 conda run -n visual-rl python -m visual_rl.cli tempflow-smoke --output-dir runs/tempflow_tiny_smoke --steps 2
@@ -68,7 +70,8 @@ conda run -n visual-rl python -m visual_rl.cli wan-plan --output-dir runs/wan_ru
 
 Latest local validation:
 
-- `pytest`: 21 tests pass.
+- `compileall`: passes for `visual_rl` and `tests`.
+- `pytest`: 32 tests pass.
 - `ruff`: passes.
 - `smoke-imports`: registers `grpo`, `flash_grpo`, `tempflow_grpo`,
   `mock_wan`, `tiny_diffusion`, SD1.5, SD3, FLUX, QwenImage,
@@ -78,6 +81,53 @@ Latest local validation:
 - `tempflow-smoke`: passes locally on tiny diffusion.
 - `flash-smoke`: passes locally on tiny diffusion.
 - `wan-plan`: still reports empty `model.model_path` and mock rewards by default.
+- 2026-05-24 local tiny validation: deterministic golden tests now cover
+  rollout cache filenames/metadata, Flash selected timesteps, parent prompt
+  indices, TempFlow branch IDs/timestep metadata, advantage masks, and
+  advantage expansion.
+- 2026-05-24 local CPU experiments:
+  `flash-smoke --output-dir /tmp/visualrl_eval_flash --steps 1` passed with
+  `flash_active_timestep_frac: 1.0` and `flash_selected_timestep_mean: 0.0`;
+  `tempflow-smoke --output-dir /tmp/visualrl_eval_tempflow --steps 1` passed
+  with `tempflow_active_timestep_frac: 0.25`.
+- 2026-05-24 local advantage-mask validation:
+  `smoke-mock --output-dir /tmp/visualrl_eval_mock_adv --steps 1` passed with
+  `loss: 0.0`, `approx_kl: 0.0`, and `group_size: 2.0`;
+  `flash-smoke --output-dir /tmp/visualrl_eval_flash_adv --steps 1` passed
+  with `flash_active_timestep_frac: 1.0`,
+  `flash_rectification_weight_mean: 1.0`, and
+  `flash_selected_timestep_mean: 0.0`;
+  `tempflow-smoke --output-dir /tmp/visualrl_eval_tempflow_adv --steps 1`
+  passed with `tempflow_active_timestep_frac: 0.25` and
+  `tempflow_noise_weight_mean: 1.0`.
+- 2026-05-24 local tiny algorithm comparison validation:
+  `tests/test_tiny_algorithm_comparison.py` passed and compares
+  full-trajectory GRPO, Flash single-step GRPO, and TempFlow branch-timestep
+  credit assignment on the same prompts, rewards, timesteps, and logprob
+  fixture; `smoke-mock --output-dir /tmp/visualrl_eval_compare_mock --steps 1`,
+  `flash-smoke --output-dir /tmp/visualrl_eval_compare_flash --steps 1`, and
+  `tempflow-smoke --output-dir /tmp/visualrl_eval_compare_tempflow --steps 1`
+  passed locally.
+- 2026-05-24 config validation:
+  `tests/test_config_v02.py` passed with 3 tests. Positive config load passed
+  for `flash_tiny_single_step.yaml` with `GOOD flash_grpo/single_step`.
+  A temporary invalid config with `algorithm.name: flash_grpo` and
+  `sample.name: full_trajectory` was rejected with
+  `ValueError: Incompatible config: algorithm.name='flash_grpo' requires
+  sample.name in {'single_step'}, got sample.name='full_trajectory'.`
+- 2026-05-24 SD1.5 numeric-smoke CLI validation:
+  `tests/test_real_image_adapters.py` passed with 3 tests, including the
+  mocked `sd15-numeric-smoke` CLI contract and explicit model-path propagation.
+  `sd15-numeric-smoke --help` passed and exposes the required `--model-path`.
+  `adapter-probe --adapter sd15_lora` returned deferred-load status
+  `{"adapter": "sd15_lora", "loaded": false, "model_path": ""}`.
+- 2026-05-24 remote SD1.5 real numeric-smoke attempt:
+  `ssh v-qiaoqifan@10.130.140.73 'hostname; nvidia-smi; nvidia-smi pmon -c 1'`
+  reported host `node01`; GPU 1 was idle at 3 MiB, 0% utilization, and no
+  `pmon` process, while GPUs 0 and 2-7 were busy. Read-only checkpoint search
+  over `$HOME`, `/data`, `/mnt`, `/share`, `/workspace`, and `/home` found
+  SD3.5 and Wan Diffusers paths only. No usable SD1.5 Diffusers checkpoint was
+  found, so the real GPU numeric smoke is deferred and no longer gates SD3.5.
 
 Server validation completed so far:
 
@@ -86,9 +136,11 @@ Server validation completed so far:
 - Two-GPU TempFlow tiny correctness probe on 5090 GPUs.
 - Real SD3.5-medium TempFlow reference-script smoke on one 5090 GPU.
 
-Real Wan checkpoint loading, World-R1 reward server calls, real SD1.5/SD3/FLUX/
+Real Wan checkpoint loading, World-R1 reward server calls, real SD3/FLUX/
 QwenImage reward-improvement runs through `VisualRLTrainer`, and Inferix eval
-are not validated yet.
+are not validated yet. SD1.5 has a local numeric-smoke CLI contract, but the
+real model run is deferred because no valid SD1.5 Diffusers checkpoint path is
+available. SD1.5 is no longer a gate for SD3.5 adapter parity work.
 
 Known validation gaps are tracked in
 [`docs/EXPERIMENT_VALIDATION_BACKLOG.md`](EXPERIMENT_VALIDATION_BACKLOG.md).
@@ -236,6 +288,9 @@ visual_rl/configs/presets/tempflow_tiny_branching.yaml
 visual_rl/configs/presets/flash_tiny_single_step.yaml
 tests/test_tempflow_branching.py
 tests/test_flash_grpo.py
+tests/test_rollout_cache.py
+tests/test_advantage_masks.py
+tests/test_tiny_algorithm_comparison.py
 ```
 
 Implemented behavior:
@@ -247,6 +302,13 @@ Implemented behavior:
 - GRPO-style update changes trainable parameters in validation probes
 - TempFlow reward trend improved in two 100-step 5090 correctness probes
 - rollout cache and checkpoint path are exercised
+- deterministic golden tests cover cache filenames/metadata, selected
+  timesteps, branch IDs, parent prompt indices, advantage masks, and advantage
+  expansion across full-trajectory GRPO, Flash single-step, and TempFlow
+  branching
+- deterministic tiny comparison covers full-trajectory GRPO, Flash
+  single-step GRPO, and TempFlow branch-timestep credit assignment on the same
+  prompt/reward/logprob/timestep fixture
 
 This is the lowest-cost end-to-end testbed for the whole infra.
 
@@ -276,9 +338,10 @@ Implemented features:
 Still pending before real-model use:
 
 - 20-50 step reward-trend validation for Flash tiny.
-- Controlled comparison against full-trajectory GRPO and TempFlow branching.
 - Scheduler-specific rectification parity against Flash-GRPO reference code.
-- SD1.5 single-step LoRA path.
+- SD3/FLUX/QwenImage single-step paths after adapter parity. SD1.5
+  single-step LoRA can be revisited only if a checkpoint path becomes
+  available.
 
 ### Phase C: TempFlow Branching Abstraction
 
@@ -306,19 +369,23 @@ Still pending before real-model use:
 
 - sequential branch execution for large models under 32 GB VRAM
 - adapter-level parity with the SD3.5 reference script
-- SD1.5/SD3 real `sample()` and `recompute_log_probs()` contracts
+- SD3 real `sample()` and `recompute_log_probs()` contracts through
+  `visual_rl`
 
-### Phase D: Real Small Image Model
+### Phase D: SD1.5 Small Image Model
 
-Add Stable Diffusion 1.5 LoRA RL before SD3/FLUX/QwenImage.
+Add Stable Diffusion 1.5 LoRA RL as an optional small-model path. This phase is
+implemented at the CLI/adapter-contract level, but the real GPU smoke is
+deferred and must not block SD3/FLUX/QwenImage integration.
 
-Files to add:
+Implemented files:
 
 ```text
 visual_rl/model_adapters/sd15.py
 visual_rl/trainer/image_trainer.py
 visual_rl/configs/presets/sd15_lora_rl.yaml
-tests/test_sd15_adapter_contract.py
+visual_rl/cli.py
+tests/test_real_image_adapters.py
 ```
 
 Suggested experiment config:
@@ -332,13 +399,24 @@ Suggested experiment config:
 - single-step or small SDE window
 - cheap image reward first
 
-This is now the next main engineering phase. The purpose is to move from
-tiny-diffusion correctness to a real Diffusers image model while keeping the
-same `RolloutBatch`/`RewardBatch`/algorithm contracts.
+Status: code-ready for a minimal SD1.5 LoRA numeric smoke, but real-model GPU
+validation is skipped for now because the server does not currently have a
+usable SD1.5 Diffusers checkpoint path.
+
+The `sd15-numeric-smoke` CLI requires an explicit `--model-path`, constructs
+the `sd15_lora` adapter, calls `sample()`, runs strict rollout validation,
+calls `recompute_log_probs()`, checks finite media/logprob tensors, checks
+logprob agreement, and reports JSON metrics.
+
+Optional command once a checkpoint exists:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run -n visual-rl python -m visual_rl.cli sd15-numeric-smoke --model-path /path/to/sd15-diffusers --resolution 128 --num-steps 1 --prompt "a red square"
+```
 
 ### Phase E: TempFlow Model Expansion
 
-After SD1.5 is stable, integrate models from the TempFlow path:
+With SD1.5 deferred, integrate models from the TempFlow path next:
 
 1. SD3
 2. FLUX
@@ -435,8 +513,9 @@ Purpose: prove the base infra.
 - group size: 4 or 8
 - algorithm: GRPO
 - expected result: reward rises, loss/clip/approx KL are logged, checkpoint saves
-- status: base tiny adapter path is implemented; long reward-trend comparison
-  across GRPO/Flash/TempFlow is still pending
+- status: base tiny adapter path is implemented; deterministic comparison
+  against Flash and TempFlow is covered; long reward-trend comparison across
+  GRPO/Flash/TempFlow is still pending
 
 ### Experiment 1: Tiny Flash-GRPO
 
@@ -455,7 +534,7 @@ Purpose: prove branch credit assignment.
 - main path plus branch samples: implemented
 - reward assigned to branch timestep: implemented
 - two-GPU 5090 correctness probe: passed
-- next: compare full GRPO, single-step GRPO, and branching GRPO
+- deterministic comparison with full GRPO and Flash single-step GRPO: passed
 
 ### Experiment 3: SD1.5 LoRA RL
 
@@ -466,7 +545,10 @@ Purpose: first real image diffusion RL curve.
 - group size 4 sequential
 - cheap reward
 - 1x 5090 runnable
-- status: next main implementation target
+- status: LoRA adapter, image trainer entry point, and `sd15-numeric-smoke`
+  CLI are implemented; local CLI contract test passes; real GPU numeric smoke
+  is deferred because no SD1.5 Diffusers checkpoint path is available. This
+  experiment is no longer gating SD3.5 adapter parity.
 
 ### Experiment 4: SD3 TempFlow-Style RL
 
@@ -477,7 +559,8 @@ Purpose: begin real TempFlow integration.
 - small group
 - reward cache
 - no large multi-reward setup initially
-- status: reference TempFlow SD3.5 smoke passed; `visual_rl` adapter is pending
+- status: reference TempFlow SD3.5 smoke passed; `visual_rl` adapter parity is
+  the next active real-model validation target
 
 ### Experiment 5: Wan Low-VRAM Smoke
 
@@ -532,6 +615,7 @@ Already available or partially available:
 - reward cache with media hash and reward version
 - rollout cache for smoke/debug runs
 - strict `fail_policy: raise` path for configured rewards
+- config validation for known rollout/algorithm compatibility
 - tiny smoke commands for Flash and TempFlow
 
 Still missing as CLI tools:
@@ -567,8 +651,8 @@ Non-Wan support now has one complete tiny path plus lazy bridges:
 | Model | Status |
 | --- | --- |
 | Tiny diffusion | implemented for GRPO/TempFlow/Flash tiny smoke |
-| SD1.5 | LoRA adapter and image trainer path implemented; GPU numeric probe pending |
-| SD3 | TempFlow reference adapter implemented; SD3.5 reference script smoke passed; adapter parity pending |
+| SD1.5 | LoRA adapter, image trainer path, and numeric-smoke CLI implemented; GPU numeric probe deferred until a checkpoint path exists |
+| SD3 | TempFlow reference adapter implemented; SD3.5 reference script smoke passed; adapter parity is next |
 | FLUX | TempFlow adapter implemented; low-resolution smoke pending |
 | QwenImage | TempFlow adapter implemented; low-resolution smoke pending |
 | CogVideoX | placeholder, World-R1 path later |
@@ -579,13 +663,12 @@ Non-Wan support now has one complete tiny path plus lazy bridges:
 The current priority order is:
 
 ```text
-1. Run SD1.5 LoRA adapter numeric smoke on one idle GPU
-2. Run SD3.5 TempFlow adapter parity smoke through `VisualRLTrainer`
-3. Validate FLUX and QwenImage low-resolution adapter smoke paths
-4. Finish tiny benchmark comparison: GRPO vs Flash-GRPO vs TempFlow-GRPO
-5. Add World-R1 reward/camera probes
-6. Run Wan low-VRAM smoke only after image model contracts are stable
-7. Add Inferix eval/preview/profiling backend
+1. Run SD3.5 TempFlow adapter parity smoke through `VisualRLTrainer`
+2. Validate FLUX and QwenImage low-resolution adapter smoke paths
+3. Optionally return to SD1.5 only if a valid Diffusers checkpoint path appears
+4. Add World-R1 reward/camera probes
+5. Run Wan low-VRAM smoke only after image model contracts are stable
+6. Add Inferix eval/preview/profiling backend
 ```
 
 The core project identity is:
@@ -667,7 +750,7 @@ Findings to fix before the next real-model phase:
    IDs have compatible batch dimensions. This lets adapter mistakes surface
    later inside loss computation. Add a stricter optional validation path for
    `visual-rl rollout-probe`, `adapter-probe`, and smoke tests before wiring
-   real SD1.5/SD3 adapters.
+   real image adapters.
 
 Fix status after v0.5 implementation:
 
@@ -682,4 +765,6 @@ Fix status after v0.5 implementation:
 - `RolloutBatch.validate_lightweight(strict=True)` checks media, latent,
   timestep, logprob, KL, and branch batch dimensions.
 - Adapter probes pass for SD1.5, SD3.5, FLUX, and QwenImage in deferred-load
-  mode. Real model numeric probes remain pending.
+  mode. SD1.5 also has a local `sd15-numeric-smoke` CLI contract test, but the
+  real GPU numeric probe is deferred until a valid SD1.5 Diffusers checkpoint
+  path is available. SD3.5 adapter parity is now the active next step.

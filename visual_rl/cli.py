@@ -132,6 +132,92 @@ def adapter_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _shape_list(value) -> list[int]:
+    shape = getattr(value, "shape", None)
+    return [int(item) for item in shape] if shape is not None else []
+
+
+def _tensor_finite(value) -> bool:
+    import torch
+
+    return bool(torch.isfinite(value.detach()).all().item())
+
+
+def _sd15_numeric_smoke_payload(args: argparse.Namespace) -> dict:
+    _register_builtin_plugins()
+    from visual_rl.core.registry import MODEL_ADAPTERS
+
+    extra = {
+        "resolution": args.resolution,
+        "dtype": args.dtype,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "logprob_std": args.logprob_std,
+    }
+    if args.device:
+        extra["device"] = args.device
+    model_config = {
+        "name": "sd15_lora",
+        "model_family": "image",
+        "model_path": args.model_path,
+        "use_lora": not args.disable_lora,
+        "extra": extra,
+    }
+    adapter = MODEL_ADAPTERS.get("sd15_lora")(model_config)
+    rollout_config = {
+        "num_steps": args.num_steps,
+        "guidance_scale": args.guidance_scale,
+        "seed": args.seed,
+    }
+    batch = adapter.sample([args.prompt], [{"source": "sd15_numeric_smoke"}], rollout_config)
+    batch.validate_strict()
+    recomputed = adapter.recompute_log_probs(batch)
+
+    import torch
+
+    old_log_probs = batch.old_log_probs.detach()
+    max_abs_logprob_delta = float((recomputed.detach() - old_log_probs).abs().max().item())
+    params = list(adapter.parameters())
+    trainable_parameters = int(sum(parameter.numel() for parameter in params))
+    payload = {
+        "adapter": adapter.name,
+        "model_path": args.model_path,
+        "prompt": args.prompt,
+        "resolution": args.resolution,
+        "num_steps": args.num_steps,
+        "guidance_scale": args.guidance_scale,
+        "seed": args.seed,
+        "media_shape": _shape_list(batch.media),
+        "latents_shape": _shape_list(batch.latents),
+        "timesteps_shape": _shape_list(batch.timesteps),
+        "old_log_probs_shape": _shape_list(old_log_probs),
+        "recomputed_log_probs_shape": _shape_list(recomputed),
+        "media_finite": _tensor_finite(batch.media),
+        "old_log_probs_finite": _tensor_finite(old_log_probs),
+        "recomputed_log_probs_finite": _tensor_finite(recomputed),
+        "max_abs_logprob_delta": max_abs_logprob_delta,
+        "trainable_parameter_tensors": len(params),
+        "trainable_parameters": trainable_parameters,
+        "device": str(getattr(adapter, "device", args.device)),
+        "dtype": str(getattr(adapter, "dtype", args.dtype)),
+        "model_metadata": dict(batch.model_metadata),
+    }
+    if not payload["media_finite"] or not payload["old_log_probs_finite"] or not payload["recomputed_log_probs_finite"]:
+        raise ValueError("SD1.5 numeric smoke produced non-finite tensors.")
+    if not torch.allclose(recomputed.detach(), old_log_probs, atol=args.logprob_atol, rtol=0.0):
+        raise ValueError(
+            "SD1.5 recomputed logprobs diverged from sampled logprobs: "
+            f"max_abs_delta={max_abs_logprob_delta:.6g}, atol={args.logprob_atol:.6g}"
+        )
+    return payload
+
+
+def sd15_numeric_smoke(args: argparse.Namespace) -> int:
+    payload = _sd15_numeric_smoke_payload(args)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def wan_plan(args: argparse.Namespace) -> int:
     _register_builtin_plugins()
     from visual_rl.configs.schema import load_config
@@ -202,6 +288,22 @@ def main(argv: list[str] | None = None) -> int:
     adapter_parser.add_argument("--device", default=None)
     adapter_parser.add_argument("--load", action="store_true")
     adapter_parser.set_defaults(func=adapter_probe)
+
+    sd15_smoke_parser = subparsers.add_parser("sd15-numeric-smoke")
+    sd15_smoke_parser.add_argument("--model-path", required=True)
+    sd15_smoke_parser.add_argument("--prompt", default="a red square")
+    sd15_smoke_parser.add_argument("--resolution", type=int, default=128)
+    sd15_smoke_parser.add_argument("--num-steps", type=int, default=1)
+    sd15_smoke_parser.add_argument("--guidance-scale", type=float, default=1.0)
+    sd15_smoke_parser.add_argument("--seed", type=int, default=17)
+    sd15_smoke_parser.add_argument("--device", default=None)
+    sd15_smoke_parser.add_argument("--dtype", default="float16")
+    sd15_smoke_parser.add_argument("--lora-rank", type=int, default=4)
+    sd15_smoke_parser.add_argument("--lora-alpha", type=int, default=8)
+    sd15_smoke_parser.add_argument("--logprob-std", type=float, default=0.1)
+    sd15_smoke_parser.add_argument("--logprob-atol", type=float, default=1e-5)
+    sd15_smoke_parser.add_argument("--disable-lora", action="store_true")
+    sd15_smoke_parser.set_defaults(func=sd15_numeric_smoke)
 
     plan_parser = subparsers.add_parser("world-r1-plan")
     plan_parser.add_argument("--model-path", required=True)

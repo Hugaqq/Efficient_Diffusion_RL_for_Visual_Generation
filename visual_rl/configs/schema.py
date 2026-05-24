@@ -171,6 +171,13 @@ class VisualRLConfig:
     legacy: dict[str, Any] = field(default_factory=dict)
 
 
+_ALGORITHM_SAMPLE_PAIRS = {
+    "grpo": {"full_trajectory"},
+    "flash_grpo": {"single_step"},
+    "tempflow_grpo": {"branching"},
+}
+
+
 def _build_dataclass(cls, src: dict[str, Any]):
     if src is None:
         return cls()
@@ -216,6 +223,20 @@ def _normalize_legacy_keys(data: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _validate_algorithm_sample_pair(cfg: VisualRLConfig) -> None:
+    algorithm_name = cfg.algorithm.name
+    sample_name = cfg.sample.name
+    allowed_samples = _ALGORITHM_SAMPLE_PAIRS.get(algorithm_name)
+    if allowed_samples is None or sample_name in allowed_samples:
+        return
+
+    expected = ", ".join(f"{name!r}" for name in sorted(allowed_samples))
+    raise ValueError(
+        f"Incompatible config: algorithm.name={algorithm_name!r} requires "
+        f"sample.name in {{{expected}}}, got sample.name={sample_name!r}."
+    )
+
+
 def load_config(path: str | Path) -> VisualRLConfig:
     path = Path(path)
     with path.open("r", encoding="utf-8") as handle:
@@ -230,6 +251,7 @@ def load_config(path: str | Path) -> VisualRLConfig:
         cfg.output_dir = cfg.paths.output_dir
     if cfg.paths.save_dir is None:
         cfg.paths.save_dir = cfg.paths.output_dir
+    _validate_algorithm_sample_pair(cfg)
     return cfg
 
 
