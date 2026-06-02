@@ -346,10 +346,7 @@ def test_reward_probe_uses_real_image_preset_resolution(capsys):
     import visual_rl.cli as cli
 
     paths = [
-        "visual_rl/configs/presets/sd15_lora_rl.yaml",
         "visual_rl/configs/presets/sd3_tempflow_adapter.yaml",
-        "visual_rl/configs/presets/flux_tempflow_adapter.yaml",
-        "visual_rl/configs/presets/qwenimage_tempflow_adapter.yaml",
     ]
 
     for path in paths:

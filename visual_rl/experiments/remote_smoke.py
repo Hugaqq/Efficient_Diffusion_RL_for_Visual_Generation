@@ -145,11 +145,9 @@ def _shell_array(items: list[str]) -> str:
     return "(" + " ".join(shlex.quote(str(item)) for item in items) + ")"
 
 
-def _tempflow_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
+def _sd3_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
     return [
-        "tempflow-image-numeric-smoke",
-        "--adapter",
-        "sd3_tempflow",
+        "sd3-numeric-smoke",
         "--model-path",
         config.model_path,
         "--repo-root",
@@ -268,7 +266,7 @@ def build_remote_script(config: RemoteSd3CliSmokeConfig) -> str:
         "image-preview",
         "--help",
     ]
-    tempflow_help_cmd = [
+    sd3_help_cmd = [
         config.conda_bin,
         "run",
         "-n",
@@ -276,7 +274,7 @@ def build_remote_script(config: RemoteSd3CliSmokeConfig) -> str:
         "python",
         "-m",
         "visual_rl.cli",
-        "tempflow-image-numeric-smoke",
+        "sd3-numeric-smoke",
         "--help",
     ]
     bounded_help_cmd = [
@@ -308,7 +306,7 @@ def build_remote_script(config: RemoteSd3CliSmokeConfig) -> str:
         "python",
         "-m",
         "visual_rl.cli",
-        *_tempflow_cli_args(config),
+        *_sd3_cli_args(config),
     ]
     bounded_cmd = [
         config.conda_bin,
@@ -386,7 +384,7 @@ BOUNDED_STEPS={shlex.quote(str(config.bounded_steps))}
 RESUME_STEPS={shlex.quote(str(config.resume_steps))}
 HELP_CMD={_shell_array(help_cmd)}
 PREVIEW_HELP_CMD={_shell_array(preview_help_cmd)}
-TEMPFLOW_HELP_CMD={_shell_array(tempflow_help_cmd)}
+        SD3_HELP_CMD={_shell_array(sd3_help_cmd)}
 BOUNDED_HELP_CMD={_shell_array(bounded_help_cmd)}
 PREVIEW_CMD={_shell_array(preview_cmd)}
 SMOKE_CMD={_shell_array(smoke_cmd)}
@@ -428,8 +426,8 @@ fi
 grep -q -- "remote-sd3-cli-smoke" "$STAGE_DIR/cli_help.log"
 "${{PREVIEW_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/image_preview_help.log"
 grep -q -- "--output-dir" "$STAGE_DIR/image_preview_help.log"
-"${{TEMPFLOW_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/tempflow_image_numeric_smoke_help.log"
-grep -q -- "--repo-root" "$STAGE_DIR/tempflow_image_numeric_smoke_help.log"
+"${{SD3_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/sd3_numeric_smoke_help.log"
+grep -q -- "--repo-root" "$STAGE_DIR/sd3_numeric_smoke_help.log"
 "${{BOUNDED_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/sd3_bounded_trainer_smoke_help.log"
 grep -q -- "--disable-rollout-cache" "$STAGE_DIR/sd3_bounded_trainer_smoke_help.log"
 
@@ -453,7 +451,7 @@ touch "$LOG_PATH"
 run_logged preview "$STAGE_DIR/image_preview.stdout.log" "${{PREVIEW_CMD[@]}}"
 test -s "$STAGE_DIR/preview/preview_000.png"
 test -s "$STAGE_DIR/preview/metadata.json"
-run_logged numeric "$STAGE_DIR/tempflow_image_numeric_smoke.stdout.log" "${{SMOKE_CMD[@]}}"
+run_logged numeric "$STAGE_DIR/sd3_numeric_smoke.stdout.log" "${{SMOKE_CMD[@]}}"
 {bounded_block}
 echo "[remote_smoke] artifact_status=ok" | tee "$STAGE_DIR/artifact_status.log"
 

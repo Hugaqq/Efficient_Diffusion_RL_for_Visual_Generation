@@ -28,6 +28,6 @@ The `train` extra is for real diffusion-model adapters:
 | Reference | Role | Runtime Policy |
 | --- | --- | --- |
 | `Flash-GRPO-main` | selected-step Wan Flash-GRPO behavior | optional, lazy |
-| `TempFlow-GRPO-main` | branching rollout and SD3/FLUX/QwenImage references | optional, lazy |
+| `TempFlow-GRPO-main` | branching rollout behavior and the SD3 image bridge | optional, lazy |
 | `World-R1-main` | Wan/world video and reward-server behavior | optional, lazy |
 | `GenRL-main` | engineering reference | never a runtime trunk |
