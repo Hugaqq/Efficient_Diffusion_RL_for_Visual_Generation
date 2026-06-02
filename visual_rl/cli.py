@@ -12,12 +12,9 @@ from typing import Any
 
 def _register_builtin_plugins() -> None:
     import visual_rl.model_adapters.mock  # noqa: F401
-    import visual_rl.model_adapters.sd15  # noqa: F401
     import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
     import visual_rl.model_adapters.wan  # noqa: F401
     import visual_rl.model_adapters.sd3  # noqa: F401
-    import visual_rl.model_adapters.flux  # noqa: F401
-    import visual_rl.model_adapters.qwenimage  # noqa: F401
     import visual_rl.algorithms.flash_grpo  # noqa: F401
     import visual_rl.algorithms.grpo  # noqa: F401
     import visual_rl.algorithms.tempflow_grpo  # noqa: F401
@@ -82,25 +79,6 @@ def flash_smoke(args: argparse.Namespace) -> int:
         config.output_dir = args.output_dir
         config.paths.output_dir = args.output_dir
     trainer = VisualRLTrainer(config)
-    metrics = trainer.train(max_steps=args.steps)
-    print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
-    return 0
-
-
-def image_train(args: argparse.Namespace) -> int:
-    _register_builtin_plugins()
-    from visual_rl.configs.schema import load_config
-    from visual_rl.trainer.image_trainer import ImageRLTrainer
-
-    default_config = Path(__file__).parent / "configs" / "presets" / "sd15_lora_rl.yaml"
-    config = load_config(args.config or default_config)
-    if args.model_path:
-        config.model.model_path = args.model_path
-        config.paths.pretrained_model = args.model_path
-    if args.output_dir:
-        config.output_dir = args.output_dir
-        config.paths.output_dir = args.output_dir
-    trainer = ImageRLTrainer(config)
     metrics = trainer.train(max_steps=args.steps)
     print(json.dumps({"output_dir": config.output_dir, "metrics": metrics}, indent=2, sort_keys=True))
     return 0
@@ -504,16 +482,6 @@ _TEMPFLOW_IMAGE_SMOKE_SPECS = {
         "label": "SD3",
         "model_family": "sd3",
         "metadata_source": "sd3_numeric_smoke",
-    },
-    "flux_tempflow": {
-        "label": "FLUX",
-        "model_family": "flux",
-        "metadata_source": "flux_numeric_smoke",
-    },
-    "qwenimage_tempflow": {
-        "label": "QwenImage",
-        "model_family": "qwenimage",
-        "metadata_source": "qwenimage_numeric_smoke",
     },
 }
 
@@ -1092,11 +1060,11 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
     _validate_sd3_bounded_trainer_args(args)
     _register_builtin_plugins()
     from visual_rl.trainer.checkpoint import save_json
-    from visual_rl.trainer.image_trainer import ImageRLTrainer
+    from visual_rl.trainer.trainer import VisualRLTrainer
 
     config = _sd3_bounded_trainer_config(args)
     _validate_config_registry_names(config)
-    trainer = ImageRLTrainer(config)
+    trainer = VisualRLTrainer(config)
     output_dir = Path(config.output_dir)
     metrics_path = output_dir / "metrics.jsonl"
     latest_path = output_dir / "latest.json"
@@ -1180,86 +1148,11 @@ def sd3_bounded_trainer_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def _sd15_numeric_smoke_payload(args: argparse.Namespace) -> dict:
+def _sd3_image_numeric_smoke_payload(args: argparse.Namespace) -> dict:
     _register_builtin_plugins()
     from visual_rl.core.registry import MODEL_ADAPTERS
 
-    extra = {
-        "resolution": args.resolution,
-        "dtype": args.dtype,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "logprob_std": args.logprob_std,
-    }
-    if args.device:
-        extra["device"] = args.device
-    model_config = {
-        "name": "sd15_lora",
-        "model_family": "image",
-        "model_path": args.model_path,
-        "use_lora": not args.disable_lora,
-        "extra": extra,
-    }
-    adapter = MODEL_ADAPTERS.get("sd15_lora")(model_config)
-    rollout_config = {
-        "num_steps": args.num_steps,
-        "guidance_scale": args.guidance_scale,
-        "seed": args.seed,
-    }
-    batch = adapter.sample([args.prompt], [{"source": "sd15_numeric_smoke"}], rollout_config)
-    batch.validate_strict()
-    recomputed = adapter.recompute_log_probs(batch)
-
-    import torch
-
-    old_log_probs = batch.old_log_probs.detach()
-    max_abs_logprob_delta = float((recomputed.detach() - old_log_probs).abs().max().item())
-    params = list(adapter.parameters())
-    trainable_parameters = int(sum(parameter.numel() for parameter in params))
-    payload = {
-        "adapter": adapter.name,
-        "model_path": args.model_path,
-        "prompt": args.prompt,
-        "resolution": args.resolution,
-        "num_steps": args.num_steps,
-        "guidance_scale": args.guidance_scale,
-        "seed": args.seed,
-        "media_shape": _shape_list(batch.media),
-        "latents_shape": _shape_list(batch.latents),
-        "timesteps_shape": _shape_list(batch.timesteps),
-        "old_log_probs_shape": _shape_list(old_log_probs),
-        "recomputed_log_probs_shape": _shape_list(recomputed),
-        "media_finite": _tensor_finite(batch.media),
-        "old_log_probs_finite": _tensor_finite(old_log_probs),
-        "recomputed_log_probs_finite": _tensor_finite(recomputed),
-        "max_abs_logprob_delta": max_abs_logprob_delta,
-        "trainable_parameter_tensors": len(params),
-        "trainable_parameters": trainable_parameters,
-        "device": str(getattr(adapter, "device", args.device)),
-        "dtype": str(getattr(adapter, "dtype", args.dtype)),
-        "model_metadata": dict(batch.model_metadata),
-    }
-    if not payload["media_finite"] or not payload["old_log_probs_finite"] or not payload["recomputed_log_probs_finite"]:
-        raise ValueError("SD1.5 numeric smoke produced non-finite tensors.")
-    if not torch.allclose(recomputed.detach(), old_log_probs, atol=args.logprob_atol, rtol=0.0):
-        raise ValueError(
-            "SD1.5 recomputed logprobs diverged from sampled logprobs: "
-            f"max_abs_delta={max_abs_logprob_delta:.6g}, atol={args.logprob_atol:.6g}"
-        )
-    return payload
-
-
-def sd15_numeric_smoke(args: argparse.Namespace) -> int:
-    payload = _sd15_numeric_smoke_payload(args)
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0
-
-
-def _tempflow_image_numeric_smoke_payload(args: argparse.Namespace, adapter_key: str | None = None) -> dict:
-    _register_builtin_plugins()
-    from visual_rl.core.registry import MODEL_ADAPTERS
-
-    adapter_key = adapter_key or args.adapter
+    adapter_key = "sd3_tempflow"
     spec = _TEMPFLOW_IMAGE_SMOKE_SPECS[adapter_key]
     model_config = _tempflow_image_model_config(args, adapter_key)
     adapter = MODEL_ADAPTERS.get(adapter_key)(model_config)
@@ -1336,17 +1229,11 @@ def _tempflow_image_numeric_smoke_payload(args: argparse.Namespace, adapter_key:
 
 
 def _sd3_numeric_smoke_payload(args: argparse.Namespace) -> dict:
-    return _tempflow_image_numeric_smoke_payload(args, adapter_key="sd3_tempflow")
+    return _sd3_image_numeric_smoke_payload(args)
 
 
 def sd3_numeric_smoke(args: argparse.Namespace) -> int:
     payload = _sd3_numeric_smoke_payload(args)
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0
-
-
-def tempflow_image_numeric_smoke(args: argparse.Namespace) -> int:
-    payload = _tempflow_image_numeric_smoke_payload(args)
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
@@ -1540,13 +1427,6 @@ def main(argv: list[str] | None = None) -> int:
     flash_parser.add_argument("--steps", type=int, default=2)
     flash_parser.set_defaults(func=flash_smoke)
 
-    image_parser = subparsers.add_parser("image-train")
-    image_parser.add_argument("--config", default=None)
-    image_parser.add_argument("--model-path", default=None)
-    image_parser.add_argument("--output-dir", default=None)
-    image_parser.add_argument("--steps", type=int, default=1)
-    image_parser.set_defaults(func=image_train)
-
     preview_parser = subparsers.add_parser("image-preview")
     preview_parser.add_argument(
         "--adapter",
@@ -1589,7 +1469,7 @@ def main(argv: list[str] | None = None) -> int:
 
     adapter_parser = subparsers.add_parser("adapter-probe")
     adapter_parser.add_argument("--config", default=None)
-    adapter_parser.add_argument("--adapter", default="sd15_lora")
+    adapter_parser.add_argument("--adapter", default="sd3_tempflow")
     adapter_parser.add_argument("--model-path", default=None)
     adapter_parser.add_argument("--device", default=None)
     adapter_parser.add_argument("--load", action="store_true")
@@ -1614,22 +1494,6 @@ def main(argv: list[str] | None = None) -> int:
     reward_probe_parser.add_argument("--seed", type=int, default=None)
     reward_probe_parser.set_defaults(func=reward_probe)
 
-    sd15_smoke_parser = subparsers.add_parser("sd15-numeric-smoke")
-    sd15_smoke_parser.add_argument("--model-path", required=True)
-    sd15_smoke_parser.add_argument("--prompt", default="a red square")
-    sd15_smoke_parser.add_argument("--resolution", type=int, default=128)
-    sd15_smoke_parser.add_argument("--num-steps", type=int, default=1)
-    sd15_smoke_parser.add_argument("--guidance-scale", type=float, default=1.0)
-    sd15_smoke_parser.add_argument("--seed", type=int, default=17)
-    sd15_smoke_parser.add_argument("--device", default=None)
-    sd15_smoke_parser.add_argument("--dtype", default="float16")
-    sd15_smoke_parser.add_argument("--lora-rank", type=int, default=4)
-    sd15_smoke_parser.add_argument("--lora-alpha", type=int, default=8)
-    sd15_smoke_parser.add_argument("--logprob-std", type=float, default=0.1)
-    sd15_smoke_parser.add_argument("--logprob-atol", type=float, default=1e-5)
-    sd15_smoke_parser.add_argument("--disable-lora", action="store_true")
-    sd15_smoke_parser.set_defaults(func=sd15_numeric_smoke)
-
     sd3_smoke_parser = subparsers.add_parser("sd3-numeric-smoke")
     sd3_smoke_parser.add_argument("--model-path", required=True)
     sd3_smoke_parser.add_argument("--repo-root", default=None)
@@ -1646,28 +1510,6 @@ def main(argv: list[str] | None = None) -> int:
     sd3_smoke_parser.add_argument("--logprob-atol", type=float, default=1e-5)
     sd3_smoke_parser.add_argument("--disable-lora", action="store_true")
     sd3_smoke_parser.set_defaults(func=sd3_numeric_smoke)
-
-    tempflow_image_smoke_parser = subparsers.add_parser("tempflow-image-numeric-smoke")
-    tempflow_image_smoke_parser.add_argument(
-        "--adapter",
-        choices=sorted(_TEMPFLOW_IMAGE_SMOKE_SPECS),
-        required=True,
-    )
-    tempflow_image_smoke_parser.add_argument("--model-path", required=True)
-    tempflow_image_smoke_parser.add_argument("--repo-root", default=None)
-    tempflow_image_smoke_parser.add_argument("--prompt", default="a red square")
-    tempflow_image_smoke_parser.add_argument("--resolution", type=int, default=128)
-    tempflow_image_smoke_parser.add_argument("--num-steps", type=int, default=1)
-    tempflow_image_smoke_parser.add_argument("--guidance-scale", type=float, default=1.0)
-    tempflow_image_smoke_parser.add_argument("--seed", type=int, default=29)
-    tempflow_image_smoke_parser.add_argument("--device", default=None)
-    tempflow_image_smoke_parser.add_argument("--dtype", default="bfloat16")
-    tempflow_image_smoke_parser.add_argument("--lora-rank", type=int, default=16)
-    tempflow_image_smoke_parser.add_argument("--lora-alpha", type=int, default=32)
-    tempflow_image_smoke_parser.add_argument("--max-sequence-length", type=int, default=None)
-    tempflow_image_smoke_parser.add_argument("--logprob-atol", type=float, default=1e-5)
-    tempflow_image_smoke_parser.add_argument("--disable-lora", action="store_true")
-    tempflow_image_smoke_parser.set_defaults(func=tempflow_image_numeric_smoke)
 
     tiny_loss_parser = subparsers.add_parser("tiny-loss-probe")
     tiny_loss_parser.add_argument("--output-dir", default="runs/tiny_loss_probe")

@@ -26,5 +26,5 @@ code is folded in.
 
 - Do not add another runner abstraction.
 - Do not treat GenRL as a runtime dependency.
-- Do not expand FLUX/QwenImage/SD1.5 work until Flash, TempFlow, and World-R1 are
-  clean enough to explain and run.
+- FLUX, QwenImage, and SD1.5 adapters are out of the current mainline; restore
+  them only through an explicit future scope decision.

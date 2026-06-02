@@ -1,32 +1,22 @@
 def test_real_image_adapters_register_deferred():
     import pytest
 
-    import visual_rl.model_adapters.flux  # noqa: F401
-    import visual_rl.model_adapters.qwenimage  # noqa: F401
-    import visual_rl.model_adapters.sd15  # noqa: F401
     import visual_rl.model_adapters.sd3  # noqa: F401
     from visual_rl.core.registry import MODEL_ADAPTERS
     from visual_rl.model_adapters.diffusers_common import AdapterNotLoadedError
 
-    for name in ["sd15_lora", "sd3_tempflow", "flux_tempflow", "qwenimage_tempflow"]:
-        adapter = MODEL_ADAPTERS.get(name)({"name": name, "model_path": "", "extra": {"defer_load": True}})
-        assert adapter.name
-        with pytest.raises(AdapterNotLoadedError):
-            adapter.parameters()
+    adapter = MODEL_ADAPTERS.get("sd3_tempflow")({"name": "sd3_tempflow", "model_path": "", "extra": {"defer_load": True}})
+    assert adapter.name
+    with pytest.raises(AdapterNotLoadedError):
+        adapter.parameters()
 
 
 def test_real_image_presets_load():
     from visual_rl.configs.schema import load_config
 
-    for path in [
-        "visual_rl/configs/presets/sd15_lora_rl.yaml",
-        "visual_rl/configs/presets/sd3_tempflow_adapter.yaml",
-        "visual_rl/configs/presets/flux_tempflow_adapter.yaml",
-        "visual_rl/configs/presets/qwenimage_tempflow_adapter.yaml",
-    ]:
-        cfg = load_config(path)
-        assert cfg.model.model_family in {"image", "sd3", "flux", "qwenimage"}
-        assert cfg.trainer["strict_rollout_validation"] is True
+    cfg = load_config("visual_rl/configs/presets/sd3_tempflow_adapter.yaml")
+    assert cfg.model.model_family == "sd3"
+    assert cfg.trainer["strict_rollout_validation"] is True
 
 
 def test_sd3_pipeline_helper_filters_unsupported_kwargs_without_return_dict():
@@ -292,70 +282,6 @@ def test_sd3_recompute_casts_latents_to_transformer_dtype_for_guidance_modes():
         run_case(guidance_scale, expected_batch, expected_mode)
 
 
-def test_sd15_numeric_smoke_cli_uses_explicit_model_path(monkeypatch, capsys):
-    import torch
-
-    import visual_rl.cli as cli
-    from visual_rl.core.registry import MODEL_ADAPTERS
-    from visual_rl.core.types import RolloutBatch
-
-    class FakeSD15Adapter:
-        name = "sd15_lora"
-
-        def __init__(self, config):
-            assert config["model_path"] == "/models/sd15"
-            assert config["extra"]["resolution"] == 64
-            assert config["extra"]["dtype"] == "float32"
-            self.device = torch.device("cpu")
-            self.dtype = torch.float32
-            self.weight = torch.nn.Parameter(torch.ones(2))
-
-        def sample(self, prompts, metadata, rollout_config):
-            assert prompts == ["a red square"]
-            assert rollout_config["num_steps"] == 1
-            return RolloutBatch(
-                prompts=prompts,
-                metadata=metadata,
-                media=torch.zeros(1, 3, 8, 8),
-                latents=torch.zeros(1, 1, 4, 8, 8),
-                next_latents=torch.zeros(1, 1, 4, 8, 8),
-                timesteps=torch.tensor([[0]]),
-                old_log_probs=torch.zeros(1, 1),
-                kl=torch.zeros(1, 1),
-                seed=rollout_config["seed"],
-                model_metadata={"adapter": self.name, "logprob": "ddim_surrogate"},
-            )
-
-        def recompute_log_probs(self, batch):
-            return torch.zeros_like(batch.old_log_probs)
-
-        def parameters(self):
-            return [self.weight]
-
-    monkeypatch.setattr(cli, "_register_builtin_plugins", lambda: None)
-    monkeypatch.setitem(MODEL_ADAPTERS._items, "sd15_lora", FakeSD15Adapter)  # noqa: SLF001
-
-    exit_code = cli.main(
-        [
-            "sd15-numeric-smoke",
-            "--model-path",
-            "/models/sd15",
-            "--resolution",
-            "64",
-            "--num-steps",
-            "1",
-            "--dtype",
-            "float32",
-        ]
-    )
-
-    assert exit_code == 0
-    output = capsys.readouterr().out
-    assert '"model_path": "/models/sd15"' in output
-    assert '"media_finite": true' in output
-    assert '"max_abs_logprob_delta": 0.0' in output
-
-
 def test_sd3_numeric_smoke_cli_uses_explicit_model_path_and_options(monkeypatch, capsys):
     import json
 
@@ -468,212 +394,6 @@ def test_sd3_numeric_smoke_cli_uses_explicit_model_path_and_options(monkeypatch,
     assert payload["trainable_parameters"] == 3
     assert payload["shapes"]["old_log_probs"] == [1, 2]
     assert payload["model_metadata"]["reference_pipeline"] == "sd3_pipeline_with_logprob"
-
-
-def test_tempflow_image_numeric_smoke_cli_flux_contract(monkeypatch, capsys):
-    import json
-
-    import torch
-
-    import visual_rl.cli as cli
-    from visual_rl.core.registry import MODEL_ADAPTERS
-    from visual_rl.core.types import RolloutBatch
-
-    class FakeFluxAdapter:
-        name = "tempflow_flux_legacy"
-
-        def __init__(self, config):
-            assert config["name"] == "flux_tempflow"
-            assert config["model_family"] == "flux"
-            assert config["model_path"] == "/models/flux"
-            assert config["use_lora"] is False
-            assert config["extra"]["repo_root"] == "/ref/tempflow"
-            assert config["extra"]["resolution"] == 64
-            assert config["extra"]["dtype"] == "float32"
-            assert config["extra"]["device"] == "cpu"
-            assert config["extra"]["lora_rank"] == 4
-            assert config["extra"]["lora_alpha"] == 8
-            self.device = torch.device("cpu")
-            self.dtype = torch.float32
-            self.weight = torch.nn.Parameter(torch.ones(5))
-
-        def sample(self, prompts, metadata, rollout_config):
-            assert prompts == ["a small flux image"]
-            assert metadata == [{"source": "flux_numeric_smoke", "adapter_key": "flux_tempflow"}]
-            assert rollout_config == {"num_steps": 1, "guidance_scale": 2.0, "seed": 7}
-            return RolloutBatch(
-                prompts=prompts,
-                metadata=metadata,
-                media=torch.zeros(1, 3, 8, 8),
-                latents=torch.zeros(1, 1, 4, 4),
-                next_latents=torch.zeros(1, 1, 4, 4),
-                timesteps=torch.tensor([[3]]),
-                old_log_probs=torch.tensor([[0.125]]),
-                kl=torch.zeros(1, 1),
-                seed=rollout_config["seed"],
-                model_metadata={
-                    "adapter": self.name,
-                    "reference_repo": "/ref/tempflow",
-                    "reference_pipeline": "flux_pipeline_with_logprob",
-                },
-            )
-
-        def recompute_log_probs(self, batch):
-            return batch.old_log_probs.clone()
-
-        def parameters(self):
-            return [self.weight]
-
-    monkeypatch.setattr(cli, "_register_builtin_plugins", lambda: None)
-    monkeypatch.setitem(MODEL_ADAPTERS._items, "flux_tempflow", FakeFluxAdapter)  # noqa: SLF001
-
-    exit_code = cli.main(
-        [
-            "tempflow-image-numeric-smoke",
-            "--adapter",
-            "flux_tempflow",
-            "--model-path",
-            "/models/flux",
-            "--repo-root",
-            "/ref/tempflow",
-            "--prompt",
-            "a small flux image",
-            "--resolution",
-            "64",
-            "--num-steps",
-            "1",
-            "--guidance-scale",
-            "2.0",
-            "--seed",
-            "7",
-            "--device",
-            "cpu",
-            "--dtype",
-            "float32",
-            "--lora-rank",
-            "4",
-            "--lora-alpha",
-            "8",
-            "--disable-lora",
-        ]
-    )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["adapter"] == "tempflow_flux_legacy"
-    assert payload["adapter_key"] == "flux_tempflow"
-    assert payload["model_family"] == "flux"
-    assert payload["repo_root"] == "/ref/tempflow"
-    assert payload["reference_repo"] == "/ref/tempflow"
-    assert payload["old_log_probs_shape"] == [1, 1]
-    assert payload["recomputed_log_probs_shape"] == [1, 1]
-    assert payload["shapes"]["next_latents"] == [1, 1, 4, 4]
-    assert payload["old_log_probs_finite"] is True
-    assert payload["recomputed_log_probs_finite"] is True
-    assert payload["max_abs_logprob_delta"] == 0.0
-    assert payload["trainable_parameters"] == 5
-    assert payload["model_metadata"]["reference_pipeline"] == "flux_pipeline_with_logprob"
-
-
-def test_tempflow_image_numeric_smoke_cli_qwenimage_contract(monkeypatch, capsys):
-    import json
-
-    import torch
-
-    import visual_rl.cli as cli
-    from visual_rl.core.registry import MODEL_ADAPTERS
-    from visual_rl.core.types import RolloutBatch
-
-    class FakeQwenImageAdapter:
-        name = "tempflow_qwenimage_legacy"
-
-        def __init__(self, config):
-            assert config["name"] == "qwenimage_tempflow"
-            assert config["model_family"] == "qwenimage"
-            assert config["model_path"] == "/models/qwenimage"
-            assert config["use_lora"] is True
-            assert config["extra"]["repo_root"] == "/ref/tempflow"
-            assert config["extra"]["resolution"] == 96
-            assert config["extra"]["dtype"] == "bfloat16"
-            assert config["extra"]["lora_rank"] == 6
-            assert config["extra"]["lora_alpha"] == 12
-            self.device = torch.device("cpu")
-            self.dtype = torch.bfloat16
-            self.weight = torch.nn.Parameter(torch.ones(7))
-
-        def sample(self, prompts, metadata, rollout_config):
-            assert prompts == ["a small qwen image"]
-            assert metadata == [{"source": "qwenimage_numeric_smoke", "adapter_key": "qwenimage_tempflow"}]
-            assert rollout_config == {"num_steps": 2, "guidance_scale": 3.0, "seed": 11}
-            return RolloutBatch(
-                prompts=prompts,
-                metadata=metadata,
-                media=torch.zeros(1, 3, 8, 8),
-                latents=torch.zeros(1, 2, 8, 4),
-                next_latents=torch.zeros(1, 2, 8, 4),
-                timesteps=torch.tensor([[5, 4]]),
-                old_log_probs=torch.tensor([[0.25, 0.5]]),
-                kl=torch.zeros(1, 2),
-                seed=rollout_config["seed"],
-                model_metadata={
-                    "adapter": self.name,
-                    "reference_repo": "/ref/tempflow",
-                    "reference_pipeline": "qwenimage_pipeline_with_logprob",
-                },
-            )
-
-        def recompute_log_probs(self, batch):
-            return batch.old_log_probs.clone()
-
-        def parameters(self):
-            return [self.weight]
-
-    monkeypatch.setattr(cli, "_register_builtin_plugins", lambda: None)
-    monkeypatch.setitem(MODEL_ADAPTERS._items, "qwenimage_tempflow", FakeQwenImageAdapter)  # noqa: SLF001
-
-    exit_code = cli.main(
-        [
-            "tempflow-image-numeric-smoke",
-            "--adapter",
-            "qwenimage_tempflow",
-            "--model-path",
-            "/models/qwenimage",
-            "--repo-root",
-            "/ref/tempflow",
-            "--prompt",
-            "a small qwen image",
-            "--resolution",
-            "96",
-            "--num-steps",
-            "2",
-            "--guidance-scale",
-            "3.0",
-            "--seed",
-            "11",
-            "--dtype",
-            "bfloat16",
-            "--lora-rank",
-            "6",
-            "--lora-alpha",
-            "12",
-        ]
-    )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["adapter"] == "tempflow_qwenimage_legacy"
-    assert payload["adapter_key"] == "qwenimage_tempflow"
-    assert payload["model_family"] == "qwenimage"
-    assert payload["repo_root"] == "/ref/tempflow"
-    assert payload["reference_repo"] == "/ref/tempflow"
-    assert payload["media_finite"] is True
-    assert payload["old_log_probs_finite"] is True
-    assert payload["recomputed_log_probs_finite"] is True
-    assert payload["max_abs_logprob_delta"] == 0.0
-    assert payload["trainable_parameters"] == 7
-    assert payload["shapes"]["old_log_probs"] == [1, 2]
-    assert payload["model_metadata"]["reference_pipeline"] == "qwenimage_pipeline_with_logprob"
-
 
 def test_image_preview_cli_writes_png_and_metadata_for_sd3_contract(monkeypatch, tmp_path, capsys):
     import json
@@ -831,14 +551,14 @@ def test_image_preview_cli_supports_tiny_diffusion_locally(tmp_path, capsys):
     assert (tmp_path / "metadata.json").exists()
 
 
-def test_sd3_bounded_trainer_smoke_cli_uses_image_trainer_contract(monkeypatch, tmp_path, capsys):
+def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypatch, tmp_path, capsys):
     import json
 
     import torch
 
     import visual_rl.cli as cli
     from visual_rl.core.types import RewardBatch, RolloutBatch
-    import visual_rl.trainer.image_trainer as image_trainer_module
+    import visual_rl.trainer.trainer as trainer_module
 
     seen = {}
 
@@ -888,7 +608,7 @@ def test_sd3_bounded_trainer_smoke_cli_uses_image_trainer_contract(monkeypatch, 
                 metadata={"prompt_color": {"phase": phase}},
             )
 
-    class FakeImageTrainer:
+    class FakeVisualRLTrainer:
         def __init__(self, config):
             seen["config"] = config
             self.output_dir = tmp_path
@@ -951,7 +671,7 @@ def test_sd3_bounded_trainer_smoke_cli_uses_image_trainer_contract(monkeypatch, 
             (self.output_dir / "latest.json").write_text(json.dumps({"step": 2}), encoding="utf-8")
             return rows
 
-    monkeypatch.setattr(image_trainer_module, "ImageRLTrainer", FakeImageTrainer)
+    monkeypatch.setattr(trainer_module, "VisualRLTrainer", FakeVisualRLTrainer)
 
     exit_code = cli.main(
         [
@@ -1106,7 +826,7 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
 
     import visual_rl.cli as cli
     from visual_rl.core.types import RewardBatch, RolloutBatch
-    import visual_rl.trainer.image_trainer as image_trainer_module
+    import visual_rl.trainer.trainer as trainer_module
 
     output_dir = tmp_path / "resume_run"
     resume_dir = tmp_path / "checkpoint_000005"
@@ -1152,7 +872,7 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
                 metadata={"prompt_color": {"target": "red"}},
             )
 
-    class FakeImageTrainer:
+    class FakeVisualRLTrainer:
         def __init__(self, config):
             seen["config"] = config
             self.output_dir = output_dir
@@ -1190,7 +910,7 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
             (self.output_dir / "latest.json").write_text(json.dumps({"step": 1}), encoding="utf-8")
             return [row]
 
-    monkeypatch.setattr(image_trainer_module, "ImageRLTrainer", FakeImageTrainer)
+    monkeypatch.setattr(trainer_module, "VisualRLTrainer", FakeVisualRLTrainer)
 
     exit_code = cli.main(
         [
@@ -1304,20 +1024,6 @@ def test_image_preview_help_runs(capsys):
     assert "--model-path" in output
     assert "--repo-root" in output
     assert "--output-dir" in output
-
-
-def test_tempflow_image_numeric_smoke_help_runs(capsys):
-    import pytest
-
-    import visual_rl.cli as cli
-
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(["tempflow-image-numeric-smoke", "--help"])
-
-    assert exc_info.value.code == 0
-    output = capsys.readouterr().out
-    assert "--adapter" in output
-    assert "--repo-root" in output
 
 
 def test_sd3_bounded_trainer_smoke_help_runs(capsys):

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-ADAPTER_KEYS = ("sd15_lora", "sd3_tempflow", "flux_tempflow", "qwenimage_tempflow", "world_r1_wan_legacy")
+ADAPTER_KEYS = ("sd3_tempflow", "world_r1_wan_legacy")
 
 
 @dataclass
@@ -52,13 +52,13 @@ def _classify_checkpoint(model_index: dict[str, Any], checkpoint_dir: Path) -> t
     if "stable-diffusion-3" in haystack or "stablediffusion3" in haystack or "sd3" in haystack:
         return "sd3", ["sd3_tempflow"]
     if "flux" in haystack:
-        return "flux", ["flux_tempflow"]
+        return "flux", []
     if "qwen" in haystack:
-        return "qwenimage", ["qwenimage_tempflow"]
+        return "qwenimage", []
     if "wan" in haystack:
         return "wan", ["world_r1_wan_legacy"]
     if "stablediffusionpipeline" in haystack or "stable-diffusion-v1" in haystack or "sd15" in haystack:
-        return "sd15", ["sd15_lora"]
+        return "sd15", []
     return "unknown", []
 
 

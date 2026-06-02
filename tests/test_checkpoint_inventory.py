@@ -21,9 +21,6 @@ def test_checkpoint_inventory_classifies_diffusers_model_dirs(tmp_path):
         [tmp_path],
         required_adapters=[
             "sd3_tempflow",
-            "flux_tempflow",
-            "qwenimage_tempflow",
-            "sd15_lora",
             "world_r1_wan_legacy",
         ],
     )
@@ -31,9 +28,6 @@ def test_checkpoint_inventory_classifies_diffusers_model_dirs(tmp_path):
     assert payload["valid"] is True
     assert payload["missing_adapters"] == []
     assert payload["found_adapters"] == [
-        "flux_tempflow",
-        "qwenimage_tempflow",
-        "sd15_lora",
         "sd3_tempflow",
         "world_r1_wan_legacy",
     ]
@@ -55,7 +49,7 @@ def test_checkpoint_inventory_reports_missing_required_adapter(tmp_path, capsys)
             "--require-adapter",
             "sd3_tempflow",
             "--require-adapter",
-            "flux_tempflow",
+            "world_r1_wan_legacy",
         ]
     )
 
@@ -63,7 +57,7 @@ def test_checkpoint_inventory_reports_missing_required_adapter(tmp_path, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is False
     assert payload["found_adapters"] == ["sd3_tempflow"]
-    assert payload["missing_adapters"] == ["flux_tempflow"]
+    assert payload["missing_adapters"] == ["world_r1_wan_legacy"]
     assert payload["errors"] == []
 
 
@@ -77,7 +71,7 @@ def test_checkpoint_inventory_ignores_parent_directory_model_keywords(tmp_path):
 
     assert payload["valid"] is True
     assert payload["records"][0]["model_type"] == "sd15"
-    assert payload["found_adapters"] == ["sd15_lora"]
+    assert payload["found_adapters"] == []
 
 
 def test_checkpoint_inventory_rejects_missing_root(tmp_path, capsys):
