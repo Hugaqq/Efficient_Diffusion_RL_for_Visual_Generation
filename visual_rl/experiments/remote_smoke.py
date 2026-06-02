@@ -33,7 +33,7 @@ _EXCLUDED_PARTS = {
     "runs",
 }
 _EXCLUDED_NAMES = {".DS_Store"}
-_ROOT_FILES = ("pyproject.toml", "README_VISUAL_RL.md")
+_ROOT_FILES = ("pyproject.toml", "README.md")
 
 
 def _default_stage_name() -> str:

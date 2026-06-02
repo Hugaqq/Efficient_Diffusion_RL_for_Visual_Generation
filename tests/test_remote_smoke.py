@@ -16,14 +16,14 @@ def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path)
     (tmp_path / "reference_code").mkdir()
     (tmp_path / "reference_code" / "legacy.py").write_text("skip\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'visual-rl'\n", encoding="utf-8")
-    (tmp_path / "README_VISUAL_RL.md").write_text("# VisualRL\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# VisualRL\n", encoding="utf-8")
 
     archive_path = tmp_path / "source.tar.gz"
     members = create_source_archive(tmp_path, archive_path)
 
     assert "visual_rl/cli.py" in members
     assert "pyproject.toml" in members
-    assert "README_VISUAL_RL.md" in members
+    assert "README.md" in members
     assert all("__pycache__" not in member for member in members)
     assert all(not member.endswith(".pyc") for member in members)
     assert all(not member.startswith("runs/") for member in members)
@@ -43,7 +43,7 @@ def test_remote_smoke_dry_run_payload_uses_stage_dir_not_shared_framecode(tmp_pa
     (tmp_path / "visual_rl").mkdir()
     (tmp_path / "visual_rl" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'visual-rl'\n", encoding="utf-8")
-    (tmp_path / "README_VISUAL_RL.md").write_text("# VisualRL\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# VisualRL\n", encoding="utf-8")
 
     config = RemoteSd3CliSmokeConfig(
         remote_root="/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke",
