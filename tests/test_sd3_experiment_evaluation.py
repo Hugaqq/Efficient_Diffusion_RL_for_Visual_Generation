@@ -73,11 +73,41 @@ def test_sd3_dataset_config_fingerprints_train_heldout_and_resumes_cleanly(
         ["a blue vase"]
     )
     assert fresh.evaluation.seeds == [1701, 1702]
+    assert fresh.rewards.weights == {"prompt_color_margin": 1.0}
+    assert fresh.rewards.clients["prompt_color_margin"]["name"] == (
+        "prompt_color_margin"
+    )
     assert fresh.train.lora_path is None
     assert resumed.train.lora_path is None
     assert config_fingerprint(config_to_dict(fresh)) == config_fingerprint(
         config_to_dict(resumed)
     )
+
+
+def test_prompt_color_margin_preserves_branch_signal_when_clipped_score_saturates():
+    import numpy as np
+
+    from visual_rl.feedback.image_rewards import (
+        PromptColorMarginRewardClient,
+        PromptColorRewardClient,
+    )
+
+    media = np.zeros((2, 3, 2, 2), dtype=np.float32)
+    media[0, 0] = 0.9
+    media[1, 0] = 0.8
+    prompts = ["a red object", "a red object"]
+    metadata = [{}, {}]
+
+    clipped, _ = PromptColorRewardClient().score(media, prompts, metadata)
+    margin, details = PromptColorMarginRewardClient().score(
+        media,
+        prompts,
+        metadata,
+    )
+
+    assert clipped.tolist() == [1.0, 1.0]
+    assert margin.tolist() == pytest.approx([0.9, 0.8])
+    assert details["score_kind"] == "unclipped_target_channel_margin"
 
 
 def test_sd3_heldout_panel_is_paired_and_reports_reward_and_guardrails(tmp_path):

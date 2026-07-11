@@ -60,4 +60,37 @@ class PromptColorRewardClient:
         raise ValueError(f"prompt_color cannot locate RGB channel in shape {images.shape}")
 
 
+@dataclass
+class PromptColorMarginRewardClient(PromptColorRewardClient):
+    """Unclipped RGB margin for branch-relative optimization."""
+
+    name: str = "prompt_color_margin"
+
+    def score(
+        self,
+        media: Any,
+        prompts: list[str],
+        metadata: list[dict[str, Any]],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        images = self._to_numpy_images(media)
+        scores = []
+        targets = []
+        for index, prompt in enumerate(prompts):
+            color = str(
+                metadata[index].get("target_color")
+                or self._color_from_prompt(prompt)
+            )
+            target = COLOR_TO_INDEX.get(color, COLOR_TO_INDEX[self.default_color])
+            channel_means = images[index].reshape(3, -1).mean(axis=1)
+            target_score = channel_means[target]
+            distractor_score = np.delete(channel_means, target).mean()
+            scores.append(float(target_score - distractor_score))
+            targets.append(color)
+        return np.asarray(scores, dtype=np.float32), {
+            "targets": targets,
+            "score_kind": "unclipped_target_channel_margin",
+        }
+
+
 REWARD_CLIENTS.register("prompt_color", PromptColorRewardClient)
+REWARD_CLIENTS.register("prompt_color_margin", PromptColorMarginRewardClient)
