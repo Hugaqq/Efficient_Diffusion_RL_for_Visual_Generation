@@ -3,10 +3,17 @@
 `reference_code/` is a local-only directory for upstream paper/source snapshots.
 It is ignored by git and should stay optional.
 
-The current local checkout does not include `reference_code/`. Before porting
-behavior from Flash-GRPO, TempFlow-GRPO, or World-R1, first restore those
-snapshots under the expected paths below or configure an explicit external
-reference path.
+The current local checkout does not include `reference_code/`. The resolver now
+also checks the sibling root `../code_base/reference_code`, which matches the
+current local layout:
+
+```text
+~/Desktop/Efficient_Diffusion_RL_for_Visual_Generation/code_base/reference_code
+```
+
+Set `VISUAL_RL_REFERENCE_CODE_ROOT` to override this location. Before porting
+behavior from Flash-GRPO, TempFlow-GRPO, or World-R1, make sure the expected
+snapshot exists in one of those roots.
 
 Expected local layout:
 

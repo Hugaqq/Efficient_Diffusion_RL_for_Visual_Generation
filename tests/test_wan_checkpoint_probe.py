@@ -11,7 +11,7 @@ def _write_model_index(path, class_name="WanPipeline"):
 def test_wan_checkpoint_probe_manifest_only(capsys, tmp_path):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     checkpoint = tmp_path / "Wan2.1-T2V-1.3B-Diffusers"
     repo_root = tmp_path / "World-R1-main"
@@ -42,7 +42,7 @@ def test_wan_checkpoint_probe_manifest_only(capsys, tmp_path):
 def test_wan_checkpoint_probe_rejects_non_wan_manifest(capsys, tmp_path):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     checkpoint = tmp_path / "stable-diffusion"
     repo_root = tmp_path / "World-R1-main"
@@ -72,7 +72,7 @@ def test_wan_checkpoint_probe_loads_fake_diffusers_pipeline(capsys, monkeypatch,
     import sys
     from types import SimpleNamespace
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     checkpoint = tmp_path / "Wan2.1-T2V-1.3B-Diffusers"
     repo_root = tmp_path / "World-R1-main"

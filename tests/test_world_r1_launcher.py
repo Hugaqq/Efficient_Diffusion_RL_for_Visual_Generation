@@ -2,7 +2,7 @@ import pytest
 
 
 def test_world_r1_plan_smoke_defaults():
-    from visual_rl.trainer.world_r1_launcher import build_world_r1_launch_plan
+    from scripts.world_r1_launcher import build_world_r1_launch_plan
 
     plan = build_world_r1_launch_plan(
         model_path="/models/wan",
@@ -15,7 +15,7 @@ def test_world_r1_plan_smoke_defaults():
 
 
 def test_world_r1_plan_normalizes_devices_and_requires_model_path():
-    from visual_rl.trainer.world_r1_launcher import build_world_r1_launch_plan
+    from scripts.world_r1_launcher import build_world_r1_launch_plan
 
     plan = build_world_r1_launch_plan(
         model_path=" /models/wan ",

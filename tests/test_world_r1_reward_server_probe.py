@@ -12,7 +12,7 @@ def test_world_r1_reward_server_probe_success(capsys, monkeypatch, tmp_path):
     import json
     import pickle
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     side_effect_dir = tmp_path / "should_not_exist"
     calls = []
@@ -72,7 +72,7 @@ def test_world_r1_reward_server_probe_3d_payload(capsys, monkeypatch):
     import json
     import pickle
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     class Response:
         content = pickle.dumps({"outputs": [0.5, 0.75], "metadata": {"kind": "3d"}})
@@ -116,7 +116,7 @@ def test_world_r1_reward_server_probe_3d_payload(capsys, monkeypatch):
 def test_world_r1_reward_server_probe_timeout_returns_structured_json(capsys, monkeypatch):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     calls = {"count": 0}
 
@@ -152,7 +152,7 @@ def test_world_r1_reward_server_probe_invalid_response_shape(capsys, monkeypatch
     import json
     import pickle
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     class Response:
         content = pickle.dumps({"outputs": [0.1], "metadata": {}})
@@ -187,7 +187,7 @@ def test_world_r1_reward_server_probe_invalid_response_shape(capsys, monkeypatch
 def test_world_r1_reward_server_probe_rejects_bad_url(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     exit_code = cli.main(
         [

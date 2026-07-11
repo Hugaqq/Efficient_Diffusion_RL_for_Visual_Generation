@@ -1,30 +1,28 @@
 # Current Goal
 
-Make VisualRL a small, readable integration repo for three diffusion-RL sources:
-Flash-GRPO, TempFlow-GRPO, and World-R1.
+VisualRL v0.6 simplified core 已完成。当前目标从“重构框架”切换为“验证框架”，第一优先级是修复并验证 SD3 TempFlow 的概率轨迹契约。
 
-## Mainline
-
-`VisualRLTrainer` is the only active training loop. Keep the train path simple:
+## 已落地
 
 ```text
-prompts -> rollout -> rewards -> advantages -> logprobs -> loss -> optimizer
+Config -> RolloutEngine -> FeedbackProvider -> OptimizerPlugin -> ArtifactManager
 ```
 
-The project should stay on this single train-loop shape while the reference
-code is folded in.
+- `ExperimentRunner` 是唯一训练循环。
+- Flash-GRPO、TempFlow-GRPO、World-R1/Wan 共用 batch、plugin、checkpoint 和 artifact 约定。
+- GenRL 只作为工程参考，不进入主干依赖。
+- 本地完整测试不运行大模型和远程服务。
 
-## Current Priorities
+## 当前优先级
 
-1. Keep tiny Flash and TempFlow tests as fast regression gates.
-2. Move real Flash-GRPO selected-step Wan code into a proper adapter.
-3. Keep SD3 TempFlow as the current image-model bridge.
-4. Validate World-R1/Wan only through explicit checkpoint loading, sample/logprob
-   tensors, and reward-server calls.
+1. 按 [SD3 TempFlow 真实验证状态](SD3_TEMPFLOW_VALIDATION_STATUS.md) 修复 source-state 与 branching parent-batch parity。
+2. 通过本地回归、GPU1 实模 parity 与 1-step backward 硬门槛。
+3. 运行 Tiny 三算法对比，验证可比较性。
+4. 只在数值门槛通过后执行 SD3/Wan bounded GPU 实验，不直接启动长训练。
+5. 记录真实 reward 延迟、显存、失败率与 resume 行为。
 
-## Non-Goals
+## 非目标
 
-- Do not add another runner abstraction.
-- Do not treat GenRL as a runtime dependency.
-- FLUX, QwenImage, and SD1.5 adapters are out of the current mainline; restore
-  them only through an explicit future scope decision.
+- 暂不恢复 SD1.5、FLUX、QwenImage、Inferix。
+- 不新增算法专用 Trainer。
+- 不把 Tiny/Fake 测试描述成真实模型性能结论。

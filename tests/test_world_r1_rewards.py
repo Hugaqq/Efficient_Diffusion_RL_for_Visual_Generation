@@ -2,7 +2,7 @@ import pytest
 
 
 def test_world_r1_reward_helpers_validate_url_and_payload_kind():
-    from visual_rl.rewards.world_r1_rewards import reward_3d_client, reward_general_client
+    from visual_rl.feedback.world_r1_rewards import reward_3d_client, reward_general_client
 
     reward_3d = reward_3d_client(" http://127.0.0.1:18080/reward_3d ")
     reward_general = reward_general_client("https://reward.example.test/general")
@@ -14,8 +14,64 @@ def test_world_r1_reward_helpers_validate_url_and_payload_kind():
     assert reward_general.timeout == 1000.0
 
 
+def test_world_r1_reward_general_samples_video_frame_payload(monkeypatch):
+    import pickle
+
+    import torch
+
+    import visual_rl.feedback.clients as clients
+    from visual_rl.feedback.world_r1_rewards import reward_general_client
+
+    calls = []
+
+    def fake_post_bytes(url, payload, timeout):
+        calls.append({"url": url, "payload": pickle.loads(payload), "timeout": timeout})
+        return pickle.dumps({"outputs": [0.25, 0.5], "metadata": {"server": "general"}})
+
+    monkeypatch.setattr(clients, "_post_bytes", fake_post_bytes)
+
+    media = torch.arange(2 * 3 * 3 * 4 * 5, dtype=torch.float32).reshape(2, 3, 3, 4, 5)
+    client = reward_general_client("http://127.0.0.1:18080/general")
+    values, metadata = client.score(media, ["a", "b"], [{}, {}])
+
+    assert values.tolist() == [0.25, 0.5]
+    assert calls[0]["payload"]["images"].shape == (2, 3, 4, 5)
+    assert torch.equal(calls[0]["payload"]["images"], media[:, 1])
+    assert calls[0]["payload"]["prompts"] == ["a", "b"]
+    assert metadata["server"] == "general"
+    assert metadata["payload_kind"] == "images"
+    assert metadata["frame_sampling"]["selected_frame_index"] == 1
+    assert metadata["frame_sampling"]["input_shape"] == [2, 3, 3, 4, 5]
+    assert metadata["frame_sampling"]["output_shape"] == [2, 3, 4, 5]
+
+
+def test_world_r1_reward_3d_uses_videos_payload(monkeypatch):
+    import pickle
+
+    import torch
+
+    import visual_rl.feedback.clients as clients
+    from visual_rl.feedback.world_r1_rewards import reward_3d_client
+
+    calls = []
+
+    def fake_post_bytes(url, payload, timeout):
+        calls.append({"url": url, "payload": pickle.loads(payload), "timeout": timeout})
+        return pickle.dumps({"outputs": [0.75], "metadata": {"server": "3d"}})
+
+    monkeypatch.setattr(clients, "_post_bytes", fake_post_bytes)
+
+    media = torch.ones(1, 2, 3, 4, 5)
+    values, metadata = reward_3d_client("http://127.0.0.1:18080/3d").score(media, ["prompt"], [{}])
+
+    assert values.tolist() == [0.75]
+    assert metadata == {"server": "3d"}
+    assert calls[0]["payload"]["videos"].shape == (1, 2, 3, 4, 5)
+    assert "images" not in calls[0]["payload"]
+
+
 def test_world_r1_reward_url_validation_rejects_non_http_endpoints():
-    from visual_rl.rewards.world_r1_rewards import validate_reward_server_url
+    from visual_rl.feedback.world_r1_rewards import validate_reward_server_url
 
     with pytest.raises(ValueError, match="must use http or https"):
         validate_reward_server_url("file:///tmp/reward.pkl", reward_name="reward_3d")
@@ -33,8 +89,8 @@ def test_remote_pickle_reward_client_falls_back_to_urllib_without_requests(monke
 
     import numpy as np
 
-    import visual_rl.rewards.clients as clients
-    from visual_rl.rewards.clients import RemotePickleRewardClient
+    import visual_rl.feedback.clients as clients
+    from visual_rl.feedback.clients import RemotePickleRewardClient
 
     calls = []
 

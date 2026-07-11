@@ -23,7 +23,7 @@ def _rollout_batch(old_log_probs, timesteps=None, metadata=None, model_metadata=
 def test_full_trajectory_grpo_expands_per_sample_advantages_across_all_timesteps():
     import torch
 
-    from visual_rl.algorithms.grpo import GRPOAlgorithm
+    from visual_rl.optimizers.grpo import GRPOAlgorithm
 
     old_log_probs = torch.zeros(2, 3)
     batch = _rollout_batch(old_log_probs)
@@ -40,7 +40,7 @@ def test_full_trajectory_grpo_expands_per_sample_advantages_across_all_timesteps
 def test_flash_single_step_advantages_expand_and_rectification_masks_rows():
     import torch
 
-    from visual_rl.algorithms.flash_grpo import FlashGRPOAlgorithm
+    from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
 
     old_log_probs = torch.zeros(3, 1)
     batch = _rollout_batch(
@@ -75,14 +75,14 @@ def test_flash_single_step_advantages_expand_and_rectification_masks_rows():
 def test_tempflow_branch_credit_assignment_masks_expected_timesteps():
     import torch
 
-    from visual_rl.algorithms.tempflow_grpo import TempFlowGRPOAlgorithm
+    from visual_rl.optimizers.tempflow_grpo import TempFlowGRPOAlgorithm
 
     old_log_probs = torch.zeros(2, 4)
     batch = _rollout_batch(
         old_log_probs,
         timesteps=torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]]),
-        metadata=[{"branch_timestep": 2}, {"branch_timestep": 5}],
-        model_metadata={"branch_timestep": 0},
+        metadata=[{"branch_step_index": 2}, {"branch_step_index": 2}],
+        model_metadata={"branch_step_index": 0},
     )
     rewards = torch.tensor([2.0, -1.0])
 
@@ -116,13 +116,13 @@ def test_tempflow_branch_credit_assignment_masks_expected_timesteps():
 def test_tempflow_active_timestep_fraction_matches_branch_mask():
     import torch
 
-    from visual_rl.algorithms.tempflow_grpo import TempFlowGRPOAlgorithm
+    from visual_rl.optimizers.tempflow_grpo import TempFlowGRPOAlgorithm
 
     old_log_probs = torch.zeros(2, 4)
     batch = _rollout_batch(
         old_log_probs,
         timesteps=torch.arange(4).repeat(2, 1),
-        metadata=[{"branch_timestep": 1}, {"branch_timestep": 3}],
+        metadata=[{"branch_step_index": 1}, {"branch_step_index": 3}],
     )
     algorithm = TempFlowGRPOAlgorithm(
         clip_range=0.2,

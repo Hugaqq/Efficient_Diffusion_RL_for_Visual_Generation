@@ -12,6 +12,7 @@ from visual_rl.model_adapters.base import ModelAdapter
 
 class MockWanAdapter(ModelAdapter):
     name = "mock_wan"
+    media_type = "video"
 
     def __init__(self, config: dict[str, Any]):
         import torch
@@ -23,6 +24,9 @@ class MockWanAdapter(ModelAdapter):
 
     def parameters(self):
         return [self.policy_bias]
+
+    def named_parameters(self):
+        return [("policy_bias", self.policy_bias)]
 
     def sample(self, prompts: list[str], metadata: list[dict[str, Any]], rollout_config: dict[str, Any]) -> RolloutBatch:
         import torch
@@ -63,6 +67,17 @@ class MockWanAdapter(ModelAdapter):
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
         torch.save({"policy_bias": self.policy_bias.detach().cpu()}, path / "mock_adapter.pt")
+
+    def load_checkpoint(self, checkpoint_dir: str) -> None:
+        import torch
+
+        state = torch.load(
+            Path(checkpoint_dir) / "mock_adapter.pt",
+            map_location=self.policy_bias.device,
+            weights_only=False,
+        )
+        with torch.no_grad():
+            self.policy_bias.copy_(state["policy_bias"].to(self.policy_bias.device))
 
 
 MODEL_ADAPTERS.register("mock_wan", MockWanAdapter)

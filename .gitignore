@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.vscode/
 .venv/
 venv/
 env/
@@ -22,6 +23,9 @@ tmp/
 # Local third-party paper/source snapshots.
 # Keep these on disk for inspection, but do not commit them to this repo.
 reference_code/
+
+# Personal paper drafts kept locally for project notes.
+docs/paper/
 
 # Large model/data caches
 hf_cache/

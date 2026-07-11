@@ -2,7 +2,7 @@ def test_tiny_loss_probe_descends_and_writes_artifacts(tmp_path):
     import json
     from pathlib import Path
 
-    from visual_rl.experiments.loss_probe import TinyLossProbeConfig, run_tiny_loss_probe
+    from scripts.loss_probe import TinyLossProbeConfig, run_tiny_loss_probe
 
     summary = run_tiny_loss_probe(
         TinyLossProbeConfig(
@@ -31,7 +31,7 @@ def test_tiny_loss_probe_descends_and_writes_artifacts(tmp_path):
 
 
 def test_tiny_loss_probe_cli_outputs_summary(tmp_path, capsys):
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     exit_code = cli.main(
         [

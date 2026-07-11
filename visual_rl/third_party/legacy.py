@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -12,22 +13,46 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def reference_code_roots() -> list[Path]:
+    """Candidate roots that contain upstream reference repositories."""
+
+    roots: list[Path] = []
+    if env_root := os.environ.get("VISUAL_RL_REFERENCE_CODE_ROOT"):
+        roots.append(Path(env_root).expanduser())
+    roots.extend(
+        [
+            project_root() / "reference_code",
+            # The current local checkout keeps upstream repos next to framecode.
+            project_root().parent / "code_base" / "reference_code",
+        ]
+    )
+    return roots
+
+
+def _reference_relative_path(raw: Path) -> Path:
+    parts = raw.parts
+    if parts and parts[0] == "reference_code":
+        return Path(*parts[1:]) if len(parts) > 1 else Path()
+    return raw
+
+
 def resolve_legacy_repo(repo_root: str | Path) -> Path:
     """Resolve a legacy/reference repo path.
 
-    The preferred layout is `reference_code/<repo>`, but older configs may still
-    pass `<repo>` from the workspace root. Keep both forms working.
+    Keep old `reference_code/<repo>` configs working while also supporting the
+    current `code_base/reference_code/<repo>` checkout and explicit env roots.
     """
 
     raw = Path(repo_root).expanduser()
     if raw.is_absolute():
         return raw.resolve()
 
+    reference_rel = _reference_relative_path(raw)
     candidates = [
         Path.cwd() / raw,
         project_root() / raw,
-        project_root() / "reference_code" / raw,
     ]
+    candidates.extend(root / reference_rel for root in reference_code_roots())
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()

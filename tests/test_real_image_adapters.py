@@ -16,7 +16,7 @@ def test_real_image_presets_load():
 
     cfg = load_config("visual_rl/configs/presets/sd3_tempflow_adapter.yaml")
     assert cfg.model.model_family == "sd3"
-    assert cfg.trainer["strict_rollout_validation"] is True
+    assert cfg.runner.strict_rollout_validation is True
 
 
 def test_sd3_pipeline_helper_filters_unsupported_kwargs_without_return_dict():
@@ -287,7 +287,7 @@ def test_sd3_numeric_smoke_cli_uses_explicit_model_path_and_options(monkeypatch,
 
     import torch
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
     from visual_rl.core.registry import MODEL_ADAPTERS
     from visual_rl.core.types import RolloutBatch
 
@@ -400,7 +400,7 @@ def test_image_preview_cli_writes_png_and_metadata_for_sd3_contract(monkeypatch,
 
     import torch
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
     from visual_rl.core.registry import MODEL_ADAPTERS
     from visual_rl.core.types import RolloutBatch
 
@@ -516,7 +516,7 @@ def test_image_preview_cli_writes_png_and_metadata_for_sd3_contract(monkeypatch,
 def test_image_preview_cli_supports_tiny_diffusion_locally(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     exit_code = cli.main(
         [
@@ -556,9 +556,9 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
 
     import torch
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
     from visual_rl.core.types import RewardBatch, RolloutBatch
-    import visual_rl.trainer.trainer as trainer_module
+    import visual_rl.runner as runner_module
 
     seen = {}
 
@@ -595,29 +595,27 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
                 model_metadata={"adapter": self.name, "phase": phase},
             )
 
-    class FakeRewardRouter:
-        def score(self, media, prompts, metadata):
-            phase = metadata[0]["phase"]
+    class FakeFeedbackProvider:
+        def score(self, batch):
+            phase = batch.metadata[0]["phase"]
             reward = 0.3 if phase == "before" else 0.9
             return RewardBatch(
                 raw={"prompt_color": torch.tensor([reward])},
                 weighted={"prompt_color": torch.tensor([reward])},
                 weighted_total=torch.tensor([reward]),
-                normalized_total=torch.tensor([0.0]),
                 valid_mask=torch.tensor([True]),
                 metadata={"prompt_color": {"phase": phase}},
             )
 
-    class FakeVisualRLTrainer:
+    class FakeExperimentRunner:
         def __init__(self, config):
             seen["config"] = config
             self.output_dir = tmp_path
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.adapter = FakeAdapter()
-            self.reward_router = FakeRewardRouter()
-            assert config.output_dir == str(tmp_path)
+            self.feedback_provider = FakeFeedbackProvider()
             assert config.paths.output_dir == str(tmp_path)
-            assert config.paths.save_dir == str(tmp_path)
+            assert config.paths.output_dir == str(tmp_path)
             assert config.paths.pretrained_model == "/models/sd35"
             assert config.model.name == "sd3_tempflow"
             assert config.model.model_family == "sd3"
@@ -637,10 +635,10 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
             assert config.train.lora_path is None
             assert config.train.max_steps == 2
             assert config.train.save_every == 2
-            assert config.trainer["strict_rollout_validation"] is True
-            assert config.trainer["disable_rollout_cache"] is True
+            assert config.runner.strict_rollout_validation is True
+            assert config.runner.disable_rollout_cache is True
 
-        def train(self, max_steps=None):
+        def run(self, max_steps=None):
             seen["max_steps"] = max_steps
             assert max_steps == 2
             with torch.no_grad():
@@ -671,7 +669,7 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
             (self.output_dir / "latest.json").write_text(json.dumps({"step": 2}), encoding="utf-8")
             return rows
 
-    monkeypatch.setattr(trainer_module, "VisualRLTrainer", FakeVisualRLTrainer)
+    monkeypatch.setattr(runner_module, "ExperimentRunner", FakeExperimentRunner)
 
     exit_code = cli.main(
         [
@@ -781,7 +779,7 @@ def test_sd3_bounded_trainer_smoke_requires_evidence_metrics(tmp_path):
 
     import pytest
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     metrics_path = tmp_path / "metrics.jsonl"
     latest_path = tmp_path / "latest.json"
@@ -824,9 +822,9 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
 
     import torch
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
     from visual_rl.core.types import RewardBatch, RolloutBatch
-    import visual_rl.trainer.trainer as trainer_module
+    import visual_rl.runner as runner_module
 
     output_dir = tmp_path / "resume_run"
     resume_dir = tmp_path / "checkpoint_000005"
@@ -861,31 +859,29 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
                 model_metadata={"adapter": self.name, "phase": phase},
             )
 
-    class FakeRewardRouter:
-        def score(self, media, prompts, metadata):
+    class FakeFeedbackProvider:
+        def score(self, batch):
             return RewardBatch(
                 raw={"prompt_color": torch.tensor([0.6])},
                 weighted={"prompt_color": torch.tensor([0.6])},
                 weighted_total=torch.tensor([0.6]),
-                normalized_total=torch.tensor([0.0]),
                 valid_mask=torch.tensor([True]),
                 metadata={"prompt_color": {"target": "red"}},
             )
 
-    class FakeVisualRLTrainer:
+    class FakeExperimentRunner:
         def __init__(self, config):
             seen["config"] = config
             self.output_dir = output_dir
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.adapter = FakeAdapter()
-            self.reward_router = FakeRewardRouter()
-            assert config.output_dir == str(output_dir)
+            self.feedback_provider = FakeFeedbackProvider()
             assert config.paths.output_dir == str(output_dir)
-            assert config.paths.save_dir == str(output_dir)
+            assert config.paths.output_dir == str(output_dir)
             assert config.paths.resume_from == str(resume_dir)
             assert config.train.lora_path == str(resume_dir)
 
-        def train(self, max_steps=None):
+        def run(self, max_steps=None):
             seen["max_steps"] = max_steps
             assert max_steps == 1
             with torch.no_grad():
@@ -910,7 +906,7 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
             (self.output_dir / "latest.json").write_text(json.dumps({"step": 1}), encoding="utf-8")
             return [row]
 
-    monkeypatch.setattr(trainer_module, "VisualRLTrainer", FakeVisualRLTrainer)
+    monkeypatch.setattr(runner_module, "ExperimentRunner", FakeExperimentRunner)
 
     exit_code = cli.main(
         [
@@ -959,7 +955,7 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
 def test_sd3_bounded_trainer_smoke_rejects_resume_without_lora(tmp_path):
     import pytest
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     resume_dir = tmp_path / "checkpoint_000005"
     resume_dir.mkdir()
@@ -989,7 +985,7 @@ def test_sd3_bounded_trainer_smoke_rejects_resume_without_lora(tmp_path):
 def test_sd3_bounded_trainer_smoke_requires_explicit_long_run(tmp_path):
     import pytest
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     base_args = [
         "sd3-bounded-trainer-smoke",
@@ -1013,7 +1009,7 @@ def test_sd3_bounded_trainer_smoke_requires_explicit_long_run(tmp_path):
 def test_image_preview_help_runs(capsys):
     import pytest
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["image-preview", "--help"])
@@ -1029,7 +1025,7 @@ def test_image_preview_help_runs(capsys):
 def test_sd3_bounded_trainer_smoke_help_runs(capsys):
     import pytest
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["sd3-bounded-trainer-smoke", "--help"])

@@ -11,7 +11,6 @@ fi
 
 conda create -y -n "${ENV_NAME}" "python=${PYTHON_VERSION}" pip
 conda run -n "${ENV_NAME}" python -m pip install --upgrade pip
-conda run -n "${ENV_NAME}" python -m pip install -e ".[dev]"
+conda run -n "${ENV_NAME}" python -m pip install -e ".[train,dev]"
 
 echo "Created ${ENV_NAME}. Activate with: conda activate ${ENV_NAME}"
-

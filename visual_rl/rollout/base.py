@@ -15,5 +15,4 @@ class RolloutEngine(ABC):
 
     @abstractmethod
     def sample(self, adapter: ModelAdapter, prompts: list[str], metadata: list[dict[str, Any]]) -> RolloutBatch:
-        pass
-
+        raise NotImplementedError
