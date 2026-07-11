@@ -34,6 +34,10 @@ DEFAULT_SD3_LORA_TARGETS = [
 ]
 
 SD3_TRANSITION_CONTRACT_VERSION = "sd3_tempflow_v2"
+SD3_CHECKPOINT_FORMAT_VERSION = 1
+SD3_CHECKPOINT_METADATA_NAME = "adapter_metadata.json"
+SD3_LORA_CHECKPOINT_SUBDIR = "transformer"
+SD3_LORA_WEIGHT_NAMES = ("adapter_model.safetensors", "adapter_model.bin")
 
 
 class SD3TempFlowAdapter(ModelAdapter):
@@ -482,25 +486,155 @@ class SD3TempFlowAdapter(ModelAdapter):
         self._ensure_loaded()
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
+
+        from visual_rl.artifacts.checkpoint import save_json
+
+        if self.use_lora:
+            peft_config = getattr(self.transformer, "peft_config", None)
+            save_adapter = getattr(self.transformer, "save_pretrained", None)
+            if not peft_config or not callable(save_adapter):
+                raise RuntimeError(
+                    "SD3 use_lora=True requires a loaded PEFT transformer with "
+                    "save_pretrained support"
+                )
+            adapter_path = path / SD3_LORA_CHECKPOINT_SUBDIR
+            save_adapter(adapter_path, safe_serialization=True)
+            weight_path = self._peft_adapter_weight_path(adapter_path)
+            config_path = adapter_path / "adapter_config.json"
+            if weight_path is None or not config_path.is_file():
+                raise RuntimeError(
+                    "SD3 PEFT save_pretrained did not write a complete adapter "
+                    f"checkpoint under {adapter_path}"
+                )
+            save_json(
+                path / SD3_CHECKPOINT_METADATA_NAME,
+                {
+                    "adapter": self.name,
+                    "adapter_config": str(config_path.relative_to(path)),
+                    "adapter_name": "default",
+                    "format_version": SD3_CHECKPOINT_FORMAT_VERSION,
+                    "save_kind": "peft_adapter",
+                    "use_lora": True,
+                    "weights": str(weight_path.relative_to(path)),
+                },
+            )
+            return
+
         import torch
 
         if hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(path / "transformer")
-        torch.save(self.transformer.state_dict(), path / "transformer_state.pt")
+            self.transformer.save_pretrained(path / SD3_LORA_CHECKPOINT_SUBDIR)
+        state_path = path / "transformer_state.pt"
+        torch.save(self.transformer.state_dict(), state_path)
+        save_json(
+            path / SD3_CHECKPOINT_METADATA_NAME,
+            {
+                "adapter": self.name,
+                "format_version": SD3_CHECKPOINT_FORMAT_VERSION,
+                "save_kind": "full_transformer_state",
+                "state": state_path.name,
+                "use_lora": False,
+            },
+        )
 
     def load_checkpoint(self, checkpoint_dir: str) -> None:
         import torch
 
         self._ensure_loaded()
-        state_path = Path(checkpoint_dir) / "transformer_state.pt"
-        if not state_path.exists():
-            raise RuntimeError(f"Missing SD3 transformer state: {state_path}")
-        state = torch.load(
-            state_path,
-            map_location=self.device,
-            weights_only=False,
-        )
-        self.transformer.load_state_dict(state)
+        path = Path(checkpoint_dir)
+        state_path = path / "transformer_state.pt"
+        if state_path.is_file():
+            state = torch.load(
+                state_path,
+                map_location=self.device,
+                weights_only=False,
+            )
+            self.transformer.load_state_dict(state)
+            return
+
+        if not self.use_lora:
+            raise RuntimeError(
+                "Missing SD3 full transformer checkpoint for use_lora=False: "
+                f"expected {state_path}"
+            )
+
+        peft_config = getattr(self.transformer, "peft_config", None)
+        if not peft_config:
+            raise RuntimeError(
+                "Cannot load an SD3 LoRA checkpoint into a non-PEFT transformer"
+            )
+        adapter_path = self._find_peft_adapter_path(path)
+        if adapter_path is None:
+            expected = path / SD3_LORA_CHECKPOINT_SUBDIR
+            raise RuntimeError(
+                "Missing SD3 checkpoint weights: expected legacy "
+                f"{state_path} or a PEFT adapter under {expected} (or {path})"
+            )
+
+        try:
+            from peft.utils.save_and_load import (
+                load_peft_weights,
+                set_peft_model_state_dict,
+            )
+        except ImportError as exc:  # pragma: no cover - optional train dependency
+            raise RuntimeError(
+                "Install visual-rl[train] with PEFT to load an SD3 LoRA checkpoint"
+            ) from exc
+
+        parameter_ids = {
+            name: id(parameter)
+            for name, parameter in self.transformer.named_parameters()
+        }
+        try:
+            adapter_state = load_peft_weights(str(adapter_path), device="cpu")
+            if not adapter_state:
+                raise ValueError("adapter weight file contains no tensors")
+            load_result = set_peft_model_state_dict(
+                self.transformer,
+                adapter_state,
+                adapter_name="default",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load SD3 PEFT adapter checkpoint from {adapter_path}: {exc}"
+            ) from exc
+
+        current_parameter_ids = {
+            name: id(parameter)
+            for name, parameter in self.transformer.named_parameters()
+        }
+        if current_parameter_ids != parameter_ids:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint loading replaced Parameter objects; "
+                "optimizer references would be invalid"
+            )
+        unexpected = list(getattr(load_result, "unexpected_keys", ()) or ())
+        if unexpected:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint contains unexpected keys: "
+                + ", ".join(str(key) for key in unexpected)
+            )
+
+    @staticmethod
+    def _peft_adapter_weight_path(path: Path) -> Path | None:
+        for name in SD3_LORA_WEIGHT_NAMES:
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @classmethod
+    def _find_peft_adapter_path(cls, checkpoint_path: Path) -> Path | None:
+        for candidate in (
+            checkpoint_path / SD3_LORA_CHECKPOINT_SUBDIR,
+            checkpoint_path,
+        ):
+            if (
+                (candidate / "adapter_config.json").is_file()
+                and cls._peft_adapter_weight_path(candidate) is not None
+            ):
+                return candidate
+        return None
 
     def _call_pipeline_with_logprob(self, **kwargs):
         signature = inspect.signature(self._pipeline_with_logprob)

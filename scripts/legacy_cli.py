@@ -810,10 +810,45 @@ def _validate_sd3_bounded_trainer_args(args: argparse.Namespace) -> None:
             raise ValueError(f"sd3-bounded-trainer-smoke --resume-from does not exist: {resume_path}")
         if not resume_path.is_dir():
             raise ValueError(f"sd3-bounded-trainer-smoke --resume-from must be a checkpoint directory: {resume_path}")
+        resume_step = _checkpoint_step_from_path(args.resume_from)
+        if int(args.steps) <= resume_step:
+            raise ValueError(
+                "sd3-bounded-trainer-smoke --steps is an absolute target and "
+                f"must exceed resumed step {resume_step}, got {args.steps}"
+            )
+    baseline_eval = getattr(args, "baseline_eval", None)
+    if baseline_eval and not Path(baseline_eval).is_file():
+        raise ValueError(
+            "sd3-bounded-trainer-smoke --baseline-eval does not exist: "
+            f"{baseline_eval}"
+        )
+
+    train_prompt_file = getattr(args, "train_prompts_file", None)
+    heldout_prompt_file = getattr(args, "heldout_prompts_file", None)
+    if bool(train_prompt_file) != bool(heldout_prompt_file):
+        raise ValueError(
+            "sd3-bounded-trainer-smoke requires both --train-prompts-file and "
+            "--heldout-prompts-file"
+        )
+    eval_seeds = list(getattr(args, "eval_seeds", []) or [])
+    if not eval_seeds:
+        raise ValueError("sd3-bounded-trainer-smoke requires at least one eval seed")
+    if len(set(eval_seeds)) != len(eval_seeds):
+        raise ValueError("sd3-bounded-trainer-smoke eval seeds must be unique")
+    eval_max_prompts = getattr(args, "eval_max_prompts", None)
+    if eval_max_prompts is not None and int(eval_max_prompts) < 1:
+        raise ValueError(
+            "sd3-bounded-trainer-smoke --eval-max-prompts must be positive"
+        )
 
 
 def _sd3_bounded_trainer_config(args: argparse.Namespace):
     from visual_rl.configs.schema import load_config
+    from visual_rl.datasets.prompt_dataset import (
+        prompt_content_sha256,
+        read_prompt_file,
+        validate_prompt_splits,
+    )
 
     default_config = _PRESET_DIR / "sd3_tempflow_adapter.yaml"
     config = load_config(default_config)
@@ -839,9 +874,37 @@ def _sd3_bounded_trainer_config(args: argparse.Namespace):
     if args.device:
         config.model.extra["device"] = args.device
     config.use_lora = not bool(args.disable_lora)
-    config.train.lora_path = args.resume_from
+    config.train.lora_path = None
 
-    config.dataset.prompts = [args.prompt]
+    if args.train_prompts_file:
+        train_prompts = read_prompt_file(args.train_prompts_file)
+        heldout_prompts = read_prompt_file(args.heldout_prompts_file)
+        validate_prompt_splits(
+            train_prompts,
+            heldout_prompts,
+            train_path=args.train_prompts_file,
+            heldout_path=args.heldout_prompts_file,
+        )
+        config.dataset.path = args.train_prompts_file
+        config.dataset.prompts = []
+        config.dataset.split_name = "train"
+        config.dataset.content_sha256 = prompt_content_sha256(train_prompts)
+        config.dataset.require_unique = True
+        config.evaluation.path = args.heldout_prompts_file
+        config.evaluation.content_sha256 = prompt_content_sha256(heldout_prompts)
+        config.evaluation.split_name = "heldout"
+        config.evaluation.seeds = list(args.eval_seeds)
+        config.evaluation.max_prompts = args.eval_max_prompts
+    else:
+        config.dataset.path = None
+        config.dataset.prompts = [args.prompt]
+        config.dataset.split_name = "train"
+        config.dataset.content_sha256 = prompt_content_sha256([args.prompt])
+        config.dataset.require_unique = True
+        config.evaluation.path = None
+        config.evaluation.content_sha256 = None
+        config.evaluation.seeds = list(args.eval_seeds)
+        config.evaluation.max_prompts = 1
     config.dataset.repeat_per_prompt = 1
     config.sample.name = "branching"
     config.sample.batch_size = 1
@@ -877,6 +940,18 @@ def _sd3_bounded_trainer_config(args: argparse.Namespace):
     config.runner.disable_rollout_cache = bool(args.disable_rollout_cache)
     config.runner.deterministic_run_dir = True
     return config
+
+
+def _comma_separated_ints(value: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in str(value).split(",") if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of integer seeds"
+        ) from exc
+    if not values:
+        raise argparse.ArgumentTypeError("at least one seed is required")
+    return values
 
 
 def _parameter_snapshots(parameters: list[Any]) -> list[Any]:
@@ -934,7 +1009,22 @@ def _resume_checkpoint_summary(path: str | None) -> dict[str, Any] | None:
 def _checkpoint_step_from_path(path: str | None) -> int:
     if not path:
         return 0
-    match = re.search(r"checkpoint[_-](\d+)", Path(path).name)
+    checkpoint_path = Path(path)
+    if checkpoint_path.name == "latest.json" and checkpoint_path.is_file():
+        return int(json.loads(checkpoint_path.read_text(encoding="utf-8"))["step"])
+    if checkpoint_path.is_dir() and (checkpoint_path / "latest.json").is_file():
+        return int(
+            json.loads(
+                (checkpoint_path / "latest.json").read_text(encoding="utf-8")
+            )["step"]
+        )
+    if checkpoint_path.is_dir() and (checkpoint_path / "checkpoint.json").is_file():
+        return int(
+            json.loads(
+                (checkpoint_path / "checkpoint.json").read_text(encoding="utf-8")
+            )["step"]
+        )
+    match = re.search(r"checkpoint[_-](\d+)", checkpoint_path.name)
     return int(match.group(1)) if match else 0
 
 
@@ -949,6 +1039,9 @@ _BOUNDED_TRAINER_REQUIRED_METRIC_KEYS = (
     "rollout_kl_mean",
     "tempflow_active_timestep_frac",
     "tempflow_noise_weight_mean",
+    "grad_norm",
+    "grad_nonzero_count",
+    "gradients_finite",
 )
 
 
@@ -984,6 +1077,10 @@ def _validate_bounded_trainer_metrics(rows: list[dict[str, Any]], *, expected_st
     non_finite = []
     for key in _BOUNDED_TRAINER_REQUIRED_METRIC_KEYS:
         value = final[key]
+        if key == "gradients_finite":
+            if value is not True:
+                non_finite.append(key)
+            continue
         if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(float(value)):
             non_finite.append(key)
     if non_finite:
@@ -1036,6 +1133,334 @@ def _tensor_mean_float(value: Any) -> float | None:
         return float(tensor.mean().cpu())
     except Exception:  # noqa: BLE001 - preview summaries should degrade to shape-only metadata
         return None
+
+
+def _bounded_prompt_split_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    from visual_rl.datasets.prompt_dataset import (
+        prompt_set_snapshot,
+        read_prompt_file,
+        validate_prompt_splits,
+    )
+
+    if not args.train_prompts_file:
+        return {
+            "mode": "single_prompt_smoke",
+            "train": prompt_set_snapshot(
+                [args.prompt],
+                split_name="train",
+            ),
+            "heldout": None,
+            "overlap_count": None,
+        }
+    snapshot = validate_prompt_splits(
+        read_prompt_file(args.train_prompts_file),
+        read_prompt_file(args.heldout_prompts_file),
+        train_path=args.train_prompts_file,
+        heldout_path=args.heldout_prompts_file,
+    )
+    snapshot["mode"] = "train_heldout"
+    return snapshot
+
+
+def _image_guardrail_summary(media: Any) -> dict[str, float]:
+    import numpy as np
+
+    image = _media_item_to_uint8_rgb(media, index=0).astype(np.float32) / 255.0
+    spatial_std = float(image.reshape(-1, 3).std(axis=0).mean())
+    dynamic_range = float(np.quantile(image, 0.95) - np.quantile(image, 0.05))
+    saturation = float((image.max(axis=2) - image.min(axis=2)).mean())
+    luminance_mean = float(image.mean())
+    return {
+        "spatial_std": spatial_std,
+        "dynamic_range_90": dynamic_range,
+        "saturation_mean": saturation,
+        "luminance_mean": luminance_mean,
+    }
+
+
+def _aggregate_guardrail(records: list[dict[str, Any]]) -> dict[str, float]:
+    if not records:
+        return {}
+    keys = sorted(records[0]["image_guardrail"])
+    return {
+        key: float(
+            sum(float(record["image_guardrail"][key]) for record in records)
+            / len(records)
+        )
+        for key in keys
+    }
+
+
+def _bounded_heldout_summary(
+    trainer: Any,
+    args: argparse.Namespace,
+    phase: str,
+    output_dir: Path,
+    *,
+    milestone_step: int,
+) -> dict[str, Any]:
+    import numpy as np
+
+    from visual_rl.datasets.prompt_dataset import prompt_id, read_prompt_file
+
+    prompts = read_prompt_file(args.heldout_prompts_file)
+    if args.eval_max_prompts is not None:
+        prompts = prompts[: int(args.eval_max_prompts)]
+    if not prompts:
+        raise ValueError("held-out evaluation prompt set is empty")
+    seeds = [int(seed) for seed in args.eval_seeds]
+    preview_dir = output_dir / "previews" / phase
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    png_paths: list[Path] = []
+    first_model_metadata: dict[str, Any] | None = None
+
+    for prompt_index, prompt in enumerate(prompts):
+        for seed in seeds:
+            rollout_config = {
+                "num_steps": int(args.num_steps),
+                "guidance_scale": float(args.guidance_scale),
+                "seed": seed,
+                "output_type": "pt",
+                "epoch_tag": milestone_step,
+            }
+            metadata = [
+                {
+                    "source": "sd3_bounded_heldout",
+                    "phase": phase,
+                    "split": "heldout",
+                    "prompt_id": prompt_id(prompt),
+                    "adapter_key": args.adapter,
+                    "eval_seed": seed,
+                }
+            ]
+            batch = trainer.adapter.sample([prompt], metadata, rollout_config)
+            batch.validate_strict()
+            rewards = trainer.feedback_provider.score(batch)
+            if not bool(rewards.valid_mask.all()):
+                raise RuntimeError(
+                    f"Bounded trainer {phase} held-out reward failure: "
+                    f"{rewards.metadata}"
+                )
+            record_index = len(records)
+            png_path = preview_dir / f"preview_{record_index:03d}.png"
+            _write_png_rgb(
+                png_path,
+                _media_item_to_uint8_rgb(batch.media, index=0),
+            )
+            png_paths.append(png_path)
+            reward_value = float(rewards.weighted_total.detach().float().cpu()[0])
+            reward_metadata = _json_safe(rewards.metadata)
+            target_values = (
+                reward_metadata.get("prompt_color", {}).get("targets", [])
+                if isinstance(reward_metadata, dict)
+                else []
+            )
+            records.append(
+                {
+                    "prompt": prompt,
+                    "prompt_id": prompt_id(prompt),
+                    "prompt_index": prompt_index,
+                    "seed": seed,
+                    "target_color": target_values[0] if target_values else None,
+                    "reward": reward_value,
+                    "png_path": str(png_path),
+                    "old_logprob_mean": _tensor_mean_float(batch.old_log_probs),
+                    "rollout_kl_mean": _tensor_mean_float(batch.kl),
+                    "image_guardrail": _image_guardrail_summary(batch.media),
+                }
+            )
+            if first_model_metadata is None:
+                first_model_metadata = _json_safe(batch.model_metadata)
+
+    scores = np.asarray([record["reward"] for record in records], dtype=np.float64)
+    per_color = {}
+    for color in sorted(
+        {record["target_color"] for record in records if record["target_color"]}
+    ):
+        color_scores = [
+            record["reward"]
+            for record in records
+            if record["target_color"] == color
+        ]
+        per_color[color] = {
+            "count": len(color_scores),
+            "reward_mean": float(np.mean(color_scores)),
+            "reward_std": float(np.std(color_scores)),
+        }
+
+    metadata_path = preview_dir / "metadata.json"
+    payload = {
+        "phase": phase,
+        "milestone_step": int(milestone_step),
+        "split": "heldout",
+        "preview_dir": str(preview_dir),
+        "png_path": str(png_paths[0]),
+        "png_paths": [str(path) for path in png_paths],
+        "metadata_path": str(metadata_path),
+        "prompt": prompts[0],
+        "prompt_count": len(prompts),
+        "sample_count": len(records),
+        "seeds": seeds,
+        "num_steps": int(args.num_steps),
+        "guidance_scale": float(args.guidance_scale),
+        "reward_mean": float(scores.mean()),
+        "reward_std": float(scores.std()),
+        "reward_min": float(scores.min()),
+        "reward_max": float(scores.max()),
+        "per_color": per_color,
+        "image_guardrail": _aggregate_guardrail(records),
+        "model_metadata": first_model_metadata or {},
+        "records": records,
+    }
+    metadata_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _paired_heldout_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    import numpy as np
+
+    before_by_key = {
+        (record["prompt_id"], int(record["seed"])): record
+        for record in before.get("records", [])
+    }
+    after_by_key = {
+        (record["prompt_id"], int(record["seed"])): record
+        for record in after.get("records", [])
+    }
+    if set(before_by_key) != set(after_by_key) or not before_by_key:
+        raise RuntimeError("held-out before/after panels are not paired")
+    ordered_keys = sorted(before_by_key)
+    delta_records = [
+        {
+            "prompt_id": key[0],
+            "seed": key[1],
+            "delta": float(after_by_key[key]["reward"])
+            - float(before_by_key[key]["reward"]),
+        }
+        for key in ordered_keys
+    ]
+    deltas = np.asarray(
+        [record["delta"] for record in delta_records],
+        dtype=np.float64,
+    )
+    seed_values = sorted({record["seed"] for record in delta_records})
+    seed_cluster_means = np.asarray(
+        [
+            np.mean(
+                [
+                    record["delta"]
+                    for record in delta_records
+                    if record["seed"] == seed
+                ]
+            )
+            for seed in seed_values
+        ],
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(0)
+    bootstrap_indices = rng.integers(
+        0,
+        len(seed_cluster_means),
+        size=(2000, len(seed_cluster_means)),
+    )
+    bootstrap_means = seed_cluster_means[bootstrap_indices].mean(axis=1)
+    guardrail_ratios = {}
+    for key, before_value in before.get("image_guardrail", {}).items():
+        after_value = float(after.get("image_guardrail", {}).get(key, 0.0))
+        guardrail_ratios[key] = (
+            None
+            if float(before_value) == 0.0
+            else after_value / float(before_value)
+        )
+    return {
+        "paired_count": len(deltas),
+        "ci_method": "bootstrap_over_eval_seed_cluster_means",
+        "eval_seed_cluster_count": len(seed_cluster_means),
+        "eval_seed_cluster_means": {
+            str(seed): float(value)
+            for seed, value in zip(
+                seed_values,
+                seed_cluster_means,
+                strict=True,
+            )
+        },
+        "reward_delta_mean": float(deltas.mean()),
+        "reward_delta_std": float(deltas.std()),
+        "reward_delta_ci95_low": float(np.quantile(bootstrap_means, 0.025)),
+        "reward_delta_ci95_high": float(np.quantile(bootstrap_means, 0.975)),
+        "reward_improved_fraction": float(np.mean(deltas > 0.0)),
+        "guardrail_after_over_before": guardrail_ratios,
+    }
+
+
+def _load_baseline_evaluation(
+    args: argparse.Namespace,
+    before: dict[str, Any],
+    output_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    baseline_path = getattr(args, "baseline_eval", None)
+    if baseline_path:
+        source = Path(baseline_path)
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    else:
+        source = Path(before["metadata_path"])
+        payload = before
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    snapshot = {
+        "source_path": str(source),
+        "content_sha256": hashlib.sha256(encoded).hexdigest(),
+        "milestone_step": int(payload.get("milestone_step", 0)),
+        "sample_count": int(payload.get("sample_count", 0)),
+    }
+    (output_dir / "baseline_evaluation.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return payload, snapshot
+
+
+def _training_trend_summary(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    import numpy as np
+
+    rewards = np.asarray(
+        [float(row["reward_mean"]) for row in metrics],
+        dtype=np.float64,
+    )
+    if rewards.size == 0:
+        return {"step_count": 0}
+    window = max(1, min(5, rewards.size // 2))
+    slope = (
+        0.0
+        if rewards.size == 1
+        else float(np.polyfit(np.arange(rewards.size), rewards, 1)[0])
+    )
+    return {
+        "step_count": int(rewards.size),
+        "reward_linear_slope_per_step": slope,
+        "reward_first_window_mean": float(rewards[:window].mean()),
+        "reward_last_window_mean": float(rewards[-window:].mean()),
+        "reward_last_minus_first_window": float(
+            rewards[-window:].mean() - rewards[:window].mean()
+        ),
+        "clipfrac_max": float(max(float(row["clipfrac"]) for row in metrics)),
+        "logprob_delta_abs_max": float(
+            max(float(row["logprob_delta_abs_max"]) for row in metrics)
+        ),
+        "grad_norm_min": float(min(float(row["grad_norm"]) for row in metrics)),
+        "grad_norm_max": float(max(float(row["grad_norm"]) for row in metrics)),
+        "all_gradients_finite": bool(
+            all(bool(row["gradients_finite"]) for row in metrics)
+        ),
+    }
 
 
 def _bounded_preview_summary(trainer: Any, args: argparse.Namespace, phase: str, output_dir: Path) -> dict[str, Any]:
@@ -1093,7 +1518,10 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
     from visual_rl.runner import ExperimentRunner
 
     config = _sd3_bounded_trainer_config(args)
+    prompt_splits = _bounded_prompt_split_snapshot(args)
     _validate_config_registry_names(config)
+    resume_base_step = _checkpoint_step_from_path(args.resume_from)
+    steps_executed = int(args.steps) - resume_base_step
     trainer = ExperimentRunner(config)
     output_dir = Path(config.paths.output_dir)
     metrics_path = output_dir / "metrics.jsonl"
@@ -1103,10 +1531,55 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
     parameters = list(trainer.adapter.parameters())
     snapshots = _parameter_snapshots(parameters)
     resume_summary = _resume_checkpoint_summary(args.resume_from)
-    resume_base_step = _checkpoint_step_from_path(args.resume_from)
-    before_preview = _bounded_preview_summary(trainer, args, "before", output_dir)
+    save_json(output_dir / "prompt_splits.json", prompt_splits)
+    if args.heldout_prompts_file:
+        before_preview = _bounded_heldout_summary(
+            trainer,
+            args,
+            "before",
+            output_dir,
+            milestone_step=resume_base_step,
+        )
+    else:
+        before_preview = _bounded_preview_summary(
+            trainer,
+            args,
+            "before",
+            output_dir,
+        )
     metrics = trainer.run(max_steps=args.steps)
-    after_preview = _bounded_preview_summary(trainer, args, "after", output_dir)
+    if args.heldout_prompts_file:
+        after_preview = _bounded_heldout_summary(
+            trainer,
+            args,
+            "after",
+            output_dir,
+            milestone_step=int(args.steps),
+        )
+        baseline_preview, baseline_snapshot = _load_baseline_evaluation(
+            args,
+            before_preview,
+            output_dir,
+        )
+        heldout_segment_delta = _paired_heldout_delta(
+            before_preview,
+            after_preview,
+        )
+        heldout_delta = _paired_heldout_delta(
+            baseline_preview,
+            after_preview,
+        )
+    else:
+        after_preview = _bounded_preview_summary(
+            trainer,
+            args,
+            "after",
+            output_dir,
+        )
+        baseline_preview = before_preview
+        baseline_snapshot = None
+        heldout_segment_delta = None
+        heldout_delta = None
     delta_summary = _parameter_delta_summary(parameters, snapshots)
     checkpoint_dirs = sorted(path for path in output_dir.glob("checkpoint_*") if path.is_dir())
     checkpoints = _checkpoint_summary(checkpoint_dirs)
@@ -1114,7 +1587,7 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
         metrics_path,
         latest_path,
         checkpoints,
-        expected_steps=int(args.steps),
+        expected_steps=steps_executed,
     )
     final_metrics = metrics[-1] if metrics else {}
     final_metrics_artifact = metrics_rows[-1] if metrics_rows else {}
@@ -1122,8 +1595,59 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
         delta_summary["parameter_delta_nonzero_count"] > 0
         and delta_summary["parameter_delta_abs_max"] > 0.0
     )
+    training_trend = _training_trend_summary(metrics)
+    numerical_gate = bool(
+        training_trend.get("all_gradients_finite", False)
+        and float(training_trend.get("grad_norm_min", 0.0)) > 0.0
+        and float(training_trend.get("clipfrac_max", float("inf"))) == 0.0
+        and float(
+            training_trend.get("logprob_delta_abs_max", float("inf"))
+        )
+        <= float(args.logprob_atol)
+    )
+    heldout_contract_valid = bool(
+        not args.heldout_prompts_file
+        or (
+            prompt_splits.get("overlap_count") == 0
+            and heldout_delta is not None
+            and int(heldout_delta["paired_count"])
+            == int(before_preview["sample_count"])
+        )
+    )
+    execution_valid = bool(
+        parameter_update_valid and numerical_gate and heldout_contract_valid
+    )
+    guardrail_ratios = (
+        {} if heldout_delta is None else heldout_delta["guardrail_after_over_before"]
+    )
+    pixel_guardrail_passed = bool(
+        not guardrail_ratios
+        or (
+            float(guardrail_ratios.get("spatial_std") or 0.0) >= 0.8
+            and float(guardrail_ratios.get("dynamic_range_90") or 0.0) >= 0.8
+        )
+    )
+    independent_training_seed_count = 1
+    if heldout_delta is None:
+        reward_trend_gate = True
+        reward_trend_rule = "not_applicable_single_prompt_smoke"
+    elif int(args.steps) <= 5:
+        reward_trend_gate = bool(
+            float(heldout_delta["reward_delta_mean"]) >= -0.02
+        )
+        reward_trend_rule = "step5_mean_delta_at_least_minus_0.02"
+    elif int(args.steps) < 50:
+        reward_trend_gate = bool(
+            float(heldout_delta["reward_delta_mean"]) > 0.0
+        )
+        reward_trend_rule = "step20_mean_delta_positive"
+    else:
+        reward_trend_gate = bool(
+            float(heldout_delta["reward_delta_ci95_low"]) > 0.0
+        )
+        reward_trend_rule = "step50_eval_seed_cluster_ci95_low_positive"
     payload = {
-        "valid": parameter_update_valid,
+        "valid": execution_valid,
         "output_dir": str(output_dir),
         "summary_path": str(summary_path),
         "metrics_path": str(metrics_path),
@@ -1136,8 +1660,10 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
         "source_checkpoint_summary": resume_summary,
         "resume_loaded": bool(args.resume_from),
         "resume_base_step": resume_base_step,
-        "resume_steps": int(args.steps) if args.resume_from else 0,
-        "effective_total_step": resume_base_step + int(args.steps),
+        "resume_steps": steps_executed if args.resume_from else 0,
+        "steps_executed": steps_executed,
+        "target_step": int(args.steps),
+        "effective_total_step": int(args.steps),
         "steps": int(args.steps),
         "metrics_line_count": len(metrics_rows),
         "required_metric_keys": list(_BOUNDED_TRAINER_REQUIRED_METRIC_KEYS),
@@ -1146,10 +1672,15 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
         "model_path": args.model_path,
         "repo_root": args.repo_root,
         "prompt": args.prompt,
+        "train_prompts_file": args.train_prompts_file,
+        "heldout_prompts_file": args.heldout_prompts_file,
+        "prompt_splits_path": str(output_dir / "prompt_splits.json"),
+        "prompt_splits": prompt_splits,
         "resolution": int(args.resolution),
         "num_steps": int(args.num_steps),
         "guidance_scale": float(args.guidance_scale),
         "seed": int(args.seed),
+        "independent_training_seed_count": independent_training_seed_count,
         "device": str(getattr(trainer.adapter, "device", args.device)),
         "dtype": str(getattr(trainer.adapter, "dtype", args.dtype)),
         "lora_rank": int(args.lora_rank),
@@ -1169,6 +1700,35 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
             "before": before_preview,
             "after": after_preview,
         },
+        "heldout_paired_delta": heldout_delta,
+        "heldout_segment_delta": heldout_segment_delta,
+        "baseline_evaluation": baseline_snapshot,
+        "training_trend": training_trend,
+        "gates": {
+            "parameter_update": parameter_update_valid,
+            "numerical": numerical_gate,
+            "heldout_contract": heldout_contract_valid,
+            "pixel_diversity_guardrail": pixel_guardrail_passed,
+            "reward_trend": reward_trend_gate,
+            "reward_trend_rule": reward_trend_rule,
+            "eligible_for_next_milestone": bool(
+                execution_valid and pixel_guardrail_passed and reward_trend_gate
+            ),
+            "eligible_for_100_steps": bool(
+                execution_valid
+                and pixel_guardrail_passed
+                and int(args.steps) >= 50
+                and heldout_delta is not None
+                and float(heldout_delta["reward_delta_ci95_low"]) > 0.0
+                and reward_trend_gate
+                and independent_training_seed_count >= 3
+            ),
+            "eligible_for_100_steps_requires": [
+                "50-step paired held-out CI95 lower bound > 0",
+                "pixel diversity guardrail passes",
+                "at least 3 independent training seeds",
+            ],
+        },
         "trainable_parameter_tensors": len(parameters),
         "trainable_parameters": int(sum(parameter.numel() for parameter in parameters)),
         **delta_summary,
@@ -1182,7 +1742,8 @@ def sd3_bounded_trainer_smoke(args: argparse.Namespace) -> int:
     print(json.dumps(payload, indent=2, sort_keys=True))
     if not payload["valid"]:
         raise RuntimeError(
-            "SD3 bounded trainer completed without a nonzero parameter update"
+            "SD3 bounded trainer failed execution gates: "
+            + json.dumps(payload.get("gates", {}), sort_keys=True)
         )
     return 0
 
@@ -1751,6 +2312,11 @@ def remote_sd3_cli_smoke(args: argparse.Namespace) -> int:
         idle_util_pct=args.idle_util_pct,
         stage_name=stage_name,
         prompt=args.prompt,
+        train_prompts_file=args.train_prompts_file,
+        heldout_prompts_file=args.heldout_prompts_file,
+        baseline_eval=args.baseline_eval,
+        eval_seeds=list(args.eval_seeds),
+        eval_max_prompts=args.eval_max_prompts,
         run_bounded_trainer=args.run_bounded_trainer,
         run_resume_validation=args.run_resume_validation,
         allow_long_run=args.allow_long_run,
@@ -1808,6 +2374,15 @@ def main(argv: list[str] | None = None) -> int:
     sd3_trainer_parser.add_argument("--model-path", required=True)
     sd3_trainer_parser.add_argument("--repo-root", required=True)
     sd3_trainer_parser.add_argument("--prompt", default="a small red cube on a white table")
+    sd3_trainer_parser.add_argument("--train-prompts-file", default=None)
+    sd3_trainer_parser.add_argument("--heldout-prompts-file", default=None)
+    sd3_trainer_parser.add_argument("--baseline-eval", default=None)
+    sd3_trainer_parser.add_argument(
+        "--eval-seeds",
+        type=_comma_separated_ints,
+        default=[1701, 1702, 1703],
+    )
+    sd3_trainer_parser.add_argument("--eval-max-prompts", type=int, default=None)
     sd3_trainer_parser.add_argument("--resolution", type=int, default=256)
     sd3_trainer_parser.add_argument("--num-steps", type=int, default=3)
     sd3_trainer_parser.add_argument("--guidance-scale", type=float, default=4.5)
@@ -1979,6 +2554,15 @@ def main(argv: list[str] | None = None) -> int:
     remote_sd3_parser.add_argument("--idle-util-pct", type=int, default=5)
     remote_sd3_parser.add_argument("--stage-name", default=None)
     remote_sd3_parser.add_argument("--prompt", default="a red square")
+    remote_sd3_parser.add_argument("--train-prompts-file", default=None)
+    remote_sd3_parser.add_argument("--heldout-prompts-file", default=None)
+    remote_sd3_parser.add_argument("--baseline-eval", default=None)
+    remote_sd3_parser.add_argument(
+        "--eval-seeds",
+        type=_comma_separated_ints,
+        default=[1701, 1702, 1703],
+    )
+    remote_sd3_parser.add_argument("--eval-max-prompts", type=int, default=None)
     remote_sd3_parser.add_argument("--run-bounded-trainer", dest="run_bounded_trainer", action="store_true", default=True)
     remote_sd3_parser.add_argument("--skip-bounded-trainer", dest="run_bounded_trainer", action="store_false")
     remote_sd3_parser.add_argument("--run-resume-validation", dest="run_resume_validation", action="store_true", default=True)

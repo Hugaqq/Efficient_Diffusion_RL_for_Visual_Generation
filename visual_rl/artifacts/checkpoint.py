@@ -46,6 +46,7 @@ def config_fingerprint(
         "per_prompt_stat_tracking",
         "model",
         "dataset",
+        "evaluation",
         "sample",
         "rollout",
         "algorithm",
