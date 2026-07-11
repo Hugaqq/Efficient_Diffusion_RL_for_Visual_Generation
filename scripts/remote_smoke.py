@@ -16,7 +16,7 @@ from typing import Any
 
 DEFAULT_REMOTE_ROOT = "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke"
 DEFAULT_SERVER = "v-qiaoqifan@10.130.140.73"
-DEFAULT_LEGACY_REPO_ROOT = "/home/v-qiaoqifan/visual_rl_experiments/flow_grpo_tempflow_smoke"
+DEFAULT_LEGACY_REPO_ROOT = "/home/v-qiaoqifan/TempFlow-GRPO"
 DEFAULT_CONDA_BIN = "/home/v-qiaoqifan/miniconda3/bin/conda"
 DEFAULT_CONDA_ENV = "visual-rl-sd35"
 ARCHIVE_NAME = "visual_rl_source.tar.gz"
@@ -59,6 +59,8 @@ class RemoteSd3CliSmokeConfig:
     lora_rank: int = 32
     lora_alpha: int = 64
     max_sequence_length: int = 128
+    branch_count: int = 2
+    logprob_atol: float = 1e-5
     bounded_steps: int = 1
     resume_steps: int = 1
     idle_memory_mb: int = 1024
@@ -179,7 +181,25 @@ def _sd3_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
         str(config.lora_alpha),
         "--max-sequence-length",
         str(config.max_sequence_length),
+        "--logprob-atol",
+        str(config.logprob_atol),
     ]
+
+
+def _sd3_branching_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
+    args = _sd3_cli_args(config)
+    args[0] = "sd3-branching-numeric-smoke"
+    args.extend(
+        [
+            "--branch-count",
+            str(config.branch_count),
+            "--branch-step-index",
+            "auto",
+            "--clip-range",
+            "0.01",
+        ]
+    )
+    return args
 
 
 def _image_preview_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
@@ -237,6 +257,8 @@ def _bounded_trainer_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
         str(config.lora_alpha),
         "--max-sequence-length",
         str(config.max_sequence_length),
+        "--logprob-atol",
+        str(config.logprob_atol),
         "--steps",
         str(config.bounded_steps),
         "--output-dir",
@@ -284,6 +306,17 @@ def build_remote_script(config: RemoteSd3CliSmokeConfig) -> str:
         "sd3-numeric-smoke",
         "--help",
     ]
+    branching_help_cmd = [
+        config.conda_bin,
+        "run",
+        "-n",
+        config.conda_env,
+        "python",
+        "-m",
+        "scripts.legacy_cli",
+        "sd3-branching-numeric-smoke",
+        "--help",
+    ]
     bounded_help_cmd = [
         config.conda_bin,
         "run",
@@ -314,6 +347,16 @@ def build_remote_script(config: RemoteSd3CliSmokeConfig) -> str:
         "-m",
         "scripts.legacy_cli",
         *_sd3_cli_args(config),
+    ]
+    branching_smoke_cmd = [
+        config.conda_bin,
+        "run",
+        "-n",
+        config.conda_env,
+        "python",
+        "-m",
+        "scripts.legacy_cli",
+        *_sd3_branching_cli_args(config),
     ]
     bounded_cmd = [
         config.conda_bin,
@@ -391,10 +434,12 @@ BOUNDED_STEPS={shlex.quote(str(config.bounded_steps))}
 RESUME_STEPS={shlex.quote(str(config.resume_steps))}
 HELP_CMD={_shell_array(help_cmd)}
 PREVIEW_HELP_CMD={_shell_array(preview_help_cmd)}
-        SD3_HELP_CMD={_shell_array(sd3_help_cmd)}
+SD3_HELP_CMD={_shell_array(sd3_help_cmd)}
+BRANCHING_HELP_CMD={_shell_array(branching_help_cmd)}
 BOUNDED_HELP_CMD={_shell_array(bounded_help_cmd)}
 PREVIEW_CMD={_shell_array(preview_cmd)}
 SMOKE_CMD={_shell_array(smoke_cmd)}
+BRANCHING_SMOKE_CMD={_shell_array(branching_smoke_cmd)}
 BOUNDED_CMD={_shell_array(bounded_cmd)}
 RESUME_CMD={_shell_array(resume_cmd)}
 
@@ -428,6 +473,12 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   shasum -a 256 scripts/legacy_cli.py | tee -a "$STAGE_DIR/source_hash_cli.txt"
 fi
+echo "[remote_smoke] visual_rl/model_adapters/sd3.py hash" | tee "$STAGE_DIR/source_hash_sd3.txt"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum visual_rl/model_adapters/sd3.py | tee -a "$STAGE_DIR/source_hash_sd3.txt"
+else
+  shasum -a 256 visual_rl/model_adapters/sd3.py | tee -a "$STAGE_DIR/source_hash_sd3.txt"
+fi
 
 "${{HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/cli_help.log"
 grep -q -- "remote-sd3-cli-smoke" "$STAGE_DIR/cli_help.log"
@@ -435,6 +486,8 @@ grep -q -- "remote-sd3-cli-smoke" "$STAGE_DIR/cli_help.log"
 grep -q -- "--output-dir" "$STAGE_DIR/image_preview_help.log"
 "${{SD3_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/sd3_numeric_smoke_help.log"
 grep -q -- "--repo-root" "$STAGE_DIR/sd3_numeric_smoke_help.log"
+"${{BRANCHING_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/sd3_branching_numeric_smoke_help.log"
+grep -q -- "--branch-step-index" "$STAGE_DIR/sd3_branching_numeric_smoke_help.log"
 "${{BOUNDED_HELP_CMD[@]}}" 2>&1 | tee "$STAGE_DIR/sd3_bounded_trainer_smoke_help.log"
 grep -q -- "--disable-rollout-cache" "$STAGE_DIR/sd3_bounded_trainer_smoke_help.log"
 
@@ -459,6 +512,7 @@ run_logged preview "$STAGE_DIR/image_preview.stdout.log" "${{PREVIEW_CMD[@]}}"
 test -s "$STAGE_DIR/preview/preview_000.png"
 test -s "$STAGE_DIR/preview/metadata.json"
 run_logged numeric "$STAGE_DIR/sd3_numeric_smoke.stdout.log" "${{SMOKE_CMD[@]}}"
+run_logged branching_numeric "$STAGE_DIR/sd3_branching_numeric_smoke.stdout.log" "${{BRANCHING_SMOKE_CMD[@]}}"
 {bounded_block}
 echo "[remote_smoke] artifact_status=ok" | tee "$STAGE_DIR/artifact_status.log"
 
