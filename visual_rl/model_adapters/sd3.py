@@ -303,9 +303,13 @@ class SD3TempFlowAdapter(ModelAdapter):
         guidance_scale = float(rollout_config.get("guidance_scale", 4.5))
         generator = make_generator(self.device, rollout_config.get("seed"))
 
-        with torch.no_grad(), self._perstep_sde_generator(
-            generator,
-            branch_count=branch_count,
+        with (
+            torch.no_grad(),
+            self._perstep_sde_generator(
+                generator,
+                branch_count=branch_count,
+            ),
+            self._transformer_input_dtype(),
         ):
             prompt_embeds, pooled_prompt_embeds = self._encode_text(prompts)
             negative_prompt_embeds, negative_pooled_prompt_embeds = self._encode_text(
@@ -865,6 +869,39 @@ class SD3TempFlowAdapter(ModelAdapter):
                         f"SD3 shared-prefix {name} differs within parent {parent}"
                     )
         return representative_rows, row_to_parent
+
+    @contextmanager
+    def _transformer_input_dtype(self):
+        """Cast per-step hidden states without rounding the saved SDE target."""
+
+        import torch
+
+        dtype = self._transformer_dtype()
+
+        def cast_hidden_states(_module, args, kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if isinstance(hidden_states, torch.Tensor):
+                if hidden_states.dtype == dtype:
+                    return None
+                updated_kwargs = dict(kwargs)
+                updated_kwargs["hidden_states"] = hidden_states.to(dtype=dtype)
+                return args, updated_kwargs
+
+            if args and isinstance(args[0], torch.Tensor):
+                if args[0].dtype == dtype:
+                    return None
+                return (args[0].to(dtype=dtype), *args[1:]), kwargs
+            return None
+
+        handle = self.transformer.register_forward_pre_hook(
+            cast_hidden_states,
+            prepend=True,
+            with_kwargs=True,
+        )
+        try:
+            yield
+        finally:
+            handle.remove()
 
     @contextmanager
     def _full_sde_generator(self, generator):

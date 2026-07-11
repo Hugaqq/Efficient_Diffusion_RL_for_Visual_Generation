@@ -314,6 +314,45 @@ def test_sd3_perstep_wrapper_hard_fails_when_real_kernel_cannot_be_replaced():
             pass
 
 
+def test_sd3_transformer_input_dtype_cast_is_scoped_and_exception_safe():
+    import torch
+
+    from visual_rl.model_adapters.sd3 import SD3TempFlowAdapter
+
+    class RecordingTransformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor(1.0, dtype=torch.bfloat16)
+            )
+            self.seen_dtypes = []
+
+        def forward(self, hidden_states=None):
+            self.seen_dtypes.append(hidden_states.dtype)
+            return hidden_states
+
+    transformer = RecordingTransformer()
+    adapter = SD3TempFlowAdapter.__new__(SD3TempFlowAdapter)
+    adapter.transformer = transformer
+    fp32_hidden_states = torch.ones(1, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="stop inside context"):
+        with adapter._transformer_input_dtype():
+            output = transformer(hidden_states=fp32_hidden_states)
+            positional_output = transformer(fp32_hidden_states)
+            assert output.dtype == torch.bfloat16
+            assert positional_output.dtype == torch.bfloat16
+            raise RuntimeError("stop inside context")
+
+    restored_output = transformer(hidden_states=fp32_hidden_states)
+    assert restored_output.dtype == torch.float32
+    assert transformer.seen_dtypes == [
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+    ]
+
+
 def _deferred_sd3_adapter(tmp_path, transformer):
     from types import SimpleNamespace
 
@@ -429,6 +468,20 @@ def test_sd3_branching_canonicalizes_bf16_source_without_rounding_target(
 
     from visual_rl.model_adapters.sd3 import SD3TempFlowAdapter
 
+    class StrictBFloat16Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor(1.0, dtype=torch.bfloat16)
+            )
+            self.seen_dtypes = []
+
+        def forward(self, *, hidden_states):
+            self.seen_dtypes.append(hidden_states.dtype)
+            if hidden_states.dtype != torch.bfloat16:
+                raise RuntimeError("transformer requires bfloat16 hidden states")
+            return (hidden_states,)
+
     repo_root = tmp_path / "TempFlow-GRPO-main"
     repo_root.mkdir()
     adapter = SD3TempFlowAdapter(
@@ -447,7 +500,7 @@ def test_sd3_branching_canonicalizes_bf16_source_without_rounding_target(
             timesteps=torch.tensor([900.0, 600.0, 300.0])
         )
     )
-    adapter.transformer = torch.nn.Linear(1, 1).to(torch.bfloat16)
+    adapter.transformer = StrictBFloat16Transformer()
     adapter._pipeline_with_logprob_perstep = object()
     adapter._encode_text = lambda prompts: (
         torch.ones(len(prompts), 1, 1, dtype=torch.bfloat16),
@@ -479,13 +532,11 @@ def test_sd3_branching_canonicalizes_bf16_source_without_rounding_target(
         torch.zeros(2, 3, 2, 2),
         torch.ones(2, 3, 2, 2),
     ]
-    adapter._call_pipeline_with_logprob_perstep = lambda **_kwargs: (
-        branch_media,
-        main_latents,
-        sde_latents,
-        log_probs,
-        kls,
-    )
+    def fake_perstep_call(**_kwargs):
+        adapter.transformer(hidden_states=raw_targets)
+        return branch_media, main_latents, sde_latents, log_probs, kls
+
+    adapter._call_pipeline_with_logprob_perstep = fake_perstep_call
 
     batch = adapter.sample_branching(
         ["a red cube"],
@@ -506,6 +557,7 @@ def test_sd3_branching_canonicalizes_bf16_source_without_rounding_target(
     assert torch.equal(batch.latents[:, 0], expected_sources)
     assert batch.next_latents.dtype == torch.float32
     assert torch.equal(batch.next_latents[:, 0], raw_targets)
+    assert adapter.transformer.seen_dtypes == [torch.bfloat16]
 
 
 @pytest.mark.parametrize(
