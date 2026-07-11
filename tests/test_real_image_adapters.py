@@ -899,19 +899,37 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
             with torch.no_grad():
                 self.adapter.weight.add_(torch.tensor([0.5, 0.0]))
             rows = [
-                {"step": 0, "reward_mean": 0.25, "approx_kl": 0.0},
+                {
+                    "step": 0,
+                    "reward_mean": 0.25,
+                    "reward_std": 0.0,
+                    "old_logprob_mean": 0.1,
+                    "new_logprob_mean": 0.1,
+                    "logprob_delta_abs_max": 0.0,
+                    "rollout_kl_mean": 0.0,
+                    "approx_kl": 0.0,
+                    "clipfrac": 0.0,
+                    "tempflow_noise_weight_mean": 1.0,
+                    "tempflow_active_timestep_frac": 0.5,
+                    "grad_norm": 0.5,
+                    "grad_nonzero_count": 1,
+                    "gradients_finite": True,
+                },
                 {
                     "step": 1,
                     "reward_mean": 0.75,
                     "reward_std": 0.0,
                     "old_logprob_mean": 0.1,
-                    "new_logprob_mean": 0.2,
-                    "logprob_delta_abs_max": 0.1,
+                    "new_logprob_mean": 0.1,
+                    "logprob_delta_abs_max": 0.0,
                     "rollout_kl_mean": 0.0,
                     "approx_kl": 0.01,
                     "clipfrac": 0.0,
                     "tempflow_noise_weight_mean": 1.0,
                     "tempflow_active_timestep_frac": 0.5,
+                    "grad_norm": 0.4,
+                    "grad_nonzero_count": 1,
+                    "gradients_finite": True,
                 },
             ]
             (self.output_dir / "metrics.jsonl").write_text(
@@ -977,6 +995,8 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
     assert payload["checkpoint_dirs"] == [str(tmp_path / "checkpoint_000002")]
     assert payload["checkpoint_summary"][0]["files"] == ["adapter_model.safetensors"]
     assert payload["steps"] == 2
+    assert payload["target_step"] == 2
+    assert payload["steps_executed"] == 2
     assert payload["resolution"] == 80
     assert payload["num_steps"] == 2
     assert payload["guidance_scale"] == 3.5
@@ -1015,8 +1035,8 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
     assert payload["final_metric_extract"] == {
         "approx_kl": 0.01,
         "clipfrac": 0.0,
-        "logprob_delta_abs_max": 0.1,
-        "new_logprob_mean": 0.2,
+        "logprob_delta_abs_max": 0.0,
+        "new_logprob_mean": 0.1,
         "old_logprob_mean": 0.1,
         "reward_mean": 0.75,
         "reward_std": 0.0,
@@ -1134,15 +1154,15 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
             assert config.paths.output_dir == str(output_dir)
             assert config.paths.output_dir == str(output_dir)
             assert config.paths.resume_from == str(resume_dir)
-            assert config.train.lora_path == str(resume_dir)
+            assert config.train.lora_path is None
 
         def run(self, max_steps=None):
             seen["max_steps"] = max_steps
-            assert max_steps == 1
+            assert max_steps == 6
             with torch.no_grad():
                 self.adapter.weight.add_(torch.tensor([0.0, 0.25, 0.0]))
             row = {
-                "step": 0,
+                "step": 5,
                 "reward_mean": 0.6,
                 "reward_std": 0.0,
                 "old_logprob_mean": 0.2,
@@ -1153,12 +1173,15 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
                 "clipfrac": 0.0,
                 "tempflow_active_timestep_frac": 1.0,
                 "tempflow_noise_weight_mean": 1.0,
+                "grad_norm": 0.25,
+                "grad_nonzero_count": 1,
+                "gradients_finite": True,
             }
             (self.output_dir / "metrics.jsonl").write_text(json.dumps(row, sort_keys=True) + "\n", encoding="utf-8")
-            checkpoint_dir = self.output_dir / "checkpoint_000001"
+            checkpoint_dir = self.output_dir / "checkpoint_000006"
             checkpoint_dir.mkdir()
             (checkpoint_dir / "adapter_model.safetensors").write_text("fake", encoding="utf-8")
-            (self.output_dir / "latest.json").write_text(json.dumps({"step": 1}), encoding="utf-8")
+            (self.output_dir / "latest.json").write_text(json.dumps({"step": 6}), encoding="utf-8")
             return [row]
 
     monkeypatch.setattr(runner_module, "ExperimentRunner", FakeExperimentRunner)
@@ -1173,18 +1196,19 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
             "--repo-root",
             "/ref/tempflow",
             "--steps",
-            "1",
+            "6",
             "--output-dir",
             str(output_dir),
             "--resume-from",
             str(resume_dir),
+            "--allow-long-run",
             "--device",
             "cpu",
         ]
     )
 
     assert exit_code == 0
-    assert seen["max_steps"] == 1
+    assert seen["max_steps"] == 6
     assert seen["preview_phases"] == ["before", "after"]
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is True
@@ -1199,8 +1223,10 @@ def test_sd3_bounded_trainer_smoke_cli_supports_resume_from_checkpoint(monkeypat
     assert payload["resume_base_step"] == 5
     assert payload["resume_steps"] == 1
     assert payload["effective_total_step"] == 6
+    assert payload["target_step"] == 6
+    assert payload["steps_executed"] == 1
     assert payload["metrics_line_count"] == 1
-    assert payload["checkpoint_dirs"] == [str(output_dir / "checkpoint_000001")]
+    assert payload["checkpoint_dirs"] == [str(output_dir / "checkpoint_000006")]
     assert payload["parameter_delta_abs_max"] == 0.25
     assert payload["parameter_delta_nonzero_count"] == 1
     assert payload["preview_artifacts"]["before"]["reward_mean"] == 0.6000000238418579

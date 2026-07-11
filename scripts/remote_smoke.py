@@ -35,6 +35,7 @@ _EXCLUDED_PARTS = {
 _EXCLUDED_NAMES = {".DS_Store"}
 _ROOT_FILES = ("pyproject.toml", "README.md", "train.py")
 _SCRIPT_FILES = ("__init__.py", "legacy_cli.py", "remote_smoke.py")
+_DATA_SUFFIXES = {".json", ".txt"}
 
 
 def _default_stage_name() -> str:
@@ -67,6 +68,11 @@ class RemoteSd3CliSmokeConfig:
     idle_util_pct: int = 5
     stage_name: str = field(default_factory=_default_stage_name)
     prompt: str = "a red square"
+    train_prompts_file: str | None = None
+    heldout_prompts_file: str | None = None
+    baseline_eval: str | None = None
+    eval_seeds: list[int] = field(default_factory=lambda: [1701, 1702, 1703])
+    eval_max_prompts: int | None = None
     run_bounded_trainer: bool = True
     run_resume_validation: bool = True
     allow_long_run: bool = False
@@ -131,6 +137,12 @@ def iter_source_archive_members(source_root: str | Path) -> list[Path]:
         path = scripts_root / script_file
         if path.is_file():
             members.append(path.relative_to(root))
+
+    prompt_root = root / "data" / "prompts"
+    if prompt_root.is_dir():
+        for path in sorted(prompt_root.rglob("*")):
+            if path.is_file() and path.suffix in _DATA_SUFFIXES:
+                members.append(path.relative_to(root))
     return members
 
 
@@ -267,6 +279,17 @@ def _bounded_trainer_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
     ]
     if config.allow_long_run:
         args.append("--allow-long-run")
+    if config.train_prompts_file:
+        args.extend(["--train-prompts-file", config.train_prompts_file])
+    if config.heldout_prompts_file:
+        args.extend(["--heldout-prompts-file", config.heldout_prompts_file])
+    if config.baseline_eval:
+        args.extend(["--baseline-eval", config.baseline_eval])
+    args.extend(
+        ["--eval-seeds", ",".join(str(seed) for seed in config.eval_seeds)]
+    )
+    if config.eval_max_prompts is not None:
+        args.extend(["--eval-max-prompts", str(config.eval_max_prompts)])
     return args
 
 
@@ -274,8 +297,23 @@ def _resume_trainer_cli_args(config: RemoteSd3CliSmokeConfig) -> list[str]:
     args = _bounded_trainer_cli_args(config)
     output_index = args.index("--output-dir") + 1
     steps_index = args.index("--steps") + 1
+    resume_target_step = config.bounded_steps + config.resume_steps
     args[output_index] = config.remote_resume_dir
-    args[steps_index] = str(config.resume_steps)
+    args[steps_index] = str(resume_target_step)
+    if resume_target_step > 5 and "--allow-long-run" not in args:
+        args.append("--allow-long-run")
+    if "--baseline-eval" not in args:
+        args.extend(
+            [
+                "--baseline-eval",
+                posixpath.join(
+                    config.remote_bounded_dir,
+                    "previews",
+                    "before",
+                    "metadata.json",
+                ),
+            ]
+        )
     args.extend(["--resume-from", config.remote_bounded_checkpoint_dir])
     return args
 
@@ -390,6 +428,11 @@ if ! find "$STAGE_DIR/bounded_${BOUNDED_STEPS}step" -maxdepth 1 -type d -name 'c
   echo "[remote_smoke] bounded trainer did not create checkpoint_*" | tee "$STAGE_DIR/artifact_status.log"
   exit 78
 fi
+grep -q -- "target_step.*${BOUNDED_STEPS}" "$STAGE_DIR/bounded_${BOUNDED_STEPS}step/summary.json"
+grep -q -- "steps_executed.*${BOUNDED_STEPS}" "$STAGE_DIR/bounded_${BOUNDED_STEPS}step/summary.json"
+grep -q -- "step.*${BOUNDED_STEPS}" "$STAGE_DIR/bounded_${BOUNDED_STEPS}step/latest.json"
+test -s "$STAGE_DIR/bounded_${BOUNDED_STEPS}step/checkpoint_$(printf '%06d' "$BOUNDED_STEPS")/adapter_metadata.json"
+test ! -e "$STAGE_DIR/bounded_${BOUNDED_STEPS}step/checkpoint_$(printf '%06d' "$BOUNDED_STEPS")/transformer_state.pt"
 """
         if config.run_resume_validation:
             bounded_block += """echo "[remote_smoke] GPU before resume" | tee "$STAGE_DIR/gpu_before_resume.log"
@@ -419,6 +462,11 @@ if ! find "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step" -max
   exit 78
 fi
 grep -q -- '"resume_loaded": true' "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step/summary.json"
+RESUME_TARGET_STEP=$((BOUNDED_STEPS + RESUME_STEPS))
+grep -q -- "target_step.*${RESUME_TARGET_STEP}" "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step/summary.json"
+grep -q -- "steps_executed.*${RESUME_STEPS}" "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step/summary.json"
+grep -q -- "step.*${RESUME_TARGET_STEP}" "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step/latest.json"
+grep -q -- '"milestone_step": 0' "$STAGE_DIR/resume_from_${BOUNDED_STEPS}step_${RESUME_STEPS}step/baseline_evaluation.json"
 """
 
     return f"""#!/usr/bin/env bash

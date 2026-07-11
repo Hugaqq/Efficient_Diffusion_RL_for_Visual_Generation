@@ -24,6 +24,18 @@ class DatasetConfig:
     path: str | None = None
     prompts: list[str] = field(default_factory=list)
     repeat_per_prompt: int = 1
+    split_name: str = "train"
+    content_sha256: str | None = None
+    require_unique: bool = False
+
+
+@dataclass
+class EvaluationConfig:
+    path: str | None = None
+    content_sha256: str | None = None
+    split_name: str = "heldout"
+    seeds: list[int] = field(default_factory=lambda: [1701, 1702, 1703])
+    max_prompts: int | None = None
 
 
 @dataclass
@@ -114,6 +126,7 @@ class VisualRLConfig:
     per_prompt_stat_tracking: bool = True
     model: ModelConfig = field(default_factory=ModelConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     sample: SampleConfig = field(default_factory=SampleConfig)
     rollout: dict[str, Any] = field(default_factory=dict)
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)

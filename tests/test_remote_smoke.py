@@ -13,6 +13,11 @@ def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path)
     (tmp_path / "scripts" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "scripts" / "legacy_cli.py").write_text("print('cli')\n", encoding="utf-8")
     (tmp_path / "scripts" / "remote_smoke.py").write_text("", encoding="utf-8")
+    (tmp_path / "data" / "prompts").mkdir(parents=True)
+    (tmp_path / "data" / "prompts" / "train.txt").write_text(
+        "a red cube\n",
+        encoding="utf-8",
+    )
     (tmp_path / "visual_rl" / "__pycache__").mkdir()
     (tmp_path / "visual_rl" / "__pycache__" / "cli.cpython-311.pyc").write_bytes(b"cache")
     (tmp_path / "runs").mkdir()
@@ -28,6 +33,7 @@ def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path)
     assert "scripts/legacy_cli.py" in members
     assert "pyproject.toml" in members
     assert "README.md" in members
+    assert "data/prompts/train.txt" in members
     assert all("__pycache__" not in member for member in members)
     assert all(not member.endswith(".pyc") for member in members)
     assert all(not member.startswith("runs/") for member in members)
@@ -82,6 +88,9 @@ def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
             repo_root="/remote/ref/TempFlow-GRPO-main",
             stage_name="unit_stage",
             prompt="a blue cube",
+            train_prompts_file="data/prompts/geneval_rgb_train_36.txt",
+            heldout_prompts_file="data/prompts/geneval_rgb_heldout_9.txt",
+            eval_seeds=[1701, 1702, 1703],
         )
     )
 
@@ -102,6 +111,9 @@ def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
     assert "gpu_pmon_before_resume.log" in script
     assert "--repo-root /remote/ref/TempFlow-GRPO-main" in script
     assert "--disable-rollout-cache" in script
+    assert "--train-prompts-file data/prompts/geneval_rgb_train_36.txt" in script
+    assert "--heldout-prompts-file data/prompts/geneval_rgb_heldout_9.txt" in script
+    assert "--eval-seeds 1701,1702,1703" in script
     assert "previews/before/preview_000.png" in script
     assert "previews/after/preview_000.png" in script
     assert '"resume_loaded": true' in script
@@ -168,3 +180,25 @@ def test_remote_sd3_cli_smoke_dry_run_can_mark_long_bounded_run(capsys):
     assert payload["config"]["allow_long_run"] is True
     assert "--steps 20" in payload["remote_script"]
     assert "--allow-long-run" in payload["remote_script"]
+
+
+def test_remote_resume_from_five_targets_six_and_enables_long_run():
+    from scripts.remote_smoke import RemoteSd3CliSmokeConfig, build_remote_script
+
+    script = build_remote_script(
+        RemoteSd3CliSmokeConfig(
+            model_path="/models/sd35",
+            stage_name="resume_five",
+            bounded_steps=5,
+            resume_steps=1,
+            allow_long_run=False,
+        )
+    )
+    resume_command = next(
+        line for line in script.splitlines() if line.startswith("RESUME_CMD=")
+    )
+
+    assert "--steps 6" in resume_command
+    assert "--allow-long-run" in resume_command
+    assert "--baseline-eval" in resume_command
+    assert "bounded_5step/previews/before/metadata.json" in resume_command
