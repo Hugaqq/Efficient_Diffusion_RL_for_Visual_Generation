@@ -46,6 +46,14 @@ algorithm:
     enabled: true
     mode: std_dev_t
 
+optimizer:
+  name: algorithm
+  params:
+    max_initial_logprob_delta: 0.00001
+    require_initial_clipfrac_zero: true
+    require_finite_gradients: true
+    require_nonzero_gradients: true
+
 rewards:
   weights:
     prompt_color: 1.0

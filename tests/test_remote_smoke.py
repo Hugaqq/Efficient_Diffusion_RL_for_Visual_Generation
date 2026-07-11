@@ -92,6 +92,8 @@ def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
     assert "CUDA_VISIBLE_DEVICES=\"$GPU\"" in script
     assert "image-preview --adapter sd3_tempflow" in script
     assert "sd3-numeric-smoke --model-path" in script
+    assert "sd3-branching-numeric-smoke --model-path" in script
+    assert "--branch-step-index auto" in script
     assert "sd3-bounded-trainer-smoke --adapter sd3_tempflow" in script
     assert "--resume-from" in script
     assert "resume_from_1step_1step" in script
@@ -105,6 +107,7 @@ def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
     assert '"resume_loaded": true' in script
     assert "remote-sd3-cli-smoke" in script
     assert "scripts/legacy_cli.py" in script
+    assert "visual_rl/model_adapters/sd3.py" in script
 
 
 def test_remote_sd3_cli_smoke_dry_run_exits_zero_and_prints_json(capsys):
@@ -137,6 +140,7 @@ def test_remote_sd3_cli_smoke_dry_run_exits_zero_and_prints_json(capsys):
     assert "scripts/legacy_cli.py" in payload["archive_members"]
     assert "image-preview --adapter sd3_tempflow" in payload["remote_script"]
     assert "sd3-numeric-smoke --model-path" in payload["remote_script"]
+    assert "sd3-branching-numeric-smoke --model-path" in payload["remote_script"]
     assert "sd3-bounded-trainer-smoke --adapter sd3_tempflow" in payload["remote_script"]
     assert "--resume-from" in payload["remote_script"]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -471,6 +472,33 @@ def _tensor_finite(value) -> bool:
     return bool(torch.isfinite(value.detach()).all().item())
 
 
+def _tensor_sha256(value) -> str:
+    import torch
+
+    tensor = torch.as_tensor(value).detach().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+    digest.update(tensor.view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _trainable_parameter_sha256(adapter) -> str:
+    named_parameters = getattr(adapter, "named_parameters", None)
+    if callable(named_parameters):
+        items = list(named_parameters())
+    else:
+        items = [
+            (f"parameter_{index}", parameter)
+            for index, parameter in enumerate(adapter.parameters())
+        ]
+    digest = hashlib.sha256()
+    for name, parameter in sorted(items, key=lambda item: item[0]):
+        digest.update(name.encode("utf-8"))
+        digest.update(_tensor_sha256(parameter).encode("ascii"))
+    return digest.hexdigest()
+
+
 _TEMPFLOW_IMAGE_SMOKE_SPECS = {
     "sd3_tempflow": {
         "label": "SD3",
@@ -770,6 +798,12 @@ def _validate_sd3_bounded_trainer_args(args: argparse.Namespace) -> None:
         )
     if args.resume_from and args.disable_lora:
         raise ValueError("sd3-bounded-trainer-smoke cannot combine --resume-from with --disable-lora.")
+    logprob_atol = float(getattr(args, "logprob_atol", 1e-5))
+    if logprob_atol < 0:
+        raise ValueError(
+            "sd3-bounded-trainer-smoke requires --logprob-atol >= 0, "
+            f"got {logprob_atol}."
+        )
     if args.resume_from:
         resume_path = Path(args.resume_from)
         if not resume_path.exists():
@@ -819,6 +853,15 @@ def _sd3_bounded_trainer_config(args: argparse.Namespace):
     }
 
     config.algorithm.name = "tempflow_grpo"
+    config.optimizer.params = {
+        **dict(config.optimizer.params),
+        "max_initial_logprob_delta": float(
+            getattr(args, "logprob_atol", 1e-5)
+        ),
+        "require_initial_clipfrac_zero": True,
+        "require_finite_gradients": True,
+        "require_nonzero_gradients": True,
+    }
     config.rewards.weights = {"prompt_color": 1.0}
     config.rewards.clients = {
         "prompt_color": {
@@ -1075,8 +1118,12 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
     )
     final_metrics = metrics[-1] if metrics else {}
     final_metrics_artifact = metrics_rows[-1] if metrics_rows else {}
+    parameter_update_valid = bool(
+        delta_summary["parameter_delta_nonzero_count"] > 0
+        and delta_summary["parameter_delta_abs_max"] > 0.0
+    )
     payload = {
-        "valid": True,
+        "valid": parameter_update_valid,
         "output_dir": str(output_dir),
         "summary_path": str(summary_path),
         "metrics_path": str(metrics_path),
@@ -1109,6 +1156,7 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
         "lora_alpha": int(args.lora_alpha),
         "max_sequence_length": int(args.max_sequence_length),
         "use_lora": not bool(args.disable_lora),
+        "logprob_atol": float(getattr(args, "logprob_atol", 1e-5)),
         "strict_rollout_validation": config.runner.strict_rollout_validation,
         "rollout_cache_disabled": config.runner.disable_rollout_cache,
         "rollout_cache_path": None if config.runner.disable_rollout_cache else str(output_dir / "rollouts"),
@@ -1132,14 +1180,20 @@ def _sd3_bounded_trainer_smoke_payload(args: argparse.Namespace) -> dict[str, An
 def sd3_bounded_trainer_smoke(args: argparse.Namespace) -> int:
     payload = _sd3_bounded_trainer_smoke_payload(args)
     print(json.dumps(payload, indent=2, sort_keys=True))
+    if not payload["valid"]:
+        raise RuntimeError(
+            "SD3 bounded trainer completed without a nonzero parameter update"
+        )
     return 0
 
 
 def _sd3_image_numeric_smoke_payload(args: argparse.Namespace) -> dict:
     _register_builtin_plugins()
     from visual_rl.core.registry import MODEL_ADAPTERS
+    from visual_rl.core.seed import seed_everything
 
     adapter_key = "sd3_tempflow"
+    seed_everything(int(args.seed))
     spec = _TEMPFLOW_IMAGE_SMOKE_SPECS[adapter_key]
     model_config = _tempflow_image_model_config(args, adapter_key)
     adapter = MODEL_ADAPTERS.get(adapter_key)(model_config)
@@ -1222,6 +1276,323 @@ def _sd3_numeric_smoke_payload(args: argparse.Namespace) -> dict:
 def sd3_numeric_smoke(args: argparse.Namespace) -> int:
     payload = _sd3_numeric_smoke_payload(args)
     print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _branch_step_index_arg(value: str) -> int | str:
+    normalized = str(value).strip().lower()
+    if normalized == "auto":
+        return "auto"
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("branch step index must be a non-negative integer or 'auto'") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("branch step index must be a non-negative integer or 'auto'")
+    return parsed
+
+
+def _branch_ids_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    try:
+        return [int(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    except AttributeError:
+        return [int(item) for item in value]
+
+
+def _branching_transition_contract(batch: Any) -> dict[str, Any]:
+    metadata_keys = sorted({str(key) for item in batch.metadata for key in item})
+    return {
+        "model_metadata": _json_safe(batch.model_metadata),
+        "sample_metadata": _json_safe(batch.metadata),
+        "metadata_keys": metadata_keys,
+        "branch_ids": _branch_ids_list(batch.branch_ids),
+        "parent_prompt_indices": [item.get("parent_prompt_index") for item in batch.metadata],
+        "branch_step_indices": [item.get("branch_step_index") for item in batch.metadata],
+        "branch_timestep_values": [item.get("branch_timestep_value") for item in batch.metadata],
+    }
+
+
+def _sd3_branching_numeric_smoke_payload(args: argparse.Namespace) -> dict[str, Any]:
+    _register_builtin_plugins()
+    from visual_rl.core.registry import MODEL_ADAPTERS
+    from visual_rl.core.seed import seed_everything
+    from visual_rl.rollout.full_trajectory import build_rollout_engine
+
+    import torch
+
+    if int(args.branch_count) < 2:
+        raise ValueError(f"sd3-branching-numeric-smoke requires --branch-count >= 2, got {args.branch_count}.")
+    if float(args.logprob_atol) < 0:
+        raise ValueError(f"sd3-branching-numeric-smoke requires --logprob-atol >= 0, got {args.logprob_atol}.")
+    if float(args.clip_range) <= 0:
+        raise ValueError(f"sd3-branching-numeric-smoke requires --clip-range > 0, got {args.clip_range}.")
+
+    adapter_key = "sd3_tempflow"
+    seed_everything(int(args.seed))
+    spec = _TEMPFLOW_IMAGE_SMOKE_SPECS[adapter_key]
+    model_config = _tempflow_image_model_config(args, adapter_key)
+    adapter = MODEL_ADAPTERS.get(adapter_key)(model_config)
+    base_rollout_config = {
+        "name": "branching",
+        "num_steps": int(args.num_steps),
+        "guidance_scale": float(args.guidance_scale),
+        "seed": int(args.seed),
+        "output_type": "pt",
+        "branch_count": int(args.branch_count),
+        "exploration_k": int(args.branch_count),
+        "include_main": False,
+        "branch_timestep_strategy": "cycle",
+        "epoch_tag": 0,
+    }
+    transition_counter = getattr(adapter, "branch_transition_count", None)
+    transition_count = int(
+        transition_counter(base_rollout_config)
+        if callable(transition_counter)
+        else base_rollout_config["num_steps"]
+    )
+    if transition_count < 1:
+        raise ValueError("sd3-branching-numeric-smoke requires at least one branch transition.")
+
+    requested_step = args.branch_step_index
+    if requested_step == "auto":
+        transition_indices = list(range(transition_count))
+    else:
+        requested_step = int(requested_step)
+        if requested_step >= transition_count:
+            raise ValueError(
+                "sd3-branching-numeric-smoke --branch-step-index is out of range: "
+                f"got {requested_step}, valid range is [0, {transition_count - 1}]."
+            )
+        transition_indices = [requested_step]
+
+    per_transition = []
+    old_log_probs_by_transition = []
+    recomputed_log_probs_by_transition = []
+    policy_sha256_before = _trainable_parameter_sha256(adapter)
+    for transition_index in transition_indices:
+        rollout_config = {
+            **base_rollout_config,
+            "branch_timesteps": [transition_index],
+        }
+        rollout = build_rollout_engine(rollout_config)
+        batch = rollout.sample(
+            adapter,
+            [args.prompt],
+            [
+                {
+                    "source": "sd3_branching_numeric_smoke",
+                    "adapter_key": adapter_key,
+                }
+            ],
+        )
+        batch.validate_strict()
+        old_log_probs = batch.old_log_probs.detach()
+        recomputed_log_probs = adapter.recompute_log_probs(batch).detach()
+        if recomputed_log_probs.shape != old_log_probs.shape:
+            raise ValueError(
+                f"{spec['label']} branching transition {transition_index} recomputed logprobs shape diverged "
+                f"from sampled logprobs: {tuple(recomputed_log_probs.shape)} != {tuple(old_log_probs.shape)}"
+            )
+
+        logprob_delta = recomputed_log_probs - old_log_probs
+        ratio = torch.exp(logprob_delta)
+        finite = {
+            "media": _tensor_finite(batch.media),
+            "latents": _tensor_finite(batch.latents),
+            "next_latents": _tensor_finite(batch.next_latents),
+            "timesteps": _tensor_finite(batch.timesteps),
+            "old_log_probs": _tensor_finite(old_log_probs),
+            "recomputed_log_probs": _tensor_finite(recomputed_log_probs),
+            "logprob_delta": _tensor_finite(logprob_delta),
+            "kl": batch.kl is None or _tensor_finite(batch.kl),
+            "branch_ids": batch.branch_ids is None or _tensor_finite(batch.branch_ids),
+        }
+        max_abs_delta = float(logprob_delta.abs().max().item())
+        clipfrac = float(((ratio - 1.0).abs() > float(args.clip_range)).float().mean().item())
+        within_atol = bool(
+            all(finite.values())
+            and torch.allclose(
+                recomputed_log_probs,
+                old_log_probs,
+                atol=float(args.logprob_atol),
+                rtol=0.0,
+            )
+        )
+        per_transition.append(
+            {
+                "transition_index": transition_index,
+                "branch_step_index": transition_index,
+                "within_atol": within_atol,
+                "max_abs_logprob_delta": max_abs_delta,
+                "clipfrac": clipfrac,
+                "finite": finite,
+                "shapes": {
+                    "media": _shape_list(batch.media),
+                    "latents": _shape_list(batch.latents),
+                    "next_latents": _shape_list(batch.next_latents),
+                    "timesteps": _shape_list(batch.timesteps),
+                    "old_log_probs": _shape_list(old_log_probs),
+                    "recomputed_log_probs": _shape_list(recomputed_log_probs),
+                    "logprob_delta": _shape_list(logprob_delta),
+                    "kl": _shape_list(batch.kl),
+                    "branch_ids": _shape_list(batch.branch_ids),
+                },
+                "contract_metadata": _branching_transition_contract(batch),
+                "initial_latent_sha256": _tensor_sha256(
+                    batch.model_tensors.get("initial_latents", batch.latents[:, :1])
+                ),
+                "scheduler_timesteps_sha256": _tensor_sha256(
+                    batch.model_tensors.get("scheduler_timesteps", batch.timesteps)
+                ),
+                "scheduler_sigmas_sha256": (
+                    _tensor_sha256(batch.model_tensors["scheduler_sigmas"])
+                    if "scheduler_sigmas" in batch.model_tensors
+                    else None
+                ),
+            }
+        )
+        old_log_probs_by_transition.append(old_log_probs)
+        recomputed_log_probs_by_transition.append(recomputed_log_probs)
+
+    stacked_old_log_probs = torch.stack(old_log_probs_by_transition, dim=0)
+    stacked_recomputed_log_probs = torch.stack(recomputed_log_probs_by_transition, dim=0)
+    stacked_delta = stacked_recomputed_log_probs - stacked_old_log_probs
+    ratio = torch.exp(stacked_delta)
+    overall_old_finite = _tensor_finite(stacked_old_log_probs)
+    overall_recomputed_finite = _tensor_finite(stacked_recomputed_log_probs)
+    overall_delta_finite = _tensor_finite(stacked_delta)
+    overall_max_abs_delta = float(stacked_delta.abs().max().item())
+    overall_clipfrac = float(((ratio - 1.0).abs() > float(args.clip_range)).float().mean().item())
+    failed_transition_indices = [
+        item["transition_index"] for item in per_transition if not item["within_atol"]
+    ]
+    policy_sha256_after = _trainable_parameter_sha256(adapter)
+    policy_unchanged = policy_sha256_before == policy_sha256_after
+    replay_fingerprint_fields = (
+        "initial_latent_sha256",
+        "scheduler_timesteps_sha256",
+        "scheduler_sigmas_sha256",
+    )
+    replay_fingerprint_unique_counts = {
+        field: len({item[field] for item in per_transition})
+        for field in replay_fingerprint_fields
+    }
+    transformer_training_states = {
+        item["contract_metadata"]["model_metadata"].get(
+            "transformer_training"
+        )
+        for item in per_transition
+    }
+    replay_fingerprints_consistent = bool(
+        all(count == 1 for count in replay_fingerprint_unique_counts.values())
+        and len(transformer_training_states) == 1
+    )
+    params = list(adapter.parameters())
+    model_metadata = [item["contract_metadata"]["model_metadata"] for item in per_transition]
+    reference_repo = model_metadata[0].get("reference_repo", args.repo_root)
+    rollout_tensors_finite = all(
+        all(item["finite"].values()) for item in per_transition
+    )
+    payload = {
+        "valid": (
+            not failed_transition_indices
+            and policy_unchanged
+            and replay_fingerprints_consistent
+        ),
+        "adapter": adapter.name,
+        "adapter_key": adapter_key,
+        "model_family": spec["model_family"],
+        "model_path": args.model_path,
+        "repo_root": args.repo_root,
+        "reference_repo": reference_repo,
+        "prompt": args.prompt,
+        "resolution": int(args.resolution),
+        "num_steps": int(args.num_steps),
+        "guidance_scale": float(args.guidance_scale),
+        "seed": int(args.seed),
+        "max_sequence_length": getattr(args, "max_sequence_length", None),
+        "branch_count": int(args.branch_count),
+        "branch_step_index": args.branch_step_index,
+        "sampling_mode": (
+            "same_seed_replay_per_transition"
+            if len(transition_indices) > 1
+            else "single_transition_rollout"
+        ),
+        "transition_count": transition_count,
+        "evaluated_transition_count": len(transition_indices),
+        "evaluated_transition_indices": transition_indices,
+        "failed_transition_indices": failed_transition_indices,
+        "logprob_atol": float(args.logprob_atol),
+        "clip_range": float(args.clip_range),
+        "max_abs_logprob_delta": overall_max_abs_delta,
+        "overall_max_abs_logprob_delta": overall_max_abs_delta,
+        "clipfrac": overall_clipfrac,
+        "overall_clipfrac": overall_clipfrac,
+        "old_log_probs_finite": overall_old_finite,
+        "recomputed_log_probs_finite": overall_recomputed_finite,
+        "logprob_delta_finite": overall_delta_finite,
+        "media_finite": all(item["finite"]["media"] for item in per_transition),
+        "rollout_tensors_finite": rollout_tensors_finite,
+        "shapes": {
+            "old_log_probs": _shape_list(stacked_old_log_probs),
+            "recomputed_log_probs": _shape_list(stacked_recomputed_log_probs),
+            "logprob_delta": _shape_list(stacked_delta),
+        },
+        "per_transition": per_transition,
+        "trainable_parameter_tensors": len(params),
+        "trainable_parameters": int(sum(parameter.numel() for parameter in params)),
+        "trainable_parameter_sha256_before": policy_sha256_before,
+        "trainable_parameter_sha256_after": policy_sha256_after,
+        "trainable_parameters_unchanged": policy_unchanged,
+        "replay_fingerprints_consistent": replay_fingerprints_consistent,
+        "replay_fingerprint_unique_counts": replay_fingerprint_unique_counts,
+        "transformer_training_states": sorted(
+            str(value) for value in transformer_training_states
+        ),
+        "device": str(getattr(adapter, "device", args.device)),
+        "dtype": str(getattr(adapter, "dtype", args.dtype)),
+        "contract_metadata": {
+            "rollout": "branching",
+            "branching_mode": "shared_prefix",
+            "branch_count": int(args.branch_count),
+            "include_main": False,
+            "requested_branch_step_index": args.branch_step_index,
+            "transition_count": transition_count,
+            "evaluated_transition_indices": transition_indices,
+            "strict_rollout_validation": True,
+            "logprob_atol": float(args.logprob_atol),
+            "clip_range": float(args.clip_range),
+            "model_metadata_by_transition": model_metadata,
+            "sampling_mode": (
+                "same_seed_replay_per_transition"
+                if len(transition_indices) > 1
+                else "single_transition_rollout"
+            ),
+        },
+    }
+    return payload
+
+
+def sd3_branching_numeric_smoke(args: argparse.Namespace) -> int:
+    payload = _sd3_branching_numeric_smoke_payload(args)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if not payload["valid"]:
+        if not payload["trainable_parameters_unchanged"]:
+            raise ValueError(
+                "SD3 branching parity smoke changed trainable parameters"
+            )
+        if not payload["replay_fingerprints_consistent"]:
+            raise ValueError(
+                "SD3 branching same-seed replay fingerprints diverged"
+            )
+        failed = ", ".join(str(item) for item in payload["failed_transition_indices"])
+        raise ValueError(
+            "SD3 branching recomputed logprobs diverged from sampled logprobs for transition(s) "
+            f"{failed}: max_abs_delta={payload['max_abs_logprob_delta']:.6g}, "
+            f"atol={payload['logprob_atol']:.6g}"
+        )
     return 0
 
 
@@ -1372,6 +1743,8 @@ def remote_sd3_cli_smoke(args: argparse.Namespace) -> int:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         max_sequence_length=args.max_sequence_length,
+        branch_count=args.branch_count,
+        logprob_atol=args.logprob_atol,
         bounded_steps=args.bounded_steps,
         resume_steps=args.resume_steps,
         idle_memory_mb=args.idle_memory_mb,
@@ -1444,6 +1817,7 @@ def main(argv: list[str] | None = None) -> int:
     sd3_trainer_parser.add_argument("--lora-rank", type=int, default=8)
     sd3_trainer_parser.add_argument("--lora-alpha", type=int, default=16)
     sd3_trainer_parser.add_argument("--max-sequence-length", type=int, default=128)
+    sd3_trainer_parser.add_argument("--logprob-atol", type=float, default=1e-5)
     sd3_trainer_parser.add_argument("--steps", type=int, default=1)
     sd3_trainer_parser.add_argument("--output-dir", required=True)
     sd3_trainer_parser.add_argument("--resume-from", default=None)
@@ -1480,22 +1854,37 @@ def main(argv: list[str] | None = None) -> int:
     reward_probe_parser.add_argument("--seed", type=int, default=None)
     reward_probe_parser.set_defaults(func=reward_probe)
 
+    def add_sd3_numeric_model_options(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--model-path", required=True)
+        command_parser.add_argument("--repo-root", default=None)
+        command_parser.add_argument("--prompt", default="a red square")
+        command_parser.add_argument("--resolution", type=int, default=256)
+        command_parser.add_argument("--num-steps", type=int, default=3)
+        command_parser.add_argument("--guidance-scale", type=float, default=4.5)
+        command_parser.add_argument("--seed", type=int, default=23)
+        command_parser.add_argument("--device", default=None)
+        command_parser.add_argument("--dtype", default="bfloat16")
+        command_parser.add_argument("--lora-rank", type=int, default=32)
+        command_parser.add_argument("--lora-alpha", type=int, default=64)
+        command_parser.add_argument("--max-sequence-length", type=int, default=128)
+        command_parser.add_argument("--logprob-atol", type=float, default=1e-5)
+        command_parser.add_argument("--disable-lora", action="store_true")
+
     sd3_smoke_parser = subparsers.add_parser("sd3-numeric-smoke")
-    sd3_smoke_parser.add_argument("--model-path", required=True)
-    sd3_smoke_parser.add_argument("--repo-root", default=None)
-    sd3_smoke_parser.add_argument("--prompt", default="a red square")
-    sd3_smoke_parser.add_argument("--resolution", type=int, default=256)
-    sd3_smoke_parser.add_argument("--num-steps", type=int, default=3)
-    sd3_smoke_parser.add_argument("--guidance-scale", type=float, default=4.5)
-    sd3_smoke_parser.add_argument("--seed", type=int, default=23)
-    sd3_smoke_parser.add_argument("--device", default=None)
-    sd3_smoke_parser.add_argument("--dtype", default="bfloat16")
-    sd3_smoke_parser.add_argument("--lora-rank", type=int, default=32)
-    sd3_smoke_parser.add_argument("--lora-alpha", type=int, default=64)
-    sd3_smoke_parser.add_argument("--max-sequence-length", type=int, default=128)
-    sd3_smoke_parser.add_argument("--logprob-atol", type=float, default=1e-5)
-    sd3_smoke_parser.add_argument("--disable-lora", action="store_true")
+    add_sd3_numeric_model_options(sd3_smoke_parser)
     sd3_smoke_parser.set_defaults(func=sd3_numeric_smoke)
+
+    sd3_branching_smoke_parser = subparsers.add_parser("sd3-branching-numeric-smoke")
+    add_sd3_numeric_model_options(sd3_branching_smoke_parser)
+    sd3_branching_smoke_parser.add_argument("--branch-count", type=int, default=2)
+    sd3_branching_smoke_parser.add_argument(
+        "--branch-step-index",
+        type=_branch_step_index_arg,
+        default="auto",
+        help="Non-negative transition index, or 'auto' to validate every branch transition.",
+    )
+    sd3_branching_smoke_parser.add_argument("--clip-range", type=float, default=0.01)
+    sd3_branching_smoke_parser.set_defaults(func=sd3_branching_numeric_smoke)
 
     tiny_loss_parser = subparsers.add_parser("tiny-loss-probe")
     tiny_loss_parser.add_argument("--output-dir", default="runs/tiny_loss_probe")
@@ -1582,6 +1971,8 @@ def main(argv: list[str] | None = None) -> int:
     remote_sd3_parser.add_argument("--lora-rank", type=int, default=32)
     remote_sd3_parser.add_argument("--lora-alpha", type=int, default=64)
     remote_sd3_parser.add_argument("--max-sequence-length", type=int, default=128)
+    remote_sd3_parser.add_argument("--branch-count", type=int, default=2)
+    remote_sd3_parser.add_argument("--logprob-atol", type=float, default=1e-5)
     remote_sd3_parser.add_argument("--bounded-steps", type=int, default=1)
     remote_sd3_parser.add_argument("--resume-steps", type=int, default=1)
     remote_sd3_parser.add_argument("--idle-memory-mb", type=int, default=1024)

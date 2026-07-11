@@ -146,3 +146,167 @@ def test_model_adapter_requires_checkpoint_methods():
 
     with pytest.raises(TypeError, match="abstract"):
         IncompleteAdapter()
+
+
+def _optimizer_gate_case(
+    *,
+    logprob_delta=0.0,
+    clipfrac=0.0,
+    gradient_mode="nonzero",
+    optimizer_config=None,
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from visual_rl.core.types import RewardBatch, RolloutBatch
+    from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
+
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+
+    class FakeAdapter:
+        def parameters(self):
+            return [parameter]
+
+        def recompute_log_probs(self, batch):
+            return batch.old_log_probs + parameter + float(logprob_delta)
+
+    class FakeAdvantageComputer:
+        def compute(self, prompts, raw_rewards, weighted_total, group_ids):
+            del prompts, raw_rewards
+            assert group_ids == [0, 0]
+            return SimpleNamespace(
+                advantages=torch.ones_like(weighted_total),
+                metrics={},
+            )
+
+    class FakeAlgorithm:
+        def compute_loss(self, batch, advantages, new_log_probs):
+            del batch, advantages
+            if gradient_mode == "zero":
+                loss = (new_log_probs * 0.0).sum()
+            else:
+                loss = new_log_probs.sum()
+            if gradient_mode == "nonfinite":
+                loss.register_hook(
+                    lambda gradient: torch.full_like(gradient, float("inf"))
+                )
+            return loss, {
+                "approx_kl": torch.tensor(0.0),
+                "clipfrac": torch.tensor(float(clipfrac)),
+                "policy_loss": loss.detach(),
+            }
+
+    class RecordingOptimizer:
+        def __init__(self):
+            self.zero_grad_calls = 0
+            self.step_calls = 0
+
+        def zero_grad(self, set_to_none=True):
+            assert set_to_none is True
+            self.zero_grad_calls += 1
+            parameter.grad = None
+
+        def step(self):
+            self.step_calls += 1
+
+    batch = RolloutBatch(
+        prompts=["same prompt", "same prompt"],
+        metadata=[{"parent_prompt_index": 0}, {"parent_prompt_index": 0}],
+        media=torch.zeros(2, 3, 2, 2),
+        latents=torch.zeros(2, 1, 1, 2, 2),
+        next_latents=torch.zeros(2, 1, 1, 2, 2),
+        timesteps=torch.zeros(2, 1),
+        old_log_probs=torch.zeros(2, 1),
+    )
+    rewards = RewardBatch(
+        raw={"score": torch.tensor([1.0, 2.0])},
+        weighted={"score": torch.tensor([1.0, 2.0])},
+        weighted_total=torch.tensor([1.0, 2.0]),
+        valid_mask=torch.tensor([True, True]),
+    )
+    plugin = AlgorithmOptimizerPlugin(
+        FakeAlgorithm(),
+        FakeAdvantageComputer(),
+        optimizer_config=optimizer_config,
+    )
+    return plugin, FakeAdapter(), batch, rewards, RecordingOptimizer()
+
+
+def test_algorithm_optimizer_rejects_initial_logprob_delta_before_step():
+    import pytest
+
+    plugin, adapter, batch, rewards, optimizer = _optimizer_gate_case(
+        logprob_delta=1e-3,
+        optimizer_config={"max_initial_logprob_delta": 1e-5},
+    )
+
+    with pytest.raises(RuntimeError, match="log-prob parity gate failed"):
+        plugin.step(adapter, batch, rewards, optimizer, {})
+
+    assert optimizer.step_calls == 0
+
+
+def test_algorithm_optimizer_rejects_initial_clipfrac_before_step():
+    import pytest
+
+    plugin, adapter, batch, rewards, optimizer = _optimizer_gate_case(
+        clipfrac=0.5,
+        optimizer_config={"require_initial_clipfrac_zero": True},
+    )
+
+    with pytest.raises(RuntimeError, match="Pre-update clipfrac gate failed"):
+        plugin.step(adapter, batch, rewards, optimizer, {})
+
+    assert optimizer.step_calls == 0
+
+
+def test_algorithm_optimizer_rejects_nonfinite_gradient_before_step():
+    import pytest
+
+    plugin, adapter, batch, rewards, optimizer = _optimizer_gate_case(
+        gradient_mode="nonfinite",
+        optimizer_config={"require_finite_gradients": True},
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite gradient detected"):
+        plugin.step(adapter, batch, rewards, optimizer, {})
+
+    assert optimizer.zero_grad_calls == 1
+    assert optimizer.step_calls == 0
+
+
+def test_algorithm_optimizer_rejects_zero_gradient_when_required_before_step():
+    import pytest
+
+    plugin, adapter, batch, rewards, optimizer = _optimizer_gate_case(
+        gradient_mode="zero",
+        optimizer_config={"require_nonzero_gradients": True},
+    )
+
+    with pytest.raises(RuntimeError, match="all gradients are zero"):
+        plugin.step(adapter, batch, rewards, optimizer, {})
+
+    assert optimizer.zero_grad_calls == 1
+    assert optimizer.step_calls == 0
+
+
+def test_algorithm_optimizer_reports_gradient_metrics_on_success():
+    import pytest
+
+    plugin, adapter, batch, rewards, optimizer = _optimizer_gate_case(
+        optimizer_config={
+            "max_initial_logprob_delta": 1e-5,
+            "require_initial_clipfrac_zero": True,
+            "require_finite_gradients": True,
+            "require_nonzero_gradients": True,
+        }
+    )
+
+    metrics = plugin.step(adapter, batch, rewards, optimizer, {})
+
+    assert optimizer.step_calls == 1
+    assert metrics["grad_norm"] == pytest.approx(2.0)
+    assert metrics["grad_nonzero_count"] == 1
+    assert metrics["grad_tensor_count"] == 1
+    assert metrics["gradients_finite"] is True

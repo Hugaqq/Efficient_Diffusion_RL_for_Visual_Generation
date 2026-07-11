@@ -395,6 +395,244 @@ def test_sd3_numeric_smoke_cli_uses_explicit_model_path_and_options(monkeypatch,
     assert payload["shapes"]["old_log_probs"] == [1, 2]
     assert payload["model_metadata"]["reference_pipeline"] == "sd3_pipeline_with_logprob"
 
+
+def _install_fake_sd3_branching_adapter(monkeypatch, delta_by_step):
+    import torch
+
+    from scripts import legacy_cli as cli
+    from visual_rl.core.registry import MODEL_ADAPTERS
+    from visual_rl.core.types import RolloutBatch
+    from visual_rl.rollout import full_trajectory as rollout_module
+    from visual_rl.rollout.branching import BranchingRollout
+
+    seen = {"sample_steps": []}
+
+    class FakeSD3BranchingAdapter:
+        name = "tempflow_sd3_legacy"
+
+        def __init__(self, config):
+            seen["model_config"] = config
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+            self.weight = torch.nn.Parameter(torch.ones(4))
+
+        def branch_transition_count(self, rollout_config):
+            assert rollout_config["num_steps"] == 3
+            return 2
+
+        def sample_branching(self, prompts, metadata, rollout_config):
+            branch_count = int(rollout_config["branch_count"])
+            transition_index = int(rollout_config["branch_step_index"])
+            seen["sample_steps"].append(transition_index)
+            seen.setdefault("rollout_configs", []).append(dict(rollout_config))
+            expanded_metadata = []
+            for branch_id in range(branch_count):
+                item = dict(metadata[0])
+                item.update(
+                    {
+                        "parent_prompt_index": 0,
+                        "branch_id": branch_id,
+                        "branch_step_index": transition_index,
+                        "branch_timestep_value": 900 - transition_index * 300,
+                        "is_main_branch": False,
+                        "rollout_kind": "tempflow_branching",
+                    }
+                )
+                expanded_metadata.append(item)
+            return RolloutBatch(
+                prompts=prompts * branch_count,
+                metadata=expanded_metadata,
+                media=torch.zeros(branch_count, 3, 8, 8),
+                latents=torch.zeros(branch_count, 1, 16, 4, 4),
+                next_latents=torch.zeros(branch_count, 1, 16, 4, 4),
+                timesteps=torch.full((branch_count, 1), 900 - transition_index * 300),
+                old_log_probs=torch.zeros(branch_count, 1),
+                kl=torch.zeros(branch_count, 1),
+                branch_ids=torch.arange(branch_count),
+                seed=rollout_config["seed"],
+                model_metadata={
+                    "adapter": self.name,
+                    "reference_repo": "/ref/tempflow",
+                    "reference_pipeline": "sd3_pipeline_with_logprob_perstep",
+                    "guidance_scale": rollout_config["guidance_scale"],
+                    "trajectory_step_indices": [transition_index],
+                    "transformer_training": False,
+                },
+                model_tensors={
+                    "initial_latents": torch.zeros(1, 16, 4, 4),
+                    "scheduler_timesteps": torch.tensor(
+                        [900.0, 600.0, 300.0]
+                    ),
+                    "scheduler_sigmas": torch.tensor(
+                        [1.0, 0.7, 0.3, 0.0]
+                    ),
+                },
+            )
+
+        def recompute_log_probs(self, batch):
+            transition_index = int(batch.model_metadata["branch_step_index"])
+            delta = torch.as_tensor(delta_by_step[transition_index], dtype=torch.float32).reshape(-1)
+            if delta.numel() == 1:
+                delta = delta.repeat(batch.old_log_probs.shape[0])
+            assert delta.numel() == batch.old_log_probs.shape[0]
+            return batch.old_log_probs + delta.reshape_as(batch.old_log_probs)
+
+        def parameters(self):
+            return [self.weight]
+
+    monkeypatch.setattr(cli, "_register_builtin_plugins", lambda: None)
+    monkeypatch.setattr(
+        rollout_module,
+        "build_rollout_engine",
+        lambda config: BranchingRollout(config),
+    )
+    monkeypatch.setitem(MODEL_ADAPTERS._items, "sd3_tempflow", FakeSD3BranchingAdapter)  # noqa: SLF001
+    return seen
+
+
+def test_sd3_branching_numeric_smoke_cli_auto_validates_every_transition(monkeypatch, capsys):
+    import json
+
+    import pytest
+
+    from scripts import legacy_cli as cli
+
+    seen = _install_fake_sd3_branching_adapter(
+        monkeypatch,
+        {
+            0: [0.0, 0.002, -0.002],
+            1: [0.0005, 0.0, 0.0],
+        },
+    )
+
+    exit_code = cli.main(
+        [
+            "sd3-branching-numeric-smoke",
+            "--model-path",
+            "/models/sd35",
+            "--repo-root",
+            "/ref/tempflow",
+            "--prompt",
+            "a green cube",
+            "--resolution",
+            "80",
+            "--num-steps",
+            "3",
+            "--guidance-scale",
+            "3.5",
+            "--seed",
+            "99",
+            "--device",
+            "cpu",
+            "--dtype",
+            "float32",
+            "--lora-rank",
+            "8",
+            "--lora-alpha",
+            "16",
+            "--max-sequence-length",
+            "77",
+            "--disable-lora",
+            "--branch-count",
+            "3",
+            "--branch-step-index",
+            "auto",
+            "--clip-range",
+            "0.001",
+            "--logprob-atol",
+            "0.01",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen["sample_steps"] == [0, 1]
+    assert seen["model_config"] == {
+        "name": "sd3_tempflow",
+        "model_family": "sd3",
+        "model_path": "/models/sd35",
+        "use_lora": False,
+        "extra": {
+            "resolution": 80,
+            "dtype": "float32",
+            "lora_rank": 8,
+            "lora_alpha": 16,
+            "max_sequence_length": 77,
+            "device": "cpu",
+            "repo_root": "/ref/tempflow",
+        },
+    }
+    for transition_index, rollout_config in enumerate(seen["rollout_configs"]):
+        assert rollout_config["name"] == "branching"
+        assert rollout_config["branch_count"] == 3
+        assert rollout_config["include_main"] is False
+        assert rollout_config["branch_step_index"] == transition_index
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is True
+    assert payload["sampling_mode"] == "same_seed_replay_per_transition"
+    assert payload["replay_fingerprints_consistent"] is True
+    assert payload["branch_step_index"] == "auto"
+    assert payload["transition_count"] == 2
+    assert payload["evaluated_transition_indices"] == [0, 1]
+    assert payload["failed_transition_indices"] == []
+    assert payload["shapes"]["old_log_probs"] == [2, 3, 1]
+    assert payload["shapes"]["recomputed_log_probs"] == [2, 3, 1]
+    assert payload["old_log_probs_finite"] is True
+    assert payload["recomputed_log_probs_finite"] is True
+    assert payload["logprob_delta_finite"] is True
+    assert payload["max_abs_logprob_delta"] == pytest.approx(0.002)
+    assert payload["clipfrac"] == pytest.approx(2 / 6)
+    assert [item["transition_index"] for item in payload["per_transition"]] == [0, 1]
+    assert payload["per_transition"][0]["clipfrac"] == pytest.approx(2 / 3)
+    assert payload["per_transition"][1]["clipfrac"] == 0.0
+    assert payload["per_transition"][0]["shapes"]["latents"] == [3, 1, 16, 4, 4]
+    transition_contract = payload["per_transition"][0]["contract_metadata"]
+    assert transition_contract["branch_ids"] == [0, 1, 2]
+    assert transition_contract["branch_step_indices"] == [0, 0, 0]
+    assert transition_contract["model_metadata"]["rollout"] == "branching"
+    assert transition_contract["model_metadata"]["branching_mode"] == "shared_prefix"
+    assert payload["contract_metadata"]["strict_rollout_validation"] is True
+    assert payload["trainable_parameters"] == 4
+
+
+def test_sd3_branching_numeric_smoke_cli_hard_fails_explicit_transition_atol(monkeypatch, capsys):
+    import json
+
+    import pytest
+
+    from scripts import legacy_cli as cli
+
+    seen = _install_fake_sd3_branching_adapter(monkeypatch, {1: [0.02, 0.0]})
+
+    with pytest.raises(ValueError, match=r"transition\(s\) 1.*atol=0.01"):
+        cli.main(
+            [
+                "sd3-branching-numeric-smoke",
+                "--model-path",
+                "/models/sd35",
+                "--repo-root",
+                "/ref/tempflow",
+                "--num-steps",
+                "3",
+                "--branch-count",
+                "2",
+                "--branch-step-index",
+                "1",
+                "--logprob-atol",
+                "0.01",
+            ]
+        )
+
+    assert seen["sample_steps"] == [1]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is False
+    assert payload["branch_step_index"] == 1
+    assert payload["evaluated_transition_indices"] == [1]
+    assert payload["failed_transition_indices"] == [1]
+    assert payload["per_transition"][0]["within_atol"] is False
+    assert payload["max_abs_logprob_delta"] == pytest.approx(0.02)
+
+
 def test_image_preview_cli_writes_png_and_metadata_for_sd3_contract(monkeypatch, tmp_path, capsys):
     import json
 
@@ -558,9 +796,22 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
 
     from scripts import legacy_cli as cli
     from visual_rl.core.types import RewardBatch, RolloutBatch
+    import visual_rl.configs.schema as schema_module
     import visual_rl.runner as runner_module
 
     seen = {}
+    real_load_config = schema_module.load_config
+
+    def load_config_without_optimizer_gates(path):
+        config = real_load_config(path)
+        config.optimizer.params = {}
+        return config
+
+    monkeypatch.setattr(
+        schema_module,
+        "load_config",
+        load_config_without_optimizer_gates,
+    )
 
     class FakeAdapter:
         name = "tempflow_sd3_legacy"
@@ -637,6 +888,10 @@ def test_sd3_bounded_trainer_smoke_cli_uses_visual_rl_trainer_contract(monkeypat
             assert config.train.save_every == 2
             assert config.runner.strict_rollout_validation is True
             assert config.runner.disable_rollout_cache is True
+            assert config.optimizer.params["max_initial_logprob_delta"] == 1e-5
+            assert config.optimizer.params["require_initial_clipfrac_zero"] is True
+            assert config.optimizer.params["require_finite_gradients"] is True
+            assert config.optimizer.params["require_nonzero_gradients"] is True
 
         def run(self, max_steps=None):
             seen["max_steps"] = max_steps
