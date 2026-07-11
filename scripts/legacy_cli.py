@@ -925,10 +925,13 @@ def _sd3_bounded_trainer_config(args: argparse.Namespace):
         "require_finite_gradients": True,
         "require_nonzero_gradients": True,
     }
-    config.rewards.weights = {"prompt_color": 1.0}
+    reward_name = (
+        "prompt_color_margin" if args.train_prompts_file else "prompt_color"
+    )
+    config.rewards.weights = {reward_name: 1.0}
     config.rewards.clients = {
-        "prompt_color": {
-            "name": "prompt_color",
+        reward_name: {
+            "name": reward_name,
             "version": "v1",
         }
     }
@@ -1251,11 +1254,15 @@ def _bounded_heldout_summary(
             png_paths.append(png_path)
             reward_value = float(rewards.weighted_total.detach().float().cpu()[0])
             reward_metadata = _json_safe(rewards.metadata)
-            target_values = (
-                reward_metadata.get("prompt_color", {}).get("targets", [])
-                if isinstance(reward_metadata, dict)
-                else []
-            )
+            target_values = []
+            if isinstance(reward_metadata, dict):
+                for reward_name in ("prompt_color_margin", "prompt_color"):
+                    target_values = reward_metadata.get(reward_name, {}).get(
+                        "targets",
+                        [],
+                    )
+                    if target_values:
+                        break
             records.append(
                 {
                     "prompt": prompt,

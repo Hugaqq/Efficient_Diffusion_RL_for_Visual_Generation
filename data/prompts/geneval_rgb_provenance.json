@@ -27,5 +27,5 @@
     },
     "unused_rows": 4
   },
-  "purpose": "A narrow RGB-control pilot for validating SD3 TempFlow training infrastructure; it is not a full GenEval score."
+  "purpose": "A narrow RGB-control pilot using an unclipped target-channel margin reward for validating SD3 TempFlow training infrastructure; it is not a full GenEval score."
 }
