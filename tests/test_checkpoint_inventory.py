@@ -9,7 +9,7 @@ def _write_model_index(path, class_name):
 
 
 def test_checkpoint_inventory_classifies_diffusers_model_dirs(tmp_path):
-    from visual_rl.experiments.checkpoint_inventory import build_checkpoint_inventory
+    from scripts.checkpoint_inventory import build_checkpoint_inventory
 
     _write_model_index(tmp_path / "stable-diffusion-3.5-medium", "StableDiffusion3Pipeline")
     _write_model_index(tmp_path / "FLUX.1-dev", "FluxPipeline")
@@ -32,13 +32,13 @@ def test_checkpoint_inventory_classifies_diffusers_model_dirs(tmp_path):
         "world_r1_wan_legacy",
     ]
     model_types = {record["model_type"] for record in payload["records"]}
-    assert model_types == {"sd3", "flux", "qwenimage", "sd15", "wan"}
+    assert model_types == {"sd3", "wan", "unknown"}
 
 
 def test_checkpoint_inventory_reports_missing_required_adapter(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     _write_model_index(tmp_path / "stable-diffusion-3.5-medium", "StableDiffusion3Pipeline")
 
@@ -62,7 +62,7 @@ def test_checkpoint_inventory_reports_missing_required_adapter(tmp_path, capsys)
 
 
 def test_checkpoint_inventory_ignores_parent_directory_model_keywords(tmp_path):
-    from visual_rl.experiments.checkpoint_inventory import build_checkpoint_inventory
+    from scripts.checkpoint_inventory import build_checkpoint_inventory
 
     contaminated_root = tmp_path / "Wan-parent"
     _write_model_index(contaminated_root / "stable-diffusion-v1-5", "StableDiffusionPipeline")
@@ -70,14 +70,14 @@ def test_checkpoint_inventory_ignores_parent_directory_model_keywords(tmp_path):
     payload = build_checkpoint_inventory([contaminated_root])
 
     assert payload["valid"] is True
-    assert payload["records"][0]["model_type"] == "sd15"
+    assert payload["records"][0]["model_type"] == "unknown"
     assert payload["found_adapters"] == []
 
 
 def test_checkpoint_inventory_rejects_missing_root(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     missing = tmp_path / "missing"
 

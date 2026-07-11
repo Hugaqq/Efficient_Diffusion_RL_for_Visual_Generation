@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
 
@@ -27,16 +25,6 @@ def resolve_torch_dtype(dtype_name: str | None):
     if dtype_name not in mapping:
         raise ValueError(f"Unsupported torch dtype: {dtype_name}")
     return mapping[dtype_name]
-
-
-def add_legacy_repo_to_path(repo_root: str | Path) -> Path:
-    root = Path(repo_root).expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"Legacy repo does not exist: {root}")
-    root_text = str(root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    return root
 
 
 def require_model_path(config: dict[str, Any], adapter_name: str) -> str:
@@ -84,13 +72,6 @@ def apply_peft_lora(
     return get_peft_model(module, lora_config)
 
 
-def maybe_enable_gradient_checkpointing(module) -> None:
-    if hasattr(module, "enable_gradient_checkpointing"):
-        module.enable_gradient_checkpointing()
-    elif hasattr(module, "gradient_checkpointing_enable"):
-        module.gradient_checkpointing_enable()
-
-
 def make_generator(device, seed: int | None):
     import torch
 
@@ -106,16 +87,3 @@ def stack_steps(values, *, dim: int = 1):
     if isinstance(values, torch.Tensor):
         return values
     return torch.stack(list(values), dim=dim)
-
-
-def tensor_media_to_unit_range(images):
-    return ((images.detach().float() + 1.0) / 2.0).clamp(0.0, 1.0)
-
-
-def surrogate_transition_log_prob(prev_sample, mean_sample, std: float):
-    variance = float(std) ** 2
-    if variance <= 0:
-        raise ValueError("surrogate logprob std must be positive")
-    log_prob = -((prev_sample.detach() - mean_sample) ** 2) / (2.0 * variance)
-    reduce_dims = tuple(range(1, log_prob.ndim))
-    return log_prob.mean(dim=reduce_dims)

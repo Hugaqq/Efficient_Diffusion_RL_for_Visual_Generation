@@ -19,9 +19,9 @@ def _rollout_batch(old_log_probs, timesteps, metadata=None, model_metadata=None)
 def test_tiny_algorithms_differ_on_same_prompt_reward_and_logprob_values():
     import torch
 
-    from visual_rl.algorithms.flash_grpo import FlashGRPOAlgorithm
-    from visual_rl.algorithms.grpo import GRPOAlgorithm
-    from visual_rl.algorithms.tempflow_grpo import TempFlowGRPOAlgorithm
+    from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
+    from visual_rl.optimizers.grpo import GRPOAlgorithm
+    from visual_rl.optimizers.tempflow_grpo import TempFlowGRPOAlgorithm
 
     prompts_rewards = torch.tensor([2.0, -1.0])
     full_timesteps = torch.arange(4).repeat(2, 1)

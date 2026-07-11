@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from visual_rl.core.types import RolloutBatch
-from visual_rl.integrations.flash_grpo.rectification import scheduler_rectification_weights
-from visual_rl.integrations.flash_grpo.timestep_sampler import (
+from visual_rl.core.registry import ROLLOUT_ENGINES
+from visual_rl.rollout.rectification import scheduler_rectification_weights
+from visual_rl.rollout.timestep_sampler import (
     expand_prompt_groups,
     resolve_timestep_indices,
     select_prompt_timestep_indices,
@@ -96,3 +97,7 @@ class SingleStepRollout(RolloutEngine):
         batch.old_log_probs = narrow(batch.old_log_probs)
         batch.kl = narrow(batch.kl)
         return batch
+
+
+ROLLOUT_ENGINES.register("single_step", SingleStepRollout)
+ROLLOUT_ENGINES.register("flash_single_step", SingleStepRollout)

@@ -6,7 +6,7 @@ def test_v02_config_loads_typed_sections():
     assert isinstance(cfg.sample, SampleConfig)
     assert isinstance(cfg.algorithm, AlgorithmConfig)
     assert cfg.model.name == "mock_wan"
-    assert cfg.sample.same_latent is True
+    assert cfg.sample.samples_per_prompt == 2
 
 
 def test_all_presets_use_compatible_algorithm_sample_pairs():
@@ -52,10 +52,34 @@ def test_config_rejects_incompatible_algorithm_sample_pairs(tmp_path):
         assert expected_message in str(exc_info.value)
 
 
+def test_config_rejects_unknown_and_legacy_keys(tmp_path):
+    import pytest
+
+    from visual_rl.configs.schema import load_config
+
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "run_name: legacy",
+                "output_dir: runs/legacy",
+                "trainer:",
+                "  show_progress: false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown fields") as exc_info:
+        load_config(path)
+    assert "output_dir" in str(exc_info.value)
+    assert "trainer" in str(exc_info.value)
+
+
 def test_validate_config_cli_accepts_shipped_preset(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/world_r1_wan_v02_mock.yaml"
 
@@ -81,7 +105,7 @@ def test_validate_config_cli_accepts_shipped_preset(capsys):
 def test_validate_config_cli_rejects_invalid_algorithm_sample_pair(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = tmp_path / "invalid_pair.yaml"
     path.write_text(
@@ -115,7 +139,7 @@ def test_validate_config_cli_rejects_invalid_algorithm_sample_pair(tmp_path, cap
 def test_validate_config_cli_rejects_missing_reward_client_alias(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = tmp_path / "missing_reward_client.yaml"
     path.write_text(
@@ -155,7 +179,7 @@ def test_validate_config_cli_rejects_missing_reward_client_alias(tmp_path, capsy
 def test_rollout_probe_mock_wan_returns_valid_shapes(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/world_r1_wan_v02_mock.yaml"
 
@@ -173,12 +197,12 @@ def test_rollout_probe_mock_wan_returns_valid_shapes(capsys):
     assert payload["sample"]["name"] == "full_trajectory"
     assert payload["rollout"]["name"] == "full_trajectory"
     assert payload["input_prompt_count"] == 2
-    assert payload["prompt_count"] == 2
-    assert payload["media_shape"] == [2, 4, 3, 16, 16]
-    assert payload["latents_shape"] == [2, 2, 4, 2, 2, 2]
-    assert payload["next_latents_shape"] == [2, 2, 4, 2, 2, 2]
-    assert payload["timesteps_shape"] == [2, 2]
-    assert payload["old_log_probs_shape"] == [2, 2]
+    assert payload["prompt_count"] == 4
+    assert payload["media_shape"] == [4, 4, 3, 16, 16]
+    assert payload["latents_shape"] == [4, 2, 4, 2, 2, 2]
+    assert payload["next_latents_shape"] == [4, 2, 4, 2, 2, 2]
+    assert payload["timesteps_shape"] == [4, 2]
+    assert payload["old_log_probs_shape"] == [4, 2]
     assert payload["model_metadata"]["adapter"] == "mock_wan"
     assert payload["seed"] == 123
     assert payload["strict"] is True
@@ -187,7 +211,7 @@ def test_rollout_probe_mock_wan_returns_valid_shapes(capsys):
 def test_rollout_probe_flash_tiny_validates_single_step_contract(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/flash_tiny_single_step.yaml"
 
@@ -217,7 +241,7 @@ def test_rollout_probe_flash_tiny_validates_single_step_contract(capsys):
 def test_rollout_probe_missing_config_path_returns_structured_json(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/does_not_exist.yaml"
 
@@ -236,7 +260,7 @@ def test_rollout_probe_missing_config_path_returns_structured_json(capsys):
 def test_reward_probe_mock_wan_routes_mock_reward_without_cache(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/world_r1_wan_v02_mock.yaml"
 
@@ -258,10 +282,8 @@ def test_reward_probe_mock_wan_routes_mock_reward_without_cache(capsys):
     assert payload["raw"]["mock"]["shape"] == [2]
     assert payload["weighted"]["mock"]["shape"] == [2]
     assert payload["weighted_total"]["shape"] == [2]
-    assert payload["normalized_total"]["shape"] == [2]
     assert payload["valid_mask"] == [True, True]
     assert payload["metadata"]["mock"]["mode"] == "prompt_media"
-    assert payload["normalize"] == "none"
     assert payload["fail_policy"] == "invalid"
     assert payload["seed"] == 123
 
@@ -269,7 +291,7 @@ def test_reward_probe_mock_wan_routes_mock_reward_without_cache(capsys):
 def test_reward_probe_flash_tiny_routes_prompt_color_reward(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = "visual_rl/configs/presets/flash_tiny_single_step.yaml"
 
@@ -300,7 +322,7 @@ def test_reward_probe_flash_tiny_routes_prompt_color_reward(capsys):
 def test_reward_probe_rejects_mismatched_reward_client_alias_without_traceback(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = tmp_path / "missing_reward_client.yaml"
     path.write_text(
@@ -343,7 +365,7 @@ def test_reward_probe_rejects_mismatched_reward_client_alias_without_traceback(t
 def test_reward_probe_uses_real_image_preset_resolution(capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     paths = [
         "visual_rl/configs/presets/sd3_tempflow_adapter.yaml",
@@ -366,7 +388,7 @@ def test_reward_probe_uses_real_image_preset_resolution(capsys):
 def test_reward_probe_uses_explicit_extra_height_width(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = tmp_path / "explicit_height_width.yaml"
     path.write_text(
@@ -415,7 +437,7 @@ def test_reward_probe_uses_explicit_extra_height_width(tmp_path, capsys):
 def test_infer_probe_image_size_accepts_top_level_model_fields():
     from types import SimpleNamespace
 
-    from visual_rl.cli import _infer_probe_image_size
+    from scripts.legacy_cli import _infer_probe_image_size
 
     dict_config = {"model": {"height": 12, "width": 14, "media_shape": [4, 3, 16, 16]}}
     assert _infer_probe_image_size(dict_config) == (12, 14)
@@ -429,7 +451,7 @@ def test_infer_probe_image_size_accepts_top_level_model_fields():
 def test_reward_probe_invalid_media_size_returns_structured_json(tmp_path, capsys):
     import json
 
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     path = tmp_path / "invalid_resolution.yaml"
     path.write_text(

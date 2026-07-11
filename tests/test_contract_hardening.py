@@ -27,7 +27,7 @@ def test_strict_rollout_validation_catches_bad_batch_axis():
 def test_reward_media_hash_uses_numpy_and_pil_content():
     import numpy as np
 
-    from visual_rl.rewards.cache import stable_hash_media
+    from visual_rl.feedback.cache import stable_hash_media
 
     first = np.zeros((4, 4, 3), dtype=np.uint8)
     second = first.copy()
@@ -44,7 +44,7 @@ def test_reward_media_hash_uses_numpy_and_pil_content():
 def test_grpo_loss_accepts_old_logprob_dtype_mismatch():
     import torch
 
-    from visual_rl.algorithms.grpo import GRPOAlgorithm
+    from visual_rl.optimizers.grpo import GRPOAlgorithm
     from visual_rl.core.types import RolloutBatch
 
     batch = RolloutBatch(

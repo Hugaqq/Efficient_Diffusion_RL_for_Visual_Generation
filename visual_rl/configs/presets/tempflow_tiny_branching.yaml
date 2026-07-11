@@ -1,6 +1,7 @@
 run_name: tempflow_tiny_branching
 seed: 7
-output_dir: runs/tempflow_tiny_branching
+paths:
+  output_dir: runs/tempflow_tiny_branching
 
 model:
   name: tiny_diffusion
@@ -19,12 +20,11 @@ sample:
   batch_size: 1
   num_steps: 4
   samples_per_prompt: 4
-  num_batches_per_epoch: 1
 
 rollout:
   branch_count: 3
-  exploration_k: 2
-  include_main: true
+  exploration_k: 3
+  include_main: false
   branch_timesteps: auto
   branch_timestep_strategy: cycle
 
@@ -49,8 +49,6 @@ rewards:
   fail_policy: raise
 
 train:
-  batch_size: 1
-  gradient_accumulation_steps: 1
   learning_rate: 0.05
   max_steps: 2
   save_every: 1

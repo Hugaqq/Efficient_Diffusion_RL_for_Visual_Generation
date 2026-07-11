@@ -1,4 +1,4 @@
 def test_import_visual_rl():
     import visual_rl
 
-    assert visual_rl.__version__ == "0.5.0"
+    assert visual_rl.__version__ == "0.6.0"

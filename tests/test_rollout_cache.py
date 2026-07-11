@@ -29,7 +29,6 @@ def test_rollout_cache_writes_stable_filenames_and_metadata(tmp_path):
         raw={"prompt_color": torch.tensor([0.25, 0.75])},
         weighted={"prompt_color": torch.tensor([0.25, 0.75])},
         weighted_total=torch.tensor([0.25, 0.75]),
-        normalized_total=torch.tensor([0.25, 0.75]),
         valid_mask=torch.tensor([True, True]),
         metadata={"clients": {"prompt_color": {"version": "v1"}}},
     )

@@ -1,6 +1,6 @@
 def test_single_step_rollout_expands_same_timestep_group():
     import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
-    import visual_rl.rewards.image_rewards  # noqa: F401
+    import visual_rl.feedback.image_rewards  # noqa: F401
     from visual_rl.configs.schema import load_config, section_to_dict
     from visual_rl.core.registry import MODEL_ADAPTERS
     from visual_rl.rollout.full_trajectory import build_rollout_engine
@@ -58,7 +58,7 @@ def test_single_step_rollout_metadata_is_deterministic_across_prompts():
 def test_flash_rectification_uses_rollout_weights():
     import torch
 
-    from visual_rl.algorithms.flash_grpo import FlashGRPOAlgorithm
+    from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
     from visual_rl.core.types import RolloutBatch
 
     batch = RolloutBatch(
@@ -83,14 +83,13 @@ def test_flash_rectification_uses_rollout_weights():
 
 def test_flash_tiny_training_smoke(tmp_path):
     import visual_rl.model_adapters.tiny_diffusion  # noqa: F401
-    import visual_rl.rewards.image_rewards  # noqa: F401
+    import visual_rl.feedback.image_rewards  # noqa: F401
     from visual_rl.configs.schema import load_config
-    from visual_rl.trainer.trainer import VisualRLTrainer
+    from visual_rl.runner import ExperimentRunner
 
     cfg = load_config("visual_rl/configs/presets/flash_tiny_single_step.yaml")
-    cfg.output_dir = str(tmp_path / "flash")
-    cfg.paths.output_dir = cfg.output_dir
-    metrics = VisualRLTrainer(cfg).train(max_steps=1)
+    cfg.paths.output_dir = str(tmp_path / "flash")
+    metrics = ExperimentRunner(cfg).run(max_steps=1)
 
     assert len(metrics) == 1
     assert "flash_selected_timestep_mean" in metrics[0]

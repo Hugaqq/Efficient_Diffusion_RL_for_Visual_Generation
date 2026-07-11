@@ -1,14 +1,13 @@
 def test_reward_router_raw_weighted_and_cache(tmp_path):
     import torch
 
-    import visual_rl.rewards.clients  # noqa: F401
-    from visual_rl.rewards.router import RewardRouter
+    import visual_rl.feedback.clients  # noqa: F401
+    from visual_rl.feedback.router import RewardRouter
 
     router = RewardRouter(
         {
             "weights": {"mock": 2.0},
             "clients": {"mock": {"name": "mock", "version": "test", "mode": "prompt_media"}},
-            "normalize": "none",
         },
         cache_dir=tmp_path / "reward_cache",
     )
@@ -23,12 +22,27 @@ def test_reward_router_raw_weighted_and_cache(tmp_path):
     assert list((tmp_path / "reward_cache").glob("*.json"))
 
 
+def test_reward_router_rejects_training_normalization_config():
+    import pytest
+
+    from visual_rl.feedback.router import RewardRouter
+
+    with pytest.raises(ValueError, match="AdvantageComputer"):
+        RewardRouter(
+            {
+                "weights": {"mock": 1.0},
+                "clients": {"mock": {"name": "mock"}},
+                "normalize": "per_batch",
+            }
+        )
+
+
 def test_reward_router_replays_cache_without_calling_client_again(tmp_path, monkeypatch):
     import numpy as np
     import torch
 
     from visual_rl.core.registry import REWARD_CLIENTS
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     calls = {"count": 0}
 
@@ -72,7 +86,7 @@ def test_reward_router_cache_key_includes_media_content(tmp_path, monkeypatch):
     import torch
 
     from visual_rl.core.registry import REWARD_CLIENTS
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     calls = {"count": 0}
 
@@ -102,7 +116,7 @@ def test_reward_router_invalid_reward_shape_sets_invalid_mask(tmp_path, monkeypa
     import numpy as np
 
     from visual_rl.core.registry import REWARD_CLIENTS
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     class BadShapeRewardClient:
         def score(self, media, prompts, metadata):
@@ -132,7 +146,7 @@ def test_reward_router_invalid_reward_shape_raises_when_configured(monkeypatch):
     import pytest
 
     from visual_rl.core.registry import REWARD_CLIENTS
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     class BadShapeRewardClient:
         def score(self, media, prompts, metadata):
@@ -156,7 +170,7 @@ def test_reward_router_invalid_reward_shape_raises_when_configured(monkeypatch):
 def test_reward_router_unknown_reward_client_name_raises():
     import pytest
 
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     with pytest.raises(KeyError, match="Unknown reward_client key"):
         RewardRouter(
@@ -171,7 +185,7 @@ def test_remote_pickle_reward_timeout_retries_and_invalid_policy(monkeypatch):
     import sys
     from types import SimpleNamespace
 
-    from visual_rl.rewards.router import RewardRouter
+    from visual_rl.feedback.router import RewardRouter
 
     calls = []
 

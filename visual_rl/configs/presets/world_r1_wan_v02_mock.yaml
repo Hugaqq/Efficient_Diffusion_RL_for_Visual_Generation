@@ -1,7 +1,5 @@
 run_name: world_r1_wan_v02_mock
-project_name: VisualRL
 seed: 42
-output_dir: runs/world_r1_wan_v02_mock
 
 model:
   name: mock_wan
@@ -10,7 +8,6 @@ model:
   media_shape: [4, 3, 16, 16]
 
 dataset:
-  prompt_fn: inline
   prompts:
     - "orbit left around a ceramic vase on a table"
     - "push in toward a red toy car"
@@ -20,11 +17,8 @@ dataset:
 sample:
   name: full_trajectory
   batch_size: 2
-  num_batches_per_epoch: 1
   num_steps: 2
-  eval_num_steps: 2
-  num_video_per_prompt: 2
-  same_latent: true
+  samples_per_prompt: 2
   noise_level: 0.7
   sde_window_size: null
   sde_window_range: null
@@ -38,7 +32,6 @@ algorithm:
   weight_advantages: false
 
 rewards:
-  normalize: none
   fail_policy: invalid
   weights:
     mock: 1.0
@@ -49,12 +42,9 @@ rewards:
       mode: prompt_media
 
 train:
-  batch_size: 2
   max_steps: 2
   learning_rate: 0.001
   save_every: 1
-  gradient_accumulation_steps: null
 
 paths:
   output_dir: runs/world_r1_wan_v02_mock
-

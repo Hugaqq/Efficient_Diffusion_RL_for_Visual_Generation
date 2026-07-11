@@ -1,6 +1,7 @@
 run_name: flash_tiny_single_step
 seed: 11
-output_dir: runs/flash_tiny_single_step
+paths:
+  output_dir: runs/flash_tiny_single_step
 
 model:
   name: tiny_diffusion
@@ -19,7 +20,6 @@ sample:
   batch_size: 1
   num_steps: 4
   samples_per_prompt: 4
-  num_batches_per_epoch: 1
 
 rollout:
   selected_step_strategy: iso_temporal
@@ -47,8 +47,6 @@ rewards:
   fail_policy: raise
 
 train:
-  batch_size: 1
-  gradient_accumulation_steps: 1
   learning_rate: 0.05
   max_steps: 2
   save_every: 1

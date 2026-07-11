@@ -5,10 +5,14 @@ import tarfile
 
 
 def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path):
-    from visual_rl.experiments.remote_smoke import create_source_archive
+    from scripts.remote_smoke import create_source_archive
 
     (tmp_path / "visual_rl").mkdir()
-    (tmp_path / "visual_rl" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (tmp_path / "visual_rl" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "scripts" / "legacy_cli.py").write_text("print('cli')\n", encoding="utf-8")
+    (tmp_path / "scripts" / "remote_smoke.py").write_text("", encoding="utf-8")
     (tmp_path / "visual_rl" / "__pycache__").mkdir()
     (tmp_path / "visual_rl" / "__pycache__" / "cli.cpython-311.pyc").write_bytes(b"cache")
     (tmp_path / "runs").mkdir()
@@ -21,7 +25,7 @@ def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path)
     archive_path = tmp_path / "source.tar.gz"
     members = create_source_archive(tmp_path, archive_path)
 
-    assert "visual_rl/cli.py" in members
+    assert "scripts/legacy_cli.py" in members
     assert "pyproject.toml" in members
     assert "README.md" in members
     assert all("__pycache__" not in member for member in members)
@@ -31,14 +35,14 @@ def test_remote_smoke_archive_includes_package_and_excludes_heavy_dirs(tmp_path)
 
     with tarfile.open(archive_path, "r:gz") as tar:
         names = tar.getnames()
-    assert "visual_rl/cli.py" in names
+    assert "scripts/legacy_cli.py" in names
     assert "visual_rl/__pycache__/cli.cpython-311.pyc" not in names
     assert "reference_code/legacy.py" not in names
     assert "runs/output.txt" not in names
 
 
 def test_remote_smoke_dry_run_payload_uses_stage_dir_not_shared_framecode(tmp_path):
-    from visual_rl.experiments.remote_smoke import RemoteSd3CliSmokeConfig, build_dry_run_payload
+    from scripts.remote_smoke import RemoteSd3CliSmokeConfig, build_dry_run_payload
 
     (tmp_path / "visual_rl").mkdir()
     (tmp_path / "visual_rl" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
@@ -69,7 +73,7 @@ def test_remote_smoke_dry_run_payload_uses_stage_dir_not_shared_framecode(tmp_pa
 
 
 def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
-    from visual_rl.experiments.remote_smoke import RemoteSd3CliSmokeConfig, build_remote_script
+    from scripts.remote_smoke import RemoteSd3CliSmokeConfig, build_remote_script
 
     script = build_remote_script(
         RemoteSd3CliSmokeConfig(
@@ -100,11 +104,11 @@ def test_remote_script_has_idle_guard_and_sd3_tempflow_command():
     assert "previews/after/preview_000.png" in script
     assert '"resume_loaded": true' in script
     assert "remote-sd3-cli-smoke" in script
-    assert "visual_rl/cli.py" in script
+    assert "scripts/legacy_cli.py" in script
 
 
 def test_remote_sd3_cli_smoke_dry_run_exits_zero_and_prints_json(capsys):
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     exit_code = cli.main(
         [
@@ -130,7 +134,7 @@ def test_remote_sd3_cli_smoke_dry_run_exits_zero_and_prints_json(capsys):
     assert payload["remote_resume_dir"].endswith("/cli_unit_stage/resume_from_1step_1step")
     assert payload["run_bounded_trainer"] is True
     assert payload["run_resume_validation"] is True
-    assert "visual_rl/cli.py" in payload["archive_members"]
+    assert "scripts/legacy_cli.py" in payload["archive_members"]
     assert "image-preview --adapter sd3_tempflow" in payload["remote_script"]
     assert "sd3-numeric-smoke --model-path" in payload["remote_script"]
     assert "sd3-bounded-trainer-smoke --adapter sd3_tempflow" in payload["remote_script"]
@@ -138,7 +142,7 @@ def test_remote_sd3_cli_smoke_dry_run_exits_zero_and_prints_json(capsys):
 
 
 def test_remote_sd3_cli_smoke_dry_run_can_mark_long_bounded_run(capsys):
-    import visual_rl.cli as cli
+    from scripts import legacy_cli as cli
 
     exit_code = cli.main(
         [

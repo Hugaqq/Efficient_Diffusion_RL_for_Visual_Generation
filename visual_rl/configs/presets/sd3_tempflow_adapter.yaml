@@ -1,6 +1,7 @@
 run_name: sd3_tempflow_adapter
 seed: 23
-output_dir: runs/sd3_tempflow_adapter
+paths:
+  output_dir: runs/sd3_tempflow_adapter
 use_lora: true
 
 model:
@@ -25,12 +26,11 @@ sample:
   batch_size: 1
   num_steps: 3
   guidance_scale: 4.5
-  num_batches_per_epoch: 1
 
 rollout:
-  branch_count: 1
+  branch_count: 2
   exploration_k: 2
-  include_main: true
+  include_main: false
   branch_timesteps: auto
   branch_timestep_strategy: cycle
   output_type: pt
@@ -53,15 +53,12 @@ rewards:
     prompt_color:
       name: prompt_color
       version: v1
-  normalize: per_batch
   fail_policy: raise
 
 train:
-  batch_size: 1
-  gradient_accumulation_steps: 1
   learning_rate: 0.00001
   max_steps: 1
   save_every: 1
 
-trainer:
+runner:
   strict_rollout_validation: true

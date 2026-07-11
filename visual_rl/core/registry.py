@@ -38,4 +38,6 @@ class Registry:
 MODEL_ADAPTERS = Registry("model_adapter")
 ALGORITHMS = Registry("algorithm")
 REWARD_CLIENTS = Registry("reward_client")
-
+FEEDBACK_PROVIDERS = Registry("feedback_provider")
+OPTIMIZER_PLUGINS = Registry("optimizer_plugin")
+ROLLOUT_ENGINES = Registry("rollout_engine")

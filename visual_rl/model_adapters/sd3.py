@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ class SD3TempFlowAdapter(ModelAdapter):
     """In-process wrapper around TempFlow-GRPO's SD3 patched pipeline."""
 
     name = "tempflow_sd3_legacy"
+    media_type = "image"
 
     def __init__(self, config: dict[str, Any]):
         import torch
@@ -57,6 +59,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         self.pipeline = None
         self.transformer = None
         self._pipeline_with_logprob = None
+        self._pipeline_with_logprob_perstep = None
         self._sde_step_with_logprob = None
         self._encode_prompt = None
         if not extra.get("defer_load", False):
@@ -73,10 +76,14 @@ class SD3TempFlowAdapter(ModelAdapter):
         model_path = require_model_path(self.config, self.name)
         with legacy_repo_path(self.repo_root):
             from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_logprob
+            from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob_perstep import (
+                pipeline_with_logprob as pipeline_with_logprob_perstep,
+            )
             from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
             from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
 
         self._pipeline_with_logprob = pipeline_with_logprob
+        self._pipeline_with_logprob_perstep = pipeline_with_logprob_perstep
         self._sde_step_with_logprob = sde_step_with_logprob
         self._encode_prompt = encode_prompt
         self.pipeline = StableDiffusion3Pipeline.from_pretrained(model_path, torch_dtype=self.dtype)
@@ -113,6 +120,20 @@ class SD3TempFlowAdapter(ModelAdapter):
         if not params:
             raise AdapterNotLoadedError("SD3 TempFlow adapter has no trainable parameters.")
         return params
+
+    def named_parameters(self):
+        self._ensure_loaded()
+        return [
+            (f"transformer.{name}", parameter)
+            for name, parameter in self.transformer.named_parameters()
+            if parameter.requires_grad
+        ]
+
+    def branch_transition_count(self, rollout_config: dict[str, Any]) -> int:
+        transition_count = int(rollout_config.get("num_steps", 3)) - 1
+        if transition_count < 1:
+            raise ValueError("SD3 TempFlow branching requires num_steps >= 2")
+        return transition_count
 
     def sample(self, prompts: list[str], metadata: list[dict[str, Any]], rollout_config: dict[str, Any]) -> RolloutBatch:
         import torch
@@ -223,16 +244,185 @@ class SD3TempFlowAdapter(ModelAdapter):
             log_probs.append(log_prob)
         return torch.stack(log_probs, dim=1)
 
+    def sample_branching(
+        self,
+        prompts: list[str],
+        metadata: list[dict[str, Any]],
+        rollout_config: dict[str, Any],
+    ) -> RolloutBatch:
+        import torch
+
+        self._ensure_loaded()
+        if self._pipeline_with_logprob_perstep is None:
+            raise RuntimeError(
+                "TempFlow SD3 per-step branching pipeline is not available."
+            )
+        if bool(rollout_config.get("include_main", False)):
+            raise ValueError("SD3 TempFlow branching does not expose a main sample")
+        branch_step_index = int(rollout_config["branch_step_index"])
+        branch_count = int(rollout_config["branch_count"])
+        num_steps = int(rollout_config.get("num_steps", 3))
+        guidance_scale = float(rollout_config.get("guidance_scale", 4.5))
+        generator = make_generator(self.device, rollout_config.get("seed"))
+
+        with torch.no_grad(), self._perstep_sde_generator(generator):
+            prompt_embeds, pooled_prompt_embeds = self._encode_text(prompts)
+            negative_prompt_embeds, negative_pooled_prompt_embeds = self._encode_text(
+                [""] * len(prompts)
+            )
+            result = self._call_pipeline_with_logprob_perstep(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                num_inference_steps=num_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                output_type=str(rollout_config.get("output_type", "pt")),
+                height=self.resolution,
+                width=self.resolution,
+                kl_reward=float(rollout_config.get("kl_reward", 0.0)),
+            )
+        if len(result) != 5:
+            raise ValueError(
+                f"SD3 per-step branching pipeline must return 5 items, got {len(result)}"
+            )
+        branch_media, main_latents, sde_latents, log_probs, kls = result
+        if branch_step_index >= len(log_probs):
+            raise ValueError(
+                f"branch_step_index {branch_step_index} exceeds returned transitions {len(log_probs)}"
+            )
+
+        selected_next = torch.as_tensor(sde_latents[branch_step_index])
+        exploration_k, gather_indices = self._branch_gather_indices(
+            selected_next.shape[0],
+            len(prompts),
+            branch_count,
+        )
+        gather = torch.as_tensor(
+            gather_indices,
+            device=selected_next.device,
+            dtype=torch.long,
+        )
+        parent_indices = [
+            parent_index
+            for parent_index in range(len(prompts))
+            for _ in range(branch_count)
+        ]
+        branch_ids = list(range(branch_count)) * len(prompts)
+        expanded_prompts = [prompts[index] for index in parent_indices]
+        scheduler_timestep = torch.as_tensor(
+            self.pipeline.scheduler.timesteps
+        )[branch_step_index].detach()
+        timestep_value = scheduler_timestep.cpu().item()
+        expanded_metadata = []
+        for row, parent_index in enumerate(parent_indices):
+            item = dict(metadata[parent_index])
+            item.update(
+                {
+                    "parent_prompt_index": parent_index,
+                    "branch_id": branch_ids[row],
+                    "branch_step_index": branch_step_index,
+                    "branch_timestep_value": timestep_value,
+                    "is_main_branch": False,
+                    "rollout_kind": "tempflow_branching",
+                }
+            )
+            expanded_metadata.append(item)
+
+        selected_latents = torch.as_tensor(main_latents[branch_step_index]).repeat_interleave(
+            branch_count,
+            dim=0,
+        )
+        selected_next = selected_next.index_select(0, gather)
+        selected_log_probs = torch.as_tensor(log_probs[branch_step_index]).index_select(
+            0,
+            gather.to(torch.as_tensor(log_probs[branch_step_index]).device),
+        )
+        selected_kl = self._select_branch_kl(
+            torch.as_tensor(kls[branch_step_index]),
+            gather_indices,
+            len(prompts),
+            branch_count,
+        )
+        selected_media = self._select_branch_media(
+            branch_media[branch_step_index],
+            gather_indices,
+        )
+        rows = len(expanded_prompts)
+        transition_count = int(
+            rollout_config.get("transition_count", len(log_probs))
+        )
+        positions = torch.arange(transition_count, dtype=torch.float32)
+        global_weights = torch.sqrt(
+            (transition_count - positions).clamp_min(1.0) / float(transition_count)
+        )
+        global_weights = global_weights / global_weights.mean().clamp_min(1e-6)
+        noise_weight = float(global_weights[branch_step_index])
+        selected_timesteps = scheduler_timestep.to(
+            device=selected_log_probs.device
+        ).reshape(1, 1).expand(rows, 1).clone()
+        return RolloutBatch(
+            prompts=expanded_prompts,
+            metadata=expanded_metadata,
+            media=selected_media,
+            latents=selected_latents[:, None].detach(),
+            next_latents=selected_next[:, None].detach(),
+            timesteps=selected_timesteps,
+            old_log_probs=selected_log_probs.reshape(rows, 1).detach(),
+            kl=selected_kl.reshape(rows, 1).detach(),
+            branch_ids=torch.as_tensor(branch_ids, dtype=torch.long),
+            epoch_tag=rollout_config.get("epoch_tag"),
+            seed=rollout_config.get("seed"),
+            model_metadata={
+                "adapter": self.name,
+                "reference_repo": str(self.repo_root),
+                "reference_pipeline": "sd3_pipeline_with_logprob_perstep",
+                "resolution": self.resolution,
+                "guidance_scale": guidance_scale,
+                "branching_mode": "shared_prefix",
+                "branch_step_index": branch_step_index,
+                "branch_timestep_value": timestep_value,
+                "trajectory_step_indices": [branch_step_index],
+                "transition_count": transition_count,
+                "noise_weights": [noise_weight],
+                "sde_generator_bound": generator is not None,
+                "reference_exploration_k": exploration_k,
+            },
+            model_tensors={
+                "prompt_embeds": prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
+                "pooled_prompt_embeds": pooled_prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
+                "negative_prompt_embeds": negative_prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
+                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds.repeat_interleave(
+                    branch_count,
+                    dim=0,
+                ).detach(),
+            },
+        )
+
     def save_pretrained(self, output_dir: str) -> None:
         self._ensure_loaded()
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
-        if hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(path)
-        else:
-            import torch
+        import torch
 
-            torch.save(self.transformer.state_dict(), path / "sd3_transformer.pt")
+        if hasattr(self.transformer, "save_pretrained"):
+            self.transformer.save_pretrained(path / "transformer")
+        torch.save(self.transformer.state_dict(), path / "transformer_state.pt")
+
+    def load_checkpoint(self, checkpoint_dir: str) -> None:
+        import torch
+
+        self._ensure_loaded()
+        state_path = Path(checkpoint_dir) / "transformer_state.pt"
+        if not state_path.exists():
+            raise RuntimeError(f"Missing SD3 transformer state: {state_path}")
+        state = torch.load(
+            state_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        self.transformer.load_state_dict(state)
 
     def _call_pipeline_with_logprob(self, **kwargs):
         signature = inspect.signature(self._pipeline_with_logprob)
@@ -241,6 +431,98 @@ class SD3TempFlowAdapter(ModelAdapter):
         if "return_dict" in supported:
             call_kwargs["return_dict"] = False
         return self._pipeline_with_logprob(self.pipeline, **call_kwargs)
+
+    def _call_pipeline_with_logprob_perstep(self, **kwargs):
+        signature = inspect.signature(self._pipeline_with_logprob_perstep)
+        supported = set(signature.parameters)
+        call_kwargs = {key: value for key, value in kwargs.items() if key in supported}
+        if "return_dict" in supported:
+            call_kwargs["return_dict"] = False
+        return self._pipeline_with_logprob_perstep(self.pipeline, **call_kwargs)
+
+    @contextmanager
+    def _perstep_sde_generator(self, generator):
+        """Bind our generator through an upstream call site that omits it."""
+
+        function_globals = getattr(
+            self._pipeline_with_logprob_perstep,
+            "__globals__",
+            None,
+        )
+        original = (
+            function_globals.get("sde_step_with_logprob")
+            if isinstance(function_globals, dict)
+            else None
+        )
+        if generator is None or not callable(original):
+            yield
+            return
+
+        def seeded_sde_step(*args, **kwargs):
+            deterministic = bool(kwargs.get("determistic", False))
+            positional_generator = len(args) >= 6 and args[5] is not None
+            if (
+                not deterministic
+                and not positional_generator
+                and kwargs.get("generator") is None
+            ):
+                kwargs["generator"] = generator
+            return original(*args, **kwargs)
+
+        function_globals["sde_step_with_logprob"] = seeded_sde_step
+        try:
+            yield
+        finally:
+            if function_globals.get("sde_step_with_logprob") is seeded_sde_step:
+                function_globals["sde_step_with_logprob"] = original
+
+    @staticmethod
+    def _branch_gather_indices(
+        expanded_size: int,
+        parent_count: int,
+        branch_count: int,
+    ) -> tuple[int, list[int]]:
+        if parent_count < 1 or expanded_size % parent_count:
+            raise ValueError("Per-step branching output is not grouped by parent prompt")
+        exploration_k = expanded_size // parent_count
+        if branch_count > exploration_k:
+            raise ValueError(
+                f"Requested {branch_count} branches but reference pipeline returned {exploration_k}"
+            )
+        indices = [
+            parent * exploration_k + branch
+            for parent in range(parent_count)
+            for branch in range(branch_count)
+        ]
+        return exploration_k, indices
+
+    @staticmethod
+    def _select_branch_kl(
+        values,
+        gather_indices: list[int],
+        parent_count: int,
+        branch_count: int,
+    ):
+        import torch
+
+        values = values.flatten()
+        if values.numel() == parent_count:
+            return values.repeat_interleave(branch_count)
+        gather = torch.as_tensor(gather_indices, device=values.device, dtype=torch.long)
+        return values.index_select(0, gather)
+
+    @staticmethod
+    def _select_branch_media(media, gather_indices: list[int]):
+        import torch
+
+        if isinstance(media, torch.Tensor):
+            gather = torch.as_tensor(
+                gather_indices,
+                device=media.device,
+                dtype=torch.long,
+            )
+            return media.index_select(0, gather).detach()
+        return [media[index] for index in gather_indices]
 
     def _encode_text(self, prompts: list[str]):
         embeds, pooled = self._encode_prompt(

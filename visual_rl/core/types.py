@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 
@@ -75,26 +74,10 @@ class RolloutBatch:
 
 @dataclass
 class RewardBatch:
+    """Feedback output before training-time advantage normalization."""
+
     raw: dict[str, Any]
     weighted: dict[str, Any]
     weighted_total: Any
-    normalized_total: Any
     valid_mask: Any
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TrainStepMetrics:
-    loss: float
-    reward_mean: float
-    reward_std: float
-    approx_kl: float
-    clipfrac: float
-    extra: dict[str, float] = field(default_factory=dict)
-
-
-@dataclass
-class CheckpointRef:
-    path: Path
-    step: int
     metadata: dict[str, Any] = field(default_factory=dict)
