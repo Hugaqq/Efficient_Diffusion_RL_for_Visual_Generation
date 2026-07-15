@@ -13,12 +13,18 @@ from visual_rl.core.types import RolloutBatch
 from visual_rl.model_adapters.base import ModelAdapter
 from visual_rl.model_adapters.diffusers_common import (
     AdapterNotLoadedError,
+    GradientCheckpointingState,
     apply_peft_lora,
+    configure_gradient_checkpointing,
+    gradient_checkpointing_metadata,
+    gradient_checkpointing_request,
     make_generator,
     require_model_path,
     resolve_torch_dtype,
     stack_steps,
     trainable_parameters,
+    validate_gradient_checkpointing_checkpoint_metadata,
+    verify_gradient_checkpointing,
 )
 from visual_rl.third_party.legacy import legacy_repo_path, resolve_legacy_repo
 
@@ -53,6 +59,11 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         self.config = config
         extra = dict(config.get("extra", {}))
+        self.gradient_checkpointing_requested = gradient_checkpointing_request(config)
+        self._gradient_checkpointing_state = GradientCheckpointingState(
+            requested=self.gradient_checkpointing_requested,
+            effective=None,
+        )
         self.repo_root = resolve_legacy_repo(config.get("repo_root", extra.get("repo_root", "reference_code/TempFlow-GRPO-main")))
         self.device = torch.device(config.get("device", extra.get("device", "cuda" if torch.cuda.is_available() else "cpu")))
         self.dtype = resolve_torch_dtype(config.get("dtype", extra.get("dtype", "bfloat16" if self.device.type == "cuda" else "float32")))
@@ -104,6 +115,11 @@ class SD3TempFlowAdapter(ModelAdapter):
         self.pipeline.text_encoder.requires_grad_(False)
         self.pipeline.text_encoder_2.requires_grad_(False)
         self.pipeline.text_encoder_3.requires_grad_(False)
+        checkpointing_state = configure_gradient_checkpointing(
+            self.pipeline.transformer,
+            self.gradient_checkpointing_requested,
+            context="SD3 base transformer",
+        )
         if self.use_lora:
             self.pipeline.transformer = apply_peft_lora(
                 self.pipeline.transformer,
@@ -122,6 +138,11 @@ class SD3TempFlowAdapter(ModelAdapter):
             self.pipeline.transformer.to(self.device)
         self.pipeline.vae.to(self.device, dtype=torch.float32)
         self.transformer = self.pipeline.transformer
+        self._gradient_checkpointing_state = verify_gradient_checkpointing(
+            self.transformer,
+            checkpointing_state,
+            context="SD3 active transformer after PEFT attach",
+        )
         self.pipeline.vae.eval()
         self.pipeline.text_encoder.eval()
         self.pipeline.text_encoder_2.eval()
@@ -237,6 +258,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             old_log_probs=log_probs.detach(),
             kl=kls.detach(),
             model_metadata={
+                **self._gradient_checkpointing_metadata(),
                 "adapter": self.name,
                 "reference_repo": str(self.repo_root),
                 "reference_pipeline": "sd3_pipeline_with_logprob",
@@ -484,6 +506,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             kl=selected_kl.reshape(rows, 1).detach(),
             branch_id=torch.as_tensor(branch_ids, dtype=torch.long),
             model_metadata={
+                **self._gradient_checkpointing_metadata(),
                 "adapter": self.name,
                 "reference_repo": str(self.repo_root),
                 "reference_pipeline": "sd3_pipeline_with_logprob_perstep",
@@ -531,6 +554,7 @@ class SD3TempFlowAdapter(ModelAdapter):
 
     def save_pretrained(self, output_dir: str) -> None:
         self._ensure_loaded()
+        checkpointing_metadata = self._gradient_checkpointing_metadata()
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
 
@@ -556,6 +580,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             save_json(
                 path / SD3_CHECKPOINT_METADATA_NAME,
                 {
+                    **checkpointing_metadata,
                     "adapter": self.name,
                     "adapter_config": str(config_path.relative_to(path)),
                     "adapter_name": "default",
@@ -576,6 +601,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         save_json(
             path / SD3_CHECKPOINT_METADATA_NAME,
             {
+                **checkpointing_metadata,
                 "adapter": self.name,
                 "format_version": SD3_CHECKPOINT_FORMAT_VERSION,
                 "save_kind": "full_transformer_state",
@@ -584,11 +610,29 @@ class SD3TempFlowAdapter(ModelAdapter):
             },
         )
 
+    def _gradient_checkpointing_metadata(self) -> dict[str, bool | None]:
+        (
+            self._gradient_checkpointing_state,
+            metadata,
+        ) = gradient_checkpointing_metadata(
+            self.train_module,
+            self._gradient_checkpointing_state,
+            context="SD3 active transformer",
+        )
+        return metadata
+
     def load_checkpoint(self, checkpoint_dir: str) -> None:
         import torch
 
         self._ensure_loaded()
         path = Path(checkpoint_dir)
+        metadata = self._checkpoint_metadata(path)
+        self._gradient_checkpointing_metadata()
+        validate_gradient_checkpointing_checkpoint_metadata(
+            metadata,
+            self._gradient_checkpointing_state,
+            context="SD3 checkpoint",
+        )
         state_path = path / "transformer_state.pt"
         if state_path.is_file():
             state = torch.load(
@@ -661,6 +705,31 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "SD3 PEFT checkpoint contains unexpected keys: "
                 + ", ".join(str(key) for key in unexpected)
             )
+
+    @staticmethod
+    def _checkpoint_metadata(path: Path) -> dict[str, Any]:
+        metadata_path = path / SD3_CHECKPOINT_METADATA_NAME
+        try:
+            metadata_path.lstat()
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect SD3 checkpoint metadata: {metadata_path}"
+            ) from exc
+        from visual_rl.artifacts.checkpoint import load_json, validated_checkpoint_file
+
+        validated = validated_checkpoint_file(
+            path,
+            metadata_path,
+            label="SD3 adapter_metadata.json",
+        )
+        metadata = load_json(validated)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"SD3 checkpoint metadata must be an object: {metadata_path}"
+            )
+        return metadata
 
     @staticmethod
     def _peft_adapter_weight_path(path: Path) -> Path | None:

@@ -846,6 +846,10 @@ def test_wan_flash_native_single_step_contract_and_recompute():
         def dtype(self):
             return self.scale.dtype
 
+        @property
+        def is_gradient_checkpointing(self):
+            return False
+
         def forward(self, hidden_states, **_kwargs):
             return (hidden_states * self.scale,)
 

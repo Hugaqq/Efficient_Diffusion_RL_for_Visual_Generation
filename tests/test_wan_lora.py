@@ -29,6 +29,9 @@ from visual_rl.runner import ExperimentRunner
 class _BaseTransformer(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self._gradient_checkpointing = False
+        self.enable_gradient_checkpointing_calls = 0
+        self.disable_gradient_checkpointing_calls = 0
         self.block = torch.nn.Module()
         for name in (
             "add_k_proj",
@@ -44,6 +47,18 @@ class _BaseTransformer(torch.nn.Module):
 
     def forward(self, *, hidden_states, **_kwargs):
         return (hidden_states * self.block.add_k_proj.weight.reshape(()),)
+
+    @property
+    def is_gradient_checkpointing(self):
+        return self._gradient_checkpointing
+
+    def enable_gradient_checkpointing(self):
+        self.enable_gradient_checkpointing_calls += 1
+        self._gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.disable_gradient_checkpointing_calls += 1
+        self._gradient_checkpointing = False
 
 
 class _CoreWanTransformer(torch.nn.Module):
@@ -82,6 +97,10 @@ class _PeftTransformer(torch.nn.Module):
     def forward(self, **kwargs):
         self.forward_calls += 1
         return (self.base_model(**kwargs)[0] + self.lora_weight,)
+
+    @property
+    def is_gradient_checkpointing(self):
+        return self.base_model.is_gradient_checkpointing
 
     def set_adapter(self, name):
         self.active_adapter = name
@@ -277,6 +296,13 @@ def test_defaults_and_config_validation_use_top_level_values():
             WorldR1WanLegacyAdapter(_config(**{key: value}))
     with pytest.raises(ValueError, match="unique"):
         WorldR1WanLegacyAdapter(_config(lora_target_modules=["to_q", "to_q"]))
+    with pytest.raises(ValueError, match="Conflicting gradient_checkpointing"):
+        WorldR1WanLegacyAdapter(
+            _config(
+                gradient_checkpointing=False,
+                extra={"gradient_checkpointing": True},
+            )
+        )
     for adapter_name in (
         ".",
         "..",
@@ -716,6 +742,72 @@ def test_sample_and_recompute_use_same_wrapped_transformer_with_gradient(fake_ru
     adapter.pipeline.transformer = _BaseTransformer()
     with pytest.raises(RuntimeError, match="same wrapped module"):
         adapter.recompute_log_probs(batch)
+
+
+@pytest.mark.parametrize(
+    ("requested", "call_attribute"),
+    [
+        (True, "enable_gradient_checkpointing_calls"),
+        (False, "disable_gradient_checkpointing_calls"),
+    ],
+)
+def test_gradient_checkpointing_is_applied_and_audited_after_peft_attach(
+    tmp_path,
+    fake_runtime,
+    requested,
+    call_attribute,
+):
+    adapter = WorldR1WanLegacyAdapter(
+        _config(
+            gradient_checkpointing=requested,
+            wan_pipeline_with_logprob=_pipeline_with_logprob,
+            sde_step_with_logprob=_sde_step,
+        )
+    )
+    adapter.load()
+
+    assert getattr(adapter.transformer.base_model, call_attribute) == 1
+    assert adapter.transformer.is_gradient_checkpointing is requested
+
+    batch = adapter.sample(["offline"], [{}], {"num_steps": 1, "train_cfg": False})
+    assert batch.model_metadata["gradient_checkpointing_requested"] is requested
+    assert batch.model_metadata["gradient_checkpointing_effective"] is requested
+
+    checkpoint = tmp_path / str(requested).lower()
+    adapter.save_pretrained(checkpoint)
+    metadata = json.loads(
+        (checkpoint / "adapter_metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["gradient_checkpointing_requested"] is requested
+    assert metadata["gradient_checkpointing_effective"] is requested
+
+    adapter.transformer.base_model._gradient_checkpointing = not requested
+    with pytest.raises(RuntimeError, match="state drifted"):
+        adapter.runtime_metadata()
+
+
+def test_wan_checkpoint_binds_new_gradient_checkpointing_metadata_but_accepts_old(
+    tmp_path,
+    fake_runtime,
+):
+    adapter = WorldR1WanLegacyAdapter(_config(gradient_checkpointing=True))
+    adapter.load()
+    adapter.save_pretrained(tmp_path)
+    metadata_path = tmp_path / "adapter_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["gradient_checkpointing_requested"] = False
+    metadata["gradient_checkpointing_effective"] = False
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="metadata mismatch"):
+        adapter.load_checkpoint(tmp_path)
+    assert adapter.transformer.lora_weight.item() == 0.5
+
+    metadata.pop("gradient_checkpointing_requested")
+    metadata.pop("gradient_checkpointing_effective")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    adapter.load_checkpoint(tmp_path)
+    assert adapter.transformer.lora_weight.item() == 3.0
 
 
 @pytest.mark.parametrize("result_shape", ["object", "tuple", "none"])

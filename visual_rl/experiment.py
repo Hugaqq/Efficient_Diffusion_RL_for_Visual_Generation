@@ -138,10 +138,15 @@ class Wan:
     low_cpu_mem_usage: bool = True
     backend: Literal["world_r1", "flash"] = "world_r1"
     flash_grpo_root: str | os.PathLike[str] = "Flash-GRPO-main"
+    gradient_checkpointing: bool | None = None
 
     def __post_init__(self) -> None:
         if self.backend not in {"world_r1", "flash"}:
             raise ValueError("backend must be one of: flash, world_r1")
+        if self.gradient_checkpointing is not None and not isinstance(
+            self.gradient_checkpointing, bool
+        ):
+            raise TypeError("gradient_checkpointing must be a bool or None")
 
     def to_config(self) -> dict[str, Any]:
         reference_root = (
@@ -162,6 +167,11 @@ class Wan:
                     "dtype": self.dtype,
                     "local_files_only": self.local_files_only,
                     "low_cpu_mem_usage": self.low_cpu_mem_usage,
+                    **(
+                        {"gradient_checkpointing": self.gradient_checkpointing}
+                        if self.gradient_checkpointing is not None
+                        else {}
+                    ),
                 },
             }
         }
@@ -178,6 +188,13 @@ class SD3:
     lora_alpha: int = 64
     max_sequence_length: int = 128
     reference_mode: bool = True
+    gradient_checkpointing: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.gradient_checkpointing is not None and not isinstance(
+            self.gradient_checkpointing, bool
+        ):
+            raise TypeError("gradient_checkpointing must be a bool or None")
 
     def to_config(self) -> dict[str, Any]:
         return {
@@ -194,6 +211,11 @@ class SD3:
                     "lora_alpha": self.lora_alpha,
                     "max_sequence_length": self.max_sequence_length,
                     "tempflow_reference_mode": self.reference_mode,
+                    **(
+                        {"gradient_checkpointing": self.gradient_checkpointing}
+                        if self.gradient_checkpointing is not None
+                        else {}
+                    ),
                 },
             }
         }
