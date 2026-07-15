@@ -1,0 +1,36 @@
+{
+  "policy": "evidence_gated",
+  "schema_version": "1",
+  "stages": {
+    "C13": {
+      "decision": "not_triggered",
+      "enabled": false,
+      "name": "rollout_reward_train_role_split",
+      "observed_evidence": "not_provided",
+      "reason": "No profiling evidence demonstrates that native DDP cannot address the measured bottleneck.",
+      "requested": false,
+      "required_evidence": [
+        "DDP baseline profiling",
+        "measured rollout or reward idle-time bottleneck",
+        "policy_version and max_staleness validation"
+      ],
+      "runtime_validation": "not_run",
+      "triggered": false
+    },
+    "C14": {
+      "decision": "not_triggered",
+      "enabled": false,
+      "name": "fsdp2_distributed_checkpoint",
+      "observed_evidence": "not_provided",
+      "reason": "No measured single-device capacity failure or DDP replication bottleneck justifies FSDP2.",
+      "requested": false,
+      "required_evidence": [
+        "Wan peak-memory profile",
+        "DDP model-replication memory bottleneck",
+        "adapter parameter-reference audit"
+      ],
+      "runtime_validation": "not_run",
+      "triggered": false
+    }
+  }
+}

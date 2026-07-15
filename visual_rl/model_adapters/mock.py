@@ -20,13 +20,19 @@ class MockWanAdapter(ModelAdapter):
         self.config = config
         self.latent_shape = tuple(config.get("latent_shape", [4, 2, 2, 2]))
         self.media_shape = tuple(config.get("media_shape", [4, 3, 16, 16]))
-        self.policy_bias = torch.nn.Parameter(torch.tensor(0.0))
+        self._train_module = torch.nn.Module()
+        self._train_module.register_parameter(
+            "policy_bias",
+            torch.nn.Parameter(torch.tensor(0.0)),
+        )
 
-    def parameters(self):
-        return [self.policy_bias]
+    @property
+    def train_module(self):
+        return self._train_module
 
-    def named_parameters(self):
-        return [("policy_bias", self.policy_bias)]
+    @property
+    def policy_bias(self):
+        return self._train_module.policy_bias
 
     def sample(self, prompts: list[str], metadata: list[dict[str, Any]], rollout_config: dict[str, Any]) -> RolloutBatch:
         import torch
@@ -52,8 +58,6 @@ class MockWanAdapter(ModelAdapter):
             timesteps=timesteps,
             old_log_probs=old_log_probs,
             kl=torch.zeros(batch_size, num_steps),
-            epoch_tag=rollout_config.get("epoch_tag"),
-            seed=seed,
             model_metadata={"adapter": self.name},
         )
 
@@ -74,7 +78,7 @@ class MockWanAdapter(ModelAdapter):
         state = torch.load(
             Path(checkpoint_dir) / "mock_adapter.pt",
             map_location=self.policy_bias.device,
-            weights_only=False,
+            weights_only=True,
         )
         with torch.no_grad():
             self.policy_bias.copy_(state["policy_bias"].to(self.policy_bias.device))

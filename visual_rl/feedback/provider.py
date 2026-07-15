@@ -9,7 +9,21 @@ class RewardRouterFeedbackProvider(FeedbackProvider):
         self.reward_router = RewardRouter(reward_config, cache_dir=cache_dir)
 
     def score(self, batch: RolloutBatch) -> RewardBatch:
-        return self.reward_router.score(batch.media, batch.prompts, batch.metadata)
+        rewards = self.reward_router.score(
+            batch.media,
+            batch.prompts,
+            batch.metadata,
+            sample_id=batch.sample_id,
+        )
+        if rewards.sample_id is None:
+            raise ValueError(
+                "RewardRouter returned no sample_id for a rollout-bound reward batch."
+            )
+        if list(rewards.sample_id) != list(batch.sample_id):
+            raise ValueError(
+                "RewardRouter sample_id order does not match the rollout batch."
+            )
+        return rewards
 
 
 FEEDBACK_PROVIDERS.register("reward_router", RewardRouterFeedbackProvider)

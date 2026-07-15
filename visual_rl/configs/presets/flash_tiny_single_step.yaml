@@ -1,7 +1,5 @@
 run_name: flash_tiny_single_step
 seed: 11
-paths:
-  output_dir: runs/flash_tiny_single_step
 
 model:
   name: tiny_diffusion
@@ -38,6 +36,7 @@ algorithm:
     normalize: true
 
 rewards:
+  replace_defaults: true
   weights:
     prompt_color: 1.0
   clients:

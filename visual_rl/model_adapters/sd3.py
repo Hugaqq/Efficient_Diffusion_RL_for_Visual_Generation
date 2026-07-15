@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,12 @@ DEFAULT_SD3_LORA_TARGETS = [
     "attn.to_v",
 ]
 
-SD3_TRANSITION_CONTRACT_VERSION = "sd3_tempflow_v2"
+SD3_TRANSITION_CONTRACT_VERSION = "sd3_tempflow_v3"
+SD3_REFERENCE_NOISE_LEVEL = 0.7
+SD3_CHECKPOINT_FORMAT_VERSION = 1
+SD3_CHECKPOINT_METADATA_NAME = "adapter_metadata.json"
+SD3_LORA_CHECKPOINT_SUBDIR = "transformer"
+SD3_LORA_WEIGHT_NAMES = ("adapter_model.safetensors", "adapter_model.bin")
 
 
 class SD3TempFlowAdapter(ModelAdapter):
@@ -57,6 +63,12 @@ class SD3TempFlowAdapter(ModelAdapter):
         self.lora_alpha = int(extra.get("lora_alpha", self.lora_rank * 2))
         self.lora_path = config.get("lora_path", extra.get("lora_path"))
         self.lora_targets = list(extra.get("lora_target_modules", DEFAULT_SD3_LORA_TARGETS))
+        self.tempflow_reference_mode = bool(
+            config.get(
+                "tempflow_reference_mode",
+                extra.get("tempflow_reference_mode", False),
+            )
+        )
         self.pipeline = None
         self.transformer = None
         self._pipeline_with_logprob = None
@@ -120,20 +132,33 @@ class SD3TempFlowAdapter(ModelAdapter):
         if self.pipeline is None or self.transformer is None:
             raise AdapterNotLoadedError("SD3 TempFlow adapter is not loaded. Provide model_path or call load().")
 
+    @property
+    def train_module(self):
+        if self.transformer is None:
+            raise AdapterNotLoadedError(
+                "SD3 TempFlow adapter has no train module before load()."
+            )
+        return self.transformer
+
     def parameters(self):
-        self._ensure_loaded()
-        params = trainable_parameters(self.transformer)
+        params = trainable_parameters(self.train_module)
         if not params:
             raise AdapterNotLoadedError("SD3 TempFlow adapter has no trainable parameters.")
         return params
 
     def named_parameters(self):
-        self._ensure_loaded()
         return [
             (f"transformer.{name}", parameter)
-            for name, parameter in self.transformer.named_parameters()
+            for name, parameter in self.train_module.named_parameters()
             if parameter.requires_grad
         ]
+
+    def prepare_for_sampling(self) -> None:
+        self.eval()
+
+    def prepare_for_training(self) -> None:
+        if self.tempflow_reference_mode:
+            self.train()
 
     def branch_transition_count(self, rollout_config: dict[str, Any]) -> int:
         transition_count = int(rollout_config.get("num_steps", 3)) - 1
@@ -145,6 +170,11 @@ class SD3TempFlowAdapter(ModelAdapter):
         import torch
 
         self._ensure_loaded()
+        self.prepare_for_sampling()
+        if self.tempflow_reference_mode:
+            self._validate_reference_noise_level(
+                rollout_config.get("noise_level", SD3_REFERENCE_NOISE_LEVEL)
+            )
         num_steps = int(rollout_config.get("num_steps", 3))
         guidance_scale = float(rollout_config.get("guidance_scale", 4.5))
         output_type = str(rollout_config.get("output_type", "pt"))
@@ -206,8 +236,6 @@ class SD3TempFlowAdapter(ModelAdapter):
             timesteps=timesteps,
             old_log_probs=log_probs.detach(),
             kl=kls.detach(),
-            epoch_tag=rollout_config.get("epoch_tag"),
-            seed=rollout_config.get("seed"),
             model_metadata={
                 "adapter": self.name,
                 "reference_repo": str(self.repo_root),
@@ -221,6 +249,10 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "transition_kernel": self._transition_kernel_identity(),
                 "scheduler_class": self._scheduler_identity(),
                 "transformer_training": bool(self.transformer.training),
+                "recompute_transformer_training": bool(
+                    self.tempflow_reference_mode
+                ),
+                "tempflow_reference_mode": self.tempflow_reference_mode,
             },
             model_tensors={
                 "prompt_embeds": prompt_embeds.detach(),
@@ -235,6 +267,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         import torch
 
         self._ensure_loaded()
+        self.prepare_for_training()
         guidance_scale = float(batch.model_metadata.get("guidance_scale", 4.5))
         prompt_embeds, pooled_prompt_embeds = self._batch_embeddings(batch, positive=True)
         neg_prompt_embeds, neg_pooled_prompt_embeds = self._batch_embeddings(batch, positive=False)
@@ -243,7 +276,10 @@ class SD3TempFlowAdapter(ModelAdapter):
         timesteps = batch.timesteps.to(self.device)
         self._validate_recompute_contract(batch, latents, next_latents)
         self._validate_scheduler_context(batch)
-        if batch.model_metadata.get("branching_mode") == "shared_prefix":
+        if (
+            batch.model_metadata.get("branching_mode") == "shared_prefix"
+            and not self.tempflow_reference_mode
+        ):
             return self._recompute_shared_prefix_log_probs(
                 batch,
                 latents=latents,
@@ -291,6 +327,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         import torch
 
         self._ensure_loaded()
+        self.prepare_for_sampling()
         if self._pipeline_with_logprob_perstep is None:
             raise RuntimeError(
                 "TempFlow SD3 per-step branching pipeline is not available."
@@ -301,6 +338,9 @@ class SD3TempFlowAdapter(ModelAdapter):
         branch_count = int(rollout_config["branch_count"])
         num_steps = int(rollout_config.get("num_steps", 3))
         guidance_scale = float(rollout_config.get("guidance_scale", 4.5))
+        noise_level = self._validate_reference_noise_level(
+            rollout_config.get("noise_level", SD3_REFERENCE_NOISE_LEVEL)
+        )
         generator = make_generator(self.device, rollout_config.get("seed"))
 
         with (
@@ -422,6 +462,14 @@ class SD3TempFlowAdapter(ModelAdapter):
         )
         global_weights = global_weights / global_weights.mean().clamp_min(1e-6)
         noise_weight = float(global_weights[branch_step_index])
+        transition_std_dev_t = float(
+            self._reference_transition_std_dev_t(
+                scheduler_timestep,
+                noise_level=noise_level,
+            )
+            .detach()
+            .cpu()
+        )
         selected_timesteps = scheduler_timestep.to(
             device=selected_log_probs.device
         ).reshape(1, 1).expand(rows, 1).clone()
@@ -434,9 +482,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             timesteps=selected_timesteps,
             old_log_probs=selected_log_probs.reshape(rows, 1).detach(),
             kl=selected_kl.reshape(rows, 1).detach(),
-            branch_ids=torch.as_tensor(branch_ids, dtype=torch.long),
-            epoch_tag=rollout_config.get("epoch_tag"),
-            seed=rollout_config.get("seed"),
+            branch_id=torch.as_tensor(branch_ids, dtype=torch.long),
             model_metadata={
                 "adapter": self.name,
                 "reference_repo": str(self.repo_root),
@@ -449,6 +495,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "trajectory_step_indices": [branch_step_index],
                 "transition_count": transition_count,
                 "noise_weights": [noise_weight],
+                "transition_std_dev_t": [transition_std_dev_t],
                 "sde_generator_bound": generator is not None,
                 "reference_exploration_k": exploration_k,
                 "branch_count": branch_count,
@@ -458,6 +505,10 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "transition_kernel": self._transition_kernel_identity(),
                 "scheduler_class": self._scheduler_identity(),
                 "transformer_training": bool(self.transformer.training),
+                "recompute_transformer_training": bool(
+                    self.tempflow_reference_mode
+                ),
+                "tempflow_reference_mode": self.tempflow_reference_mode,
                 "branch_rng_consumption": "dynamic_branch_count",
             },
             model_tensors={
@@ -482,25 +533,155 @@ class SD3TempFlowAdapter(ModelAdapter):
         self._ensure_loaded()
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
+
+        from visual_rl.artifacts.checkpoint import save_json
+
+        if self.use_lora:
+            peft_config = getattr(self.transformer, "peft_config", None)
+            save_adapter = getattr(self.transformer, "save_pretrained", None)
+            if not peft_config or not callable(save_adapter):
+                raise RuntimeError(
+                    "SD3 use_lora=True requires a loaded PEFT transformer with "
+                    "save_pretrained support"
+                )
+            adapter_path = path / SD3_LORA_CHECKPOINT_SUBDIR
+            save_adapter(adapter_path, safe_serialization=True)
+            weight_path = self._peft_adapter_weight_path(adapter_path)
+            config_path = adapter_path / "adapter_config.json"
+            if weight_path is None or not config_path.is_file():
+                raise RuntimeError(
+                    "SD3 PEFT save_pretrained did not write a complete adapter "
+                    f"checkpoint under {adapter_path}"
+                )
+            save_json(
+                path / SD3_CHECKPOINT_METADATA_NAME,
+                {
+                    "adapter": self.name,
+                    "adapter_config": str(config_path.relative_to(path)),
+                    "adapter_name": "default",
+                    "format_version": SD3_CHECKPOINT_FORMAT_VERSION,
+                    "save_kind": "peft_adapter",
+                    "use_lora": True,
+                    "weights": str(weight_path.relative_to(path)),
+                },
+            )
+            return
+
         import torch
 
         if hasattr(self.transformer, "save_pretrained"):
-            self.transformer.save_pretrained(path / "transformer")
-        torch.save(self.transformer.state_dict(), path / "transformer_state.pt")
+            self.transformer.save_pretrained(path / SD3_LORA_CHECKPOINT_SUBDIR)
+        state_path = path / "transformer_state.pt"
+        torch.save(self.transformer.state_dict(), state_path)
+        save_json(
+            path / SD3_CHECKPOINT_METADATA_NAME,
+            {
+                "adapter": self.name,
+                "format_version": SD3_CHECKPOINT_FORMAT_VERSION,
+                "save_kind": "full_transformer_state",
+                "state": state_path.name,
+                "use_lora": False,
+            },
+        )
 
     def load_checkpoint(self, checkpoint_dir: str) -> None:
         import torch
 
         self._ensure_loaded()
-        state_path = Path(checkpoint_dir) / "transformer_state.pt"
-        if not state_path.exists():
-            raise RuntimeError(f"Missing SD3 transformer state: {state_path}")
-        state = torch.load(
-            state_path,
-            map_location=self.device,
-            weights_only=False,
-        )
-        self.transformer.load_state_dict(state)
+        path = Path(checkpoint_dir)
+        state_path = path / "transformer_state.pt"
+        if state_path.is_file():
+            state = torch.load(
+                state_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+            self.transformer.load_state_dict(state)
+            return
+
+        if not self.use_lora:
+            raise RuntimeError(
+                "Missing SD3 full transformer checkpoint for use_lora=False: "
+                f"expected {state_path}"
+            )
+
+        peft_config = getattr(self.transformer, "peft_config", None)
+        if not peft_config:
+            raise RuntimeError(
+                "Cannot load an SD3 LoRA checkpoint into a non-PEFT transformer"
+            )
+        adapter_path = self._find_peft_adapter_path(path)
+        if adapter_path is None:
+            expected = path / SD3_LORA_CHECKPOINT_SUBDIR
+            raise RuntimeError(
+                "Missing SD3 checkpoint weights: expected legacy "
+                f"{state_path} or a PEFT adapter under {expected} (or {path})"
+            )
+
+        try:
+            from peft.utils.save_and_load import (
+                load_peft_weights,
+                set_peft_model_state_dict,
+            )
+        except ImportError as exc:  # pragma: no cover - optional train dependency
+            raise RuntimeError(
+                "Install visual-rl[train] with PEFT to load an SD3 LoRA checkpoint"
+            ) from exc
+
+        parameter_ids = {
+            name: id(parameter)
+            for name, parameter in self.transformer.named_parameters()
+        }
+        try:
+            adapter_state = load_peft_weights(str(adapter_path), device="cpu")
+            if not adapter_state:
+                raise ValueError("adapter weight file contains no tensors")
+            load_result = set_peft_model_state_dict(
+                self.transformer,
+                adapter_state,
+                adapter_name="default",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load SD3 PEFT adapter checkpoint from {adapter_path}: {exc}"
+            ) from exc
+
+        current_parameter_ids = {
+            name: id(parameter)
+            for name, parameter in self.transformer.named_parameters()
+        }
+        if current_parameter_ids != parameter_ids:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint loading replaced Parameter objects; "
+                "optimizer references would be invalid"
+            )
+        unexpected = list(getattr(load_result, "unexpected_keys", ()) or ())
+        if unexpected:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint contains unexpected keys: "
+                + ", ".join(str(key) for key in unexpected)
+            )
+
+    @staticmethod
+    def _peft_adapter_weight_path(path: Path) -> Path | None:
+        for name in SD3_LORA_WEIGHT_NAMES:
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @classmethod
+    def _find_peft_adapter_path(cls, checkpoint_path: Path) -> Path | None:
+        for candidate in (
+            checkpoint_path / SD3_LORA_CHECKPOINT_SUBDIR,
+            checkpoint_path,
+        ):
+            if (
+                (candidate / "adapter_config.json").is_file()
+                and cls._peft_adapter_weight_path(candidate) is not None
+            ):
+                return candidate
+        return None
 
     def _call_pipeline_with_logprob(self, **kwargs):
         signature = inspect.signature(self._pipeline_with_logprob)
@@ -576,6 +757,83 @@ class SD3TempFlowAdapter(ModelAdapter):
         scheduler_type = type(self.pipeline.scheduler)
         return f"{scheduler_type.__module__}.{scheduler_type.__qualname__}"
 
+    def _reference_transition_std_dev_t(self, timestep, *, noise_level: float):
+        """Evaluate the standard deviation returned by TempFlow's frozen kernel."""
+
+        import torch
+
+        scheduler = self.pipeline.scheduler
+        noise_level = self._validate_reference_noise_level(noise_level)
+        requested_timestep = torch.as_tensor(timestep).reshape(-1)
+        if requested_timestep.numel() != 1 or not bool(
+            torch.isfinite(requested_timestep).all()
+        ):
+            raise ValueError(
+                "TempFlow reference transition requires one finite scheduler timestep"
+            )
+        try:
+            step_index = int(scheduler.index_for_timestep(timestep))
+        except Exception as exc:
+            raise ValueError(
+                "TempFlow reference transition timestep is absent from the scheduler"
+            ) from exc
+
+        timesteps = torch.as_tensor(scheduler.timesteps).reshape(-1)
+        sigmas = torch.as_tensor(scheduler.sigmas).reshape(-1)
+        if step_index < 0 or step_index >= timesteps.numel() - 1:
+            raise ValueError(
+                "TempFlow reference transition timestep must identify a non-terminal "
+                f"scheduler step, got index {step_index}"
+            )
+        if step_index + 1 >= sigmas.numel():
+            raise ValueError(
+                "TempFlow reference transition is missing sigma_{t+1}"
+            )
+        scheduled_timestep = torch.as_tensor(timesteps[step_index]).reshape(-1)
+        if (
+            scheduled_timestep.numel() != 1
+            or float(requested_timestep.item()) != float(scheduled_timestep.item())
+        ):
+            raise ValueError(
+                "TempFlow reference transition timestep does not match the indexed "
+                "scheduler step"
+            )
+        if not sigmas.is_floating_point():
+            sigmas = sigmas.to(torch.get_default_dtype())
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+        sigma_max = sigmas[1].to(dtype=sigma.dtype, device=sigma.device)
+        if not bool(torch.isfinite(torch.stack([sigma, sigma_next, sigma_max])).all()):
+            raise ValueError(
+                "TempFlow reference transition sigmas must be finite"
+            )
+        denominator_sigma = torch.where(sigma == 1, sigma_max, sigma)
+        base_variance = sigma / (1 - denominator_sigma)
+        sigma_delta = sigma - sigma_next
+        if not bool((base_variance > 0).item()) or not bool(
+            (sigma_delta > 0).item()
+        ):
+            raise ValueError(
+                "TempFlow reference transition requires positive base variance and "
+                "sigma_t - sigma_{t+1}"
+            )
+        base_std = torch.sqrt(base_variance) * noise_level
+        return base_std * torch.sqrt(sigma_delta)
+
+    def _validate_reference_noise_level(self, noise_level: float) -> float:
+        try:
+            value = float(noise_level)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("TempFlow noise_level must be a finite positive number") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("TempFlow noise_level must be a finite positive number")
+        if self.tempflow_reference_mode and value != SD3_REFERENCE_NOISE_LEVEL:
+            raise ValueError(
+                "TempFlow reference mode is pinned to the frozen SD3 kernel "
+                f"noise_level={SD3_REFERENCE_NOISE_LEVEL}, got {value}"
+            )
+        return value
+
     def _transition_kernel_identity(self) -> str:
         kernel = self._sde_step_with_logprob
         if kernel is None:
@@ -592,6 +850,11 @@ class SD3TempFlowAdapter(ModelAdapter):
     ) -> None:
         version = batch.model_metadata.get("trajectory_contract_version")
         if version != SD3_TRANSITION_CONTRACT_VERSION:
+            if self.tempflow_reference_mode:
+                raise ValueError(
+                    "SD3 TempFlow reference mode requires trajectory contract "
+                    f"{SD3_TRANSITION_CONTRACT_VERSION!r}, got {version!r}"
+                )
             return
         expected_dtype = batch.model_metadata.get("trajectory_source_dtype")
         if expected_dtype and str(latents.dtype) != expected_dtype:
@@ -618,12 +881,16 @@ class SD3TempFlowAdapter(ModelAdapter):
                 f"{current_kernel} != {expected_kernel}"
             )
         expected_training = batch.model_metadata.get("transformer_training")
-        if expected_training is not None and bool(self.transformer.training) != bool(
-            expected_training
+        recompute_training = batch.model_metadata.get(
+            "recompute_transformer_training",
+            expected_training,
+        )
+        if recompute_training is not None and bool(self.transformer.training) != bool(
+            recompute_training
         ):
             raise ValueError(
-                "SD3 transformer train/eval mode changed after rollout; "
-                "old/new log-prob parity is not defined"
+                "SD3 transformer mode does not match the recorded recompute contract: "
+                f"{self.transformer.training} != {recompute_training}"
             )
 
     def _validate_scheduler_context(self, batch: RolloutBatch) -> None:

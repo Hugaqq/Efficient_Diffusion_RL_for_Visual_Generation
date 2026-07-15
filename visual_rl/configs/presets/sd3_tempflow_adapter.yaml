@@ -1,20 +1,17 @@
 run_name: sd3_tempflow_adapter
 seed: 23
-paths:
-  output_dir: runs/sd3_tempflow_adapter
 use_lora: true
 
 model:
   name: sd3_tempflow
   model_family: sd3
-  model_path: ""
   extra:
-    repo_root: reference_code/TempFlow-GRPO-main
-    resolution: 256
+    resolution: 512
     dtype: bfloat16
     lora_rank: 32
     lora_alpha: 64
     max_sequence_length: 128
+    tempflow_reference_mode: false
 
 dataset:
   prompts:
@@ -24,12 +21,13 @@ dataset:
 sample:
   name: branching
   batch_size: 1
-  num_steps: 3
+  num_steps: 10
   guidance_scale: 4.5
+  noise_level: 0.7
 
 rollout:
-  branch_count: 2
-  exploration_k: 2
+  branch_count: 6
+  exploration_k: 6
   include_main: false
   branch_timesteps: auto
   branch_timestep_strategy: cycle
@@ -37,14 +35,20 @@ rollout:
 
 algorithm:
   name: tempflow_grpo
-  clip_range: 0.01
+  objective_version: policy_identity_v1
+  clip_range: 0.0001
   adv_clip_max: 5.0
   beta: 0.0
   advantage_mode: grpo
+  advantage_epsilon: 0.0001
+  advantage_dtype: float64
+  params:
+    preserve_advantage_dtype: true
   credit_assignment: branch_timestep
   noise_weighting:
     enabled: true
-    mode: std_dev_t
+    mode: reference_std_dev_t
+    scale: 2.25
 
 optimizer:
   name: algorithm
@@ -55,6 +59,7 @@ optimizer:
     require_nonzero_gradients: true
 
 rewards:
+  replace_defaults: true
   weights:
     prompt_color: 1.0
   clients:
@@ -64,7 +69,8 @@ rewards:
   fail_policy: raise
 
 train:
-  learning_rate: 0.00001
+  learning_rate: 0.0003
+  max_grad_norm: 1.0
   max_steps: 1
   save_every: 1
 

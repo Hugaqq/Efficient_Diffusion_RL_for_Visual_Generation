@@ -1,0 +1,50 @@
+{
+  "prompts": [
+    {
+      "metadata": {
+        "group_id": "group-302a12bdb0b5a212d2379e19",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-302a12bdb0b5a212d2379e19",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 1,
+        "split": "train"
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-7a4cf81748e684bba25606c5",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-7a4cf81748e684bba25606c5",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 1,
+        "split": "train"
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table"
+    }
+  ],
+  "run_id": "world_r1_real_wan_one_step",
+  "schema_version": "2"
+}

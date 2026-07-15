@@ -1,0 +1,14 @@
+{
+  "authoritative_completed_steps": 1,
+  "completed_steps": 1,
+  "pid": 1132783,
+  "rank": 0,
+  "run_id": "flash_grpo_real_wan_one_step",
+  "schema_version": "1",
+  "start_step": 0,
+  "started_from_step": 0,
+  "state": "completed",
+  "target_steps": 1,
+  "valid": true,
+  "world_size": 1
+}

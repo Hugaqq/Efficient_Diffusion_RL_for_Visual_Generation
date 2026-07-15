@@ -1,0 +1,12 @@
+{
+  "checkpoint_config_fingerprint": "39c5f87d3047120019aa45511dd6b0dcf709db29e4a217dd0ad0fef3a76870a5",
+  "e2_original_paths_fingerprint": "39c5f87d3047120019aa45511dd6b0dcf709db29e4a217dd0ad0fef3a76870a5",
+  "e2b_copied_paths_fingerprint": "8145f1011c501af898e9e43138d507807e0b8e676fac942436a1a13f6820669f",
+  "train_content_sha256": "4ccbe865c736fd074146029915fd39dab285f42dccd97c3f73a6ea2e6cdda867",
+  "heldout_content_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3",
+  "changed_fields": [
+    "dataset.path",
+    "evaluation.path"
+  ],
+  "optimizer_steps_executed": 0
+}

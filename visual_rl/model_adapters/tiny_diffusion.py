@@ -24,13 +24,19 @@ class TinyDiffusionAdapter(ModelAdapter):
         if self.channels != 3:
             raise ValueError("TinyDiffusionAdapter currently expects 3 channels for prompt_color reward.")
         self.device = torch.device(config.get("device", extra.get("device", "cpu")))
-        self.color_bias = torch.nn.Parameter(torch.zeros(self.channels, device=self.device))
+        self._train_module = torch.nn.Module()
+        self._train_module.register_parameter(
+            "color_bias",
+            torch.nn.Parameter(torch.zeros(self.channels, device=self.device)),
+        )
 
-    def parameters(self):
-        return [self.color_bias]
+    @property
+    def train_module(self):
+        return self._train_module
 
-    def named_parameters(self):
-        return [("color_bias", self.color_bias)]
+    @property
+    def color_bias(self):
+        return self._train_module.color_bias
 
     def sample(self, prompts: list[str], metadata: list[dict[str, Any]], rollout_config: dict[str, Any]) -> RolloutBatch:
         import torch
@@ -58,8 +64,6 @@ class TinyDiffusionAdapter(ModelAdapter):
             timesteps=timesteps,
             old_log_probs=old_log_probs,
             kl=torch.zeros(batch_size, num_steps),
-            epoch_tag=rollout_config.get("epoch_tag"),
-            seed=seed,
             model_metadata={"adapter": self.name, "image_size": self.image_size},
         )
 
@@ -160,9 +164,7 @@ class TinyDiffusionAdapter(ModelAdapter):
             timesteps=timesteps,
             old_log_probs=old_log_probs,
             kl=torch.zeros(rows, num_steps),
-            branch_ids=torch.as_tensor(branch_ids, dtype=torch.long),
-            epoch_tag=rollout_config.get("epoch_tag"),
-            seed=seed,
+            branch_id=torch.as_tensor(branch_ids, dtype=torch.long),
             model_metadata={
                 "adapter": self.name,
                 "image_size": self.image_size,
@@ -191,7 +193,7 @@ class TinyDiffusionAdapter(ModelAdapter):
         state = torch.load(
             Path(checkpoint_dir) / "tiny_diffusion.pt",
             map_location=self.device,
-            weights_only=False,
+            weights_only=True,
         )
         with torch.no_grad():
             self.color_bias.copy_(state["color_bias"].to(self.device))

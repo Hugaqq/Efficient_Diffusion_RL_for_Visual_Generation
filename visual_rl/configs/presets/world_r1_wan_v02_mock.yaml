@@ -32,6 +32,7 @@ algorithm:
   weight_advantages: false
 
 rewards:
+  replace_defaults: true
   fail_policy: invalid
   weights:
     mock: 1.0
@@ -45,6 +46,3 @@ train:
   max_steps: 2
   learning_rate: 0.001
   save_every: 1
-
-paths:
-  output_dir: runs/world_r1_wan_v02_mock

@@ -1,0 +1,221 @@
+{
+  "dataset_name": "tempflow_real_rgb_v2",
+  "filter_stats": {
+    "upstream_test": {
+      "accepted": 138,
+      "raw_lines": 2448,
+      "rejected_color_contract": 2273,
+      "rejected_length": 14,
+      "rejected_quality": 5,
+      "rejected_quality_malformed_or_repetitive": 5,
+      "rejected_safety": 18,
+      "rejected_safety_blocked_term": 16,
+      "rejected_safety_minor_reference": 4
+    },
+    "upstream_train": {
+      "accepted": 7439,
+      "raw_lines": 129197,
+      "rejected_color_contract": 120474,
+      "rejected_duplicate": 3,
+      "rejected_length": 136,
+      "rejected_quality": 19,
+      "rejected_quality_malformed_or_repetitive": 19,
+      "rejected_safety": 1126,
+      "rejected_safety_blocked_term": 1062,
+      "rejected_safety_minor_reference": 215
+    }
+  },
+  "overlap": {
+    "heldout_external": 0,
+    "train_external": 0,
+    "train_heldout": 0
+  },
+  "purpose": "Research-only online diffusion RL prompt dataset for RGB-control validation.",
+  "reuse_scope": "Internal research experiment pending final upstream license review.",
+  "seed": 20260712,
+  "selection": {
+    "blocked_terms": [
+      "nsfw",
+      "nude",
+      "nudity",
+      "naked",
+      "porn",
+      "pornographic",
+      "sexual",
+      "erotic",
+      "gore",
+      "gruesome",
+      "decapitated",
+      "blood",
+      "bloody",
+      "bleeding",
+      "corpse",
+      "murder",
+      "kill",
+      "killed",
+      "slaughter",
+      "weapon",
+      "weapons",
+      "gun",
+      "guns",
+      "rifle",
+      "knife",
+      "death",
+      "dead",
+      "bloodied",
+      "bloodstains",
+      "killer",
+      "undead",
+      "zombie",
+      "violence",
+      "violent",
+      "terror",
+      "girl",
+      "girls",
+      "boy",
+      "boys",
+      "baby",
+      "underwear",
+      "underware",
+      "lingerie",
+      "cigarette",
+      "smoking",
+      "drug"
+    ],
+    "dedupe": "NFKC + whitespace normalization + casefold exact match",
+    "max_words": 60,
+    "min_words": 4,
+    "minor_patterns": [
+      "\\b(?:child|children|kid|kids|toddler|preteen|teenage|teenager)\\b",
+      "\\b(?:schoolgirl|schoolgirls|schoolboy|schoolboys)\\b",
+      "\\b(?:young|little)\\s+(?:girl|boy)\\b",
+      "\\b(?:[0-9]|1[0-7])\\s*(?:yo|y/o|year[ -]old)\\b"
+    ],
+    "quality_patterns": [
+      ",\\s*,",
+      "(\\b\\w+\\b)(?:\\s*,?\\s*\\1){3,}"
+    ],
+    "require_exactly_one_target_color": true,
+    "target_colors": [
+      "red",
+      "green",
+      "blue"
+    ]
+  },
+  "source_snapshot_revision": "63e4def7159940ba7d60e4e6250eee868342388c",
+  "sources": {
+    "hpsv2": {
+      "derivation": "Prompt files distributed with the TempFlow-GRPO snapshot.",
+      "files": {
+        "test": {
+          "path": "TempFlow-GRPO/dataset/hpsv2/test.txt",
+          "sha256": "6eb1c5561a58da305155ba00755822de4f8b0bc239175e20334e431e978f4a82"
+        },
+        "train": {
+          "path": "TempFlow-GRPO/dataset/hpsv2/train.txt",
+          "sha256": "95898977905748158610673c31894055e6baaffc315b271171eb5d59bb077955"
+        }
+      },
+      "license_status": "HPSv2 code is Apache-2.0; prompt-file provenance still requires attribution review.",
+      "upstream": "https://github.com/tgxs002/HPSv2"
+    },
+    "pickscore": {
+      "derivation": "TempFlow-GRPO/dataset/pickscore/prpocess.py extracts unique captions.",
+      "files": {
+        "test": {
+          "path": "TempFlow-GRPO/dataset/pickscore/test.txt",
+          "sha256": "d75c025fa451866e70f7e36243f7cdd93095523cb51f5f9651f2ce3236d20262"
+        },
+        "train": {
+          "path": "TempFlow-GRPO/dataset/pickscore/train.txt",
+          "sha256": "2f425adcbb9a6d0feee7c6c448e1cb83a1f71deca9434b803907e2578eca837f"
+        }
+      },
+      "license_status": "Verify the pinned upstream dataset card before redistribution.",
+      "upstream": "https://huggingface.co/datasets/pickapic-anonymous/pickapic_v1"
+    }
+  },
+  "splits": {
+    "external_test": {
+      "colors": {
+        "blue": 20,
+        "green": 20,
+        "red": 20
+      },
+      "count": 60,
+      "jsonl": "external_test.jsonl",
+      "jsonl_sha256": "5aeb9895fd259f7135fff2a3d4325b9da637173e833fb79946997df269b2edbc",
+      "sources": {
+        "hpsv2": 7,
+        "pickscore": 53
+      },
+      "txt": "external_test.txt",
+      "txt_sha256": "9dc1042c4ca2ac0a836868a3a2c48717797684b2adab2ee55a54ec739db2d350"
+    },
+    "heldout": {
+      "colors": {
+        "blue": 200,
+        "green": 200,
+        "red": 200
+      },
+      "count": 600,
+      "jsonl": "heldout.jsonl",
+      "jsonl_sha256": "cdec0a87f8e3f52ebcaa03e00dee8c6492c4fb0fa300beaed442c779f5f749f6",
+      "sources": {
+        "hpsv2": 493,
+        "pickscore": 107
+      },
+      "txt": "heldout.txt",
+      "txt_sha256": "9f438ad09b0679042a9014ddf8e12647ebe5c0aeae081029e01da098a8a84812"
+    },
+    "heldout_fast": {
+      "colors": {
+        "blue": 30,
+        "green": 30,
+        "red": 30
+      },
+      "count": 90,
+      "jsonl": "heldout_fast.jsonl",
+      "jsonl_sha256": "1a35f5754482784adb776e780beb02f3deb20709ef0938e335782663a4a3a74e",
+      "sources": {
+        "hpsv2": 73,
+        "pickscore": 17
+      },
+      "subset_of": "heldout",
+      "txt": "heldout_fast.txt",
+      "txt_sha256": "c01bcba0c534ffb46eb31fd4a471a7516760ec988be48ae9ddacbb06858c02f6"
+    },
+    "heldout_pilot": {
+      "colors": {
+        "blue": 4,
+        "green": 4,
+        "red": 4
+      },
+      "count": 12,
+      "jsonl": "heldout_pilot.jsonl",
+      "jsonl_sha256": "a6f84a3a25c20c2511580a24c7b1ae0b478f28043f96737ecf872e17a1ddcd14",
+      "sources": {
+        "hpsv2": 12
+      },
+      "subset_of": "heldout",
+      "txt": "heldout_pilot.txt",
+      "txt_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3"
+    },
+    "train": {
+      "colors": {
+        "blue": 1200,
+        "green": 1200,
+        "red": 1200
+      },
+      "count": 3600,
+      "jsonl": "train.jsonl",
+      "jsonl_sha256": "dd5edf62590874cd1a90edc21da6a5e3da8f69b6c12c71ca4d15c3d3016e45ed",
+      "sources": {
+        "hpsv2": 2938,
+        "pickscore": 662
+      },
+      "txt": "train.txt",
+      "txt_sha256": "4ccbe865c736fd074146029915fd39dab285f42dccd97c3f73a6ea2e6cdda867"
+    }
+  }
+}

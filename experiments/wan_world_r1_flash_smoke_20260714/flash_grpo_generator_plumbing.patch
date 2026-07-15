@@ -1,0 +1,11 @@
+diff --git a/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py b/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
+--- a/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
++++ b/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
+@@ -338,6 +338,7 @@ def wan_pipeline_with_logprob(
+                 noise_pred.float(),
+                 t.unsqueeze(0),
+                 latents.float(),
++                generator=generator,
+                 determistic=determistic,
+                 return_pixel_log_prob=return_pixel_log_prob
+             )

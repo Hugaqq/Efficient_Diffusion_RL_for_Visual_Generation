@@ -1,19 +1,24 @@
 run_name: world_r1_wan_bounded
 seed: 42
-paths:
-  output_dir: runs/world_r1_wan_bounded
+use_lora: true
 
 model:
   name: world_r1_wan_legacy
   model_family: wan
-  model_path: ""
   extra:
-    repo_root: World-R1-main
     device: cpu
     dtype: float32
     local_files_only: true
     low_cpu_mem_usage: true
     train_cfg: true
+    use_camera_trajectory: true
+    lora_rank: 32
+    lora_alpha: 64
+    lora_target_modules:
+      - to_k
+      - to_out.0
+      - to_q
+      - to_v
 
 dataset:
   prompts:
@@ -47,16 +52,32 @@ algorithm:
   weight_advantages: false
 
 rewards:
+  replace_defaults: true
   weights:
     reward_general: 1.0
     reward_3d: 1.0
   clients:
     reward_general:
       name: reward_general
+      version: world_r1-reference-v1
       url: http://127.0.0.1:8090/
+      protocol_mode: reference_v1
+      wire_format: legacy_pickle
+      allow_unsafe_pickle: true
+      trusted_hosts:
+        - 127.0.0.1
+        - localhost
     reward_3d:
       name: reward_3d
+      version: world_r1-reference-v1
       url: http://127.0.0.1:8089/
+      protocol_mode: reference_v1
+      wire_format: legacy_pickle
+      allow_unsafe_pickle: true
+      trusted_hosts:
+        - 127.0.0.1
+        - localhost
+      require_camera_trajectory: true
   fail_policy: invalid
 
 train:

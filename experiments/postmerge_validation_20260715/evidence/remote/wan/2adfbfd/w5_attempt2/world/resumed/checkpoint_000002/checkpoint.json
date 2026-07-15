@@ -1,0 +1,38 @@
+{
+  "adapter_payload_sha256": "334e0ff0811f42cc2394b3a3f4a3c50aff6a8729f9ce31c4fafef16bf12a1a75",
+  "config_fingerprint": "0ee0c014ec4d4d9b6c49b96e55647d2554e9d5c572f3c357c7b1b92d43d45a35",
+  "config_fingerprint_scheme": "component-sha256-v1",
+  "config_fingerprint_version": 2,
+  "data_identity": {
+    "evaluation": {
+      "content_sha256": null,
+      "max_prompts": null,
+      "prompts": [],
+      "seeds": [
+        1701,
+        1702,
+        1703
+      ],
+      "split_name": "heldout"
+    },
+    "train": {
+      "content_sha256": "11970a56585025a9f7c880c35fb4b2a2b47d5f4ef993c8cb19aa06f7b7cb468e",
+      "repeat_per_prompt": 1,
+      "require_unique": false,
+      "sampling_seed": 0,
+      "sampling_strategy": "sequential",
+      "split_name": "train"
+    }
+  },
+  "data_identity_fingerprint": "056c30351894b88692412e0354fa4aa45f0a1337ad853a8e0da1ba576d7fa91d",
+  "data_source": {
+    "evaluation_path": null,
+    "train_path": null
+  },
+  "format_version": 4,
+  "implementation_identity_fingerprint": "503faa0843876ae1ff971c394585231b20dbcb04c305ddd36c9bdda40de5564c",
+  "step": 2,
+  "training_semantics_fingerprint": "a528cde6b0c74c8f5c58fcec50b493c3d76cd9ddd2053aa51d193c35178384fb",
+  "training_state": "training_state.pt",
+  "training_state_sha256": "261b7cb376c98db144c0df24b1138ef32ed94712ffdaa16283cf4943f048a92f"
+}

@@ -1,0 +1,38 @@
+{
+  "adapter_payload_sha256": "9ee9afc5a03e75816552d92c98f6b3c3c8f7109021a38b13b135cc62cee793e6",
+  "config_fingerprint": "cf6d6b60aa026e298587036c3d184967d101adc0c4080b830b31553eda0e4d3e",
+  "config_fingerprint_scheme": "component-sha256-v1",
+  "config_fingerprint_version": 2,
+  "data_identity": {
+    "evaluation": {
+      "content_sha256": null,
+      "max_prompts": null,
+      "prompts": [],
+      "seeds": [
+        1701,
+        1702,
+        1703
+      ],
+      "split_name": "heldout"
+    },
+    "train": {
+      "content_sha256": "1586b5557541d41ec2bdc3f4f55ef6b31a1e3c651ac410d732070976e5b9bc2b",
+      "repeat_per_prompt": 1,
+      "require_unique": false,
+      "sampling_seed": 0,
+      "sampling_strategy": "sequential",
+      "split_name": "train"
+    }
+  },
+  "data_identity_fingerprint": "db730b60b48d75fc5cf60ac57ffcb5442afc0e23c66c70dd202ee13e69502b76",
+  "data_source": {
+    "evaluation_path": null,
+    "train_path": null
+  },
+  "format_version": 4,
+  "implementation_identity_fingerprint": "af13a0697eb46078196b89f90490a88568f3f48526cfc92712abbe1b57fd0e9c",
+  "step": 2,
+  "training_semantics_fingerprint": "fbcae02058114656f6e7a54613da37efa80af1e3195927140efa839612c52cbe",
+  "training_state": "training_state.pt",
+  "training_state_sha256": "bc9ebe62b538f2645e808105dfe5dae0a6d64376715c1f303e4465ad255a0b1d"
+}

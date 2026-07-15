@@ -22,7 +22,9 @@ def reference_code_roots() -> list[Path]:
     roots.extend(
         [
             project_root() / "reference_code",
-            # The current local checkout keeps upstream repos next to framecode.
+            # Current source checkout: <workspace>/code_base/<upstream-repo>.
+            project_root().parent / "code_base",
+            # Keep the older nested code_base/reference_code layout compatible.
             project_root().parent / "code_base" / "reference_code",
         ]
     )
@@ -40,7 +42,7 @@ def resolve_legacy_repo(repo_root: str | Path) -> Path:
     """Resolve a legacy/reference repo path.
 
     Keep old `reference_code/<repo>` configs working while also supporting the
-    current `code_base/reference_code/<repo>` checkout and explicit env roots.
+    current `code_base/<repo>` checkout and explicit env roots.
     """
 
     raw = Path(repo_root).expanduser()

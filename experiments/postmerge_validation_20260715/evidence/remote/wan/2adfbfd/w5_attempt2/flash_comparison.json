@@ -1,0 +1,116 @@
+{
+  "adapter_sha256": {
+    "continuous": "9ee9afc5a03e75816552d92c98f6b3c3c8f7109021a38b13b135cc62cee793e6",
+    "resumed": "9ee9afc5a03e75816552d92c98f6b3c3c8f7109021a38b13b135cc62cee793e6"
+  },
+  "all_exact_gates_passed": true,
+  "byte_diagnostics": {
+    "final_checkpoint_tree_byte_exact": false,
+    "note": "torch.save archive bytes are not a semantic equality gate; each tree is independently hash-validated before the deserialized state is compared exactly"
+  },
+  "failed_gates": [],
+  "gates": {
+    "all_final_runs_secure": true,
+    "all_segments_valid": true,
+    "final_adapter_exact": true,
+    "final_checkpoint_metadata_semantic_exact": true,
+    "final_training_state_exact": true,
+    "manifest_semantic_exact": true,
+    "metrics_rows_2_1_1": true,
+    "resume_loaded_step_one": true,
+    "split_final_hash_equals_resume_initial": true,
+    "step_one_metrics_exact": true,
+    "step_zero_metrics_exact": true
+  },
+  "label": "flash-grpo-postmerge-v4-2adfbfd",
+  "observational_metrics_excluded": [
+    "backward_time_s",
+    "checkpoint_write_time_s",
+    "optimizer_time_s",
+    "peak_gpu_memory_bytes",
+    "recompute_time_s",
+    "reward_executor_provider_queue_wait_count",
+    "reward_executor_provider_queue_wait_max_s",
+    "reward_executor_provider_queue_wait_p50_s",
+    "reward_executor_provider_queue_wait_p95_s",
+    "reward_executor_provider_queue_wait_sum_s",
+    "reward_executor_queue_wait_count",
+    "reward_executor_queue_wait_max_s",
+    "reward_executor_queue_wait_p50_s",
+    "reward_executor_queue_wait_p95_s",
+    "reward_executor_queue_wait_sum_s",
+    "reward_executor_service_latency_count",
+    "reward_executor_service_latency_max_s",
+    "reward_executor_service_latency_p50_s",
+    "reward_executor_service_latency_p95_s",
+    "reward_executor_service_latency_sum_s",
+    "reward_executor_wall_time_s",
+    "reward_latency_p50_s",
+    "reward_latency_p95_s",
+    "reward_time_s",
+    "rollout_cache_time_s",
+    "rollout_time_s",
+    "update_time_s"
+  ],
+  "run_security": {
+    "continuous": {
+      "audit_schema_version": "2",
+      "checkpoint_tree_sha256": "2ec7a90c57acd7a7e68fefe6a2b80025a1e43b851ef6ad71e2583223cb220da9",
+      "gates": {
+        "artifact_audit_valid": true,
+        "checkpoint_v4": true,
+        "manifest_v2": true,
+        "marker_tree_valid": true,
+        "metrics_projection_semantic": true,
+        "status_authoritative": true
+      },
+      "manifest_schema_version": "2"
+    },
+    "resumed": {
+      "audit_schema_version": "2",
+      "checkpoint_tree_sha256": "12cde85d717a2ca30710fb6c4f7bfea3e558509b70095202c9472c8b4b1089fe",
+      "gates": {
+        "artifact_audit_valid": true,
+        "checkpoint_v4": true,
+        "manifest_v2": true,
+        "marker_tree_valid": true,
+        "metrics_projection_semantic": true,
+        "status_authoritative": true
+      },
+      "manifest_schema_version": "2"
+    },
+    "split": {
+      "audit_schema_version": "2",
+      "checkpoint_tree_sha256": "6f3746f09e67ee157d71762466add9fd3efa42d352d855fed3f59c5bd5bc6249",
+      "gates": {
+        "artifact_audit_valid": true,
+        "checkpoint_v4": true,
+        "manifest_v2": true,
+        "marker_tree_valid": true,
+        "metrics_projection_semantic": true,
+        "status_authoritative": true
+      },
+      "manifest_schema_version": "2"
+    }
+  },
+  "schema_version": "1",
+  "training_state_exact": {
+    "adapter_payload_sha256": true,
+    "config_fingerprint": true,
+    "config_fingerprint_scheme": true,
+    "config_fingerprint_version": true,
+    "data_identity": true,
+    "data_identity_fingerprint": true,
+    "data_source": true,
+    "format_version": true,
+    "identity_payload": true,
+    "implementation": true,
+    "implementation_identity_fingerprint": true,
+    "optimizer": true,
+    "plugin": true,
+    "rng": true,
+    "step": true,
+    "training_semantics_fingerprint": true
+  },
+  "valid": true
+}

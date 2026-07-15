@@ -1,0 +1,40 @@
+{
+  "records": [
+    {
+      "reward_values": {
+        "raw": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.8594359159469604
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.8594359159469604
+        },
+        "weighted_total": 1.613435983657837
+      },
+      "sample_id": "step-000001-rank-0000-0d4f77a37a3febe235163708",
+      "schema_version": "2",
+      "step": 1
+    },
+    {
+      "reward_values": {
+        "raw": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.513668954372406
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.513668954372406
+        },
+        "weighted_total": 1.2676689624786377
+      },
+      "sample_id": "step-000001-rank-0000-7a600a8e8564a74a1ab36db6",
+      "schema_version": "2",
+      "step": 1
+    }
+  ],
+  "run_id": "world_r1_real_wan_one_step",
+  "schema_version": "2"
+}

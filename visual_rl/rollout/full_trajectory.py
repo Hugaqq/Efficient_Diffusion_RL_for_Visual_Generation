@@ -4,14 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from visual_rl.core.types import RolloutBatch
+from visual_rl.core.types import RolloutBatch, StepContext
 from visual_rl.core.registry import ROLLOUT_ENGINES
 from visual_rl.model_adapters.base import ModelAdapter
 from visual_rl.rollout.base import RolloutEngine
 
 
 class FullTrajectoryRollout(RolloutEngine):
-    def sample(self, adapter: ModelAdapter, prompts: list[str], metadata: list[dict[str, Any]]) -> RolloutBatch:
+    def sample(
+        self,
+        adapter: ModelAdapter,
+        prompts: list[str],
+        metadata: list[dict[str, Any]],
+        context: StepContext | None = None,
+    ) -> RolloutBatch:
+        context = self.resolve_context(context)
         samples_per_prompt = int(self.config.get("samples_per_prompt", 2))
         if samples_per_prompt < 1:
             raise ValueError("samples_per_prompt must be >= 1")
@@ -34,14 +41,13 @@ class FullTrajectoryRollout(RolloutEngine):
                 expanded_metadata.append(sample_metadata)
                 parent_indices.append(parent_index)
 
-        adapter_config = {
-            **self.config,
-            "samples_per_prompt": 1,
-            "num_video_per_prompt": 1,
-            "num_videos_per_prompt": 1,
-        }
+        adapter_config = self.runtime_config(
+            context,
+            samples_per_prompt=1,
+            num_video_per_prompt=1,
+            num_videos_per_prompt=1,
+        )
         batch = adapter.sample(expanded_prompts, expanded_metadata, adapter_config)
-        batch.validate_lightweight(strict=True)
         if len(batch.prompts) != len(expanded_prompts):
             raise ValueError(
                 "Adapter returned a different batch size after full-trajectory expansion"
@@ -53,7 +59,11 @@ class FullTrajectoryRollout(RolloutEngine):
                 "parent_prompt_indices": parent_indices,
             }
         )
-        return batch
+        return self.finalize_batch(
+            batch,
+            context,
+            media_type=getattr(adapter, "media_type", None),
+        )
 
 
 def build_rollout_engine(config: dict[str, Any]) -> RolloutEngine:
