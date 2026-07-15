@@ -2,7 +2,7 @@
 
 更新时间：2026-07-15
 
-本文件只维护实验顺序、冻结条件、执行状态、验收门槛和结果边界。项目架构与学习路线仍以 `docs/PROJECT_OVERVIEW.md` 为准；完整待补实验矩阵、代码修改与验收门槛的对应关系持续记录在 `experiments/INFRA_VALIDATION_WORKLOG.md`，该文件是 backlog 的唯一权威清单；每个具体实验的完整 recipe 和原始结果放在各自子目录中。
+本文件是当前实验顺序、冻结条件、执行状态、验收门槛和结果边界的唯一事实来源。项目 Goal、架构与学习路线以 `docs/PROJECT_OVERVIEW.md` 为准；`experiments/INFRA_VALIDATION_WORKLOG.md` 是合并阶段的历史修改/验收快照，不再维护当前 backlog；每个具体实验的完整 recipe 和原始结果放在各自子目录中。
 
 ## 总规则
 
@@ -12,7 +12,7 @@
 4. 前一硬门槛失败时停在当前规模定位，不用更长训练掩盖问题。
 5. Tiny/Fake、真实推理、单步更新、resume、短训练、多 seed 效果是不同证据，不互相替代。
 6. 不访问其他用户目录，不终止其他用户进程，不使用 root；GPU 被占用时等待或降级为单卡顺序执行。
-7. 已冻结实验与 infra 修复必须分开：先用原代码完成 E2b attempt 2，再修改 checkpoint 指纹；不得用修复后的代码回写或覆盖首次失败证据。
+7. 已冻结实验与 infra 修复必须分开。历史 E2b 已按该规则完成；其首次失败与 attempt 2 证据继续保留，任何后续修复都不得回写或覆盖旧 attempt。
 8. Infra 验收分为两条通道：deterministic/audit 通道要求机械正确性和可复现性；performance/training 通道允许预注册浮点容差并用重复运行、多 seed 和 control 判断效果。两类结论不得互相替代。
 
 ## 当前状态总览
@@ -20,11 +20,13 @@
 | ID | 实验 | 状态 | 当前结论/下一动作 |
 |---|---|---|---|
 | B0 | 合并后本地 acceptance | 已通过 | `2adfbfd` 完整 non-distributed：883 passed、2 skipped、5 deselected；真实双进程 Gloo：5 passed、885 deselected；Ruff、compileall 与 diff check 全部通过 |
+| M0 | 当前 GitHub `main` | 已发布并通过本地与 P6 门槛 | `main` 已包含 `ee4a44f`：在 `a34a3b8` 基线上加入 Wan/SD3 gradient-checkpointing 显式 on/off、effective-state、provenance 和 resume drift 合同；927 passed、2 skipped、5 deselected，Gloo 5 passed，Ruff/compileall/diff check、独立 review 与 P6 固定 Wan 单步真实 GPU A/B 通过 |
+| G0 | gradient-checkpointing 合同修复 | 已完成并发布 | `ee4a44f` 已进入 `main`。P6 证明固定 `128×128`、5 帧、4 denoising step、单 GPU、单步 Wan LoRA 下三对训练语义 exact，update peak median 下降 `3,190,562,816` bytes（`17.57%`）；不能外推到稳态吞吐、任意尺寸或质量 |
 | B1 | 历史细粒度回归套件 | 已通过 | 从 Git 临时导出运行：190/190；不恢复旧测试文件 |
-| B2 | `2adfbfd` 合并后 Wan correctness gate | 已通过（W5/W6-general/W7b） | W7b 的 480 个 gradient tensor 逐位一致；W5 六段 valid、两份 11-gate 比较 exact；`reward_general` 三方分数逐位一致且坏请求 fail closed。SD3 与 HPS-backed Wan 训练 post-merge 仍待执行 |
+| B2 | 合并后真实 correctness gate | 已通过（SD3/W5/W6-general/W7b/O4） | W7b 的 480 个 gradient tensor 逐位一致；W5 六段 valid、两份 11-gate 比较 exact；`reward_general` 三方分数逐位一致且坏请求 fail closed；SD3 continuous/resume 16 个 exact gate 通过；O4 完成真实 HPS 单步和恢复后 reward 中断 fail-closed |
 | A1 | 外部算法插件最小接入 | 已通过 | 独立模块零核心改动完成 config→rollout→reward→loss→update→metrics→checkpoint；checkpoint 记录外部类身份 |
 | A2 | 算法互换 contract | 已通过 | TinyDiffusion 上 GRPO/full、TempFlow/branch、Flash/single-step 均通过严格 RolloutBatch、公共 metrics/manifest/checkpoint 与算法特有 credit metadata |
-| A4 | scorer 插件装载与隔离 | 已通过（本地） | 外部 batch scorer、方向、cache key/version、坏 shape、timeout×3、invalid/raise、健康 scorer 不污染全部通过；真实 World-R1 服务留给 W6/O4 |
+| A4 | scorer 插件装载与隔离 | 已通过（本地 + O4 真实 HPS） | 外部 batch scorer、方向、cache key/version、坏 shape、timeout×3、invalid/raise、健康 scorer 不污染全部通过；O4 进一步验证真实 HPS healthy request 和恢复后 pre-scorer 服务中断 fail-closed |
 | A5/D-data1/D-data2 | 固定 HF 数据 provider 与统一追溯 | 已通过 | 固定 PartiPrompts revision 的 12 行离线快照与本地副本，经同一 runner 完成一步；metrics、rollout、adapter、规范化 SampleManifest 精确一致，24/24 样本可反查源行 |
 | A6 | 新算法改动面审计 | 已完成，有 CLI 边界 | Python API 核心改动 0；新增外部 module/config/harness。通用 CLI 缺少从 YAML 自动发现外部 plugin 的机制，仍需薄启动器 |
 | D-data7 | train/held-out 泄漏检测 | 已通过，并发现旧数据问题 | 三类合成泄漏均 fail-fast；旧 3,600/12 split 检出 2 对近重复，不能再用于正面效果 claim；T3b 90 条 fixture 审计干净 |
@@ -40,6 +42,7 @@
 | O1 | 五阶段真实进程中断恢复 | 已通过 | reward/cache/optimizer/checkpoint/latest 后 child exit 91；恢复到 step2 与连续 reference 的 adapter/metrics/manifest 精确相同，无重复 step/样本 |
 | O3/O5 | 写入失败恢复与生命周期状态 | 已通过 | completed/failed/live/stale/missing 可区分且聚合 fail-closed；ENOSPC/半写/只读不推进 latest，恢复后 exact，stale tmp 清零 |
 | O2 | 真实 CUDA OOM | 已通过 fail-safe；自动降级不支持 | GPU2 申请192 GiB后明确 failed/invalid，step0 且无 metrics/latest/checkpoint，显存释放；同环境16 px control完成一步 |
+| O4 | 真实 HPS reward 服务中断 | 已通过（窄边界） | GPU2 Wan + GPU4 HPS：健康 step1 完成真实更新；从 step1 恢复后，step2 请求进入但 scorer 前终止自有服务，1 次请求/0 重试/0 optimizer/无 step2 artifact，step1 持久状态不变，进程、端口和 GPU 清理完成。下一步扩展 mid-scorer/commit 故障点与稳态 reward profiling |
 | S3 | GPU/进程所有权安全 | 已通过（单机、自有进程） | 普通 UID + GPU2；错 start tick 不发信号，只有 UID/PID start/command token 全匹配才终止自建 child |
 | E1 | SD3 3-seed active/control，10 steps | 已完成，效果门槛失败 | 六个 run 均 execution valid；聚合 CI 跨 0，blue 三个 seed 全为负；禁止扩大效果规模 |
 | E2 | SD3 真实 resume 等价性 | 已完成，严格等价失败 | 能完整恢复并继续，但独立运行在 resume 前已出现数值漂移，最终 LoRA 不相等 |
@@ -58,10 +61,17 @@
 | E5 | SD3 20/50-step 多 seed | 未解锁 | 仅在 E1 跨 run 全部门槛通过后启动 |
 | V1 | Flash-GRPO/Wan 真实路径 | W0-W7b 已通过 | 原生同/异构 selected sampler 的 media/embedding/latent/logprob/loss/480 梯度逐位一致；轨迹状态存储 10.5x 减少，但吞吐仍待 P2 实测 |
 | V2 | World-R1 reward + Wan 闭环 | W6 已通过；`2adfbfd` general parity 已复验 | post-merge `reward_general` direct/reference/infra 均为 `[0.260009765625, 0.1943359375]`、两组差值为 0；坏请求 500、silent fallback false。真实 DA3+Qwen 3D 仍沿用既有证据 |
-| W8 | Wan 真实HPS 3-seed active/control | 已完成：机械通过、效果失败 | 12/12 run有效，active更新/control精确零、像素护栏通过；World/Flash配对均值均为负且CI跨0，W9保持锁定，下一步Q3失败诊断 |
-| Q3 | Wan独立视频质量诊断 | 已完成：安全通过、独立效果失败 | 240视频/1,200帧双遍PickScore与step0身份精确；无塌缩且时间/清晰度护栏通过，但World/Flash独立效果CI均跨0；下一步P3 |
-| P1 | 单卡阶段 profiler | 主要阶段已覆盖 | W8已记录真实Wan load/rollout/reward/recompute-backward-optimizer/cache/checkpoint/artifact和物理显存；细分与native对照留给P2 |
-| P3 | 单卡 32GB 可行域 | 部分完成 | 15 个采样单元和 3 个一步训练单元通过；`480x832/5帧/4-step` 一步训练峰值 `28,336 MiB`，仍缺多 prompt/seed、OOM bracket 与真实 reward 共驻 |
+| W8 | Wan 真实HPS 3-seed active/control | 已完成：机械通过、效果失败 | 12/12 run有效，active更新/control精确零、像素护栏通过；World/Flash配对均值均为负且CI跨0。后续 Q3 已确认独立效果同样失败，W9继续锁定 |
+| Q3 | Wan独立视频质量诊断 | 已完成：安全通过、独立效果失败 | 240视频/1,200帧双遍PickScore与step0身份精确；无塌缩且时间/清晰度护栏通过，但World/Flash独立效果CI均跨0。该失败诊断已闭环，后续资源工作由 P3/P6 承接 |
+| P1 | 单卡阶段 profiler | 主要阶段已覆盖 | W8 已记录真实 Wan load/rollout/reward/recompute-backward-optimizer/cache/checkpoint/artifact；O4 冷启动 step 的 reward 占 87.91%。下一步先做 reward warm/cold 与批处理稳态 A/B，再做 native 对照 |
+| P3 | 单卡 32GB 可行域 | 部分完成；旧 GC A/B 无效，P6 新 A/B 通过 | 15 个采样单元和 3 个一步训练单元通过；`480x832/5帧/4-step` 一步训练峰值 `28,336 MiB`。旧 silent-no-op 结果仍作废；P6 已用修复后的 effective-state 合同证明小尺寸单步 update 显存下降，仍缺多 prompt/seed、OOM bracket、其他尺寸与真实 reward 共驻 |
+| P5 | HPSv2 prompt-group call coalescing | 微基准通过，完整训练待验证 | 同一 GPU/进程/两张同 prompt 图片下，一次 list call 与两次单图 call reward 逐位一致，调用时间均值改善 `2.084x`；远端 HPSv2 1.2.0 的 list 分支内部仍逐图 forward，因此这只证明减少重复 scorer 调用的潜力，不是 tensor/GPU batching。下一步先完善 P7 单 GPU 合同，再以固定 payload 与完整 O4 one-step A/B 验证顺序、fail-closed、显存和端到端收益 |
+| P6 | Wan gradient-checkpointing 严格 A/B | 已通过（固定单步配置） | schema-v2 attempt 2 的 8 个独立进程全部 valid；三对 measured 的 14 项 rollout/reward/logprob/gradient/state/update 摘要全部 exact，on/off update peak median 为 `14,966,723,072 / 18,157,285,888` bytes，下降 `3,190,562,816` bytes（`17.5718%`）。attempt 1 因把 executor timing 纳入 reward digest 而不具比较资格，保留为失败证据；结论不覆盖稳态吞吐或质量 |
+| P7 | World-R1 prompt-group call-coalescing patch | CPU manager contract 通过，真实 instance/HPS/GPU 待验证 | 冻结上游源码和 patch，13 个 manager mock tests 通过；独立审计确认它减少每个 prompt 的 `hpsv2.score` 调用次数，但不是一次 batched GPU forward。发布前先补真实 `GeneralRewardInstance`、异常后锁恢复与单可见 GPU fail-closed，并只在可信 loopback wrapper 中运行；随后做固定 payload HPS A/B 和完整 O4 one-step correctness/吞吐 A/B |
+| MG1 | 真实双卡 DDP/NCCL correctness | 未完成 | CPU/Gloo 合同已通过，但真实 GPU 必须验证相同 effective batch、完整 prompt group 不拆分、无重复样本、rank 一致 update/failure/rollback、checkpoint/resume 和资源清理；若当前 sampler/cursor 合同不足，先修产品再实验 |
+| MG2 | 双卡扩展效率 | 锁定 | 仅在 MG1 通过后，以相同语义的单卡 reference 比较吞吐、step time、通信占比和每卡峰值显存；两张或多张 GPU 各跑独立 run 不计 DDP 扩展 |
+| W10 | World-R1 / Flash-GRPO 大型多 reward 验证 | 已规划，等待近期门槛 | 保留 W8 低分辨率、单 HPS、10-step 效果失败结论；P7、doctor/高层 API 和 10–100 step 稳态门槛完成后，再按复杂视频 prompt、共享多维视频 reward、World-R1 3D reward、独立 held-out evaluator 和 240-step × 3-seed active/control 计划推进；本阶段仍优先于 WM0-minWM |
+| WM0-WM3 | minWM 交互式世界模型方向 | 已规划，未启动 | 不替换 Wan；以 Wan2.1/minWM checkpoint 为外部 backbone/runtime，先完成 action-conditioned 因果推理与统一数据合同，再按 zero-update、LoRA 单步、resume、active/control 门槛决定是否进入 RL post-training |
 
 ## B0/B1：当前代码回归基线
 
@@ -86,7 +96,7 @@
 - `reward_general` post-merge attempt 1 通过：direct、World-R1 reference HTTP 与 infra client 三路分数均为 `[0.260009765625, 0.1943359375]`，两组比较差值为 0；坏图像与坏 pickle 均返回 HTTP 500，`silent_fallback_detected=false`。该探针只使用 loopback 上的 legacy 协议，不开放外部服务面。
 - 完整非 checkpoint 证据索引见 [WAN_RESULTS_2adfbfd.md](postmerge_validation_20260715/WAN_RESULTS_2adfbfd.md)。
 
-这组证据只重新确认当前提交上的 Wan sampler/recompute、deterministic resume 与 `reward_general` 协议 parity。它没有运行 HPS-backed Wan active/control 训练，也没有比较 native/infra 吞吐，因此不改变既有 W8/Q3 效果失败结论，不解锁质量提升、速度提升、P2 或 W9 声明。当前提交的 SD3 真实路径与 HPS-backed Wan 训练 post-merge gate 仍待执行。
+W5/W6/W7b 证据确认了 Wan sampler/recompute、deterministic resume 与 `reward_general` 协议 parity。后续 O4 已在 `d6ce72a` 上补齐真实 HPS 单步训练和恢复后 pre-scorer 服务中断门槛；SD3 post-merge continuous/resume 的 16 个 exact gate 也已通过。它们仍不改变既有 W8/Q3 效果失败结论，也不解锁质量提升、速度提升、P2 或 W9 声明。
 
 ## E1：SD3 多 seed 10-step active/control
 
@@ -407,9 +417,9 @@ E3a 使用 GPU2，空闲时可退到 GPU3；单进程、deterministic runtime、
 - T2b v2 已完成固定轨迹 mode 因果消融：eval/train recompute 最大差为 0，但二者与 sampled old log-prob 最大差均为 `0.007318`、最大 `clipfrac=1.0`，branch 8/0 比 `150.837`。mode 假设被否定。
 - T2d v1 全部门槛通过：single-parent forward 完全恢复 sampling old log-prob（最大差 0、`clipfrac=0`），six-branch batch 复现 `0.007318`/`clipfrac=1.0`；首次非零差在 BF16 noise prediction `0.515625`，SDE mean 差 `0.167527`，std 差 0。
 - T2e v4 已通过实际 shared-prefix adapter policy-identity 复验：正式路径覆盖九个 transition，old/new 最大差 `0.0`、`clipfrac=0.0`、参数指纹不变。v1-v3 均为加载模型前的 staging 失败并完整保留。
-- 冻结两种显式执行模式：`tempflow_reference_mode=true` 只支撑原生 parity 结论；`false` 支撑 policy-identity/effectiveness。T3 三 seed 10-step active/control 已完成且效果门槛失败；T2c 现为下一项，20/50/100-step 仍锁定。
+- 冻结两种显式执行模式：`tempflow_reference_mode=true` 只支撑原生 parity 结论；`false` 支撑 policy-identity/effectiveness。T3 三 seed 10-step active/control 已完成且效果门槛失败；后续 T2c 也已完成，结论见当前总览，20/50/100-step 仍锁定。
 - T3 已完成：两项 preflight 与六个正式 run 的机械门槛全部通过，60/60 步 old/new log-prob 和 clipfrac 为 0；但 active mean `+0.00851066`、CI95 `[-0.0436011,+0.0602622]`、正向 seed `2/3`、red `-0.0393180`，seed307/419 像素护栏失败。
-- `eligible_for_effectiveness_claim=false`、`eligible_for_20_step_expansion=false`。这证明 policy drift 是机械 bug，但不是效果失败的充分原因；下一步 T2c，长程继续锁定。
+- `eligible_for_effectiveness_claim=false`、`eligible_for_20_step_expansion=false`。这证明 policy drift 是机械 bug，但不是效果失败的充分原因；后续 T2c 已完成，长程仍锁定。
 - 完整可重建结果见 `experiments/sd3_tempflow_effect_diagnosis_20260714/README.md`、`experiments/sd3_tempflow_mode_ablation_20260714/RESULTS.md`、`analysis.json` 和 `report.html`。HTML 已通过结构校验；自动视觉 QA 受本地 `file://` 浏览器策略限制，待人工检查。
 
 ## 后续实验队列
@@ -422,7 +432,180 @@ E3a 使用 GPU2，空闲时可退到 GPU3；单进程、deterministic runtime、
 
 - Flash/Wan：真实 checkpoint 推理 -> single-step/log-prob parity -> LoRA 单步更新 -> resume -> bounded run。
 - World-R1：Wan LoRA 补齐 -> 真实 reward server 协议/方向/延迟 -> full trajectory parity -> active/control -> bounded multi-seed。
-- 当前 `2adfbfd` 已重跑 W7b、W5 correctness 与 `reward_general` 协议 parity；接下来补 SD3 真实 post-merge gate 和 HPS-backed Wan 训练 preflight。完成这些机械门槛仍不能替代质量或速度实验。
+- SD3 post-merge exact resume 与 O4 HPS-backed Wan 单步/中断门槛均已完成。下一步不再重复机械 preflight，而是先做 reward warm/cold、逐样本/批量、checkpoint 常驻和 10–100 step 稳态 profiling，再决定异步 overlap 或多 reward worker；这些结果仍不能替代独立质量实验。
+
+### W10：World-R1 / Flash-GRPO 大型多 reward 验证
+
+W10 是 P7、doctor/高层 API 和 10–100 step 稳态门槛之后的下一项大型质量主线，并优先于 WM0-minWM；当前立即执行的工程任务仍是 P7。W10 验证的是 VisualRL 能否在真实 Wan、复杂视频 prompt、多元 reward、长时间更新和中途恢复下保持正确，并让多个主要 reward 在独立 held-out 数据上共同改善。W10 不是把 W8 的旧 recipe 直接增加步数：W8 的 `64px/5帧/2-step`、12 条 PartiPrompts、单一 HPS、10-step 效果失败结论永久保留；W10 使用新的实验 ID、数据身份、reward 身份和预注册门槛。
+
+#### 证据分层
+
+W10 必须分开报告三类结论：
+
+1. **Infra correctness**：数据顺序、rollout、reward、梯度、optimizer、checkpoint、resume、artifact 和故障恢复正确。
+2. **Optimization effectiveness**：active 相对匹配 control 的训练与 held-out reward 有统计提升。
+3. **Independent quality**：未参与训练的 evaluator、像素/视频护栏和人工面板不退化。
+
+训练 reward 上升不能单独证明 Infra 正确，也不能替代独立质量。单步 reward 允许因 prompt、noise 和 timestep 波动；“reward 增长”按冻结 checkpoint 窗口和 held-out 前后差定义，不要求每一步单调上升。
+
+#### 数据计划
+
+- 训练集目标为 240 条固定视频 prompt，优先从 [`VidProM`](https://vidprom.github.io/) 的冻结 revision 中筛选并保存原始行号、筛选脚本、许可证、内容 SHA256 和近重复审计。
+- 训练集按人物/动物动作、多对象交互、空间关系、运动方向与速度、数量/属性绑定、复杂场景/镜头运动六类分层，每类目标 40 条；不得由最终结果反向删除失败 prompt。
+- held-out 使用与训练集无内容或语义近重复的 [`T2V-CompBench`](https://t2v-compbench-2025.github.io/) 固定分层子集，目标为七类各 20 条、共 140 条；该集合不得进入训练或 reward normalization。
+- [`VBench`](https://github.com/Vchitect/VBench) 只用于 baseline/final 独立评估；不作为每 step reward，也不据其结果调整已运行 recipe。
+- World-R1 额外冻结带显式 camera trajectory 的 prompt/trajectory 子集；共享算法比较与 World-R1 原生 3D 验证分开报告。
+
+#### Reward 计划
+
+两条算法共享的训练 reward 至少覆盖：
+
+```text
+text-to-video alignment
+visual quality
+motion quality
+temporal consistency / dynamic guardrail
+```
+
+优先评估 [`VideoReward`](https://github.com/KlingAIResearch/VideoAlign) 的 text alignment、visual quality 和 motion quality 三个分量；在接入前必须完成固定视频的 direct/reference/infra parity、batch-preservation、方向、无效输出、timeout、cache identity 和服务中断门槛。World-R1 原生分支再增加：
+
+```text
+score_meta_view
+score_reconstruction
+score_trajectory_alignment
+```
+
+- 每个 reward 分量保存 raw score、version、checkpoint identity、输入 frame policy 和 latency；不得只保存加权总分。
+- 在独立 calibration snapshot 上冻结每个分量的 mean/std、方向、clip 和权重，再写入 config/checkpoint identity；训练中不得自适应改变 normalization 来制造上升趋势。
+- HPSv2、PickScore、T2V-CompBench/VBench 指标和人工盲评至少保留一组完全不参与训练的独立验收信号。
+- 共享算法比较只使用两边都能计算的 reward core；World-R1 的 3D reward 作为单独 native arm，不与缺少相同 camera-trajectory 条件的 Flash 数值直接排名。
+
+#### 算法与公平性
+
+- World-R1 与 Flash-GRPO 使用同一 Wan2.1 base revision、初始 LoRA、prompt 顺序、seed 集合、共享 reward 版本、训练/评估 split 和 artifact schema。
+- World-R1 保留 full-trajectory 与 camera-aware/3D 语义；Flash-GRPO 保留 single-step、selected timestep 和 rectification 语义，不为表面统一而改写参考算法。
+- 两条路径 diffusion steps 和保留轨迹不同，因此“相同步数”不等于相同计算量。效果按各自 active/control 判断；跨算法效率另按 reward gain/GPU-hour、samples/s、reward calls、峰值显存和最终独立质量报告。
+- 正式配置优先使用 P3 候选 `480x832/5帧/4-step`；必须先证明 World-R1、Flash 和多 reward 服务都能在冻结资源布局下安全运行。若共同配置不成立，选择两条路径共同通过的最高规格并保留失败证据，不允许运行时静默降级。
+
+#### 分阶段执行
+
+1. **W10-A，5-step 联调**：24 条分层 prompt，验证所有 scorer、raw/normalized reward、方向、batch、cache、artifact 与 GPU/进程清理。
+2. **W10-B，20-step active/control**：每条算法一个 seed，确认 active 非零更新、control 精确零更新、主要 reward 梯度方向合理且无明显独立护栏退化。
+3. **W10-C，60-step 单 seed**：检查 reward 趋势、clip/ratio/gradient、显存、句柄、cache、checkpoint 和 reward server 的稳态行为；未通过不得启动正式长跑。
+4. **W10-D，240-step 正式实验**：完整覆盖 240 条训练 prompt；World-R1/Flash 各 3 seeds × active/control，共 12 个正式 run。固定 checkpoint/eval 点为 baseline、20、60、120、180、240。
+5. **W10-R，恢复哨兵**：每条算法至少完成一次 deterministic `40 continuous` 对 `20 + process exit + resume-to-40`；大型 effectiveness run 使用 performance runtime 时只按预注册容差与统计门槛判断，不宣称 bitwise exact。
+
+#### Infra 硬门槛
+
+- 所有计划 step、sample、prompt 和 reward 记录无缺失、重复或错序，数值全部 finite。
+- active LoRA 非零更新、base model 不变；matched zero-LR control 参数精确不变。
+- commit marker、checkpoint tree digest、manifest、metrics、cache 和 status/audit 全部一致；恢复后 dataset cursor、RNG、optimizer、plugin 和 sample identity 连续。
+- 任何 reward 服务失败、OOM、进程中断或写入失败不得产生部分 optimizer 更新或伪 completed artifact；已提交旧 step 保持权威。
+- GPU、端口、子进程、临时目录和文件句柄在每个 run 后释放；只管理本实验拥有且身份完全匹配的进程。
+
+#### Reward 增长门槛
+
+对每个主要训练 reward 分量分别计算 held-out `final - baseline`；目标是每个分量均大于 0，而不是只要求加权总分上升。正式晋级还要求：
+
+- World-R1 与 Flash 各自 3/3 active seed 的 aggregate active-control 均值为正；
+- hierarchical bootstrap CI95 下界大于 0；
+- train 与 held-out 的 checkpoint-window 趋势方向一致；
+- 任何主要分量不得出现统计显著退化，不允许一个 reward 暴涨掩盖另一个 reward 下降；
+- control 的参数变化为零，reward 波动必须落在预注册 sampling-noise 边界内。
+
+W10-B 或 W10-C 若未表现出可信的多 reward 改善，停止并检查数据、reward 尺度、分量冲突和 credit assignment；不得用 W10-D 的更长训练掩盖失败。
+
+#### 独立质量与停止条件
+
+- T2V-CompBench 分层结果、VBench temporal consistency/motion smoothness/dynamic degree/overall consistency、固定 HPS/PickScore 和像素视频护栏不得显著退化。
+- 保留固定 before/after 人工双盲面板；不得由训练 reward 模型或 AI 自动替代真实评审结论。
+- 出现饱和、静态化、闪烁、运动消失、prompt/reward hacking，或只有训练 reward 增长而独立指标不增长时，效果验收失败。
+- W10 通过只证明当前模型、数据、reward 和 240-step 范围内的 correctness/effectiveness；不自动外推为长程收敛、SOTA、吞吐提升或 minWM 可行。
+
+#### 资源布局
+
+P3 的 `480x832/5帧/4-step` 单步训练物理峰值为 `28,336 MiB`，因此多 reward 不与训练模型共驻同一张 32GB GPU。正式 recipe 冻结独立资源角色，例如：
+
+```text
+GPU2：Wan / LoRA training
+独立 reward GPU：VideoReward、World-R1 general/3D worker
+CPU/本地盘：artifact、cache、validator 与报告重建
+```
+
+启动前必须检查物理 GPU 基线、模型/reward checkpoint 身份、端口所有权和预计峰值；GPU 不满足时等待或安全停止，不动态降低分辨率、帧数、reward 或 batch 后继续记为同一实验。
+
+### WM0-WM3：从 Wan 视频生成扩展到 minWM 交互式世界模型
+
+这一方向不是用 minWM 替换 Wan，也不把 minWM 的完整 Trainer 合并进 VisualRL。minWM 是将双向 T2V/TI2V backbone 转换为相机或动作可控、因果、少步自回归世界模型的完整流水线；其官方实现本身包含 Wan2.1-T2V-1.3B 路径。因此本项目采用以下关系：
+
+```text
+Wan2.1 / minWM checkpoint（外部 backbone 与 reference runtime）
+-> action-conditioned causal rollout adapter
+-> VisualRL reward / evaluation / checkpoint / audit
+-> 有界 RL 或 reward-guided post-training
+```
+
+参考资料：[`minWM` technical report](https://arxiv.org/abs/2605.30263) 与 [`shengshu-ai/minWM`](https://github.com/shengshu-ai/minWM)。
+
+#### 架构边界
+
+- `ExperimentRunner` 继续是 VisualRL 唯一训练协调器；不得复制 minWM 的训练循环到核心主线。
+- minWM 作为外部 reference/runtime，通过新的 `WorldModelAdapter` 或等价插件边界接入。
+- 复用现有 Wan checkpoint、artifact、安全恢复和评估能力；minWM 自己的多阶段 checkpoint 只通过显式 adapter 映射。
+- 第一阶段只读推理，不下载或启动完整四阶段训练；未经有界门槛验证，不进入大规模 SFT、AR diffusion、Causal ODE/CD 或 DMD 复现。
+
+#### WM0：只读可行性与身份冻结
+
+- 冻结 minWM commit、Wan2.1 base/DMD checkpoint、环境、推理脚本、action/camera trajectory 和输出校验和。
+- 使用官方 Wan Action2V checkpoint 完成至少两条不同相机动作序列的分段因果推理。
+- 保存首帧、分段视频、动作序列、history/state identity、每段 seed 与 wall time；不得只保留最终拼接视频。
+- 建立 external-reference 与 adapter 输出的 media、动作顺序、chunk 数量和状态传递一致性门槛。
+
+WM0 通过条件：同一 checkpoint、初始状态、动作和 seed 的 reference/adapter 轨迹语义一致；重复运行在声明的 deterministic/tolerance 模式下满足预注册门槛；失败时停止在 adapter 层，不复制 minWM Trainer 绕过合同。
+
+#### WM1：正式世界模型数据合同
+
+新增或等价表达统一的 `WorldRolloutBatch`：
+
+```text
+initial_state
+action_sequence
+generated_chunks
+history_state / history_identity
+frame_timestamps
+rollout_latency
+termination_mask
+sample_id / trajectory_id / chunk_id
+```
+
+合同必须明确 action 与生成 chunk 的一一对应、历史窗口、因果 mask、跨 chunk seed、padding/termination 语义和 image/video layout。关键训练语义不得只放在自由 metadata 中。cache、manifest、checkpoint 和 resume 必须能够验证 trajectory/chunk/history identity，拒绝跨 generation 或跨轨迹混用。
+
+#### WM2：世界模型独立评估
+
+至少冻结四类与训练 reward 分离的 evaluator：
+
+- action/camera adherence：生成运动是否遵循输入动作及方向；
+- temporal/spatial consistency：主体、背景、遮挡和场景几何是否跨 chunk 连续；
+- long-horizon drift：随 rollout 长度增加的身份、结构和画质退化；
+- latency-quality trade-off：首帧延迟、单动作响应时间、吞吐、峰值显存与质量。
+
+必须保留固定 active/control、失败动作和失败轨迹；reward 上升不能替代独立 evaluator 与人工盲评。普通视频 PickScore/HPS 只能作为画质辅助指标，不能单独证明世界模型的可控性或因果正确性。
+
+#### WM3：有界训练与晋级门槛
+
+按以下顺序执行，不直接复现完整 minWM 四阶段训练：
+
+1. zero-update/reference parity；
+2. LoRA 单步更新，验证梯度、参数变化和 base-model 不变性；
+3. continuous 与 split/resume 的 trajectory、optimizer、RNG、history identity 和最终 adapter 比较；
+4. 一条短 action trajectory 的 active/control；
+5. 多 seed bounded post-training，并同时检查 action reward、独立一致性、安全护栏和延迟。
+
+只有 action/camera reward 与至少一个独立 world-model evaluator 同时改善，control 保持零更新或预注册噪声边界，且长程一致性与延迟护栏不退化，才允许扩大步数或接入 Causal Forcing/DMD 后训练。若必须引入第二个 Runner、无法稳定表达 history identity，或改善只存在于训练 reward，则停止主线接入并将其保留为独立研究分支。
+
+#### 执行顺序
+
+WM0 延后到 W10 得出明确的通过或失败结论并完成证据收口之后。执行顺序是先完成 P7、doctor/高层 API 和 10–100 step 稳态门槛，再进入 W10；W10 完成后才扩展 action-conditioned world-model 合同。WM0-WM2 届时可作为下一代研究 POC；WM3 仍不得跳过当前 artifact/checkpoint 安全边界、资源预算和 W10 暴露出的 reward/长稳问题。
 
 ### P1：效率与多卡
 
@@ -430,6 +613,11 @@ E3a 使用 GPU2，空闲时可退到 GPU3；单进程、deterministic runtime、
 
 ## 更新日志
 
+- 2026-07-15：P6 schema-v2 attempt 2 通过。RTX 5090 GPU7 上 2 次 warm-up 与 6 次交错 measured 均为独立进程、同一冻结身份且资源清理有效；三对 on/off 的 14 项训练摘要全部 exact。gradient checkpointing 将固定 Wan 单步 update peak median 从 `18,157,285,888` 降至 `14,966,723,072` bytes，减少 `3,190,562,816` bytes（`17.5718%`），超过 512 MiB/5% 双门槛。独立重跑 validator 与远端结果逐字节一致；只据此发布 `ee4a44f` 合同和窄边界显存结论，下一项当前任务为 P7。
+- 2026-07-15：登记 W10 World-R1/Flash-GRPO 大型多 reward 验证，作为 P7、doctor/API 与稳态门槛之后、WM0 之前的后续大型质量阶段。W8 低语义 10-step 失败保持不变；W10 新建 VidProM 240 条分层训练 snapshot、T2V-CompBench held-out、VideoReward 共享分量、World-R1 3D 分量、5/20/60/240-step 分级门槛、3-seed active/control、deterministic resume 哨兵与独立 VBench/人工质量验收。多 reward 原始分量必须分别增长，不能只看加权总分或用长跑掩盖短阶段失败；全局执行顺序以当前总览为准。
+- 2026-07-15：O4 attempt 3 通过。GPU2 的真实 Wan/HPS healthy step1 完成一次 optimizer 更新并发布 checkpoint；从 step1 恢复后在 step2 请求进入、scorer 前终止 GPU4 的自有 reward server，1 次请求、0 重试、0 optimizer、无 step2 artifact，step1 关键状态和 semantic tree 不变，所有进程/GPU/端口清理通过。健康 step 的 reward 时间占 87.91%，只作为下一轮稳态 profiling 假设，不作加速结论。
+- 2026-07-15：高层 Wan/Flash-GRPO API commit `806c21a` 经 899 个 non-distributed、5 个真实 CPU/Gloo DDP、Ruff、compileall、diff check 和独立 review 后 fast-forward 推送到 GitHub `main`；发布树不含 `exercises`、`.codex` 或 O4 草稿。
+- 2026-07-15：登记 WM0-WM3 minWM 交互式世界模型方向。明确 minWM 不替换 Wan，也不引入第二套 Runner；先以 Wan2.1/minWM checkpoint 完成只读因果推理、`WorldRolloutBatch` 合同和独立 world-model evaluator，再用 zero-update、LoRA 单步、resume 与 active/control 决定是否进入有界 RL post-training。
 - 2026-07-15：`2adfbfd` 完成本地统一回归（883 passed、2 skipped、5 deselected；Gloo 5 passed、885 deselected）和真实 Wan post-merge gate。W7b 480 个梯度逐位一致；W5 attempt 1 因 harness 在 deterministic runtime 前初始化 CUDA 而于训练前失败，修正顺序后的 attempt 2 六段 run 全部 valid、World/Flash 两份 11-gate 比较均 exact；`reward_general` 三方分数逐位一致、坏请求 500、无 silent fallback。质量/速度声明继续锁定，SD3 与 HPS-backed Wan 训练 post-merge 仍待执行。
 - 2026-07-13：建立账本；记录 B0/B1 通过；冻结并完成 E1。六个 run 全部执行有效，但效果门槛失败；下载非 checkpoint 证据并转入 E2。
 - 2026-07-13：E2 第一进程完成 step 5；验证 checkpoint 完整后启动独立 resume-to-10 进程。

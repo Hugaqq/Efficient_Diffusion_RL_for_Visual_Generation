@@ -163,8 +163,9 @@ conda run -n visual-rl ruff check visual_rl scripts tests train.py
 Wan LoRA、分布式归约和两进程 CPU/gloo。它不声明覆盖真实大模型、远程 reward
 server、GPU/NCCL 的数值与效果验证。
 
-项目定位、三阶段计划、完成/未完成状态、World-R1 硬门槛和能力边界见
+项目 Goal、当前状态、三条工作线、下一步顺序和能力边界见
 [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md)；真实实验的当前状态、冻结 recipe
-和晋级门槛见 [experiments/EXPERIMENT_PLAN.md](experiments/EXPERIMENT_PLAN.md)，阶段性结果
-与修复方向见
-[experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md](experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md)。
+和晋级门槛见 [experiments/EXPERIMENT_PLAN.md](experiments/EXPERIMENT_PLAN.md)。合并阶段的历史
+结果快照保留在
+[experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md](experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md)，
+但不再作为当前状态来源。
