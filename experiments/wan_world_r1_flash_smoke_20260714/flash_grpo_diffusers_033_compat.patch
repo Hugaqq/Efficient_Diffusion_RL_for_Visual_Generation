@@ -1,0 +1,83 @@
+diff --git a/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py b/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
+index 6e1a9da..01ca13e 100644
+--- a/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
++++ b/flow_grpo/diffusers_patch/wan2_1_pipeline_with_logprob_sample.py
+@@ -1,3 +1,4 @@
++import contextlib
+ from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+ import torch
+ from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
+@@ -7,6 +8,11 @@ import math
+ import numpy as np
+ # import logger
+
++def _cache_context_or_null(model, name: str):
++    if hasattr(model, "cache_context"):
++        return model.cache_context(name)
++    return contextlib.nullcontext()
++
+ def sde_step_with_logprob(
+     self: UniPCMultistepScheduler,
+     model_output: torch.FloatTensor,
+@@ -196,7 +202,6 @@ def wan_pipeline_with_logprob(
+         prompt_embeds,
+         negative_prompt_embeds,
+         callback_on_step_end_tensor_inputs,
+-        guidance_scale_2,
+     )
+
+     if num_frames % self.vae_scale_factor_temporal != 1:
+@@ -207,6 +212,6 @@ def wan_pipeline_with_logprob(
+         )
+         num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+     num_frames = max(num_frames, 1)
+
+-    if self.config.boundary_ratio is not None and guidance_scale_2 is None:
++    if getattr(self.config, "boundary_ratio", None) is not None and guidance_scale_2 is None:
+         guidance_scale_2 = guidance_scale
+@@ -267,6 +272,6 @@ def wan_pipeline_with_logprob(
+     # print(timesteps)
+
+-    if self.config.boundary_ratio is not None:
++    if getattr(self.config, "boundary_ratio", None) is not None:
+         boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+     else:
+         boundary_timestep = None
+@@ -276,6 +281,13 @@ def wan_pipeline_with_logprob(
+
+     if determistic == False:
+         import random
+         sampled_indices = index
++        if isinstance(sampled_indices, (list, tuple)):
++            unique_indices = {int(item) for item in sampled_indices}
++            if len(unique_indices) != 1:
++                raise ValueError(
++                    "Flash sampler requires one homogeneous selected index per batch"
++                )
++            sampled_indices = unique_indices.pop()
+     else:
+         sampled_indices = 1000000 # never match
+@@ -307,6 +319,6 @@ def wan_pipeline_with_logprob(
+                 current_guidance_scale = guidance_scale_2
+
+             latent_model_input = latents.to(transformer_dtype)
+-            if self.config.expand_timesteps:
++            if getattr(self.config, "expand_timesteps", False):
+                 # seq_len: num_latent_frames * latent_height//2 * latent_width//2
+                 temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+@@ -317,6 +329,6 @@ def wan_pipeline_with_logprob(
+             else:
+                 timestep = t.expand(latents.shape[0])
+
+-            with current_model.cache_context("cond"):
++            with _cache_context_or_null(current_model, "cond"):
+                 noise_pred = current_model(
+                     hidden_states=latent_model_input,
+@@ -328,6 +340,6 @@ def wan_pipeline_with_logprob(
+                 )[0]
+
+             if self.do_classifier_free_guidance:
+-                with current_model.cache_context("uncond"):
++                with _cache_context_or_null(current_model, "uncond"):
+                     noise_uncond = current_model(
+                         hidden_states=latent_model_input,

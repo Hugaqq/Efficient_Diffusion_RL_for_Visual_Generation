@@ -1,0 +1,58 @@
+{
+  "prompts": [
+    {
+      "metadata": {
+        "group_id": "group-af7274a772c6a085ecbd1fde",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 0,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-af7274a772c6a085ecbd1fde",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 1,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-91f297dd64c66e4551ea05aa",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 0,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table"
+    },
+    {
+      "metadata": {
+        "group_id": "group-91f297dd64c66e4551ea05aa",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 1,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table"
+    }
+  ],
+  "run_id": "flash_grpo_real_wan_one_step",
+  "schema_version": "2"
+}

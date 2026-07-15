@@ -1,0 +1,372 @@
+{
+  "artifact_step_semantics": "zero_based",
+  "checkpoint": {
+    "completed_steps": 2,
+    "final_path": "checkpoint_000002",
+    "path": "checkpoint_000002",
+    "sha256": "58cb4cbb83896f7394b12f31bd06fad87e32685b1f64e88bd174c3fc27918b1f"
+  },
+  "commit_id": 2,
+  "completed_steps": 2,
+  "completed_steps_semantics": "one_based_count",
+  "kind": "artifact_commit",
+  "run_id": "world_r1_real_wan_one_step",
+  "schema_version": "1",
+  "staged_steps": [
+    1
+  ],
+  "steps": [
+    {
+      "artifact_step": 1,
+      "manifest_records": [
+        {
+          "branch_id": 0,
+          "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/world_resume2/checkpoint_000002",
+          "group_id": "group-7a4cf81748e684bba25606c5",
+          "media_path": null,
+          "media_type": "video",
+          "model_metadata": {
+            "adapter": "world_r1_wan_legacy",
+            "adapter_key": "world_r1_wan_legacy",
+            "adapter_name": "default",
+            "checkpoint_format": "wan_peft_adapter_v1",
+            "device": "cuda",
+            "diffusion_clip": null,
+            "dtype": "torch.bfloat16",
+            "frame_shape": [
+              2,
+              5,
+              3,
+              64,
+              64
+            ],
+            "frames": null,
+            "guidance_scale": null,
+            "height": null,
+            "lora_alpha": 32,
+            "lora_rank": 16,
+            "lora_targets": [
+              "to_k",
+              "to_out.0",
+              "to_q",
+              "to_v"
+            ],
+            "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+            "noise_level": null,
+            "num_steps": null,
+            "parent_prompt_indices": [
+              0,
+              0
+            ],
+            "pipeline_class": "WanPipeline",
+            "reference_path": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "reference_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "repo_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "rollout": "full_trajectory",
+            "sample_config": {
+              "device": "cuda",
+              "diffusion_clip": false,
+              "diffusion_clip_value": 0.45,
+              "frames": 5,
+              "guidance_scale": 1.0,
+              "height": 64,
+              "kl_reward": 0.0,
+              "max_sequence_length": 128,
+              "noise_level": 0.7,
+              "num_steps": 2,
+              "num_videos_per_prompt": 1,
+              "sde_type": "flow_sde",
+              "sde_window_range": null,
+              "sde_window_size": 0,
+              "seed": 1402,
+              "train_cfg": false,
+              "use_camera_trajectory": false,
+              "width": 64
+            },
+            "samples_per_prompt": 2,
+            "scheduler": {
+              "class": "UniPCMultistepScheduler",
+              "timesteps": [
+                999,
+                749
+              ]
+            },
+            "sde_type": null,
+            "transformer_class": "PeftModel",
+            "use_lora": true,
+            "wan_backend": "world_r1",
+            "width": null
+          },
+          "prompt": "a vivid red cube slowly rotating on a white table",
+          "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+          "prompt_metadata": {
+            "group_id": "group-7a4cf81748e684bba25606c5",
+            "parent_prompt_index": 0,
+            "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+            "rollout_kind": "full_trajectory",
+            "sample_index": 0,
+            "split": "train"
+          },
+          "reward_values": {
+            "raw": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.8594359159469604
+            },
+            "valid": true,
+            "weighted": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.8594359159469604
+            },
+            "weighted_total": 1.613435983657837
+          },
+          "rollout_cache_path": null,
+          "rollout_type": "full_trajectory",
+          "run_id": "world_r1_real_wan_one_step",
+          "sample_id": "step-000001-rank-0000-0d4f77a37a3febe235163708",
+          "sample_index": 0,
+          "schema_version": "2",
+          "seed": 1402,
+          "step": 1,
+          "timestep_summary": {
+            "branch_id": 0,
+            "count": 2,
+            "values": [
+              999,
+              749
+            ]
+          }
+        },
+        {
+          "branch_id": 1,
+          "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/world_resume2/checkpoint_000002",
+          "group_id": "group-7a4cf81748e684bba25606c5",
+          "media_path": null,
+          "media_type": "video",
+          "model_metadata": {
+            "adapter": "world_r1_wan_legacy",
+            "adapter_key": "world_r1_wan_legacy",
+            "adapter_name": "default",
+            "checkpoint_format": "wan_peft_adapter_v1",
+            "device": "cuda",
+            "diffusion_clip": null,
+            "dtype": "torch.bfloat16",
+            "frame_shape": [
+              2,
+              5,
+              3,
+              64,
+              64
+            ],
+            "frames": null,
+            "guidance_scale": null,
+            "height": null,
+            "lora_alpha": 32,
+            "lora_rank": 16,
+            "lora_targets": [
+              "to_k",
+              "to_out.0",
+              "to_q",
+              "to_v"
+            ],
+            "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+            "noise_level": null,
+            "num_steps": null,
+            "parent_prompt_indices": [
+              0,
+              0
+            ],
+            "pipeline_class": "WanPipeline",
+            "reference_path": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "reference_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "repo_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+            "rollout": "full_trajectory",
+            "sample_config": {
+              "device": "cuda",
+              "diffusion_clip": false,
+              "diffusion_clip_value": 0.45,
+              "frames": 5,
+              "guidance_scale": 1.0,
+              "height": 64,
+              "kl_reward": 0.0,
+              "max_sequence_length": 128,
+              "noise_level": 0.7,
+              "num_steps": 2,
+              "num_videos_per_prompt": 1,
+              "sde_type": "flow_sde",
+              "sde_window_range": null,
+              "sde_window_size": 0,
+              "seed": 1402,
+              "train_cfg": false,
+              "use_camera_trajectory": false,
+              "width": 64
+            },
+            "samples_per_prompt": 2,
+            "scheduler": {
+              "class": "UniPCMultistepScheduler",
+              "timesteps": [
+                999,
+                749
+              ]
+            },
+            "sde_type": null,
+            "transformer_class": "PeftModel",
+            "use_lora": true,
+            "wan_backend": "world_r1",
+            "width": null
+          },
+          "prompt": "a vivid red cube slowly rotating on a white table",
+          "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+          "prompt_metadata": {
+            "group_id": "group-7a4cf81748e684bba25606c5",
+            "parent_prompt_index": 0,
+            "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+            "rollout_kind": "full_trajectory",
+            "sample_index": 1,
+            "split": "train"
+          },
+          "reward_values": {
+            "raw": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.513668954372406
+            },
+            "valid": true,
+            "weighted": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.513668954372406
+            },
+            "weighted_total": 1.2676689624786377
+          },
+          "rollout_cache_path": null,
+          "rollout_type": "full_trajectory",
+          "run_id": "world_r1_real_wan_one_step",
+          "sample_id": "step-000001-rank-0000-7a600a8e8564a74a1ab36db6",
+          "sample_index": 1,
+          "schema_version": "2",
+          "seed": 1402,
+          "step": 1,
+          "timestep_summary": {
+            "branch_id": 1,
+            "count": 2,
+            "values": [
+              999,
+              749
+            ]
+          }
+        }
+      ],
+      "metric_row": {
+        "approx_kl": 0.0,
+        "backward_time_s": 0.3501325501129031,
+        "checkpoint_write_time_s": 0.4370061634108424,
+        "clipfrac": 0.0,
+        "grad_clip_max_norm": 1.0,
+        "grad_nonzero_count": 11796304.0,
+        "grad_norm": 3.8172759461215766e-08,
+        "grad_preclip_norm": 3.818422555923462e-08,
+        "grad_tensor_count": 480.0,
+        "gradients_finite": true,
+        "group_size": 2.0,
+        "logprob_delta_abs_max": 0.0,
+        "logprob_delta_mean": 0.0,
+        "loss": 0.0,
+        "new_logprob_mean": -0.3557693362236023,
+        "old_logprob_mean": -0.3557693362236023,
+        "optimizer_time_s": 0.0649956613779068,
+        "peak_gpu_memory_bytes": 15537234432.0,
+        "policy_loss": 0.0,
+        "recompute_time_s": 0.32892102003097534,
+        "reward_cache_hit_rate": 0.0,
+        "reward_cache_hits": 0.0,
+        "reward_cache_misses": 2.0,
+        "reward_executor_attempts": 1.0,
+        "reward_executor_background_work_may_continue": 0.0,
+        "reward_executor_cancelled": 0.0,
+        "reward_executor_final_failure_count": 0.0,
+        "reward_executor_final_failure_rate": 0.0,
+        "reward_executor_first_failure_count": 0.0,
+        "reward_executor_first_failure_rate": 0.0,
+        "reward_executor_hard_cancel_supported": 0.0,
+        "reward_executor_pending": 0.0,
+        "reward_executor_provider_attempt_budget_known": 0.0,
+        "reward_executor_provider_attempt_budget_per_shard": 0.0,
+        "reward_executor_provider_concurrency_limit": 1.0,
+        "reward_executor_provider_queue_wait_count": 1.0,
+        "reward_executor_provider_queue_wait_max_s": 0.0,
+        "reward_executor_provider_queue_wait_p50_s": 0.0,
+        "reward_executor_provider_queue_wait_p95_s": 0.0,
+        "reward_executor_provider_queue_wait_sum_s": 0.0,
+        "reward_executor_queue_wait_count": 1.0,
+        "reward_executor_queue_wait_max_s": 1.4446675777435303e-05,
+        "reward_executor_queue_wait_p50_s": 1.4446675777435303e-05,
+        "reward_executor_queue_wait_p95_s": 1.4446675777435303e-05,
+        "reward_executor_queue_wait_sum_s": 1.4446675777435303e-05,
+        "reward_executor_retries": 0.0,
+        "reward_executor_retry_failure_count": 0.0,
+        "reward_executor_retry_failure_rate": 0.0,
+        "reward_executor_running": 0.0,
+        "reward_executor_service_latency_count": 1.0,
+        "reward_executor_service_latency_max_s": 0.016063911840319633,
+        "reward_executor_service_latency_p50_s": 0.016063911840319633,
+        "reward_executor_service_latency_p95_s": 0.016063911840319633,
+        "reward_executor_service_latency_sum_s": 0.016063911840319633,
+        "reward_executor_shards": 1.0,
+        "reward_executor_still_running": 0.0,
+        "reward_executor_timed_out_work_may_continue": 0.0,
+        "reward_executor_timeouts": 0.0,
+        "reward_executor_wall_time_s": 0.016151531599462032,
+        "reward_latency_p50_s": 0.005884077399969101,
+        "reward_latency_p95_s": 0.009616544470191002,
+        "reward_mean": 1.4405524730682373,
+        "reward_std": 0.1728835105895996,
+        "reward_time_s": 0.016450961120426655,
+        "rollout_cache_time_s": 3.423541784286499e-06,
+        "rollout_kl_abs_max": 0.0,
+        "rollout_kl_mean": 0.0,
+        "rollout_time_s": 0.9786580326035619,
+        "schema_version": "2",
+        "step": 1,
+        "trained_prompt_num": 1.0,
+        "update_microbatches": 1,
+        "update_time_s": 0.9414699785411358,
+        "zero_std_ratio": 0.0
+      },
+      "reward_rows": [
+        {
+          "reward_values": {
+            "raw": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.8594359159469604
+            },
+            "valid": true,
+            "weighted": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.8594359159469604
+            },
+            "weighted_total": 1.613435983657837
+          },
+          "sample_id": "step-000001-rank-0000-0d4f77a37a3febe235163708",
+          "schema_version": "2",
+          "step": 1
+        },
+        {
+          "reward_values": {
+            "raw": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.513668954372406
+            },
+            "valid": true,
+            "weighted": {
+              "mock": 0.7540000081062317,
+              "prompt_color": 0.513668954372406
+            },
+            "weighted_total": 1.2676689624786377
+          },
+          "sample_id": "step-000001-rank-0000-7a600a8e8564a74a1ab36db6",
+          "schema_version": "2",
+          "step": 1
+        }
+      ]
+    }
+  ],
+  "transaction_id": "da7392ee04d64e68a4f34dae186b9d6a"
+}

@@ -15,16 +15,40 @@ dist/
 # Experiment outputs
 logs/
 runs/
+reports/
 outputs/
 checkpoints/
 wandb/
 tmp/
 
+# Local orchestration and research notes
+.codex/
+CURRENT_PLAN.md
+
+# Personal learning workspace. Keep exercises locally, outside version control.
+exercises/
+
+# Generated experiment bundles and runtime evidence stay outside Git. Curated
+# recipes, validators, summaries, and small machine-readable results are added
+# explicitly instead of committing whole run directories.
+experiments/**/*.tar.gz
+experiments/**/run/
+experiments/**/runs/
+experiments/**/runs_*/
+experiments/**/remote_results/
+experiments/**/*.lock
+experiments/**/*.pid
+
+# Locally generated research prompt splits. Regenerate them with the dataset
+# preparation script after checking upstream redistribution terms.
+data/prompts/tempflow_real_rgb_v*/
+data/prompts/sd3_quality_probe_v1.txt
+
 # Local third-party paper/source snapshots.
 # Keep these on disk for inspection, but do not commit them to this repo.
 reference_code/
 
-# Personal paper drafts kept locally for project notes.
+# Personal paper drafts and machine-generated document artifacts.
 docs/paper/
 
 # Large model/data caches

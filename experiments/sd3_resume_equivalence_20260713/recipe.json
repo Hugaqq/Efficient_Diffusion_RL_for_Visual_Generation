@@ -1,0 +1,48 @@
+{
+  "experiment_id": "sd3_resume_equivalence_20260713",
+  "purpose": "Compare a real SD3 TempFlow continuous 10-step run with a separate 5-step process followed by checkpoint resume to the same absolute step 10.",
+  "source_archive_sha256": "0741431b47a5171ba30a3f7cd336ac4d546f54c41a01b0cb65f1fd0415dd5594",
+  "model_index_sha256": "b5e97ca0d3c0cd9a1e3ed91a71bbdd489de7941b23fe038b3aaa9acf36fd1543",
+  "tempflow_reference_commit": "63e4def7159940ba7d60e4e6250eee868342388c",
+  "dataset": {
+    "train_sha256": "4ccbe865c736fd074146029915fd39dab285f42dccd97c3f73a6ea2e6cdda867",
+    "heldout_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3"
+  },
+  "shared_training_config": {
+    "seed": 201,
+    "condition": "active",
+    "resolution": 256,
+    "diffusion_steps": 20,
+    "guidance_scale": 4.5,
+    "branch_count": 2,
+    "sample_batch_size": 1,
+    "reward": "prompt_color_guarded",
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "dtype": "bfloat16",
+    "eval_seeds": [1701, 1702, 1703]
+  },
+  "continuous_reference": {
+    "summary": "../sd3_multiseed_10step_20260713/evidence/runs/seed201_active/summary.json",
+    "remote_checkpoint": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed201_active/checkpoint_000010",
+    "adapter_sha256": "087d9a6bec6f46586bc1c5d9b1ebf7b6be01c889418c217148648f8d47d8d564",
+    "training_state_sha256": "e54e0735a4ed5cb0c4659116fbf1b096e5dd83e31859eb9bfc834718962bb9f8"
+  },
+  "split_run": {
+    "first_process_target_step": 5,
+    "resume_process_target_step": 10
+  },
+  "pre_registered_gates": {
+    "both_segments_execution_valid": true,
+    "resume_loaded": true,
+    "resume_base_step": 5,
+    "resume_steps": 5,
+    "final_adapter_sha256_exact_match": true,
+    "final_training_state_semantic_match": true,
+    "steps_5_to_9_metric_max_abs_delta": 0.000001,
+    "heldout_reward_delta_max_abs_delta": 0.000001,
+    "no_duplicate_or_missing_artifacts": true,
+    "base_transformer_unchanged": true
+  },
+  "remote_stage": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713"
+}

@@ -1,21 +1,22 @@
-"""Minimal installed command-line entry for config-driven training."""
+"""Deprecated repository-local ``train.py --config`` compatibility entry."""
 
 from __future__ import annotations
 
 import argparse
+import sys
 
-from visual_rl.configs.schema import load_config
-from visual_rl.runner import ExperimentRunner
+from visual_rl.cli import main as cli_main
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="visual-rl")
-    parser.add_argument(
-        "--config", required=True, help="Path to a VisualRL YAML config"
+    parser = argparse.ArgumentParser(prog="train.py")
+    parser.add_argument("--config", required=True)
+    args, remainder = parser.parse_known_args(argv)
+    print(
+        "warning: train.py --config is deprecated; use visual-rl run CONFIG",
+        file=sys.stderr,
     )
-    args = parser.parse_args(argv)
-    ExperimentRunner(load_config(args.config)).run()
-    return 0
+    return cli_main(["run", args.config, *remainder])
 
 
 if __name__ == "__main__":

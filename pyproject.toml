@@ -34,7 +34,7 @@ dev = [
 ]
 
 [project.scripts]
-visual-rl = "visual_rl.entrypoint:main"
+visual-rl = "visual_rl.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["visual_rl*"]
@@ -45,3 +45,6 @@ include = ["visual_rl*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["reference_code", "third_party", ".git", ".venv", "runs"]
+markers = [
+  "distributed: tests requiring local multi-process torch.distributed loopback sockets",
+]

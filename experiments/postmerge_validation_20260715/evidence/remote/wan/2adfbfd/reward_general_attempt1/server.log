@@ -1,0 +1,18 @@
+General reward worker 0 initialized
+ * Serving Flask app 'serve_general_reward'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:18090
+Press CTRL+C to quit
+/tmp/v-qiaoqifan/envs/world_r1_reward/lib/python3.10/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/tmp/v-qiaoqifan/envs/world_r1_reward/lib/python3.10/site-packages/hpsv2/img_score.py:76: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast():
+127.0.0.1 - - [15/Jul/2026 12:35:00] "POST / HTTP/1.1" 200 -
+INFO:werkzeug:127.0.0.1 - - [15/Jul/2026 12:35:00] "POST / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Jul/2026 12:35:02] "POST / HTTP/1.1" 200 -
+INFO:werkzeug:127.0.0.1 - - [15/Jul/2026 12:35:02] "POST / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Jul/2026 12:35:02] "POST / HTTP/1.1" 500 -
+INFO:werkzeug:127.0.0.1 - - [15/Jul/2026 12:35:02] "[35m[1mPOST / HTTP/1.1[0m" 500 -
+127.0.0.1 - - [15/Jul/2026 12:35:02] "POST / HTTP/1.1" 500 -
+INFO:werkzeug:127.0.0.1 - - [15/Jul/2026 12:35:02] "[35m[1mPOST / HTTP/1.1[0m" 500 -

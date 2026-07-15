@@ -38,7 +38,12 @@ class ManifestBuilder:
 
         batch.validate_lightweight()
         batch_size = len(batch.prompts)
-        self._validate_rewards(rewards, batch_size)
+        rewards.validate_against(batch)
+        if batch.context is not None and batch.context.step != step:
+            raise ValueError(
+                "artifact step must match batch.context.step: "
+                f"{step} != {batch.context.step}"
+            )
         resolved_media_paths = self._resolve_media_paths(media_paths, batch_size)
         model_metadata = to_jsonable(dict(batch.model_metadata))
         resolved_rollout_type = rollout_type or batch.model_metadata.get("rollout")
@@ -46,58 +51,40 @@ class ManifestBuilder:
         records: list[SampleRecord] = []
         for index in range(batch_size):
             prompt_metadata = to_jsonable(dict(batch.metadata[index]))
-            seed = prompt_metadata.get("seed", batch.seed)
+            branch_id = to_jsonable(self._batch_item(batch.branch_id, index))
             record = SampleRecord(
                 run_id=self.run_id,
-                sample_id=self._sample_id(step, index),
+                sample_id=str(self._batch_item(batch.sample_id, index)),
                 sample_index=index,
                 step=step,
                 prompt=batch.prompts[index],
                 media_type=media_type,
                 prompt_metadata=prompt_metadata,
-                seed=int(seed) if seed is not None else None,
+                seed=(
+                    int(batch.context.seed)
+                    if batch.context is not None
+                    else None
+                ),
                 rollout_type=str(resolved_rollout_type)
                 if resolved_rollout_type is not None
                 else None,
-                timestep_summary=self._timestep_summary(batch, index, prompt_metadata),
+                timestep_summary=self._timestep_summary(
+                    batch,
+                    index,
+                    prompt_metadata,
+                    branch_id,
+                ),
                 reward_values=self._reward_values(rewards, index),
                 media_path=resolved_media_paths[index],
                 rollout_cache_path=self._path_string(rollout_cache_path),
                 checkpoint_path=self._path_string(checkpoint_path),
                 model_metadata=dict(model_metadata),
+                prompt_id=str(self._batch_item(batch.prompt_id, index)),
+                group_id=str(self._batch_item(batch.group_id, index)),
+                branch_id=branch_id,
             )
             records.append(record)
         return records
-
-    def _sample_id(self, step: int, index: int) -> str:
-        return f"{self.run_id}-step-{step:06d}-sample-{index:06d}"
-
-    @classmethod
-    def _validate_rewards(cls, rewards: RewardBatch, batch_size: int) -> None:
-        for group_name, group in (("raw", rewards.raw), ("weighted", rewards.weighted)):
-            for reward_name, values in group.items():
-                cls._require_batch_axis(
-                    f"rewards.{group_name}.{reward_name}", values, batch_size
-                )
-        for name in ("weighted_total", "valid_mask"):
-            cls._require_batch_axis(
-                f"rewards.{name}", getattr(rewards, name), batch_size
-            )
-
-    @staticmethod
-    def _require_batch_axis(name: str, value: Any, batch_size: int) -> None:
-        shape = getattr(value, "shape", None)
-        if shape is not None:
-            if len(shape) == 0 or int(shape[0]) != batch_size:
-                actual = "scalar" if len(shape) == 0 else int(shape[0])
-                raise ValueError(
-                    f"{name} batch dimension must be {batch_size}, got {actual}"
-                )
-            return
-        if isinstance(value, (str, bytes)) or not hasattr(value, "__len__"):
-            raise ValueError(f"{name} must have a batch dimension of {batch_size}")
-        if len(value) != batch_size:
-            raise ValueError(f"{name} length must be {batch_size}, got {len(value)}")
 
     @staticmethod
     def _batch_item(value: Any, index: int) -> Any:
@@ -126,18 +113,19 @@ class ManifestBuilder:
         batch: RolloutBatch,
         index: int,
         prompt_metadata: Mapping[str, Any],
+        branch_id: Any,
     ) -> dict[str, Any]:
         values = to_jsonable(cls._batch_item(batch.timesteps, index))
         summary: dict[str, Any] = {
             "values": values,
             "count": len(values) if isinstance(values, list) else 1,
+            "branch_id": branch_id,
         }
         for key in (
             "selected_timestep",
             "selected_timestep_index",
             "branch_step_index",
             "branch_timestep_value",
-            "branch_id",
         ):
             if key in prompt_metadata:
                 summary[key] = prompt_metadata[key]

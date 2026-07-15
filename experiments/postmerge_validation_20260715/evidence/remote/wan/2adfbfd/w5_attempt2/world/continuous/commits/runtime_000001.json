@@ -1,0 +1,26 @@
+{
+  "commit_id": 1,
+  "completed_steps": 1,
+  "kind": "artifact_commit_runtime",
+  "measurement_boundary": "after_authoritative_commit_latest_and_retention_before_runtime_sidecar_persist_and_projection_refresh",
+  "run_id": "world_r1_real_wan_one_step",
+  "schema_version": "1",
+  "steps": [
+    {
+      "artifact_step": 0,
+      "metrics": {
+        "artifact_commit_time_s": 0.1300389925017953,
+        "artifact_cycle_samples_per_second": 0.3148438560089672,
+        "artifact_cycle_steps": 1,
+        "artifact_cycle_time_s": 6.352355181239545,
+        "artifact_stage_time_s": 0.02082239743322134,
+        "checkpoint_time_s": 0.8128748452290893,
+        "checkpoint_write_time_s": 0.6567658707499504,
+        "post_commit_bookkeeping_time_s": 0.004957064054906368,
+        "samples_per_second": 0.3148438560089672,
+        "step_time_s": 6.352355181239545
+      }
+    }
+  ],
+  "transaction_id": "3b10846d748e4fb095c18a799764e31e"
+}

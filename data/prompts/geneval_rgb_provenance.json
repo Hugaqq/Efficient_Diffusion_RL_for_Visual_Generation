@@ -1,0 +1,31 @@
+{
+  "dataset": "GenEval",
+  "official_repository": "https://github.com/djghosh13/geneval",
+  "source_url": "https://raw.githubusercontent.com/djghosh13/geneval/main/prompts/evaluation_metadata.jsonl",
+  "source_sha256": "5c48e0813e812e3c373fa5c8ed07a8f0a483be30272b4427b0559c8048e67c13",
+  "source_rows": 553,
+  "selection": {
+    "tag": "color_attr",
+    "supported_color_words": [
+      "red",
+      "green",
+      "blue"
+    ],
+    "rule": "Keep prompts containing exactly one supported color word so prompt_color has one unambiguous target.",
+    "eligible_rows": 49,
+    "train": {
+      "count": 36,
+      "content_sha256": "d09e533b151d513f7f7944a0677a72d7d9e7187b9c5001f5cd5148efc0b45a66",
+      "per_color": 12,
+      "path": "data/prompts/geneval_rgb_train_36.txt"
+    },
+    "heldout": {
+      "count": 9,
+      "content_sha256": "f3d8975c1a9cfad296809eb42b37ed3632b5a32f9af0148a9e5e58ac1c10afe1",
+      "per_color": 3,
+      "path": "data/prompts/geneval_rgb_heldout_9.txt"
+    },
+    "unused_rows": 4
+  },
+  "purpose": "A narrow RGB-control pilot using an unclipped target-channel margin reward for validating SD3 TempFlow training infrastructure; it is not a full GenEval score."
+}

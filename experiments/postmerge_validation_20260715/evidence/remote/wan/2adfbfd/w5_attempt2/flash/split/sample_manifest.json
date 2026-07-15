@@ -1,0 +1,300 @@
+{
+  "records": [
+    {
+      "branch_id": 0,
+      "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/flash_split1/checkpoint_000001",
+      "group_id": "group-af7274a772c6a085ecbd1fde",
+      "media_path": null,
+      "media_type": "video",
+      "model_metadata": {
+        "actual_scheduler_timestep": 999,
+        "actual_scheduler_timesteps": [
+          999,
+          999
+        ],
+        "adapter": "world_r1_wan_legacy",
+        "adapter_key": "world_r1_wan_legacy",
+        "adapter_name": "default",
+        "checkpoint_format": "wan_peft_adapter_v1",
+        "device": "cuda",
+        "diffusion_clip": null,
+        "dtype": "torch.bfloat16",
+        "flash_rectification_weights": [
+          [
+            1.0
+          ],
+          [
+            1.0
+          ]
+        ],
+        "frame_shape": [
+          2,
+          5,
+          3,
+          64,
+          64
+        ],
+        "frames": null,
+        "guidance_scale": null,
+        "height": null,
+        "lora_alpha": 32,
+        "lora_rank": 16,
+        "lora_targets": [
+          "to_k",
+          "to_out.0",
+          "to_q",
+          "to_v"
+        ],
+        "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+        "noise_level": null,
+        "num_steps": 2,
+        "parent_prompt_indices": [
+          0,
+          0
+        ],
+        "pipeline_class": "WanPipeline",
+        "rectification_mode": "scheduler_formula",
+        "reference_path": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "reference_root": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "repo_root": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "rollout": "single_step",
+        "sample_config": {
+          "device": "cuda",
+          "diffusion_clip": false,
+          "diffusion_clip_value": 0.45,
+          "frames": 5,
+          "guidance_scale": 1.0,
+          "height": 64,
+          "kl_reward": 0.0,
+          "max_sequence_length": 128,
+          "noise_level": 0.7,
+          "num_steps": 2,
+          "num_videos_per_prompt": 1,
+          "sde_type": "flow_sde",
+          "sde_window_range": null,
+          "sde_window_size": 0,
+          "seed": 1402,
+          "train_cfg": false,
+          "use_camera_trajectory": false,
+          "width": 64
+        },
+        "samples_per_prompt": 2,
+        "scheduler": {
+          "class": "UniPCMultistepScheduler",
+          "timesteps": [
+            999,
+            749
+          ]
+        },
+        "sde_type": null,
+        "selected_step_strategy": "first",
+        "selected_timestep_indices": [
+          0,
+          0
+        ],
+        "selected_timestep_values": null,
+        "selected_timesteps": [
+          0,
+          0
+        ],
+        "timestep_candidates": [
+          0,
+          1
+        ],
+        "transformer_class": "PeftModel",
+        "use_lora": true,
+        "wan_backend": "flash",
+        "width": null
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table",
+      "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+      "prompt_metadata": {
+        "group_id": "group-af7274a772c6a085ecbd1fde",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 0,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "reward_values": {
+        "raw": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.7524267435073853
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.7524267435073853
+        },
+        "weighted_total": 0.9514267444610596
+      },
+      "rollout_cache_path": null,
+      "rollout_type": "single_step",
+      "run_id": "flash_grpo_real_wan_one_step",
+      "sample_id": "step-000000-rank-0000-ca961e913ffd56ef16a3584b",
+      "sample_index": 0,
+      "seed": 1402,
+      "step": 0,
+      "timestep_summary": {
+        "branch_id": 0,
+        "count": 1,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "values": [
+          999
+        ]
+      }
+    },
+    {
+      "branch_id": 1,
+      "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/flash_split1/checkpoint_000001",
+      "group_id": "group-af7274a772c6a085ecbd1fde",
+      "media_path": null,
+      "media_type": "video",
+      "model_metadata": {
+        "actual_scheduler_timestep": 999,
+        "actual_scheduler_timesteps": [
+          999,
+          999
+        ],
+        "adapter": "world_r1_wan_legacy",
+        "adapter_key": "world_r1_wan_legacy",
+        "adapter_name": "default",
+        "checkpoint_format": "wan_peft_adapter_v1",
+        "device": "cuda",
+        "diffusion_clip": null,
+        "dtype": "torch.bfloat16",
+        "flash_rectification_weights": [
+          [
+            1.0
+          ],
+          [
+            1.0
+          ]
+        ],
+        "frame_shape": [
+          2,
+          5,
+          3,
+          64,
+          64
+        ],
+        "frames": null,
+        "guidance_scale": null,
+        "height": null,
+        "lora_alpha": 32,
+        "lora_rank": 16,
+        "lora_targets": [
+          "to_k",
+          "to_out.0",
+          "to_q",
+          "to_v"
+        ],
+        "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+        "noise_level": null,
+        "num_steps": 2,
+        "parent_prompt_indices": [
+          0,
+          0
+        ],
+        "pipeline_class": "WanPipeline",
+        "rectification_mode": "scheduler_formula",
+        "reference_path": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "reference_root": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "repo_root": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+        "rollout": "single_step",
+        "sample_config": {
+          "device": "cuda",
+          "diffusion_clip": false,
+          "diffusion_clip_value": 0.45,
+          "frames": 5,
+          "guidance_scale": 1.0,
+          "height": 64,
+          "kl_reward": 0.0,
+          "max_sequence_length": 128,
+          "noise_level": 0.7,
+          "num_steps": 2,
+          "num_videos_per_prompt": 1,
+          "sde_type": "flow_sde",
+          "sde_window_range": null,
+          "sde_window_size": 0,
+          "seed": 1402,
+          "train_cfg": false,
+          "use_camera_trajectory": false,
+          "width": 64
+        },
+        "samples_per_prompt": 2,
+        "scheduler": {
+          "class": "UniPCMultistepScheduler",
+          "timesteps": [
+            999,
+            749
+          ]
+        },
+        "sde_type": null,
+        "selected_step_strategy": "first",
+        "selected_timestep_indices": [
+          0,
+          0
+        ],
+        "selected_timestep_values": null,
+        "selected_timesteps": [
+          0,
+          0
+        ],
+        "timestep_candidates": [
+          0,
+          1
+        ],
+        "transformer_class": "PeftModel",
+        "use_lora": true,
+        "wan_backend": "flash",
+        "width": null
+      },
+      "prompt": "a vivid blue sphere slowly rotating on a white table",
+      "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+      "prompt_metadata": {
+        "group_id": "group-af7274a772c6a085ecbd1fde",
+        "parent_prompt_index": 0,
+        "prompt_id": "acffa967b38df18283e558485b8f20630b04f768b98fa02ab79d9dd0a56c524a",
+        "rollout_kind": "flash_single_step",
+        "sample_index": 1,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "split": "train"
+      },
+      "reward_values": {
+        "raw": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.2622121572494507
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.2622121572494507
+        },
+        "weighted_total": 0.461212158203125
+      },
+      "rollout_cache_path": null,
+      "rollout_type": "single_step",
+      "run_id": "flash_grpo_real_wan_one_step",
+      "sample_id": "step-000000-rank-0000-b311dc68e98276df59ba49cd",
+      "sample_index": 1,
+      "seed": 1402,
+      "step": 0,
+      "timestep_summary": {
+        "branch_id": 1,
+        "count": 1,
+        "selected_timestep": 0,
+        "selected_timestep_index": 0,
+        "values": [
+          999
+        ]
+      }
+    }
+  ],
+  "run_id": "flash_grpo_real_wan_one_step",
+  "schema_version": "2"
+}

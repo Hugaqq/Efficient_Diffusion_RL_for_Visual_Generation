@@ -1,0 +1,54 @@
+{
+  "attempt_id": "sd3_runtime_determinism_20260713_attempt_2",
+  "frozen_at": "2026-07-13",
+  "purpose": "Complete the original E2b same-checkpoint determinism audit without changing infra code.",
+  "correction_from_attempt_1": "Reuse the checkpoint-bound E2 dataset and evaluation absolute paths instead of relocated content-identical copies.",
+  "source_checkpoint": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713/runs/split_to_5/checkpoint_000005",
+  "expected_config_fingerprint": "39c5f87d3047120019aa45511dd6b0dcf709db29e4a217dd0ad0fef3a76870a5",
+  "train_prompts_file": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713/data/train.txt",
+  "train_content_sha256": "4ccbe865c736fd074146029915fd39dab285f42dccd97c3f73a6ea2e6cdda867",
+  "heldout_prompts_file": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713/data/heldout_pilot.txt",
+  "heldout_content_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3",
+  "branches": {
+    "a_existing_gpu2": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713/runs/resume_to_10",
+    "b_attempt_2_gpu2": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_runtime_determinism_20260713/runs/attempt_2_repeat_gpu2",
+    "c_attempt_2_gpu3": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_runtime_determinism_20260713/runs/attempt_2_repeat_gpu3"
+  },
+  "gpu_mapping": {
+    "b_attempt_2_gpu2": 2,
+    "c_attempt_2_gpu3": 3
+  },
+  "shared_config": {
+    "model_path": "/home/v-qiaoqifan/flow_grpo/hf_cache/stable-diffusion-3.5-medium",
+    "repo_root": "/home/v-qiaoqifan/TempFlow-GRPO",
+    "condition": "active",
+    "seed": 201,
+    "target_step": 10,
+    "resume_base_step": 5,
+    "resolution": 256,
+    "diffusion_steps": 20,
+    "guidance_scale": 4.5,
+    "sample_batch_size": 1,
+    "branch_count": 2,
+    "reward_name": "prompt_color_guarded",
+    "eval_seeds": [1701, 1702, 1703],
+    "dtype": "bfloat16",
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "max_sequence_length": 128,
+    "logprob_atol": 0.00001,
+    "rollout_cache_disabled": true
+  },
+  "gates": {
+    "both_new_branches_valid": true,
+    "metrics_rows_per_branch": 5,
+    "resume_loaded": true,
+    "resume_base_step": 5,
+    "target_step": 10,
+    "prompt_and_step_sequence_exact_match": true,
+    "adapter_exact_match": true,
+    "numeric_metric_max_abs_delta": 0.000001,
+    "heldout_reward_delta_max_abs_delta": 0.000001
+  },
+  "preservation_rule": "Do not overwrite attempt 1 logs or any E2 reference artifact; download evidence without checkpoints."
+}

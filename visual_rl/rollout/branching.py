@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from visual_rl.core.types import RolloutBatch
+from visual_rl.core.types import RolloutBatch, StepContext
 from visual_rl.core.registry import ROLLOUT_ENGINES
 from visual_rl.model_adapters.base import ModelAdapter
 from visual_rl.rollout.base import RolloutEngine
@@ -24,11 +24,14 @@ class BranchingRollout(RolloutEngine):
         adapter: ModelAdapter,
         prompts: list[str],
         metadata: list[dict[str, Any]],
+        context: StepContext | None = None,
     ) -> RolloutBatch:
+        context = self.resolve_context(context)
         spec = branching_spec_from_config(self.config)
+        base_runtime_config = self.runtime_config(context)
         transition_counter = getattr(adapter, "branch_transition_count", None)
         transition_count = int(
-            transition_counter(self.config)
+            transition_counter(base_runtime_config)
             if callable(transition_counter)
             else self.config.get("num_steps", 1)
         )
@@ -40,7 +43,7 @@ class BranchingRollout(RolloutEngine):
         )
         branch_step_index = select_branch_timestep(
             candidates,
-            self.config.get("epoch_tag"),
+            context.epoch_tag,
             spec.branch_timestep_strategy,
         )
         sample_branching = getattr(adapter, "sample_branching", None)
@@ -49,17 +52,16 @@ class BranchingRollout(RolloutEngine):
                 f"Adapter {adapter.name!r} does not implement shared-prefix sample_branching()."
             )
 
-        branch_config = {
-            **self.config,
-            "branch_step_index": branch_step_index,
-            "branch_step_candidates": candidates,
-            "branch_count": spec.branch_count,
-            "exploration_k": spec.branch_count,
-            "include_main": spec.include_main,
-            "transition_count": transition_count,
-        }
+        branch_config = self.runtime_config(
+            context,
+            branch_step_index=branch_step_index,
+            branch_step_candidates=candidates,
+            branch_count=spec.branch_count,
+            exploration_k=spec.branch_count,
+            include_main=spec.include_main,
+            transition_count=transition_count,
+        )
         batch = sample_branching(prompts, metadata, branch_config)
-        self._validate_result(batch, len(prompts), spec.branch_count, spec.include_main)
         batch.model_metadata.update(
             {
                 "rollout": "branching",
@@ -71,7 +73,18 @@ class BranchingRollout(RolloutEngine):
                 "transition_count": transition_count,
             }
         )
-        return batch
+        finalized = self.finalize_batch(
+            batch,
+            context,
+            media_type=getattr(adapter, "media_type", None),
+        )
+        self._validate_result(
+            finalized,
+            len(prompts),
+            spec.branch_count,
+            spec.include_main,
+        )
+        return finalized
 
     @staticmethod
     def _validate_result(

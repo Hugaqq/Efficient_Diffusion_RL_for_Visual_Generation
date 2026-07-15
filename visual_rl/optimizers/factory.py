@@ -31,12 +31,21 @@ def _build_algorithm_optimizer(config: VisualRLConfig) -> OptimizerPlugin:
         use_global_std=config.sample.global_std,
         max_group_std=config.sample.max_group_std,
         mode=config.algorithm.advantage_mode,
+        epsilon=config.algorithm.advantage_epsilon,
+        output_dtype=config.algorithm.advantage_dtype,
     )
 
     return AlgorithmOptimizerPlugin(
         algorithm=algorithm,
         advantage_computer=advantage_computer,
-        optimizer_config=config.optimizer.params,
+        optimizer_config={
+            key: value
+            for key, value in config.optimizer.params.items()
+            if key != "target"
+        },
+        max_grad_norm=config.train.max_grad_norm,
+        update_microbatch_size=config.train.update_microbatch_size,
+        precision=config.train.precision,
     )
 
 

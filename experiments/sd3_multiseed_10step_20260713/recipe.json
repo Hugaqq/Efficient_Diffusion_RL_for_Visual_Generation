@@ -1,0 +1,75 @@
+{
+  "experiment_id": "sd3_multiseed_10step_20260713",
+  "purpose": "Test whether the guarded RGB held-out effect repeats across independent training seeds and exceeds a matched zero-learning-rate control.",
+  "source": {
+    "branch": "codex/sd3-dataset-pilot",
+    "git_head": "9bc1f54da25f346339f6a868bed6d587f59e0c71",
+    "working_source_archive_sha256": "0741431b47a5171ba30a3f7cd336ac4d546f54c41a01b0cb65f1fd0415dd5594"
+  },
+  "environment": {
+    "host": "node01",
+    "conda_env": "visual-rl-sd35",
+    "python": "3.10.16",
+    "torch": "2.11.0",
+    "diffusers": "0.37.0",
+    "transformers": "5.6.0",
+    "peft": "0.19.1",
+    "gpus": [
+      "NVIDIA GeForce RTX 5090 32607 MiB GPU2",
+      "NVIDIA GeForce RTX 5090 32607 MiB GPU3"
+    ]
+  },
+  "model": {
+    "path": "/home/v-qiaoqifan/flow_grpo/hf_cache/stable-diffusion-3.5-medium",
+    "model_index_sha256": "b5e97ca0d3c0cd9a1e3ed91a71bbdd489de7941b23fe038b3aaa9acf36fd1543"
+  },
+  "reference": {
+    "path": "/home/v-qiaoqifan/TempFlow-GRPO",
+    "commit": "63e4def7159940ba7d60e4e6250eee868342388c"
+  },
+  "dataset": {
+    "name": "tempflow_real_rgb_v2",
+    "source_revision": "63e4def7159940ba7d60e4e6250eee868342388c",
+    "manifest_sha256": "322aa1b4f451e74c381a1561759244db2a94e8ef44495fe4323fc6e8f7b197fe",
+    "train_count": 3600,
+    "train_sha256": "4ccbe865c736fd074146029915fd39dab285f42dccd97c3f73a6ea2e6cdda867",
+    "heldout_count": 12,
+    "heldout_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3",
+    "heldout_balance": {
+      "red": 4,
+      "green": 4,
+      "blue": 4
+    }
+  },
+  "training": {
+    "training_seeds": [201, 307, 419],
+    "conditions": ["active", "zero_lr_control"],
+    "optimizer_steps": 10,
+    "diffusion_steps": 20,
+    "resolution": 256,
+    "guidance_scale": 4.5,
+    "branch_count": 2,
+    "sample_batch_size": 1,
+    "reward": "prompt_color_guarded",
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "dtype": "bfloat16"
+  },
+  "evaluation": {
+    "eval_seeds": [1701, 1702, 1703],
+    "paired_samples_per_run": 36,
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 0
+  },
+  "gates": {
+    "all_runs_execution_valid": true,
+    "minimum_training_seed_count": 3,
+    "minimum_positive_training_seed_fraction": 0.8,
+    "active_hierarchical_ci95_low_positive": true,
+    "every_color_mean_positive": true,
+    "active_exceeds_zero_lr_control": true,
+    "active_exceeds_twice_control_noise_rms": true,
+    "pixel_guardrails_pass": true
+  },
+  "remote_stage": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713"
+}

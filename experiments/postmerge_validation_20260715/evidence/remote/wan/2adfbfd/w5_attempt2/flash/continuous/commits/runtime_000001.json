@@ -1,0 +1,26 @@
+{
+  "commit_id": 1,
+  "completed_steps": 1,
+  "kind": "artifact_commit_runtime",
+  "measurement_boundary": "after_authoritative_commit_latest_and_retention_before_runtime_sidecar_persist_and_projection_refresh",
+  "run_id": "flash_grpo_real_wan_one_step",
+  "schema_version": "1",
+  "steps": [
+    {
+      "artifact_step": 0,
+      "metrics": {
+        "artifact_commit_time_s": 0.131887243129313,
+        "artifact_cycle_samples_per_second": 0.2591117620015959,
+        "artifact_cycle_steps": 1,
+        "artifact_cycle_time_s": 7.718677008524537,
+        "artifact_stage_time_s": 0.02203014213591814,
+        "checkpoint_time_s": 0.818432928994298,
+        "checkpoint_write_time_s": 0.659848895855248,
+        "post_commit_bookkeeping_time_s": 0.0043903132900595665,
+        "samples_per_second": 0.2591117620015959,
+        "step_time_s": 7.718677008524537
+      }
+    }
+  ],
+  "transaction_id": "12240877477c4298b9c53cb84cac6317"
+}

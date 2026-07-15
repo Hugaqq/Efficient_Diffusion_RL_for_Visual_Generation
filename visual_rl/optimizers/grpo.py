@@ -47,5 +47,15 @@ class GRPOAlgorithm:
             policy_loss = policy_loss + self.beta * batch.kl.to(new_log_probs.device, dtype=new_log_probs.dtype).mean()
         return policy_loss, {"approx_kl": approx_kl, "clipfrac": clipfrac, "policy_loss": policy_loss.detach()}
 
+    @staticmethod
+    def reduction_weight(batch: RolloutBatch, advantages) -> int:
+        import torch
+
+        del advantages
+        old_log_probs = torch.as_tensor(batch.old_log_probs)
+        if old_log_probs.ndim == 0 or old_log_probs.shape[0] != batch.batch_size:
+            raise ValueError("GRPO old_log_probs must have a batch dimension")
+        return old_log_probs.numel()
+
 
 ALGORITHMS.register("grpo", GRPOAlgorithm)

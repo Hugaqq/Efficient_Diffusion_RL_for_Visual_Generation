@@ -1,0 +1,116 @@
+{
+  "active": {
+    "ci95_high": 0.002382874343311411,
+    "ci95_low": -0.00031703789890916265,
+    "eval_seed_cluster_rms": 0.0021017328889678896,
+    "mean": 0.0009368213186799375,
+    "positive_training_seed_fraction": 1.0,
+    "training_seed_count": 3,
+    "training_seed_means": {
+      "201": 0.0012410613449497356,
+      "307": 0.0015607480373647476,
+      "419": 8.654573725329481e-06
+    }
+  },
+  "active_minus_zero_lr_control": {
+    "ci95_high": 0.002382874343311411,
+    "ci95_low": -0.00031703789890916265,
+    "mean": 0.0009368213186799375
+  },
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 0,
+  "claim_scope": "pre_registered_heldout_rgb_control",
+  "contract": {
+    "branch_count": 2,
+    "eval_seeds": [
+      1701,
+      1702,
+      1703
+    ],
+    "guidance_scale": 4.5,
+    "heldout_content_sha256": "aeefd1c4bd2a7f16a19822b387cac3b58c311afa653e69c6636655c59caaf0d3",
+    "model_path": "/home/v-qiaoqifan/flow_grpo/hf_cache/stable-diffusion-3.5-medium",
+    "num_steps": 20,
+    "resolution": 256,
+    "sample_batch_size": 1,
+    "sample_count": 36,
+    "target_step": 10
+  },
+  "eligible_for_effectiveness_claim": false,
+  "gates": {
+    "active_exceeds_twice_control_noise_rms": true,
+    "active_exceeds_zero_lr_control": false,
+    "active_hierarchical_ci95_low_positive": false,
+    "all_runs_execution_valid": true,
+    "every_color_mean_positive": false,
+    "minimum_training_seed_count": true,
+    "positive_training_seed_fraction": true
+  },
+  "method": "hierarchical_bootstrap_training_seed_then_eval_seed",
+  "per_color": {
+    "blue": {
+      "ci95_high": 0.0004855204748714129,
+      "ci95_low": -0.002413043131430944,
+      "eval_seed_cluster_rms": 0.0020031894321822312,
+      "mean": -0.001021221952719821,
+      "positive_training_seed_fraction": 0.0,
+      "training_seed_count": 3,
+      "training_seed_means": {
+        "201": -0.0005172876020272573,
+        "307": -9.897056346138318e-05,
+        "419": -0.002447407692670822
+      }
+    },
+    "green": {
+      "ci95_high": 0.005496381031763222,
+      "ci95_low": -0.0019124941382971073,
+      "eval_seed_cluster_rms": 0.005276388462323306,
+      "mean": 0.0015539013418472475,
+      "positive_training_seed_fraction": 0.6666666666666666,
+      "training_seed_count": 3,
+      "training_seed_means": {
+        "201": 0.002153392881155014,
+        "307": 0.0035423300384233394,
+        "419": -0.0010340188940366108
+      }
+    },
+    "red": {
+      "ci95_high": 0.005586918521051605,
+      "ci95_low": -0.0013256549007362789,
+      "eval_seed_cluster_rms": 0.00551508864889101,
+      "mean": 0.002277784566912386,
+      "positive_training_seed_fraction": 1.0,
+      "training_seed_count": 3,
+      "training_seed_means": {
+        "201": 0.00208707875572145,
+        "307": 0.001238884637132287,
+        "419": 0.0035073903078834214
+      }
+    }
+  },
+  "source_summaries": {
+    "active": [
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed201_active/summary.json",
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed307_active/summary.json",
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed419_active/summary.json"
+    ],
+    "zero_lr_control": [
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed201_control/summary.json",
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed307_control/summary.json",
+      "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_multiseed_10step_20260713/runs/seed419_control/summary.json"
+    ]
+  },
+  "zero_lr_control": {
+    "ci95_high": 0.0,
+    "ci95_low": 0.0,
+    "eval_seed_cluster_rms": 0.0,
+    "mean": 0.0,
+    "positive_training_seed_fraction": 0.0,
+    "training_seed_count": 3,
+    "training_seed_means": {
+      "201": 0.0,
+      "307": 0.0,
+      "419": 0.0
+    }
+  }
+}

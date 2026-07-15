@@ -1,0 +1,238 @@
+{
+  "records": [
+    {
+      "branch_id": 0,
+      "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/world_split1/checkpoint_000001",
+      "group_id": "group-302a12bdb0b5a212d2379e19",
+      "media_path": null,
+      "media_type": "video",
+      "model_metadata": {
+        "adapter": "world_r1_wan_legacy",
+        "adapter_key": "world_r1_wan_legacy",
+        "adapter_name": "default",
+        "checkpoint_format": "wan_peft_adapter_v1",
+        "device": "cuda",
+        "diffusion_clip": null,
+        "dtype": "torch.bfloat16",
+        "frame_shape": [
+          2,
+          5,
+          3,
+          64,
+          64
+        ],
+        "frames": null,
+        "guidance_scale": null,
+        "height": null,
+        "lora_alpha": 32,
+        "lora_rank": 16,
+        "lora_targets": [
+          "to_k",
+          "to_out.0",
+          "to_q",
+          "to_v"
+        ],
+        "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+        "noise_level": null,
+        "num_steps": null,
+        "parent_prompt_indices": [
+          0,
+          0
+        ],
+        "pipeline_class": "WanPipeline",
+        "reference_path": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "reference_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "repo_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "rollout": "full_trajectory",
+        "sample_config": {
+          "device": "cuda",
+          "diffusion_clip": false,
+          "diffusion_clip_value": 0.45,
+          "frames": 5,
+          "guidance_scale": 1.0,
+          "height": 64,
+          "kl_reward": 0.0,
+          "max_sequence_length": 128,
+          "noise_level": 0.7,
+          "num_steps": 2,
+          "num_videos_per_prompt": 1,
+          "sde_type": "flow_sde",
+          "sde_window_range": null,
+          "sde_window_size": 0,
+          "seed": 1401,
+          "train_cfg": false,
+          "use_camera_trajectory": false,
+          "width": 64
+        },
+        "samples_per_prompt": 2,
+        "scheduler": {
+          "class": "UniPCMultistepScheduler",
+          "timesteps": [
+            999,
+            749
+          ]
+        },
+        "sde_type": null,
+        "transformer_class": "PeftModel",
+        "use_lora": true,
+        "wan_backend": "world_r1",
+        "width": null
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table",
+      "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+      "prompt_metadata": {
+        "group_id": "group-302a12bdb0b5a212d2379e19",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 0,
+        "split": "train"
+      },
+      "reward_values": {
+        "raw": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.6546188592910767
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.6546188592910767
+        },
+        "weighted_total": 1.4086189270019531
+      },
+      "rollout_cache_path": null,
+      "rollout_type": "full_trajectory",
+      "run_id": "world_r1_real_wan_one_step",
+      "sample_id": "step-000000-rank-0000-483eebc0679013ed5f73955d",
+      "sample_index": 0,
+      "seed": 1401,
+      "step": 0,
+      "timestep_summary": {
+        "branch_id": 0,
+        "count": 2,
+        "values": [
+          999,
+          749
+        ]
+      }
+    },
+    {
+      "branch_id": 1,
+      "checkpoint_path": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/world_split1/checkpoint_000001",
+      "group_id": "group-302a12bdb0b5a212d2379e19",
+      "media_path": null,
+      "media_type": "video",
+      "model_metadata": {
+        "adapter": "world_r1_wan_legacy",
+        "adapter_key": "world_r1_wan_legacy",
+        "adapter_name": "default",
+        "checkpoint_format": "wan_peft_adapter_v1",
+        "device": "cuda",
+        "diffusion_clip": null,
+        "dtype": "torch.bfloat16",
+        "frame_shape": [
+          2,
+          5,
+          3,
+          64,
+          64
+        ],
+        "frames": null,
+        "guidance_scale": null,
+        "height": null,
+        "lora_alpha": 32,
+        "lora_rank": 16,
+        "lora_targets": [
+          "to_k",
+          "to_out.0",
+          "to_q",
+          "to_v"
+        ],
+        "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+        "noise_level": null,
+        "num_steps": null,
+        "parent_prompt_indices": [
+          0,
+          0
+        ],
+        "pipeline_class": "WanPipeline",
+        "reference_path": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "reference_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "repo_root": "/tmp/v-qiaoqifan/reference/World-R1-main",
+        "rollout": "full_trajectory",
+        "sample_config": {
+          "device": "cuda",
+          "diffusion_clip": false,
+          "diffusion_clip_value": 0.45,
+          "frames": 5,
+          "guidance_scale": 1.0,
+          "height": 64,
+          "kl_reward": 0.0,
+          "max_sequence_length": 128,
+          "noise_level": 0.7,
+          "num_steps": 2,
+          "num_videos_per_prompt": 1,
+          "sde_type": "flow_sde",
+          "sde_window_range": null,
+          "sde_window_size": 0,
+          "seed": 1401,
+          "train_cfg": false,
+          "use_camera_trajectory": false,
+          "width": 64
+        },
+        "samples_per_prompt": 2,
+        "scheduler": {
+          "class": "UniPCMultistepScheduler",
+          "timesteps": [
+            999,
+            749
+          ]
+        },
+        "sde_type": null,
+        "transformer_class": "PeftModel",
+        "use_lora": true,
+        "wan_backend": "world_r1",
+        "width": null
+      },
+      "prompt": "a vivid red cube slowly rotating on a white table",
+      "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+      "prompt_metadata": {
+        "group_id": "group-302a12bdb0b5a212d2379e19",
+        "parent_prompt_index": 0,
+        "prompt_id": "e49c2e72b2f042ad919133808a22e0fae14fd780f33b2231b64ed643a5e1f9d6",
+        "rollout_kind": "full_trajectory",
+        "sample_index": 1,
+        "split": "train"
+      },
+      "reward_values": {
+        "raw": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.29650789499282837
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.7540000081062317,
+          "prompt_color": 0.29650789499282837
+        },
+        "weighted_total": 1.05050790309906
+      },
+      "rollout_cache_path": null,
+      "rollout_type": "full_trajectory",
+      "run_id": "world_r1_real_wan_one_step",
+      "sample_id": "step-000000-rank-0000-885b81f0c7513dfbf6f1d4dc",
+      "sample_index": 1,
+      "seed": 1401,
+      "step": 0,
+      "timestep_summary": {
+        "branch_id": 1,
+        "count": 2,
+        "values": [
+          999,
+          749
+        ]
+      }
+    }
+  ],
+  "run_id": "world_r1_real_wan_one_step",
+  "schema_version": "2"
+}

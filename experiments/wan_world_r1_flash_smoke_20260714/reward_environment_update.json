@@ -1,0 +1,46 @@
+{
+  "date": "2026-07-14",
+  "environment": "/tmp/v-qiaoqifan/envs/world_r1_reward",
+  "environment_kind": "venv_with_flow_grpo_system_site_packages",
+  "purpose": "isolated World-R1 HPSv2 and DA3/Qwen reward-server validation",
+  "root_used": false,
+  "flow_grpo_environment_modified": false,
+  "packages": {
+    "decorator": "4.4.2",
+    "flask": "3.1.3",
+    "gsplat": "1.5.3",
+    "hpsv2": "1.2.0",
+    "lpips": "0.1.4",
+    "moviepy": "1.0.3",
+    "numpy": "1.26.4",
+    "nvidia-cuda-nvcc-cu12": "12.8.93 (Linux wheel contains ptxas but no nvcc executable)",
+    "qwen-vl-utils": "0.0.14",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "transformers": "4.57.1"
+  },
+  "gsplat_build_toolchain": {
+    "conda_prefix": "/tmp/v-qiaoqifan/envs/cuda-nvcc-12.8",
+    "channels": [
+      "nvidia/label/cuda-12.8.0",
+      "conda-forge"
+    ],
+    "cuda_nvcc": "12.8.61",
+    "cuda_cudart": "12.8.57",
+    "gcc_linux_64": "13.4.0",
+    "gxx_linux_64": "13.4.0",
+    "target_arch": "sm_120",
+    "torch_extensions_dir": "/tmp/v-qiaoqifan/torch_extensions/gsplat_1_5_3_torch_2_11_cu128_sm120",
+    "compiled_extension_size": 19249168,
+    "compiled_extension_sha256": "424a5f7072d451797359e5f0f9d9012265d021f1c98eb035ead74687610e612e",
+    "max_jobs": 1,
+    "root_used": false
+  },
+  "compatibility_notes": [
+    "World-R1 imports moviepy.editor, which is absent from MoviePy 2.x; the isolated reward environment was pinned to moviepy==1.0.3.",
+    "HPSv2 1.2.0 omitted bpe_simple_vocab_16e6.txt.gz from its wheel; the exact official vocabulary was added only inside this isolated environment.",
+    "gsplat 1.5.3 JIT requires a real nvcc; the NVIDIA PyPI Linux wheel did not provide that executable, so a separate user-owned CUDA 12.8.61 Conda prefix was used.",
+    "The Conda CUDA headers live under targets/x86_64-linux/include; CPATH and matching library paths plus TORCH_CUDA_ARCH_LIST=12.0 were required for the RTX 5090 build.",
+    "The flow_grpo conda environment, system Python, and other users' environments were not changed."
+  ]
+}

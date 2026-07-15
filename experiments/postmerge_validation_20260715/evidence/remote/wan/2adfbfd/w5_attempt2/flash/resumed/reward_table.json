@@ -1,0 +1,40 @@
+{
+  "records": [
+    {
+      "reward_values": {
+        "raw": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.7455874681472778
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.7455874681472778
+        },
+        "weighted_total": 0.9445874691009521
+      },
+      "sample_id": "step-000001-rank-0000-0865b1d5405a0964190bfb10",
+      "schema_version": "2",
+      "step": 1
+    },
+    {
+      "reward_values": {
+        "raw": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.6204268932342529
+        },
+        "valid": true,
+        "weighted": {
+          "mock": 0.19900000095367432,
+          "prompt_color": 0.6204268932342529
+        },
+        "weighted_total": 0.8194268941879272
+      },
+      "sample_id": "step-000001-rank-0000-a013031f356a8c562a8bdb9c",
+      "schema_version": "2",
+      "step": 1
+    }
+  ],
+  "run_id": "flash_grpo_real_wan_one_step",
+  "schema_version": "2"
+}

@@ -1,7 +1,5 @@
 run_name: tempflow_tiny_branching
 seed: 7
-paths:
-  output_dir: runs/tempflow_tiny_branching
 
 model:
   name: tiny_diffusion
@@ -40,6 +38,7 @@ algorithm:
     mode: std_dev_t
 
 rewards:
+  replace_defaults: true
   weights:
     prompt_color: 1.0
   clients:

@@ -1,0 +1,186 @@
+{
+  "algorithm": {
+    "adv_clip_max": 5.0,
+    "advantage_dtype": "float32",
+    "advantage_epsilon": 1e-06,
+    "advantage_mode": "grpo",
+    "beta": 0.0,
+    "branch": {},
+    "clip_range": 0.001,
+    "credit_assignment": "all",
+    "name": "flash_grpo",
+    "noise_weighting": {},
+    "objective_version": "reference_v1",
+    "params": {},
+    "rectification": {
+      "enabled": true,
+      "mode": "scheduler_formula",
+      "normalize": true
+    },
+    "weight_advantages": false
+  },
+  "dataset": {
+    "content_sha256": "1586b5557541d41ec2bdc3f4f55ef6b31a1e3c651ac410d732070976e5b9bc2b",
+    "empty_prompt_policy": "error",
+    "path": null,
+    "prompts": [
+      "a vivid blue sphere slowly rotating on a white table"
+    ],
+    "repeat_per_prompt": 1,
+    "require_unique": false,
+    "sampling_seed": 0,
+    "sampling_strategy": "sequential",
+    "split_name": "train"
+  },
+  "evaluation": {
+    "content_sha256": null,
+    "max_prompts": null,
+    "path": null,
+    "prompts": [],
+    "seeds": [
+      1701,
+      1702,
+      1703
+    ],
+    "split_name": "heldout"
+  },
+  "model": {
+    "extra": {
+      "device": "cuda",
+      "dtype": "bfloat16",
+      "flash_grpo_root": "/tmp/v-qiaoqifan/reference/Flash-GRPO-main",
+      "gradient_checkpointing": true,
+      "local_files_only": true,
+      "lora_alpha": 32,
+      "lora_rank": 16,
+      "low_cpu_mem_usage": true,
+      "train_cfg": false,
+      "wan_backend": "flash"
+    },
+    "latent_shape": [
+      4,
+      2,
+      2,
+      2
+    ],
+    "media_shape": [
+      4,
+      3,
+      16,
+      16
+    ],
+    "model_family": "wan",
+    "model_path": "/tmp/v-qiaoqifan/models/Wan2.1-T2V-1.3B-Diffusers",
+    "name": "world_r1_wan_legacy"
+  },
+  "optimizer": {
+    "name": "algorithm",
+    "params": {}
+  },
+  "paths": {
+    "output_dir": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/flash_resume2",
+    "pretrained_model": null,
+    "resume_from": "/tmp/v-qiaoqifan/visualrl_infra_validation_20260715/runs/wan_w5_2adfbfd_attempt2/flash_split1"
+  },
+  "per_prompt_stat_tracking": true,
+  "rewards": {
+    "cache_dir": null,
+    "clients": {
+      "mock": {
+        "name": "mock"
+      },
+      "prompt_color": {
+        "name": "prompt_color",
+        "version": "v1"
+      }
+    },
+    "fail_policy": "raise",
+    "provider": "reward_router",
+    "provider_params": {},
+    "replace_defaults": false,
+    "weights": {
+      "mock": 1.0,
+      "prompt_color": 1.0
+    }
+  },
+  "rollout": {
+    "frames": 5,
+    "height": 64,
+    "max_sequence_length": 128,
+    "rectification_mode": "scheduler_formula",
+    "selected_step_strategy": "first",
+    "timestep_range": [
+      0,
+      1
+    ],
+    "train_cfg": false,
+    "width": 64
+  },
+  "run_name": "flash_grpo_real_wan_one_step",
+  "runner": {
+    "artifact_max_bytes": null,
+    "auto_load_model": true,
+    "checkpoint_keep_last": null,
+    "conditional_scaling": {
+      "fsdp2": false,
+      "split_roles": false
+    },
+    "deterministic_run_dir": true,
+    "deterministic_runtime": true,
+    "disable_rollout_cache": true,
+    "distributed": {
+      "backend": null,
+      "device": null,
+      "max_snapshot_tensor_bytes": 1073741824,
+      "timeout_s": 30.0
+    },
+    "progress_interval": 1,
+    "progress_leave": false,
+    "reward_executor": {
+      "max_in_flight": null,
+      "max_retries": 0,
+      "max_workers": 4,
+      "microbatch_size": 1,
+      "mode": "sync",
+      "require_hard_timeout": false,
+      "submit_timeout_s": 30.0,
+      "timeout_s": 30.0
+    },
+    "rollout_cache_dir": null,
+    "rollout_cache_keep_last": null,
+    "rollout_cache_max_bytes": null,
+    "show_progress": false,
+    "strict_rollout_validation": true
+  },
+  "sample": {
+    "batch_size": 1,
+    "diffusion_clip": false,
+    "diffusion_clip_value": 0.45,
+    "global_std": false,
+    "guidance_scale": 1.0,
+    "kl_reward": 0.0,
+    "max_group_std": false,
+    "name": "single_step",
+    "noise_level": 0.7,
+    "num_steps": 2,
+    "samples_per_prompt": 2,
+    "sde_type": "flow_sde",
+    "sde_window_range": null,
+    "sde_window_size": null
+  },
+  "seed": 1402,
+  "train": {
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-08,
+    "adam_weight_decay": 0.0001,
+    "learning_rate": 0.0001,
+    "lora_path": null,
+    "max_grad_norm": 1.0,
+    "max_steps": 2,
+    "precision": "fp32",
+    "save_every": 1,
+    "update_microbatch_size": null
+  },
+  "use_lora": true
+}

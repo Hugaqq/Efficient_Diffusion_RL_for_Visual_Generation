@@ -1,0 +1,313 @@
+{
+  "coefficient_comparison": {
+    "equal": true,
+    "finite": true,
+    "max_abs": 0.0,
+    "shape_actual": [
+      2,
+      1
+    ],
+    "shape_reference": [
+      2,
+      1
+    ]
+  },
+  "cuda": {
+    "cuda_runtime": "12.8",
+    "device_name": "NVIDIA GeForce RTX 5090",
+    "peak_allocated_bytes": 15446140416,
+    "peak_reserved_bytes": 15667822592,
+    "torch": "2.11.0+cu128"
+  },
+  "elapsed_seconds": 70.77895936649293,
+  "gates": {
+    "all_480_gradients_exact": true,
+    "flash_reference_contract": true,
+    "grouped_seed_contract_exact": true,
+    "loss_exact": true,
+    "parameters_unchanged": true,
+    "recomputed_logprob_exact": true,
+    "retained_one_transition": true,
+    "sample_order_and_tensors_exact": true,
+    "scheduler_metadata_exact": true,
+    "selected_indices_exact": true
+  },
+  "gradient": {
+    "infra_sha256": "cf6b0a1fcb9e4864b3b2d5da0e8163d390cd545904e4901f0493b6a72d4ef56c",
+    "max_abs": 0.0,
+    "reference_sha256": "cf6b0a1fcb9e4864b3b2d5da0e8163d390cd545904e4901f0493b6a72d4ef56c",
+    "tensor_count": 480
+  },
+  "infra_metrics": {
+    "approx_kl": 1.8673285140380358e-09,
+    "clipfrac": 0.0,
+    "flash_active_timestep_frac": 1.0,
+    "flash_rectification_weight_mean": 0.9999999403953552,
+    "flash_selected_timestep_mean": 1.5,
+    "policy_loss": -0.031563371419906616
+  },
+  "loss": {
+    "abs_difference": 0.0,
+    "infra": -0.031563371419906616,
+    "reference": -0.031563371419906616
+  },
+  "new_logprob_comparison": {
+    "equal": true,
+    "finite": true,
+    "max_abs": 0.0,
+    "shape_actual": [
+      2,
+      1
+    ],
+    "shape_reference": [
+      2,
+      1
+    ]
+  },
+  "parameter_sha256_after": "29e9987904f11c29bf8797ec7066656ca302b23301ea043e9fd9f15a67f87582",
+  "parameter_sha256_before": "29e9987904f11c29bf8797ec7066656ca302b23301ea043e9fd9f15a67f87582",
+  "prompt_batch_composition_diagnostic": {
+    "batch_composition_bitwise_invariance_claimed": false,
+    "dtype_actual": "torch.bfloat16",
+    "dtype_reference": "torch.bfloat16",
+    "equal": false,
+    "finite": true,
+    "gating": false,
+    "max_abs": 0.05859375,
+    "mean_abs": 0.00010734100942499936,
+    "nonzero_count": 92444,
+    "scope": "singleton encoding concatenation versus one shared batch encoding; heterogeneous grouping parity uses the shared batch conditioning",
+    "shape_actual": [
+      2,
+      128,
+      4096
+    ],
+    "shape_reference": [
+      2,
+      128,
+      4096
+    ]
+  },
+  "runtime": {
+    "base_sample_seed": 1718,
+    "deterministic_algorithms": true,
+    "group_seeds_by_selected_index": {
+      "1": 2001724,
+      "2": 3001727
+    },
+    "num_steps": 20,
+    "objective_version": "reference_v1",
+    "rectification_source": "dynamic_sde_coefficient",
+    "scheduler": {
+      "class": "UniPCMultistepScheduler",
+      "timesteps": [
+        999,
+        982,
+        963,
+        944,
+        922,
+        899,
+        874,
+        847,
+        817,
+        785,
+        749,
+        710,
+        666,
+        617,
+        562,
+        499,
+        428,
+        345,
+        249,
+        136
+      ]
+    },
+    "selected_indices": [
+      2,
+      1
+    ],
+    "selected_timesteps": [
+      963,
+      982
+    ],
+    "train_cfg": false
+  },
+  "sample_comparisons": {
+    "coefficient": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1
+      ],
+      "shape_reference": [
+        2,
+        1
+      ]
+    },
+    "kl": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1
+      ],
+      "shape_reference": [
+        2,
+        1
+      ]
+    },
+    "latents": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1,
+        16,
+        2,
+        8,
+        8
+      ],
+      "shape_reference": [
+        2,
+        1,
+        16,
+        2,
+        8,
+        8
+      ]
+    },
+    "media": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        5,
+        3,
+        64,
+        64
+      ],
+      "shape_reference": [
+        2,
+        5,
+        3,
+        64,
+        64
+      ]
+    },
+    "next_latents": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1,
+        16,
+        2,
+        8,
+        8
+      ],
+      "shape_reference": [
+        2,
+        1,
+        16,
+        2,
+        8,
+        8
+      ]
+    },
+    "old_log_probs": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1
+      ],
+      "shape_reference": [
+        2,
+        1
+      ]
+    },
+    "prompt_embeds": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        128,
+        4096
+      ],
+      "shape_reference": [
+        2,
+        128,
+        4096
+      ]
+    },
+    "timesteps": {
+      "equal": true,
+      "finite": true,
+      "max_abs": 0.0,
+      "shape_actual": [
+        2,
+        1
+      ],
+      "shape_reference": [
+        2,
+        1
+      ]
+    }
+  },
+  "source_sha256": {
+    "adapter": "87e3b3ea3a0c90855abcba203b4639e9275d353de16c5df90bae90e00af1c967",
+    "flash_sampler": "1f223275bce998c650b1e38b983d1ae0fb165a3e8a8679044ef87f639974cabb",
+    "harness": "b91fb4c918c0a9984a4645b43e4416eb7c49948d7fdbfa2b247f5a62822a1adc",
+    "rectification": "c772dfa9a2216d4771c47a73d409bef3ac7919e6d914dddf93618cc6a453cf46",
+    "rollout": "b578b0716ab936380e2623a8268e115e707d7920ffc9ede4c61a6d6994f38402"
+  },
+  "training_input_contract": {
+    "adapter_dtype": "torch.bfloat16",
+    "detached": {
+      "coefficient": true,
+      "latents": true,
+      "next_latents": true,
+      "old_log_probs": true,
+      "prompt_embeds": true,
+      "timesteps": true
+    },
+    "latent_contiguous_after": true,
+    "latent_contiguous_before": true,
+    "latent_dtype_after": "torch.bfloat16",
+    "latent_dtype_before": "torch.float32",
+    "latent_stride_after": [
+      2048,
+      128,
+      64,
+      8,
+      1
+    ],
+    "latent_stride_before": [
+      2048,
+      128,
+      64,
+      8,
+      1
+    ],
+    "prompt_contiguous_after": true,
+    "prompt_contiguous_before": true,
+    "prompt_dtype_after": "torch.bfloat16",
+    "prompt_dtype_before": "torch.bfloat16",
+    "sde_current_latent_dtype_after": "torch.float32",
+    "sde_current_latent_dtype_before": "torch.float32",
+    "sde_next_latent_dtype_after": "torch.float32",
+    "sde_next_latent_dtype_before": "torch.float32",
+    "transformer_device": "cuda:0",
+    "transformer_dtype": "torch.bfloat16"
+  },
+  "valid": true
+}

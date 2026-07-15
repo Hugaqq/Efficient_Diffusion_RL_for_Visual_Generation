@@ -1,0 +1,39 @@
+{
+  "experiment_id": "sd3_runtime_determinism_20260713",
+  "purpose": "Measure independent-run drift by launching multiple resume branches from the exact same real SD3 step-5 checkpoint and restored RNG state.",
+  "source_archive_sha256": "0741431b47a5171ba30a3f7cd336ac4d546f54c41a01b0cb65f1fd0415dd5594",
+  "source_checkpoint": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_resume_equivalence_20260713/runs/split_to_5/checkpoint_000005",
+  "source_adapter_sha256": "4490296c3966a5b3fc3a6806eba4bd2fab6f692dae9bb3bd5017d685b0c2ba13",
+  "source_training_state_sha256": "561d989ce234bbeed2c7e5025ec5399078c6c11a6efd048e1feec5ebbd8d9657",
+  "branches": {
+    "a_existing_gpu2": "../sd3_resume_equivalence_20260713/evidence/runs/resume_to_10",
+    "b_repeat_gpu2": "GPU2 fresh process resume step 5 to 10",
+    "c_repeat_gpu3": "GPU3 fresh process resume step 5 to 10"
+  },
+  "shared_config": {
+    "seed": 201,
+    "target_step": 10,
+    "resume_base_step": 5,
+    "diffusion_steps": 20,
+    "resolution": 256,
+    "reward": "prompt_color_guarded",
+    "eval_seeds": [1701, 1702, 1703],
+    "dtype": "bfloat16"
+  },
+  "runtime_flags_observed": {
+    "torch_deterministic_algorithms": false,
+    "cudnn_deterministic": false,
+    "cudnn_benchmark": false,
+    "matmul_allow_tf32": false,
+    "cudnn_allow_tf32": true
+  },
+  "gates": {
+    "all_branches_execution_valid": true,
+    "prompt_and_step_sequence_exact_match": true,
+    "adapter_exact_match": true,
+    "numeric_metric_max_abs_delta": 0.000001,
+    "heldout_reward_delta_max_abs_delta": 0.000001
+  },
+  "interpretation": "If branches from the identical checkpoint diverge, E2 cannot use an exact independent-run gate until a deterministic runtime mode is implemented and separately validated. Do not loosen the gate after seeing results.",
+  "remote_stage": "/home/v-qiaoqifan/visual_rl_experiments/visualrl_remote_cli_smoke/sd3_runtime_determinism_20260713"
+}

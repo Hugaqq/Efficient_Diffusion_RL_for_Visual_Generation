@@ -24,6 +24,19 @@ class Registry:
             return _decorator(value)
         return _decorator
 
+    def register_builtin(self, key: str, value: T) -> T:
+        """Register a trusted built-in or verify an identical prior import."""
+
+        current = self._items.get(key)
+        if current is None:
+            self._items[key] = value
+        elif current is not value:
+            raise KeyError(
+                f"{self.name} registry drift for {key!r}: "
+                f"expected {value!r}, found {current!r}"
+            )
+        return value
+
     def get(self, key: str) -> object:
         try:
             return self._items[key]
@@ -33,6 +46,9 @@ class Registry:
 
     def keys(self) -> list[str]:
         return sorted(self._items)
+
+    def items(self) -> tuple[tuple[str, object], ...]:
+        return tuple((key, self._items[key]) for key in sorted(self._items))
 
 
 MODEL_ADAPTERS = Registry("model_adapter")
