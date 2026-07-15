@@ -112,11 +112,11 @@ class RewardConfig:
 
 @dataclass
 class RewardExecutorConfig:
-    """Runtime-only policy for synchronous or bounded asynchronous scoring."""
+    """Execution policy for synchronous or bounded asynchronous scoring."""
 
     mode: str = "sync"
     max_workers: int = 4
-    microbatch_size: int = 1
+    microbatch_size: int | None = None
     timeout_s: float = 30.0
     max_retries: int = 0
     submit_timeout_s: float = 30.0
@@ -570,12 +570,23 @@ def _validate_runtime_config(cfg: VisualRLConfig) -> None:
     executor = cfg.runner.reward_executor
     if executor.mode not in {"sync", "async"}:
         raise ValueError("runner.reward_executor.mode must be one of: sync, async")
-    for name in ("max_workers", "microbatch_size"):
-        value = getattr(executor, name)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"runner.reward_executor.{name} must be an integer")
-        if value < 1:
-            raise ValueError(f"runner.reward_executor.{name} must be positive")
+    if isinstance(executor.max_workers, bool) or not isinstance(
+        executor.max_workers, int
+    ):
+        raise TypeError("runner.reward_executor.max_workers must be an integer")
+    if executor.max_workers < 1:
+        raise ValueError("runner.reward_executor.max_workers must be positive")
+    if executor.microbatch_size is not None:
+        if isinstance(executor.microbatch_size, bool) or not isinstance(
+            executor.microbatch_size, int
+        ):
+            raise TypeError(
+                "runner.reward_executor.microbatch_size must be an integer or null"
+            )
+        if executor.microbatch_size < 1:
+            raise ValueError(
+                "runner.reward_executor.microbatch_size must be positive when provided"
+            )
     if executor.max_in_flight is not None:
         if isinstance(executor.max_in_flight, bool) or not isinstance(
             executor.max_in_flight, int

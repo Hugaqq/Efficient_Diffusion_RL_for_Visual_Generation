@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -82,6 +83,29 @@ class _FunctionProvider(FeedbackProvider):
         return self.function(batch)
 
 
+def test_async_default_preserves_complete_batch_and_original_identity() -> None:
+    context = _context()
+    batch = _batch(context=context)
+    observed: list[RolloutBatch] = []
+
+    def score(received: RolloutBatch) -> RewardBatch:
+        observed.append(received)
+        return _reward(received)
+
+    provider = _FunctionProvider(score)
+    with AsyncRewardExecutor(provider, max_workers=4) as executor:
+        handle = executor.submit(batch, context)
+        rewards = executor.collect(handle, batch, context)
+
+    assert handle.shards == 1
+    assert executor.microbatch_size is None
+    assert provider.calls == 1
+    assert observed == [batch]
+    assert observed[0] is batch
+    assert rewards.sample_id == batch.sample_id
+    assert rewards.metadata["_executor"]["shards"] == 1
+
+
 def test_async_out_of_order_shards_restore_original_order_and_metadata() -> None:
     context = _context()
     batch = _batch(context=context)
@@ -137,6 +161,119 @@ def test_async_out_of_order_shards_restore_original_order_and_metadata() -> None
     assert metrics["retry_failure_rate"] == 0.0
     assert metrics["final_failure_count"] == 0
     assert metrics["final_failure_rate"] == 0.0
+
+
+def test_explicit_shards_recursively_merge_world_r1_metadata() -> None:
+    context = _context()
+    batch = _batch(context=context)
+
+    def score(shard: RolloutBatch) -> RewardBatch:
+        cache_hit = shard.sample_id[0] == "sample-0"
+        shard_index = int(shard.sample_id[0].rsplit("-", 1)[-1])
+        return _reward(
+            shard,
+            metadata={
+                "reward_general": {
+                    "server_revision": "hps-v2.1-fixture",
+                    "configured_batch_size": 2,
+                    "request_count": 1,
+                    "payload_batch_sizes": [shard.batch_size],
+                    "valid_mask": [True] * shard.batch_size,
+                    "encoding": {
+                        "input_shape": [shard.batch_size, 3, 8, 8],
+                        "input_layout": "BCHW",
+                    },
+                },
+                "reward_3d": {
+                    "score_reconstruction": [0.5] * shard.batch_size,
+                    "score_meta_view": [0.25] * shard.batch_size,
+                    "score_trajectory_alignment": [0.75] * shard.batch_size,
+                    "trajectory_comparison_paths": ["same.json"]
+                    * shard.batch_size,
+                    "constant_channels": [0.1, 0.2],
+                    "quality_flags": [shard_index] * shard.batch_size,
+                    "quality_tuple": (shard_index,) * shard.batch_size,
+                    "quality_array": np.full(shard.batch_size, shard_index),
+                },
+                "_runtime": {
+                    "cache_hits": int(cache_hit),
+                    "cache_misses": int(not cache_hit),
+                    "cache_hit_rate": float(cache_hit),
+                    "client_latencies_s": [float(shard.batch_size)],
+                },
+            },
+        )
+
+    with AsyncRewardExecutor(
+        _FunctionProvider(score),
+        microbatch_size=2,
+        max_workers=2,
+        max_in_flight=2,
+    ) as executor:
+        rewards = executor.score(batch, context)
+
+    metadata = rewards.metadata["reward_general"]
+    assert metadata == {
+        "server_revision": "hps-v2.1-fixture",
+        "configured_batch_size": 2,
+        "request_count": 2,
+        "payload_batch_sizes": [2, 2],
+        "valid_mask": [True, True, True, True],
+        "encoding": {
+            "input_shape": [4, 3, 8, 8],
+            "input_layout": "BCHW",
+        },
+    }
+    reward_3d_metadata = dict(rewards.metadata["reward_3d"])
+    quality_array = reward_3d_metadata.pop("quality_array")
+    np.testing.assert_array_equal(quality_array, np.asarray([0, 0, 2, 2]))
+    assert reward_3d_metadata == {
+        "score_reconstruction": [0.5, 0.5, 0.5, 0.5],
+        "score_meta_view": [0.25, 0.25, 0.25, 0.25],
+        "score_trajectory_alignment": [0.75, 0.75, 0.75, 0.75],
+        "trajectory_comparison_paths": [
+            "same.json",
+            "same.json",
+            "same.json",
+            "same.json",
+        ],
+        "constant_channels": [0.1, 0.2],
+        "quality_flags": [0, 0, 2, 2],
+        "quality_tuple": (0, 0, 2, 2),
+    }
+    runtime = rewards.metadata["_runtime"]
+    assert runtime["cache_hits"] == 1
+    assert runtime["cache_misses"] == 1
+    assert runtime["cache_hit_rate"] == 0.5
+    assert runtime["client_latencies_s"] == [2.0, 2.0]
+
+
+def test_explicit_shards_reject_partially_present_sample_metadata() -> None:
+    context = _context()
+    batch = _batch(context=context)
+
+    def score(shard: RolloutBatch) -> RewardBatch:
+        metadata: dict[str, Any] = {"reward_3d": {}}
+        if shard.sample_id[0] == "sample-0":
+            metadata["reward_3d"]["score_reconstruction"] = [0.5, 0.5]
+        return _reward(shard, metadata=metadata)
+
+    with AsyncRewardExecutor(
+        _FunctionProvider(score),
+        microbatch_size=2,
+        max_workers=2,
+        max_in_flight=2,
+    ) as executor:
+        with pytest.raises(
+            RewardExecutionError,
+            match="Merged reward batch failed validation",
+        ) as raised:
+            executor.score(batch, context)
+
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "score_reconstruction must be present in every shard" in str(
+        raised.value.__cause__
+    )
 
 
 @pytest.mark.parametrize("failure", ["keys", "total", "mask", "finite"])
@@ -706,6 +843,35 @@ def test_typed_config_builds_async_executor() -> None:
         "sample-3",
     ]
     assert provider.calls == 2
+
+
+def test_typed_async_config_defaults_to_one_complete_submission() -> None:
+    config = config_from_dict(
+        {
+            "run_name": "async-complete-batch",
+            "runner": {"reward_executor": {"mode": "async"}},
+        }
+    )
+    provider = _FunctionProvider(_reward)
+
+    assert config.runner.reward_executor.microbatch_size is None
+    with build_reward_executor(provider, config.runner.reward_executor) as executor:
+        rewards = executor.score(_batch(context=_context()), _context())
+        assert executor.microbatch_size is None
+
+    assert provider.calls == 1
+    assert rewards.metadata["_executor"]["shards"] == 1
+
+
+def test_mapping_async_config_defaults_to_one_complete_submission() -> None:
+    provider = _FunctionProvider(_reward)
+
+    with build_reward_executor(provider, {"mode": "async"}) as executor:
+        rewards = executor.score(_batch(context=_context()), _context())
+        assert executor.microbatch_size is None
+
+    assert provider.calls == 1
+    assert rewards.metadata["_executor"]["shards"] == 1
 
 
 @pytest.mark.parametrize(

@@ -321,6 +321,10 @@ def test_reference_general_payload_is_jpeg_and_uses_fixed_middle_frame():
         ((6, 4), "RGB"),
     ]
     assert metadata["encoding"]["selected_frame_index"] == 2
+    assert metadata["server_revision"] is None
+    assert metadata["configured_batch_size"] == 64
+    assert metadata["request_count"] == 1
+    assert metadata["payload_batch_sizes"] == [2]
     assert metadata["identity_mode"] == "trusted_input_order"
     assert metadata["server_identity_echo"] is False
     assert "sample_id" not in metadata
@@ -693,11 +697,13 @@ def test_general_rounds_but_3d_truncates_float_pixels(monkeypatch):
         "http://localhost:8090",
         transport=FakeTransport(),
         media_layout="BCHW",
+        server_revision="quantization-general-v1",
     )
     reward_3d = WorldR1Reward3DClient(
         "http://localhost:8089",
         transport=FakeTransport(),
         media_layout="BCHW",
+        server_revision="quantization-3d-v1",
     )
     media = np.full((1, 3, 2, 2), 0.5, dtype=np.float32)
 
@@ -742,6 +748,69 @@ def test_strict_v2_requires_echoed_identity_version_and_boolean_mask():
     assert metadata["sample_id"] == sample_id
     assert metadata["valid_mask"] == [True, False]
     assert metadata["identity_mode"] == "server_echo"
+
+
+def test_strict_v2_chunks_five_items_as_two_two_one_and_preserves_order():
+    sample_id = [f"sample-{index}" for index in range(5)]
+    prompts = [f"prompt-{index}" for index in range(5)]
+    transport = FakeTransport(
+        _response(
+            {
+                "outputs": [0.0, 1.0],
+                "protocol_version": "strict_v2",
+                "sample_id": sample_id[:2],
+                "valid_mask": [True, True],
+            }
+        ),
+        _response(
+            {
+                "outputs": [2.0, 3.0],
+                "protocol_version": "strict_v2",
+                "sample_id": sample_id[2:4],
+                "valid_mask": [True, True],
+            }
+        ),
+        _response(
+            {
+                "outputs": [4.0],
+                "protocol_version": "strict_v2",
+                "sample_id": sample_id[4:],
+                "valid_mask": [True],
+            }
+        ),
+    )
+    client = WorldR1RewardGeneralClient(
+        "http://localhost:8090",
+        transport=transport,
+        protocol_mode="strict_v2",
+        media_layout="BCHW",
+        batch_size=2,
+        server_revision="general-hps-v2.1-sha256:fixture",
+    )
+
+    values, metadata = client.score(
+        np.zeros((5, 3, 4, 5), dtype=np.uint8),
+        prompts,
+        [{} for _ in prompts],
+        sample_id=sample_id,
+    )
+
+    assert values.tolist() == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
+    assert [call["payload"]["prompts"] for call in transport.calls] == [
+        prompts[:2],
+        prompts[2:4],
+        prompts[4:],
+    ]
+    assert [call["payload"]["sample_id"] for call in transport.calls] == [
+        sample_id[:2],
+        sample_id[2:4],
+        sample_id[4:],
+    ]
+    assert metadata["sample_id"] == sample_id
+    assert metadata["server_revision"] == "general-hps-v2.1-sha256:fixture"
+    assert metadata["configured_batch_size"] == 2
+    assert metadata["request_count"] == 3
+    assert metadata["payload_batch_sizes"] == [2, 2, 1]
 
 
 def test_strict_v2_and_router_reject_duplicate_sample_identity():
@@ -1070,6 +1139,7 @@ def test_router_merges_and_restores_invalid_mask_from_cache(tmp_path):
                     "name": "reward_general",
                     "version": "wire-v2",
                     "url": "http://localhost:8090",
+                    "server_revision": "strict-invalid-mask-v1",
                     "protocol_mode": "strict_v2",
                     "media_layout": "BCHW",
                     "transport": transport,
@@ -1436,6 +1506,16 @@ def test_world_r1_positive_config_rejects_zero_and_non_finite(field, value):
         WorldR1RewardGeneralClient("http://localhost:8090", **kwargs)
 
 
+@pytest.mark.parametrize("server_revision", ["", "   ", 1, True, b"revision"])
+def test_world_r1_server_revision_must_be_non_empty_string_or_none(server_revision):
+    with pytest.raises((TypeError, ValueError), match="server_revision"):
+        WorldR1RewardGeneralClient(
+            "http://localhost:8090",
+            transport=FakeTransport(),
+            server_revision=server_revision,
+        )
+
+
 @pytest.mark.parametrize("value", [0.0, float("nan"), float("inf"), float("-inf")])
 def test_remote_pickle_timeout_rejects_zero_and_non_finite(value):
     with pytest.raises(ValueError, match="finite and positive"):
@@ -1488,7 +1568,10 @@ def test_legacy_pickle_requires_exact_host_explicit_opt_in(kwargs, match):
 
 def test_legacy_pickle_policy_and_wire_are_part_of_cache_fingerprint():
     client = WorldR1RewardGeneralClient(
-        "http://localhost:8090", transport=FakeTransport(), **_legacy_kwargs()
+        "http://localhost:8090",
+        transport=FakeTransport(),
+        server_revision="legacy-general-v1",
+        **_legacy_kwargs(),
     )
     fingerprint = client.cache_fingerprint()
     assert fingerprint["wire_format"] == LEGACY_PICKLE
@@ -1515,22 +1598,35 @@ def test_protocol_mode_and_batch_policy_are_part_of_cache_fingerprint():
         transport=FakeTransport(),
         protocol_mode="reference_v1",
         batch_size=4,
+        server_revision="general-v1",
     )
     strict = WorldR1RewardGeneralClient(
         "http://localhost:8090",
         transport=FakeTransport(),
         protocol_mode="strict_v2",
         batch_size=4,
+        server_revision="general-v1",
     )
     different_batch = WorldR1RewardGeneralClient(
         "http://localhost:8090",
         transport=FakeTransport(),
         protocol_mode="reference_v1",
         batch_size=8,
+        server_revision="general-v1",
     )
 
     assert reference.cache_fingerprint() != strict.cache_fingerprint()
     assert reference.cache_fingerprint() != different_batch.cache_fingerprint()
+
+
+def test_missing_server_revision_explicitly_disables_client_cache_fingerprint():
+    client = WorldR1RewardGeneralClient(
+        "http://localhost:8090",
+        transport=FakeTransport(),
+    )
+
+    assert client.server_revision is None
+    assert client.cache_fingerprint() is None
 
 
 def test_mock_mode_change_cannot_hit_an_old_router_cache_entry(tmp_path):
@@ -1576,6 +1672,7 @@ def test_injected_transport_without_fingerprint_disables_cache(tmp_path):
                         "name": "reward_general",
                         "url": "http://localhost:8090",
                         "media_layout": "BCHW",
+                        "server_revision": "general-v1",
                         "transport": transport,
                     }
                 },
@@ -1625,6 +1722,7 @@ def test_explicit_injected_fingerprint_is_secret_free_cacheable_and_isolated(tmp
                         "name": "reward_general",
                         "url": "http://localhost:8090",
                         "media_layout": "BCHW",
+                        "server_revision": "general-v1",
                         "transport": transport,
                     }
                 },
@@ -1661,10 +1759,41 @@ def test_explicit_injected_fingerprint_is_secret_free_cacheable_and_isolated(tmp
     assert len(list(tmp_path.glob("*.json"))) == 2
 
 
-def test_default_transport_is_not_constructor_config_and_remains_cacheable(
+def test_default_transport_and_same_server_revision_hit_shared_cache(
     tmp_path, monkeypatch
 ):
     transport = FakeTransport(_response({"outputs": [0.75]}))
+    monkeypatch.setattr(world_r1_rewards, "requests_session", lambda: transport)
+    config = {
+        "weights": {"reward_general": 1.0},
+        "clients": {
+            "reward_general": {
+                "name": "reward_general",
+                "url": "http://localhost:8090",
+                "media_layout": "BCHW",
+                "server_revision": "general-v1",
+            }
+        },
+        "fail_policy": "raise",
+    }
+    args = (np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}])
+
+    first_router = RewardRouter(config, cache_dir=tmp_path)
+    second_router = RewardRouter(config, cache_dir=tmp_path)
+    first = first_router.score(*args, sample_id=["sample"])
+    second = second_router.score(*args, sample_id=["sample"])
+
+    assert first.weighted_total.tolist() == second.weighted_total.tolist() == [0.75]
+    assert transport.calls and len(transport.calls) == 1
+    assert first_router.client_fingerprints["reward_general"] is not None
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+def test_missing_server_revision_disables_persistent_cache(tmp_path, monkeypatch):
+    transport = FakeTransport(
+        _response({"outputs": [0.25]}),
+        _response({"outputs": [0.75]}),
+    )
     monkeypatch.setattr(world_r1_rewards, "requests_session", lambda: transport)
     config = {
         "weights": {"reward_general": 1.0},
@@ -1684,10 +1813,49 @@ def test_default_transport_is_not_constructor_config_and_remains_cacheable(
     first = first_router.score(*args, sample_id=["sample"])
     second = second_router.score(*args, sample_id=["sample"])
 
-    assert first.weighted_total.tolist() == second.weighted_total.tolist() == [0.75]
-    assert transport.calls and len(transport.calls) == 1
-    assert first_router.client_fingerprints["reward_general"] is not None
-    assert len(list(tmp_path.glob("*.json"))) == 1
+    assert first.weighted_total.tolist() == [0.25]
+    assert second.weighted_total.tolist() == [0.75]
+    assert len(transport.calls) == 2
+    assert first_router.client_fingerprints["reward_general"] is None
+    assert second_router.client_fingerprints["reward_general"] is None
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_same_url_different_server_revision_cannot_share_cache(tmp_path, monkeypatch):
+    transport = FakeTransport(
+        _response({"outputs": [0.25]}),
+        _response({"outputs": [0.75]}),
+    )
+    monkeypatch.setattr(world_r1_rewards, "requests_session", lambda: transport)
+
+    def config(server_revision):
+        return {
+            "weights": {"reward_general": 1.0},
+            "clients": {
+                "reward_general": {
+                    "name": "reward_general",
+                    "url": "http://localhost:8090",
+                    "media_layout": "BCHW",
+                    "server_revision": server_revision,
+                }
+            },
+            "fail_policy": "raise",
+        }
+
+    args = (np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}])
+    revision_a = RewardRouter(config("general-v1"), cache_dir=tmp_path)
+    revision_b = RewardRouter(config("general-v2"), cache_dir=tmp_path)
+
+    first = revision_a.score(*args, sample_id=["sample"])
+    second = revision_b.score(*args, sample_id=["sample"])
+
+    assert first.weighted_total.tolist() == [0.25]
+    assert second.weighted_total.tolist() == [0.75]
+    assert len(transport.calls) == 2
+    assert revision_a.client_fingerprints["reward_general"] != (
+        revision_b.client_fingerprints["reward_general"]
+    )
+    assert len(list(tmp_path.glob("*.json"))) == 2
 
 
 def test_router_signature_detection_preserves_old_clients_and_does_not_hide_typeerror():

@@ -25,7 +25,7 @@ _BUILTIN_PROVIDER_NAMES = frozenset({"reward_router"})
 _EXECUTOR_DEFAULTS = {
     "mode": "sync",
     "max_workers": 4,
-    "microbatch_size": 1,
+    "microbatch_size": None,
     "timeout_s": 30.0,
     "max_retries": 0,
     "submit_timeout_s": 30.0,
@@ -137,8 +137,9 @@ def _config_values(config) -> dict[str, Any]:
 def _validate_executor_values(values: Mapping[str, Any]) -> None:
     if values["mode"] not in {"sync", "async"}:
         raise ValueError("reward executor mode must be one of: sync, async")
-    for name in ("max_workers", "microbatch_size"):
-        _require_positive_int(name, values[name])
+    _require_positive_int("max_workers", values["max_workers"])
+    if values["microbatch_size"] is not None:
+        _require_positive_int("microbatch_size", values["microbatch_size"])
     _require_non_negative_int("max_retries", values["max_retries"])
     _require_positive_float("timeout_s", values["timeout_s"])
     _require_non_negative_float("submit_timeout_s", values["submit_timeout_s"])

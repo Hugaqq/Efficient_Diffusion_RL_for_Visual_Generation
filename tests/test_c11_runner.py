@@ -129,6 +129,10 @@ def test_default_sync_runner_keeps_provider_identity_and_training_fingerprint(
     async_config["runner"]["reward_executor"]["mode"] = "async"
     async_config["runner"]["reward_executor"]["require_hard_timeout"] = True
     async_config["runner"]["distributed"]["max_snapshot_tensor_bytes"] = 2048
+    explicitly_sharded_1 = deepcopy(async_config)
+    explicitly_sharded_1["runner"]["reward_executor"]["microbatch_size"] = 1
+    explicitly_sharded_2 = deepcopy(async_config)
+    explicitly_sharded_2["runner"]["reward_executor"]["microbatch_size"] = 2
     calls = 0
     original_score = runner.feedback_provider.score
 
@@ -142,6 +146,12 @@ def test_default_sync_runner_keeps_provider_identity_and_training_fingerprint(
     assert runner.reward_executor is None
     assert config_fingerprint(sync_config, identity) == config_fingerprint(
         async_config, identity
+    )
+    assert config_fingerprint(sync_config, identity) != config_fingerprint(
+        explicitly_sharded_1, identity
+    )
+    assert config_fingerprint(explicitly_sharded_1, identity) != config_fingerprint(
+        explicitly_sharded_2, identity
     )
     metrics = runner.run()[0]
 

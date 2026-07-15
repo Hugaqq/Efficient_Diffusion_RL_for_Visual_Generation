@@ -21,6 +21,9 @@ class _UnstableConstructorValue(Exception):
     pass
 
 
+_MISSING_CACHE_FINGERPRINT = object()
+
+
 class RewardRouter:
     def __init__(self, config: dict[str, Any], cache_dir: str | Path | None = None):
         self.config = config
@@ -322,9 +325,15 @@ class RewardRouter:
             "client_class": cls._type_identity(client),
             "constructor_sha256": stable_hash_json(normalized_constructor),
         }
-        fingerprint = getattr(client, "cache_fingerprint", None)
-        if fingerprint is not None:
+        fingerprint = getattr(
+            client,
+            "cache_fingerprint",
+            _MISSING_CACHE_FINGERPRINT,
+        )
+        if fingerprint is not _MISSING_CACHE_FINGERPRINT:
             value = fingerprint() if callable(fingerprint) else fingerprint
+            if value is None:
+                return None
             identity["client_reported_sha256"] = stable_hash_json(
                 cls._normalize_explicit_fingerprint(value)
             )
@@ -355,6 +364,8 @@ class RewardRouter:
         if fingerprint is None:
             raise _UnstableConstructorValue
         declared = fingerprint() if callable(fingerprint) else fingerprint
+        if declared is None:
+            raise _UnstableConstructorValue
         normalized = cls._normalize_explicit_fingerprint(declared)
         return {
             "kind": "injected_callable" if callable(value) else "injected_object",

@@ -21,6 +21,38 @@ from visual_rl.feedback.base import FeedbackProvider
 from visual_rl.feedback.clients import RewardProtocolError
 
 
+_SAMPLE_METADATA_FIELDS = frozenset(
+    {
+        "sample_id",
+        "score_meta_view",
+        "score_reconstruction",
+        "score_trajectory_alignment",
+        "source_rows",
+        "trajectory_comparison_paths",
+        "valid_mask",
+    }
+)
+_RUNTIME_SEQUENCE_METADATA_FIELDS = frozenset(
+    {"client_latencies_s", "reward_latencies_s"}
+)
+_REQUIRED_CONSISTENT_METADATA_FIELDS = frozenset(
+    {
+        *_SAMPLE_METADATA_FIELDS,
+        "configured_batch_size",
+        "encoding",
+        "identity_mode",
+        "payload_batch_sizes",
+        "payload_kind",
+        "protocol_mode",
+        "protocol_version",
+        "request_count",
+        "sample_id_mode",
+        "server_identity_echo",
+        "server_revision",
+    }
+)
+
+
 class RewardExecutionError(RuntimeError):
     """Reward execution failed without producing a complete valid batch."""
 
@@ -457,6 +489,10 @@ class SyncRewardExecutor(RewardExecutor):
 class AsyncRewardExecutor(RewardExecutor):
     """Bounded thread-pool executor for trusted in-process providers.
 
+    By default each submission stays intact so providers can preserve their own
+    batch semantics. Set ``microbatch_size`` explicitly only when the provider
+    or its resource envelope requires partitioning within one reward handle.
+
     Collection deadlines are soft: Python cannot terminate an already-running
     provider call. Providers requiring a hard deadline need process isolation.
 
@@ -472,7 +508,7 @@ class AsyncRewardExecutor(RewardExecutor):
         provider: FeedbackProvider,
         *,
         max_workers: int = 4,
-        microbatch_size: int = 1,
+        microbatch_size: int | None = None,
         timeout_s: float = 30.0,
         max_retries: int = 0,
         submit_timeout_s: float = 30.0,
@@ -492,7 +528,11 @@ class AsyncRewardExecutor(RewardExecutor):
                 "in-process provider calls; use a process-isolated provider"
             )
         self.max_workers = _positive_int("max_workers", max_workers)
-        self.microbatch_size = _positive_int("microbatch_size", microbatch_size)
+        self.microbatch_size = (
+            None
+            if microbatch_size is None
+            else _positive_int("microbatch_size", microbatch_size)
+        )
         self.timeout_s = _positive_float("timeout_s", timeout_s)
         self.max_retries = _non_negative_int("max_retries", max_retries)
         self.submit_timeout_s = _non_negative_float(
@@ -525,12 +565,15 @@ class AsyncRewardExecutor(RewardExecutor):
     def submit(self, batch: RolloutBatch, context: StepContext) -> RewardHandle:
         self._prepare_submission(batch, context)
         submitted_at = time.monotonic()
-        shards = [
-            batch.slice(
-                range(start, min(start + self.microbatch_size, batch.batch_size))
-            )
-            for start in range(0, batch.batch_size, self.microbatch_size)
-        ]
+        if self.microbatch_size is None:
+            shards = [batch]
+        else:
+            shards = [
+                batch.slice(
+                    range(start, min(start + self.microbatch_size, batch.batch_size))
+                )
+                for start in range(0, batch.batch_size, self.microbatch_size)
+            ]
         tasks: list[_ShardTask] = []
         cancellation = _HandleCancellation()
         with self._state_lock:
@@ -849,7 +892,10 @@ def _merge_reward_batches(
 
 
 def _merge_metadata(
-    metadata: Sequence[Mapping[str, Any]], shard_sizes: Sequence[int]
+    metadata: Sequence[Mapping[str, Any]],
+    shard_sizes: Sequence[int],
+    *,
+    path: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if len(metadata) == 1:
         return dict(metadata[0])
@@ -857,6 +903,11 @@ def _merge_metadata(
     merged: dict[str, Any] = {}
     for key in keys:
         if not all(key in item for item in metadata):
+            if str(key) in _REQUIRED_CONSISTENT_METADATA_FIELDS:
+                child = ".".join((*path, str(key)))
+                raise ValueError(
+                    f"Shard metadata {child} must be present in every shard"
+                )
             merged[key] = {
                 str(index): item[key]
                 for index, item in enumerate(metadata)
@@ -864,23 +915,135 @@ def _merge_metadata(
             }
             continue
         values = [item[key] for item in metadata]
-        if all(_values_equal(values[0], value) for value in values[1:]):
-            merged[key] = values[0]
-        elif all(
-            isinstance(value, list) and len(value) == size
-            for value, size in zip(values, shard_sizes)
-        ):
-            merged[key] = [entry for value in values for entry in value]
-        elif all(
-            isinstance(value, tuple) and len(value) == size
-            for value, size in zip(values, shard_sizes)
-        ):
-            merged[key] = tuple(entry for value in values for entry in value)
-        elif _batch_arrays(values, shard_sizes):
-            merged[key] = _concatenate_arrays(values)
-        else:
-            merged[key] = values
+        merged[key] = _merge_metadata_values(
+            values,
+            shard_sizes,
+            path=(*path, str(key)),
+        )
+    if path and path[-1] == "_runtime":
+        hits = merged.get("cache_hits")
+        misses = merged.get("cache_misses")
+        if _is_non_negative_int(hits) and _is_non_negative_int(misses):
+            requests = hits + misses
+            merged["cache_hit_rate"] = float(hits / requests) if requests else 0.0
     return merged
+
+
+def _merge_metadata_values(
+    values: Sequence[Any],
+    shard_sizes: Sequence[int],
+    *,
+    path: tuple[str, ...],
+) -> Any:
+    field = path[-1]
+    if _is_additive_count_path(path) and all(
+        _is_non_negative_int(value) for value in values
+    ):
+        return sum(values)
+    if all(isinstance(value, Mapping) for value in values):
+        return _merge_metadata(values, shard_sizes, path=path)
+    if field in _SAMPLE_METADATA_FIELDS and all(
+        isinstance(value, list) and len(value) == size
+        for value, size in zip(values, shard_sizes)
+    ):
+        return [entry for value in values for entry in value]
+    if field in _SAMPLE_METADATA_FIELDS and all(
+        isinstance(value, tuple) and len(value) == size
+        for value, size in zip(values, shard_sizes)
+    ):
+        return tuple(entry for value in values for entry in value)
+    if field in _SAMPLE_METADATA_FIELDS and _batch_arrays(values, shard_sizes):
+        return _concatenate_arrays(values)
+    if field in _SAMPLE_METADATA_FIELDS:
+        raise ValueError(
+            f"Shard metadata {'.'.join(path)} must contain one entry per sample"
+        )
+    if field == "payload_batch_sizes" and all(
+        _valid_payload_batch_sizes(value, size)
+        for value, size in zip(values, shard_sizes)
+    ):
+        return [entry for value in values for entry in value]
+    if field == "payload_batch_sizes":
+        raise ValueError(
+            f"Shard metadata {'.'.join(path)} must contain positive batch sizes "
+            "that sum to the shard size"
+        )
+    if _is_runtime_sequence_path(path) and all(
+        isinstance(value, list) for value in values
+    ):
+        return [entry for value in values for entry in value]
+    merged_input_shape = _merge_input_shapes(values, shard_sizes, path=path)
+    if merged_input_shape is not None:
+        return merged_input_shape
+    if all(_values_equal(values[0], value) for value in values[1:]):
+        return values[0]
+    if all(isinstance(value, list) for value in values) and all(
+        len(value) == size for value, size in zip(values, shard_sizes)
+    ):
+        return [entry for value in values for entry in value]
+    if all(isinstance(value, tuple) for value in values) and all(
+        len(value) == size for value, size in zip(values, shard_sizes)
+    ):
+        return tuple(entry for value in values for entry in value)
+    if _batch_arrays(values, shard_sizes):
+        return _concatenate_arrays(values)
+    return list(values)
+
+
+def _is_additive_count_path(path: tuple[str, ...]) -> bool:
+    field = path[-1]
+    return field == "request_count" or (
+        len(path) >= 2
+        and path[-2] == "_runtime"
+        and field in {"cache_hits", "cache_misses"}
+    )
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _valid_payload_batch_sizes(value: Any, shard_size: int) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_is_non_negative_int(item) and item > 0 for item in value)
+        and sum(value) == shard_size
+    )
+
+
+def _is_runtime_sequence_path(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) >= 2
+        and path[-2] == "_runtime"
+        and path[-1] in _RUNTIME_SEQUENCE_METADATA_FIELDS
+    )
+
+
+def _merge_input_shapes(
+    values: Sequence[Any],
+    shard_sizes: Sequence[int],
+    *,
+    path: tuple[str, ...],
+) -> list[int] | None:
+    if len(path) < 2 or path[-2:] != ("encoding", "input_shape"):
+        return None
+    if not all(
+        isinstance(value, list)
+        and len(value) >= 1
+        and all(_is_non_negative_int(dimension) for dimension in value)
+        and value[0] == size
+        for value, size in zip(values, shard_sizes)
+    ):
+        raise ValueError(
+            f"Shard metadata {'.'.join(path)} must start with the shard size"
+        )
+    tail = values[0][1:]
+    if not all(value[1:] == tail for value in values[1:]):
+        raise ValueError(
+            f"Shard metadata {'.'.join(path)} has inconsistent media dimensions"
+        )
+    return [sum(shard_sizes), *tail]
 
 
 def _values_equal(left: Any, right: Any) -> bool:

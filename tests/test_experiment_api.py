@@ -420,6 +420,12 @@ def test_python_api_exposes_precision_microbatch_and_reward_execution(tmp_path):
     assert not (tmp_path / "runtime-api").exists()
 
 
+def test_reward_execution_defaults_to_full_submitted_batch_sentinel():
+    config = vr.RewardExecution().to_config()["runner"]["reward_executor"]
+
+    assert config["microbatch_size"] is None
+
+
 def test_mock_run_uses_one_runner_and_returns_lightweight_result(tmp_path, monkeypatch):
     import visual_rl.runner as runner_module
 

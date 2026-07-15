@@ -78,6 +78,13 @@ result = experiment.run(["a red cube on a white table"])
 # experiment.run([...], resume_from=result.latest_checkpoint)
 ```
 
+远端 World-R1 实验应显式声明冻结的 scorer 身份，例如
+`vr.rewards.WorldR1(..., protocol_mode="strict_v2",
+general_server_revision="hps-v2.1:<sha256>")`。未声明 `server_revision` 仍可运行，
+但持久 reward cache 会关闭，避免同一 URL 更换 scorer 后误命中旧结果。异步 reward
+使用 `vr.RewardExecution(mode="async")` 时默认把完整提交 batch 交给 provider；只有显式
+设置 `microbatch_size=N` 才分片，并把该分片策略纳入 checkpoint 恢复语义。
+
 真实 Diffusers 模型可通过
 `vr.models.Wan(..., gradient_checkpointing=True)` 或
 `vr.models.SD3(..., gradient_checkpointing=True)` 显式启用 gradient checkpointing；
