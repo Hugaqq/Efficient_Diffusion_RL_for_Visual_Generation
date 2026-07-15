@@ -78,6 +78,14 @@ result = experiment.run(["a red cube on a white table"])
 # experiment.run([...], resume_from=result.latest_checkpoint)
 ```
 
+真实 Diffusers 模型可通过
+`vr.models.Wan(..., gradient_checkpointing=True)` 或
+`vr.models.SD3(..., gradient_checkpointing=True)` 显式启用 gradient checkpointing；
+也可显式传入 `False`。省略该参数保持原有配置与 fingerprint 不变。显式请求会在
+PEFT attach 后核验实际状态，并将 `requested/effective` 写入 rollout 与 checkpoint
+provenance；新 checkpoint 的声明与恢复时状态不一致会拒绝恢复，旧 checkpoint 缺少
+这两个字段时仍按原兼容规则加载。
+
 ```bash
 visual-rl presets
 visual-rl validate preset:flash_tiny_single_step

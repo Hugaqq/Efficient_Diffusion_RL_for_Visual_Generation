@@ -14,8 +14,14 @@ from visual_rl.core.types import RolloutBatch
 from visual_rl.model_adapters.base import ModelAdapter
 from visual_rl.model_adapters.diffusers_common import (
     AdapterNotLoadedError,
+    GradientCheckpointingState,
+    configure_gradient_checkpointing,
+    gradient_checkpointing_metadata,
+    gradient_checkpointing_request,
     make_generator,
     require_model_path,
+    validate_gradient_checkpointing_checkpoint_metadata,
+    verify_gradient_checkpointing,
 )
 from visual_rl.model_adapters.diffusers_common import resolve_torch_dtype
 from visual_rl.third_party.legacy import legacy_repo_path, resolve_legacy_repo
@@ -94,12 +100,18 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
     media_type = "video"
 
     def __init__(self, config: dict[str, Any]):
+        gradient_checkpointing_requested = gradient_checkpointing_request(config)
         extra = dict(config.get("extra") or {})
         self.config = {
             **extra,
             **{key: value for key, value in config.items() if key != "extra"},
         }
         self.wan_backend = self._wan_backend()
+        self.gradient_checkpointing_requested = gradient_checkpointing_requested
+        self._gradient_checkpointing_state = GradientCheckpointingState(
+            requested=self.gradient_checkpointing_requested,
+            effective=None,
+        )
         self.use_lora = self._required_bool("use_lora", True)
         self.lora_path = self._optional_local_absolute_path("lora_path")
         self.lora_rank = self._positive_int("lora_rank", 32)
@@ -195,6 +207,11 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
                 self.pipeline = self.pipeline.to(device)
             self._configure_inference_components(device=device, dtype=dtype)
             base_transformer = self.pipeline.transformer
+            checkpointing_state = configure_gradient_checkpointing(
+                base_transformer,
+                self.gradient_checkpointing_requested,
+                context="Wan base transformer",
+            )
             if self.use_lora:
                 self._validate_lora_targets(base_transformer)
                 self.transformer = self._attach_lora(base_transformer)
@@ -211,6 +228,11 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
             self.device = self._infer_device(device)
             self.dtype = dtype or getattr(self.transformer, "dtype", None)
             self.model_path = str(model_path)
+            self._gradient_checkpointing_state = verify_gradient_checkpointing(
+                self.transformer,
+                checkpointing_state,
+                context="Wan active transformer after PEFT attach",
+            )
         return self
 
     def sample(
@@ -665,6 +687,7 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
 
     def save_pretrained(self, output_dir: str) -> None:
         transformer = self.train_module
+        runtime_metadata = self.runtime_metadata()
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
         from visual_rl.artifacts.checkpoint import (
@@ -710,7 +733,7 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
             save_json(
                 path / WAN_CHECKPOINT_METADATA_NAME,
                 {
-                    **self.runtime_metadata(),
+                    **runtime_metadata,
                     "adapter": self.name,
                     "adapter_config": str(config_path.relative_to(path)),
                     "format_version": WAN_CHECKPOINT_FORMAT_VERSION,
@@ -733,7 +756,7 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
         save_json(
             path / WAN_CHECKPOINT_METADATA_NAME,
             {
-                **self.runtime_metadata(),
+                **runtime_metadata,
                 "adapter": self.name,
                 "format_version": WAN_CHECKPOINT_FORMAT_VERSION,
                 "save_kind": save_kind,
@@ -751,6 +774,12 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
             label="Wan checkpoint root",
         )
         metadata = self._checkpoint_metadata(path)
+        self._refresh_gradient_checkpointing_state()
+        validate_gradient_checkpointing_checkpoint_metadata(
+            metadata,
+            self._gradient_checkpointing_state,
+            context="Wan checkpoint",
+        )
         state_path = path / "transformer_state.pt"
         validated_state = self._optional_checkpoint_file(
             path,
@@ -797,7 +826,17 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
         transformer.load_state_dict(state)
 
     def runtime_metadata(self) -> dict[str, Any]:
+        if self.transformer is None:
+            checkpointing_metadata = {
+                "gradient_checkpointing_requested": (
+                    self._gradient_checkpointing_state.requested
+                ),
+                "gradient_checkpointing_effective": None,
+            }
+        else:
+            checkpointing_metadata = self._refresh_gradient_checkpointing_state()
         return {
+            **checkpointing_metadata,
             "model_path": self.model_path
             or self.config.get("model_path")
             or self.config.get("pretrained_model"),
@@ -829,6 +868,17 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
                 "wan_peft_adapter_v1" if self.use_lora else "wan_full_transformer_v1"
             ),
         }
+
+    def _refresh_gradient_checkpointing_state(self) -> dict[str, bool | None]:
+        (
+            self._gradient_checkpointing_state,
+            metadata,
+        ) = gradient_checkpointing_metadata(
+            self.train_module,
+            self._gradient_checkpointing_state,
+            context="Wan active transformer",
+        )
+        return metadata
 
     def _ensure_loaded(self) -> None:
         if self.pipeline is None or self.transformer is None or self.scheduler is None:

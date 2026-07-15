@@ -40,6 +40,7 @@ class ResumePreflightError(PreflightError):
 
 
 _FLASH_REFERENCE_COEFFICIENT = "flash_reference_coefficient"
+_GRADIENT_CHECKPOINTING = "gradient_checkpointing"
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ _CATALOG = (
         "model",
         "v1",
         ("torch", "diffusers"),
+        (ComponentCapability(_GRADIENT_CHECKPOINTING),),
     ),
     ComponentDescriptor(
         "model",
@@ -121,6 +123,7 @@ _CATALOG = (
         "model",
         "v1",
         ("torch", "diffusers"),
+        (ComponentCapability(_GRADIENT_CHECKPOINTING),),
     ),
     ComponentDescriptor(
         "model",
@@ -135,6 +138,7 @@ _CATALOG = (
                 _FLASH_REFERENCE_COEFFICIENT,
                 (("model.extra.wan_backend", "flash"),),
             ),
+            ComponentCapability(_GRADIENT_CHECKPOINTING),
         ),
     ),
     ComponentDescriptor(
@@ -405,6 +409,25 @@ def _builtin_model_capability(
             for path, expected in capability.required_config
         )
     return False
+
+
+def _validate_gradient_checkpointing(
+    config: VisualRLConfig,
+    errors: list[str],
+) -> None:
+    extra = config.model.extra
+    if "gradient_checkpointing" not in extra:
+        return
+    requested = extra["gradient_checkpointing"]
+    if not isinstance(requested, bool):
+        errors.append("model.extra.gradient_checkpointing must be a bool")
+        return
+    supported = _builtin_model_capability(config, _GRADIENT_CHECKPOINTING)
+    if supported is False:
+        errors.append(
+            f"Built-in model {config.model.name!r} does not support "
+            "explicit gradient_checkpointing"
+        )
 
 
 def _resolved_config_sha256(values: dict[str, Any]) -> str:
@@ -696,6 +719,7 @@ def static_preflight(config: VisualRLConfig) -> PreflightReport:
     except (TypeError, ValueError) as exc:
         raise StaticPreflightError(str(exc)) from exc
     errors: list[str] = []
+    _validate_gradient_checkpointing(config, errors)
     _validate_selected_flash_contract(config, errors)
     wan_lora_selected = _validate_selected_wan_lora(config, errors)
     _validate_selected_tempflow_contract(config, errors)
