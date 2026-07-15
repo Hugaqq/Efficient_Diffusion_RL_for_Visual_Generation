@@ -657,12 +657,38 @@ print(json.dumps({
     assert runtime == payload["identity_runtime"]
     assert runtime["enabled"] is True
     assert runtime["pythonhashseed"] == "7"
+    assert runtime["python_ignore_environment"] is False
     assert runtime["cublas_workspace_config"] == ":4096:8"
     assert runtime["deterministic_algorithms"] is True
     assert runtime["cudnn_deterministic"] is True
     assert runtime["cudnn_benchmark"] is False
     assert runtime["matmul_allow_tf32"] is False
     assert runtime["cudnn_allow_tf32"] is False
+
+
+def test_deterministic_runtime_rejects_interpreter_that_ignores_environment():
+    """-E/-I must not turn a visible env string into false hash determinism."""
+
+    script = (
+        "import sys; "
+        f"sys.path.insert(0, {str(ROOT)!r}); "
+        "from visual_rl.core.determinism import configure_runtime; "
+        "configure_runtime(enabled=True, seed=7)"
+    )
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = "7"
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "started with -E or -I" in completed.stderr
 
 
 def test_installed_style_cli_runs_in_a_clean_process(tmp_path):
