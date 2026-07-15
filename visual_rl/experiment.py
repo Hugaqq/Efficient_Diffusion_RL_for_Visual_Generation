@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from visual_rl.configs.resolver import resolve_experiment
 from visual_rl.configs.schema import VisualRLConfig, config_to_dict
@@ -136,15 +136,28 @@ class Wan:
     dtype: str = "bfloat16"
     local_files_only: bool = True
     low_cpu_mem_usage: bool = True
+    backend: Literal["world_r1", "flash"] = "world_r1"
+    flash_grpo_root: str | os.PathLike[str] = "Flash-GRPO-main"
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"world_r1", "flash"}:
+            raise ValueError("backend must be one of: flash, world_r1")
 
     def to_config(self) -> dict[str, Any]:
+        reference_root = (
+            {"world_r1_root": _path(self.world_r1_root)}
+            if self.backend == "world_r1"
+            else {"flash_grpo_root": _path(self.flash_grpo_root)}
+        )
+        backend_config = {} if self.backend == "world_r1" else {"wan_backend": "flash"}
         return {
             "model": {
                 "name": "world_r1_wan_legacy",
                 "model_path": _path(self.checkpoint),
                 "model_family": "wan",
                 "extra": {
-                    "world_r1_root": _path(self.world_r1_root),
+                    **backend_config,
+                    **reference_root,
                     "device": self.device,
                     "dtype": self.dtype,
                     "local_files_only": self.local_files_only,
@@ -307,7 +320,7 @@ class PromptColor:
 @dataclass(frozen=True)
 class WorldR1:
     general_url: str
-    geometry_url: str
+    geometry_url: str | None = None
     general_weight: float = 1.0
     geometry_weight: float = 1.0
     general_timeout: float = 1000.0
@@ -326,7 +339,12 @@ class WorldR1:
         )
 
         validate_max_response_bytes(self.max_response_bytes)
-        for url in (self.general_url, self.geometry_url):
+        urls = (
+            (self.general_url,)
+            if self.geometry_url is None
+            else (self.general_url, self.geometry_url)
+        )
+        for url in urls:
             validate_wire_security_policy(
                 url,
                 wire_format=self.wire_format,
@@ -335,37 +353,38 @@ class WorldR1:
             )
 
     def to_config(self) -> dict[str, Any]:
+        weights = {"reward_general": self.general_weight}
+        clients = {
+            "reward_general": {
+                "name": "reward_general",
+                "version": "v1",
+                "url": self.general_url,
+                "timeout": self.general_timeout,
+                "retries": self.retries,
+                "wire_format": self.wire_format,
+                "allow_unsafe_pickle": self.allow_unsafe_pickle,
+                "trusted_hosts": list(self.trusted_hosts),
+                "max_response_bytes": self.max_response_bytes,
+            }
+        }
+        if self.geometry_url is not None:
+            weights["reward_3d"] = self.geometry_weight
+            clients["reward_3d"] = {
+                "name": "reward_3d",
+                "version": "v1",
+                "url": self.geometry_url,
+                "timeout": self.geometry_timeout,
+                "retries": self.retries,
+                "wire_format": self.wire_format,
+                "allow_unsafe_pickle": self.allow_unsafe_pickle,
+                "trusted_hosts": list(self.trusted_hosts),
+                "max_response_bytes": self.max_response_bytes,
+            }
         return {
             "rewards": {
                 "replace_defaults": True,
-                "weights": {
-                    "reward_general": self.general_weight,
-                    "reward_3d": self.geometry_weight,
-                },
-                "clients": {
-                    "reward_general": {
-                        "name": "reward_general",
-                        "version": "v1",
-                        "url": self.general_url,
-                        "timeout": self.general_timeout,
-                        "retries": self.retries,
-                        "wire_format": self.wire_format,
-                        "allow_unsafe_pickle": self.allow_unsafe_pickle,
-                        "trusted_hosts": list(self.trusted_hosts),
-                        "max_response_bytes": self.max_response_bytes,
-                    },
-                    "reward_3d": {
-                        "name": "reward_3d",
-                        "version": "v1",
-                        "url": self.geometry_url,
-                        "timeout": self.geometry_timeout,
-                        "retries": self.retries,
-                        "wire_format": self.wire_format,
-                        "allow_unsafe_pickle": self.allow_unsafe_pickle,
-                        "trusted_hosts": list(self.trusted_hosts),
-                        "max_response_bytes": self.max_response_bytes,
-                    },
-                },
+                "weights": weights,
+                "clients": clients,
                 "fail_policy": self.fail_policy,
             }
         }
@@ -509,11 +528,13 @@ class FlashGRPO:
     adv_clip_max: float = 5.0
     rectification_mode: str = "scheduler_formula"
     normalize_rectification: bool = True
+    objective_version: str = "legacy"
 
     def to_config(self) -> dict[str, Any]:
         return {
             "algorithm": {
                 "name": "flash_grpo",
+                "objective_version": self.objective_version,
                 "clip_range": self.clip_range,
                 "beta": self.beta,
                 "adv_clip_max": self.adv_clip_max,

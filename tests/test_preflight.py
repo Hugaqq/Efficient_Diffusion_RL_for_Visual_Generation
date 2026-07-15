@@ -14,7 +14,12 @@ from visual_rl.artifacts.checkpoint import (
     checkpoint_tree_sha256,
     read_and_validate_training_state,
 )
-from visual_rl.configs import ExperimentSpec, resolve_experiment
+from visual_rl.configs import (
+    ExperimentSpec,
+    read_experiment_spec,
+    read_packaged_preset,
+    resolve_experiment,
+)
 from visual_rl.preflight import (
     PreflightReport,
     ResumePreflightError,
@@ -80,6 +85,75 @@ def test_static_preflight_config_fingerprint_and_dict_are_stable(tmp_path):
     assert len(first.resolved_config_sha256) == 64
     assert first.resolved_config_sha256 == second.resolved_config_sha256
     assert first.to_dict() == second.to_dict()
+
+
+def test_flash_wan_reference_yaml_still_passes_generic_flash_contract(tmp_path):
+    config = resolve_experiment(
+        ExperimentSpec(
+            preset=read_packaged_preset("flash_wan_reference"),
+            context_dir=tmp_path,
+        )
+    ).config
+
+    report = static_preflight(config)
+
+    assert config.model.extra["wan_backend"] == "flash"
+    assert config.sample.name == "single_step"
+    assert config.algorithm.objective_version == "reference_v1"
+    assert config.algorithm.beta == 0
+    assert any(
+        item.kind == "algorithm" and item.name == "flash_grpo"
+        for item in report.components
+    )
+
+
+def test_flash_reference_yaml_rejects_builtin_tiny_without_coefficient(tmp_path):
+    config_path = tmp_path / "tiny-reference.yaml"
+    config_path.write_text(
+        """\
+preset: flash_tiny_single_step
+explicit:
+  algorithm:
+    objective_version: reference_v1
+    beta: 0.0
+""",
+        encoding="utf-8",
+    )
+    config = resolve_experiment(read_experiment_spec(config_path)).config
+
+    with pytest.raises(
+        StaticPreflightError,
+        match="Flash-GRPO reference_v1 requires model capability",
+    ):
+        static_preflight(config)
+
+
+def test_flash_reference_keeps_external_model_capability_extensible(tmp_path):
+    config = resolve_experiment(
+        ExperimentSpec(
+            preset=read_packaged_preset("flash_tiny_single_step"),
+            explicit={
+                "model": {
+                    "name": "external_flash_model",
+                    "extra": {
+                        "target": "external_flash_model:ExternalFlashModel",
+                        "version": "v1",
+                    },
+                },
+                "algorithm": {
+                    "objective_version": "reference_v1",
+                    "beta": 0.0,
+                },
+            },
+            context_dir=tmp_path,
+        )
+    ).config
+
+    report = static_preflight(config)
+
+    model = next(item for item in report.components if item.kind == "model")
+    assert model.name == "external_flash_model"
+    assert model.target == "external_flash_model:ExternalFlashModel"
 
 
 def test_static_preflight_rejects_unknown_name_relative_path_and_target(tmp_path):
@@ -381,6 +455,29 @@ def test_static_rejects_unknown_without_target_and_wrong_builtin_version(tmp_pat
     single_argument_config.model.extra["version"] = "wrong"
     with pytest.raises(StaticPreflightError, match="version .* does not match"):
         trusted_component_load(single_argument_config)
+
+
+def test_wan_backend_matrix_does_not_reject_external_rollout(tmp_path):
+    config = _resolved(tmp_path)
+    config.model.name = "world_r1_wan_legacy"
+    config.model.model_family = "wan"
+    config.model.extra = {"world_r1_root": str(tmp_path / "world-r1")}
+    config.sample.name = "external_wan_rollout"
+    config.rollout = {
+        "target": "external_wan_rollout:ExternalWanRollout",
+        "version": "v1",
+    }
+    config.algorithm.name = "external_wan_algorithm"
+    config.algorithm.params = {
+        "target": "external_wan_algorithm:ExternalWanAlgorithm",
+        "version": "v1",
+    }
+
+    report = static_preflight(config)
+
+    rollout = next(item for item in report.components if item.kind == "rollout")
+    assert rollout.name == "external_wan_rollout"
+    assert rollout.target == "external_wan_rollout:ExternalWanRollout"
 
 
 def test_external_metadata_must_be_serializable(tmp_path):

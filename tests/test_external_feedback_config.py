@@ -562,6 +562,40 @@ def test_world_r1_python_api_requires_explicit_legacy_pickle_policy():
     assert clients["reward_3d"]["trusted_hosts"] == ["localhost", "127.0.0.1"]
 
 
+def test_world_r1_python_api_supports_general_only_legacy_loopback(tmp_path):
+    reward = vr.rewards.WorldR1(
+        "http://127.0.0.1:8090/",
+        wire_format="legacy_pickle",
+        allow_unsafe_pickle=True,
+        trusted_hosts=("127.0.0.1",),
+        retries=0,
+    )
+    experiment = _experiment(tmp_path, reward)
+    config = config_to_dict(experiment.resolve())["rewards"]
+
+    assert config["weights"] == {"reward_general": 1.0}
+    assert set(config["clients"]) == {"reward_general"}
+    assert experiment.validate().trusted is False
+    assert config["clients"]["reward_general"] == {
+        "name": "reward_general",
+        "version": "v1",
+        "url": "http://127.0.0.1:8090/",
+        "timeout": 1000.0,
+        "retries": 0,
+        "wire_format": "legacy_pickle",
+        "allow_unsafe_pickle": True,
+        "trusted_hosts": ["127.0.0.1"],
+        "max_response_bytes": 16 * 1024 * 1024,
+    }
+
+    dual = vr.rewards.WorldR1(
+        "http://127.0.0.1:8090/",
+        "http://127.0.0.1:8089/",
+    ).to_config()["rewards"]
+    assert set(dual["weights"]) == {"reward_general", "reward_3d"}
+    assert set(dual["clients"]) == {"reward_general", "reward_3d"}
+
+
 def test_packaged_world_r1_preset_does_not_retain_schema_mock(tmp_path):
     envelope = tmp_path / "world-r1.yaml"
     envelope.write_text("preset: world_r1_wan_bounded\n", encoding="utf-8")

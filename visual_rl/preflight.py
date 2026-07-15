@@ -39,6 +39,15 @@ class ResumePreflightError(PreflightError):
     """A requested resume path is absent or structurally unsupported."""
 
 
+_FLASH_REFERENCE_COEFFICIENT = "flash_reference_coefficient"
+
+
+@dataclass(frozen=True)
+class ComponentCapability:
+    name: str
+    required_config: tuple[tuple[str, Any], ...] = ()
+
+
 @dataclass(frozen=True)
 class ComponentDescriptor:
     kind: str
@@ -48,6 +57,7 @@ class ComponentDescriptor:
     interface: str
     version: str
     dependencies: tuple[str, ...] = ()
+    capabilities: tuple[ComponentCapability, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +130,12 @@ _CATALOG = (
         "model",
         "v1",
         ("torch", "diffusers", "numpy", "PIL"),
+        (
+            ComponentCapability(
+                _FLASH_REFERENCE_COEFFICIENT,
+                (("model.extra.wan_backend", "flash"),),
+            ),
+        ),
     ),
     ComponentDescriptor(
         "algorithm",
@@ -371,6 +387,26 @@ def _component_target(component: object) -> str:
     return f"{component.__module__}:{component.__qualname__}"
 
 
+def _builtin_model_capability(
+    config: VisualRLConfig,
+    capability_name: str,
+) -> bool | None:
+    """Return capability support for a built-in model, or None for extensions."""
+
+    descriptor = _CATALOG_BY_KEY.get(("model", config.model.name))
+    if descriptor is None:
+        return None
+    values = config_to_dict(config)
+    for capability in descriptor.capabilities:
+        if capability.name != capability_name:
+            continue
+        return all(
+            _lookup(values, path) == expected
+            for path, expected in capability.required_config
+        )
+    return False
+
+
 def _resolved_config_sha256(values: dict[str, Any]) -> str:
     try:
         payload = json.dumps(
@@ -397,6 +433,19 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
     backend = extra.get("wan_backend", "world_r1")
     if backend not in {"world_r1", "flash"}:
         errors.append("Wan wan_backend must be one of: flash, world_r1")
+    builtin_rollout = ("rollout", config.sample.name) in _CATALOG_BY_KEY
+    if builtin_rollout and backend == "world_r1" and config.sample.name != "full_trajectory":
+        errors.append(
+            "Wan wan_backend=world_r1 only supports full_trajectory rollout"
+        )
+    if (
+        builtin_rollout
+        and backend == "flash"
+        and config.sample.name not in {"single_step", "flash_single_step"}
+    ):
+        errors.append(
+            "Wan wan_backend=flash only supports single_step or flash_single_step rollout"
+        )
     root_key = "flash_grpo_root" if backend == "flash" else "world_r1_root"
     reference_root = extra.get(root_key)
     if reference_root is not None:
@@ -445,8 +494,6 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
     if config.algorithm.name == "flash_grpo" and objective_version == "reference_v1":
         if backend != "flash":
             errors.append("Flash-GRPO reference_v1 requires wan_backend=flash")
-        if config.algorithm.beta != 0:
-            errors.append("Flash-GRPO reference_v1 requires beta=0")
     for name, default in (("lora_rank", 32), ("lora_alpha", 64)):
         value = extra.get(name, default)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -480,6 +527,35 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
         elif _URL_PATTERN.match(lora_path) or not os.path.isabs(lora_path):
             errors.append("Wan effective lora_path must be a local absolute path")
     return lora_selected
+
+
+def _validate_selected_flash_contract(
+    config: VisualRLConfig,
+    errors: list[str],
+) -> None:
+    """Validate Flash objective semantics independently of the selected model."""
+
+    if config.algorithm.name != "flash_grpo":
+        return
+    objective_version = config.algorithm.objective_version
+    supported_versions = {"legacy", "legacy_v0", "reference_v1"}
+    if objective_version not in supported_versions:
+        errors.append(
+            "Flash-GRPO objective_version must be one of: legacy, "
+            "legacy_v0, reference_v1"
+        )
+        return
+    if objective_version == "reference_v1" and config.algorithm.beta != 0:
+        errors.append("Flash-GRPO reference_v1 requires beta=0")
+    if objective_version == "reference_v1" and _builtin_model_capability(
+        config,
+        _FLASH_REFERENCE_COEFFICIENT,
+    ) is False:
+        errors.append(
+            "Flash-GRPO reference_v1 requires model capability "
+            f"{_FLASH_REFERENCE_COEFFICIENT!r}; built-in model "
+            f"{config.model.name!r} does not provide it for this configuration"
+        )
 
 
 def _validate_selected_tempflow_contract(
@@ -620,6 +696,7 @@ def static_preflight(config: VisualRLConfig) -> PreflightReport:
     except (TypeError, ValueError) as exc:
         raise StaticPreflightError(str(exc)) from exc
     errors: list[str] = []
+    _validate_selected_flash_contract(config, errors)
     wan_lora_selected = _validate_selected_wan_lora(config, errors)
     _validate_selected_tempflow_contract(config, errors)
     if config.evaluation.path and config.evaluation.prompts:
