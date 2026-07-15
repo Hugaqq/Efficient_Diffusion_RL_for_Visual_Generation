@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import sys
@@ -536,6 +537,12 @@ def test_world_r1_and_external_configs_do_not_retain_mock_reward(tmp_path):
         and client["allow_unsafe_pickle"] is False
         for client in world_r1.rewards.clients.values()
     )
+    assert all(
+        "protocol_mode" not in client
+        and "batch_size" not in client
+        and "server_revision" not in client
+        for client in world_r1.rewards.clients.values()
+    )
     assert external.rewards.weights == {"quality": 1.0}
     assert external.rewards.clients == {}
     assert "mock" not in config_to_dict(world_r1)["rewards"]
@@ -594,6 +601,106 @@ def test_world_r1_python_api_supports_general_only_legacy_loopback(tmp_path):
     ).to_config()["rewards"]
     assert set(dual["weights"]) == {"reward_general", "reward_3d"}
     assert set(dual["clients"]) == {"reward_general", "reward_3d"}
+
+
+def test_world_r1_python_api_resolves_protocol_batch_and_server_revisions(tmp_path):
+    reward = vr.rewards.WorldR1(
+        general_url="http://127.0.0.1:8090/",
+        geometry_url="http://127.0.0.1:8089/",
+        protocol_mode="strict_v2",
+        general_batch_size=2,
+        geometry_batch_size=3,
+        general_server_revision=" general-hps-v2.1 ",
+        geometry_server_revision="geometry-v3",
+    )
+    config = _experiment(tmp_path, reward).resolve()
+    clients = config.rewards.clients
+
+    assert clients["reward_general"]["protocol_mode"] == "strict_v2"
+    assert clients["reward_general"]["batch_size"] == 2
+    assert clients["reward_general"]["server_revision"] == "general-hps-v2.1"
+    assert clients["reward_3d"]["protocol_mode"] == "strict_v2"
+    assert clients["reward_3d"]["batch_size"] == 3
+    assert clients["reward_3d"]["server_revision"] == "geometry-v3"
+
+
+def test_world_r1_python_api_preserves_legacy_positional_field_order():
+    reward = vr.rewards.WorldR1(
+        "http://127.0.0.1:8090/",
+        None,
+        0.5,
+        0.25,
+        10.0,
+        20.0,
+        0,
+        "raise",
+        "json_v1",
+        False,
+        ("127.0.0.1",),
+        1024,
+    )
+
+    assert reward.wire_format == "json_v1"
+    assert reward.allow_unsafe_pickle is False
+    assert reward.trusted_hosts == ("127.0.0.1",)
+    assert reward.max_response_bytes == 1024
+    assert reward.protocol_mode == "reference_v1"
+    assert reward.general_batch_size == 64
+    assert reward.geometry_batch_size == 8
+
+
+def test_world_r1_semantic_defaults_have_one_fingerprint_representation():
+    omitted = {
+        "rewards": {
+            "clients": {
+                "general": {"name": "reward_general"},
+                "geometry": {"name": "reward_3d"},
+            }
+        }
+    }
+    explicit = deepcopy(omitted)
+    explicit["rewards"]["clients"]["general"].update(
+        {
+            "protocol_mode": "reference_v1",
+            "batch_size": 64,
+            "server_revision": None,
+        }
+    )
+    explicit["rewards"]["clients"]["geometry"].update(
+        {
+            "protocol_mode": "reference_v1",
+            "batch_size": 8,
+            "server_revision": None,
+        }
+    )
+
+    baseline = config_fingerprint(omitted)
+    assert config_fingerprint(explicit) == baseline
+    for client_name, field, value in (
+        ("general", "protocol_mode", "strict_v2"),
+        ("general", "batch_size", 2),
+        ("general", "server_revision", "hps-v2.1"),
+        ("geometry", "batch_size", 3),
+        ("geometry", "server_revision", "geometry-v3"),
+    ):
+        changed = deepcopy(explicit)
+        changed["rewards"]["clients"][client_name][field] = value
+        assert config_fingerprint(changed) != baseline
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"protocol_mode": "future_v3"},
+        {"general_batch_size": 0},
+        {"geometry_batch_size": True},
+        {"general_server_revision": "   "},
+        {"geometry_server_revision": 7},
+    ],
+)
+def test_world_r1_python_api_rejects_invalid_product_contract(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        vr.rewards.WorldR1("http://127.0.0.1:8090/", **kwargs)
 
 
 def test_packaged_world_r1_preset_does_not_retain_schema_mock(tmp_path):

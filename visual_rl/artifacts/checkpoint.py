@@ -46,7 +46,11 @@ _DISTRIBUTED_CHECKPOINT_FORMAT_VERSIONS = _SAFE_CHECKPOINT_FORMAT_VERSIONS
 _SUPPORTED_CONFIG_FINGERPRINT_VERSIONS = {1, CONFIG_FINGERPRINT_VERSION}
 _CHECKPOINT_CONTROL_FILES = {"checkpoint.json", "training_state.pt"}
 _ADAPTER_HASH_CHUNK_SIZE = 1024 * 1024
-_SAFE_CONFIG_FINGERPRINT_SCHEME = "component-sha256-v1"
+_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES = frozenset({"component-sha256-v1"})
+_SAFE_CONFIG_FINGERPRINT_SCHEME = "component-sha256-v2"
+_SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES = frozenset(
+    {*_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES, _SAFE_CONFIG_FINGERPRINT_SCHEME}
+)
 _SEMANTIC_CONFIG_KEYS = {
     "seed",
     "use_lora",
@@ -69,6 +73,7 @@ class ValidatedTrainingState:
     checkpoint_dir: Path
     state: dict[str, Any]
     metadata: dict[str, Any]
+    applicable: bool = True
 
     @property
     def step(self) -> int:
@@ -319,8 +324,18 @@ def _build_v2_fingerprint_bundle(
     validate_data: bool,
     fingerprint_scheme: str | None = _SAFE_CONFIG_FINGERPRINT_SCHEME,
 ) -> dict[str, Any]:
+    if fingerprint_scheme is not None and (
+        not isinstance(fingerprint_scheme, str)
+        or fingerprint_scheme not in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES
+    ):
+        raise ValueError(f"Unsupported config fingerprint scheme: {fingerprint_scheme}")
     source = deepcopy(to_jsonable(config))
-    training_semantics = _training_semantics_payload(source)
+    training_semantics = _training_semantics_payload(
+        source,
+        include_reward_batch_partition=(
+            fingerprint_scheme == _SAFE_CONFIG_FINGERPRINT_SCHEME
+        ),
+    )
     data_identity, data_source = _data_identity_payload(
         source,
         validate_data=validate_data,
@@ -336,7 +351,7 @@ def _build_v2_fingerprint_bundle(
         "data_identity_fingerprint": _payload_sha256(data_identity),
         "implementation_identity_fingerprint": _payload_sha256(implementation_identity),
     }
-    if fingerprint_scheme == _SAFE_CONFIG_FINGERPRINT_SCHEME:
+    if fingerprint_scheme in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES:
         fingerprint = _payload_sha256(component_fingerprints)
     elif fingerprint_scheme is None:
         fingerprint = _payload_sha256(raw_identity_payload)
@@ -357,17 +372,58 @@ def _build_v2_fingerprint_bundle(
     return bundle
 
 
-def _training_semantics_payload(source: dict[str, Any]) -> dict[str, Any]:
+def _training_semantics_payload(
+    source: dict[str, Any],
+    *,
+    include_reward_batch_partition: bool = False,
+) -> dict[str, Any]:
     payload = {
         key: deepcopy(source[key]) for key in _SEMANTIC_CONFIG_KEYS if key in source
     }
+    if include_reward_batch_partition:
+        _normalize_world_r1_reward_defaults(payload)
     paths = payload.get("paths", {})
     for key in ("output_dir", "resume_from"):
         paths.pop(key, None)
     train = payload.get("train", {})
     for key in ("max_steps", "save_every"):
         train.pop(key, None)
+    runner = source.get("runner") or {}
+    reward_executor = runner.get("reward_executor") or {}
+    if (
+        include_reward_batch_partition
+        and reward_executor.get("mode") == "async"
+        and reward_executor.get("microbatch_size") is not None
+    ):
+        payload["reward_batch_partition"] = {
+            "microbatch_size": reward_executor["microbatch_size"]
+        }
     return payload
+
+
+def _normalize_world_r1_reward_defaults(payload: dict[str, Any]) -> None:
+    rewards = payload.get("rewards")
+    if not isinstance(rewards, dict):
+        return
+    clients = rewards.get("clients")
+    if not isinstance(clients, dict):
+        return
+    for key, client in clients.items():
+        if not isinstance(client, dict):
+            continue
+        name = client.get("name", key)
+        if name == "reward_general":
+            default_batch_size = 64
+        elif name == "reward_3d":
+            default_batch_size = 8
+        else:
+            continue
+        if client.get("protocol_mode") == "reference_v1":
+            client.pop("protocol_mode")
+        if client.get("batch_size") == default_batch_size:
+            client.pop("batch_size")
+        if client.get("server_revision", object()) is None:
+            client.pop("server_revision")
 
 
 def _data_identity_payload(
@@ -765,6 +821,11 @@ def save_training_state(
     if version not in _SUPPORTED_CONFIG_FINGERPRINT_VERSIONS:
         raise ValueError(f"Unsupported config fingerprint version: {version}")
     if version == 1:
+        _reject_ambiguous_legacy_reward_partition(
+            config,
+            fingerprint_scheme=None,
+            read_only_audit=False,
+        )
         fingerprint = config_fingerprint(
             config,
             implementation,
@@ -1299,6 +1360,11 @@ def read_and_validate_training_state(
         raise RuntimeError(f"Unsupported config fingerprint version: {state_version}")
 
     if state_version == 1:
+        _reject_ambiguous_legacy_reward_partition(
+            config,
+            fingerprint_scheme=None,
+            read_only_audit=use_checkpoint_implementation_identity,
+        )
         expected = config_fingerprint(config, validation_implementation, version=1)
         actual = state.get("config_fingerprint")
         if actual != expected:
@@ -1312,11 +1378,17 @@ def read_and_validate_training_state(
             )
     else:
         _validate_v2_checkpoint_metadata(state, metadata)
+        fingerprint_scheme = state.get("config_fingerprint_scheme")
+        _reject_ambiguous_legacy_reward_partition(
+            config,
+            fingerprint_scheme=fingerprint_scheme,
+            read_only_audit=use_checkpoint_implementation_identity,
+        )
         current = _build_v2_fingerprint_bundle(
             config,
             validation_implementation,
             validate_data=True,
-            fingerprint_scheme=state.get("config_fingerprint_scheme"),
+            fingerprint_scheme=fingerprint_scheme,
         )
         actual = state.get("config_fingerprint")
         expected = current["config_fingerprint"]
@@ -1338,6 +1410,7 @@ def read_and_validate_training_state(
         checkpoint_dir=checkpoint_dir,
         state=state,
         metadata=metadata,
+        applicable=not use_checkpoint_implementation_identity,
     )
 
 
@@ -1352,6 +1425,10 @@ def apply_training_state(
 
     if not isinstance(validated, ValidatedTrainingState):
         raise TypeError("apply_training_state requires ValidatedTrainingState")
+    if not validated.applicable:
+        raise RuntimeError(
+            "Cannot apply a checkpoint validated with read-only audit identity"
+        )
     state = validated.state
     distributed_state = state.get("distributed_state")
     if distributed_state is None:
@@ -1893,7 +1970,11 @@ def _validate_v2_checkpoint_metadata(
             "training_state.pt"
         )
     fingerprint_scheme = state.get("config_fingerprint_scheme")
-    if fingerprint_scheme == _SAFE_CONFIG_FINGERPRINT_SCHEME:
+    if fingerprint_scheme is not None and not isinstance(fingerprint_scheme, str):
+        raise RuntimeError(
+            f"Unsupported config fingerprint scheme: {fingerprint_scheme!r}"
+        )
+    if fingerprint_scheme in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES:
         if redact_artifact_config(payload) != payload:
             raise RuntimeError("Checkpoint v2 identity payload contains unredacted secrets")
         if redact_artifact_config(state.get("data_source")) != state.get("data_source"):
@@ -1936,6 +2017,45 @@ def _validate_v2_checkpoint_metadata(
             raise RuntimeError(
                 f"Checkpoint v2 {key} does not match its canonical identity payload"
             )
+
+
+def _reject_ambiguous_legacy_reward_partition(
+    config: Mapping[str, Any],
+    *,
+    fingerprint_scheme: Any,
+    read_only_audit: bool,
+) -> None:
+    if fingerprint_scheme is not None and not isinstance(fingerprint_scheme, str):
+        raise RuntimeError(
+            f"Unsupported config fingerprint scheme: {fingerprint_scheme!r}"
+        )
+    if read_only_audit or fingerprint_scheme not in {
+        None,
+        *_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES,
+    }:
+        return
+    runner = config.get("runner") or {}
+    if not isinstance(runner, Mapping):
+        return
+    reward_executor = runner.get("reward_executor") or {}
+    if not isinstance(reward_executor, Mapping):
+        return
+    # Legacy schemas accepted only positive integer microbatch sizes. Preserve
+    # their historical validation rule, while refusing ``None`` because it is a
+    # new full-batch sentinel that could otherwise reinterpret the old default 1.
+    microbatch_size = reward_executor.get("microbatch_size")
+    if reward_executor.get("mode") == "async" and (
+        isinstance(microbatch_size, bool)
+        or not isinstance(microbatch_size, int)
+        or microbatch_size < 1
+    ):
+        raise RuntimeError(
+            "Resume rejected: this legacy checkpoint fingerprint did not bind the async "
+            "reward batch partition. Older VisualRL releases defaulted "
+            "microbatch_size to a positive integer. Explicitly restore the "
+            "original resolved microbatch_size, or use an audited checkpoint "
+            "migration."
+        )
 
 
 def _identity_differences(

@@ -41,6 +41,23 @@ SCORE_TRAJECTORY_ALIGNMENT = "score_trajectory_alignment"
 TRAJECTORY_COMPARISON_PATHS = "trajectory_comparison_paths"
 
 
+def validate_server_revision(
+    value: Any,
+    *,
+    field: str = "server_revision",
+) -> str | None:
+    """Normalize an optional, user-declared remote scorer revision."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"World-R1 {field} must be a non-empty string or None.")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"World-R1 {field} must be a non-empty string or None.")
+    return normalized
+
+
 def validate_reward_server_url(url: str, *, reward_name: str = "reward server") -> str:
     """Return a normalized HTTP(S) reward-server URL or raise ValueError."""
 
@@ -339,6 +356,7 @@ class _WorldR1RewardClient:
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         media_layout: str = "auto",
         batch_size: int | None = None,
+        server_revision: str | None = None,
         transport: Any = None,
         sleep: Any = time.sleep,
         jpeg_encoder: Any = None,
@@ -363,6 +381,7 @@ class _WorldR1RewardClient:
         self.max_response_bytes = validate_max_response_bytes(max_response_bytes)
         self.media_layout = str(media_layout)
         self.batch_size = self.default_batch_size if batch_size is None else int(batch_size)
+        self.server_revision = validate_server_revision(server_revision)
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("World-R1 reward timeout must be finite and positive.")
         if self.retries < 0 or self.retries > 10:
@@ -408,10 +427,13 @@ class _WorldR1RewardClient:
                 }
             )
 
-    def cache_fingerprint(self) -> dict[str, Any]:
+    def cache_fingerprint(self) -> dict[str, Any] | None:
+        if self.server_revision is None:
+            return None
         return {
             "client": f"{type(self).__module__}:{type(self).__qualname__}",
             "url": self.url,
+            "server_revision": self.server_revision,
             "protocol_mode": self.protocol_mode,
             "wire_format": self.wire_format,
             "allow_unsafe_pickle": self.allow_unsafe_pickle,
@@ -497,7 +519,11 @@ class _WorldR1RewardClient:
                     f"{expected_total}, got {len(items)}."
                 )
         result_metadata: dict[str, Any] = {
+            "server_revision": self.server_revision,
             "protocol_mode": self.protocol_mode,
+            "configured_batch_size": self.batch_size,
+            "request_count": len(payloads),
+            "payload_batch_sizes": [len(payload["prompts"]) for payload in payloads],
             "valid_mask": all_valid,
             "payload_kind": self.payload_kind,
             "encoding": encoding_metadata,
@@ -788,8 +814,10 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
         self.require_camera_trajectory = require_camera_trajectory
         super().__init__(url, timeout=timeout, retries=retries, **kwargs)
 
-    def cache_fingerprint(self) -> dict[str, Any]:
+    def cache_fingerprint(self) -> dict[str, Any] | None:
         fingerprint = super().cache_fingerprint()
+        if fingerprint is None:
+            return None
         fingerprint["require_camera_trajectory"] = self.require_camera_trajectory
         return fingerprint
 

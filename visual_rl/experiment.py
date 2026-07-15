@@ -353,14 +353,52 @@ class WorldR1:
     allow_unsafe_pickle: bool = False
     trusted_hosts: tuple[str, ...] = ()
     max_response_bytes: int = 16 * 1024 * 1024
+    protocol_mode: str = "reference_v1"
+    general_batch_size: int = 64
+    geometry_batch_size: int = 8
+    general_server_revision: str | None = None
+    geometry_server_revision: str | None = None
 
     def __post_init__(self) -> None:
         from visual_rl.feedback.clients import (
             validate_max_response_bytes,
             validate_wire_security_policy,
         )
+        from visual_rl.feedback.world_r1_rewards import (
+            WORLD_R1_PROTOCOL_MODES,
+            validate_server_revision,
+        )
 
         validate_max_response_bytes(self.max_response_bytes)
+        if self.protocol_mode not in WORLD_R1_PROTOCOL_MODES:
+            raise ValueError(
+                "protocol_mode must be one of "
+                f"{sorted(WORLD_R1_PROTOCOL_MODES)}."
+            )
+        for name, value in (
+            ("general_batch_size", self.general_batch_size),
+            ("geometry_batch_size", self.geometry_batch_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"World-R1 {name} must be an integer.")
+            if value <= 0:
+                raise ValueError(f"World-R1 {name} must be positive.")
+        object.__setattr__(
+            self,
+            "general_server_revision",
+            validate_server_revision(
+                self.general_server_revision,
+                field="general_server_revision",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "geometry_server_revision",
+            validate_server_revision(
+                self.geometry_server_revision,
+                field="geometry_server_revision",
+            ),
+        )
         urls = (
             (self.general_url,)
             if self.geometry_url is None
@@ -389,6 +427,13 @@ class WorldR1:
                 "max_response_bytes": self.max_response_bytes,
             }
         }
+        general = clients["reward_general"]
+        if self.protocol_mode != "reference_v1":
+            general["protocol_mode"] = self.protocol_mode
+        if self.general_batch_size != 64:
+            general["batch_size"] = self.general_batch_size
+        if self.general_server_revision is not None:
+            general["server_revision"] = self.general_server_revision
         if self.geometry_url is not None:
             weights["reward_3d"] = self.geometry_weight
             clients["reward_3d"] = {
@@ -402,6 +447,13 @@ class WorldR1:
                 "trusted_hosts": list(self.trusted_hosts),
                 "max_response_bytes": self.max_response_bytes,
             }
+            geometry = clients["reward_3d"]
+            if self.protocol_mode != "reference_v1":
+                geometry["protocol_mode"] = self.protocol_mode
+            if self.geometry_batch_size != 8:
+                geometry["batch_size"] = self.geometry_batch_size
+            if self.geometry_server_revision is not None:
+                geometry["server_revision"] = self.geometry_server_revision
         return {
             "rewards": {
                 "replace_defaults": True,
@@ -624,7 +676,7 @@ class RewardExecution:
 
     mode: str = "sync"
     max_workers: int = 4
-    microbatch_size: int = 1
+    microbatch_size: int | None = None
     timeout_s: float = 30.0
     max_retries: int = 0
     submit_timeout_s: float = 30.0
