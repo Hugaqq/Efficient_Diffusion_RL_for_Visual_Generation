@@ -15,6 +15,7 @@ _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 _NVIDIA_TF32_OVERRIDE = "0"
 _RUNTIME_ASSERT_KEYS = (
     "pythonhashseed",
+    "python_ignore_environment",
     "cublas_workspace_config",
     "nvidia_tf32_override",
     "deterministic_algorithms",
@@ -36,6 +37,11 @@ def configure_runtime(*, enabled: bool, seed: int) -> dict[str, Any]:
     """
 
     expected_hash_seed = str(int(seed))
+    if enabled and bool(sys.flags.ignore_environment):
+        raise RuntimeError(
+            "runner.deterministic_runtime cannot verify PYTHONHASHSEED when "
+            "Python was started with -E or -I (environment options ignored)"
+        )
     if enabled and os.environ.get("PYTHONHASHSEED") != expected_hash_seed:
         raise RuntimeError(
             "runner.deterministic_runtime requires PYTHONHASHSEED to be set "
@@ -108,6 +114,7 @@ def runtime_snapshot(*, enabled: bool, seed: int) -> dict[str, Any]:
         "enabled": bool(enabled),
         "seed": int(seed),
         "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        "python_ignore_environment": bool(sys.flags.ignore_environment),
         "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         "nvidia_tf32_override": os.environ.get("NVIDIA_TF32_OVERRIDE"),
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
