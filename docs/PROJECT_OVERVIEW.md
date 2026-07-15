@@ -224,11 +224,24 @@ Resume 使用 `run --resume`，不增加语义重叠的独立命令。CLI 需要
 
 ```python
 experiment = vr.Experiment(
-    model=vr.models.Wan(checkpoint="..."),
+    model=vr.models.Wan(
+        checkpoint="/path/to/Wan2.1-T2V-1.3B-Diffusers",
+        backend="flash",
+        flash_grpo_root="/path/to/Flash-GRPO-main",
+    ),
     rollout=vr.rollouts.Flash(selected_steps=4),
-    reward=vr.rewards.WorldR1(general_url="...", geometry_url="..."),
+    reward=vr.rewards.WorldR1(
+        general_url="http://127.0.0.1:8090/",
+        wire_format="legacy_pickle",
+        allow_unsafe_pickle=True,
+        trusted_hosts=("127.0.0.1",),
+        retries=0,
+    ),
     advantage=vr.advantages.GroupNormalize(epsilon=1e-4),
-    objective=vr.objectives.TempFlow(clip_range=0.01, temporal_scale=2.25),
+    objective=vr.objectives.FlashGRPO(
+        clip_range=0.01,
+        objective_version="reference_v1",
+    ),
     train=vr.Train(steps=20, lr=1e-5),
 )
 

@@ -38,6 +38,7 @@ _PATH_FIELDS = (
     "paths.resume_from",
     "model.extra.repo_root",
     "model.extra.world_r1_root",
+    "model.extra.flash_grpo_root",
     "model.extra.model_path",
     "model.extra.lora_path",
 )

@@ -127,7 +127,178 @@ def test_relative_paths_use_experiment_construction_cwd(tmp_path, monkeypatch):
     assert config.model.extra["world_r1_root"] == str(
         construction_dir / "repos/world-r1"
     )
+    assert "wan_backend" not in config.model.extra
+    assert "flash_grpo_root" not in config.model.extra
     assert config.paths.output_dir == str(construction_dir / "runs/api")
+
+
+def test_wan_python_descriptor_selects_exact_backend_root_and_keeps_positionals(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    legacy = vr.models.Wan(
+        "models/wan",
+        "repos/world-r1",
+        "cpu",
+        "float32",
+        False,
+        False,
+    ).to_config()["model"]["extra"]
+    flash = vr.models.Wan(
+        "models/wan",
+        backend="flash",
+        flash_grpo_root="repos/flash-grpo",
+    )
+    experiment = vr.Experiment(
+        model=flash,
+        rollout=vr.rollouts.Flash(),
+        reward=vr.rewards.Mock(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=vr.objectives.FlashGRPO(),
+        train=vr.Train(),
+    )
+    resolved = experiment.resolve().model.extra
+
+    assert "wan_backend" not in legacy
+    assert legacy["world_r1_root"] == "repos/world-r1"
+    assert "flash_grpo_root" not in legacy
+    assert legacy["device"] == "cpu"
+    assert legacy["dtype"] == "float32"
+    assert legacy["local_files_only"] is False
+    assert legacy["low_cpu_mem_usage"] is False
+    assert resolved["wan_backend"] == "flash"
+    assert resolved["flash_grpo_root"] == str(tmp_path / "repos/flash-grpo")
+    assert "world_r1_root" not in resolved
+    assert experiment.validate().trusted is False
+    assert experiment.resolve().algorithm.objective_version == "legacy"
+    with pytest.raises(ValueError, match="backend must be one of"):
+        vr.models.Wan("models/wan", backend="other")
+
+
+@pytest.mark.parametrize(
+    ("model", "rollout", "objective", "message"),
+    [
+        (
+            vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
+            vr.rollouts.Flash(),
+            vr.objectives.FlashGRPO(),
+            "Wan wan_backend=world_r1 only supports full_trajectory rollout",
+        ),
+        (
+            vr.models.Wan(
+                "/models/wan",
+                backend="flash",
+                flash_grpo_root="/repos/flash-grpo",
+            ),
+            vr.rollouts.FullTrajectory(),
+            vr.objectives.GRPO(),
+            "Wan wan_backend=flash only supports single_step or flash_single_step rollout",
+        ),
+        (
+            vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
+            vr.rollouts.Branching(),
+            vr.objectives.TempFlow(),
+            "Wan wan_backend=world_r1 only supports full_trajectory rollout",
+        ),
+        (
+            vr.models.Wan(
+                "/models/wan",
+                backend="flash",
+                flash_grpo_root="/repos/flash-grpo",
+            ),
+            vr.rollouts.Branching(),
+            vr.objectives.TempFlow(),
+            "Wan wan_backend=flash only supports single_step or flash_single_step rollout",
+        ),
+    ],
+)
+def test_wan_python_api_rejects_rollout_backend_mismatch(
+    tmp_path, model, rollout, objective, message
+):
+    experiment = vr.Experiment(
+        model=model,
+        rollout=rollout,
+        reward=vr.rewards.Mock(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=objective,
+        train=vr.Train(),
+        output_dir=tmp_path / "invalid",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        experiment.validate()
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_default_wan_descriptor_preserves_legacy_v2_fingerprint(tmp_path):
+    experiment = vr.Experiment(
+        model=vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
+        rollout=vr.rollouts.FullTrajectory(),
+        reward=vr.rewards.Mock(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=vr.objectives.GRPO(),
+        train=vr.Train(),
+        output_dir=tmp_path / "run",
+    )
+    current = experiment.to_config()
+    legacy = json.loads(json.dumps(current))
+    legacy["model"]["extra"].pop("wan_backend", None)
+    explicit_world_r1 = json.loads(json.dumps(current))
+    explicit_world_r1["model"]["extra"]["wan_backend"] = "world_r1"
+
+    assert "wan_backend" not in current["model"]["extra"]
+    assert config_fingerprint(current, {}, version=2) == config_fingerprint(
+        legacy, {}, version=2
+    )
+    assert config_fingerprint(current, {}, version=2) != config_fingerprint(
+        explicit_world_r1, {}, version=2
+    )
+
+
+def test_flash_grpo_descriptor_exposes_compatible_objective_versions():
+    assert vr.objectives.FlashGRPO().to_config()["algorithm"][
+        "objective_version"
+    ] == "legacy"
+    assert vr.objectives.FlashGRPO(objective_version="reference_v1").to_config()[
+        "algorithm"
+    ]["objective_version"] == "reference_v1"
+
+
+@pytest.mark.parametrize(
+    ("objective_version", "beta", "message"),
+    [
+        (
+            "not-a-flash-objective",
+            0.0,
+            "Flash-GRPO objective_version must be one of",
+        ),
+        ("reference_v1", 0.1, "Flash-GRPO reference_v1 requires beta=0"),
+        (
+            "reference_v1",
+            0.0,
+            "Flash-GRPO reference_v1 requires model capability",
+        ),
+    ],
+)
+def test_flash_grpo_static_contract_is_model_independent(
+    tmp_path, objective_version, beta, message
+):
+    experiment = vr.Experiment(
+        model=vr.models.TinyDiffusion(),
+        rollout=vr.rollouts.Flash(),
+        reward=vr.rewards.Mock(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=vr.objectives.FlashGRPO(
+            objective_version=objective_version,
+            beta=beta,
+        ),
+        train=vr.Train(),
+        output_dir=tmp_path / "invalid",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        experiment.validate()
+    assert not (tmp_path / "invalid").exists()
 
 
 def test_python_and_yaml_resolve_to_identical_config_and_fingerprint(tmp_path):
