@@ -239,8 +239,15 @@ def test_status_cli_returns_nonzero_for_missing_failed_and_stale(tmp_path):
     assert str(tmp_path) not in missing.stdout + missing.stderr
 
 
-def test_packaged_preset_reference_matches_file_and_validates_from_any_cwd(tmp_path):
-    preset_path = ROOT / "visual_rl/configs/presets/flash_tiny_single_step.yaml"
+@pytest.mark.parametrize(
+    "preset_name",
+    ["flash_tiny_single_step", "world_r1_wan_bounded"],
+)
+def test_packaged_preset_reference_matches_file_and_validates_from_any_cwd(
+    tmp_path,
+    preset_name,
+):
+    preset_path = ROOT / f"visual_rl/configs/presets/{preset_name}.yaml"
     output_dir = tmp_path / "equivalent-run"
     common = (
         "--set",
@@ -253,7 +260,7 @@ def test_packaged_preset_reference_matches_file_and_validates_from_any_cwd(tmp_p
     packaged = _subprocess(
         tmp_path,
         "inspect",
-        "preset:flash_tiny_single_step",
+        f"preset:{preset_name}",
         *common,
     )
     file_backed = _subprocess(tmp_path, "inspect", str(preset_path), *common)
@@ -270,7 +277,7 @@ def test_packaged_preset_reference_matches_file_and_validates_from_any_cwd(tmp_p
     validated = _subprocess(
         tmp_path,
         "validate",
-        "preset:flash_tiny_single_step",
+        f"preset:{preset_name}",
         "--json",
     )
     assert validated.returncode == 0, validated.stderr

@@ -59,7 +59,7 @@ rewards:
   clients:
     reward_general:
       name: reward_general
-      version: world_r1-reference-v1
+      version: v1
       url: http://127.0.0.1:8090/
       protocol_mode: reference_v1
       wire_format: legacy_pickle
@@ -69,7 +69,7 @@ rewards:
         - localhost
     reward_3d:
       name: reward_3d
-      version: world_r1-reference-v1
+      version: v1
       url: http://127.0.0.1:8089/
       protocol_mode: reference_v1
       wire_format: legacy_pickle
