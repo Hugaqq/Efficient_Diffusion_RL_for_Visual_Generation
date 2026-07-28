@@ -1,224 +1,371 @@
-"""Executable v0.6 loss characterization for the W02 -> W04 cutover.
-
-The JSON fixture was captured at the frozen v0.6 baseline.  These tests rebuild
-the probe from public VisualRL classes, so the fixture is an enforced regression
-oracle rather than an unaudited artifact or a dependency on a temporary script.
-"""
+"""The one UpdateEngine path from typed inputs through atomic AdamW."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-from pathlib import Path
+import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from visual_rl.core.seed import seed_everything
-from visual_rl.model_adapters.tiny_diffusion import TinyDiffusionAdapter
-from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
-from visual_rl.optimizers.grpo import GRPOAlgorithm
-from visual_rl.optimizers.tempflow_grpo import TempFlowGRPOAlgorithm
-
-
-FIXTURE_PATH = (
-    Path(__file__).parent / "fixtures" / "characterization" / "v0_6_loss_probe.json"
+from visual_rl.core.types import (
+    FrozenMapping,
+    PolicyRecomputeStats,
+    RewardBatch,
+    RolloutBatch,
+    StepContext,
+    ValidatedRuntimeEnv,
 )
+from visual_rl.distributed import build_strategy
+from visual_rl.optimizers.advantages import AdvantageComputer
+from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
+from visual_rl.optimizers.base import OptimizerPlugin
+from visual_rl.optimizers.grpo import GRPOAlgorithm
+from visual_rl.optimizers.update_engine import UpdateResult
 
 
-@pytest.fixture(scope="module")
-def characterization() -> dict:
-    with FIXTURE_PATH.open(encoding="utf-8") as handle:
-        fixture = json.load(handle)
-    assert fixture["schema"] == "visual_rl.characterization/v0_6_loss_probe.v1"
-    return fixture
+class _TrainModule(torch.nn.Module):
+    def __init__(self, value: float = 0.05) -> None:
+        super().__init__()
+        self.delta = torch.nn.Parameter(torch.tensor(value))
 
 
-def _adapter(config: dict) -> TinyDiffusionAdapter:
-    return TinyDiffusionAdapter(
-        {
-            "name": "tiny_diffusion",
-            "extra": {
-                "image_size": config["image_size"],
-                "device": config["device"],
-            },
-        }
+class _Adapter:
+    def __init__(self, value: float = 0.05) -> None:
+        self.train_module = _TrainModule(value)
+        self.recompute_calls = 0
+        self.reference_calls = 0
+
+    def recompute_policy_stats(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
+        self.recompute_calls += 1
+        features = batch.recompute_payload["features"]
+        new_log_probs = self.train_module.delta * features
+        if not require_reference:
+            return PolicyRecomputeStats(new_log_probs=new_log_probs)
+        self.reference_calls += 1
+        current = batch.next_latents + self.train_module.delta
+        reference = batch.next_latents.detach().clone()
+        return PolicyRecomputeStats(
+            new_log_probs=new_log_probs,
+            current_transition_mean=current,
+            transition_std=torch.ones_like(batch.old_log_probs),
+            reference_transition_mean=reference,
+        )
+
+    def named_parameters(self):
+        return tuple(self.train_module.named_parameters())
+
+
+class _MismatchedDtypeAlgorithm(GRPOAlgorithm):
+    ADVANTAGE_DTYPE = "float64"
+
+
+def _strategy(adapter: _Adapter):
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="single",
+            device="cpu",
+            timeout_s=5.0,
+            max_snapshot_tensor_bytes=None,
+        ),
+        ValidatedRuntimeEnv(
+            mode="single",
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            group_rank=None,
+            group_world_size=None,
+            master_addr=None,
+            master_port=None,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping(),
+        ),
+    )
+    strategy.prepare(adapter)
+    return strategy
+
+
+def _batch(
+    *,
+    context: StepContext | None = None,
+    transition_mask: torch.Tensor | None = None,
+) -> RolloutBatch:
+    context = context or StepContext(step=0, seed=17)
+    batch_size, transition_count = 4, 2
+    mask = (
+        torch.ones(batch_size, transition_count, dtype=torch.bool)
+        if transition_mask is None
+        else transition_mask
+    )
+    return RolloutBatch(
+        prompts=("a", "a", "b", "b"),
+        metadata=({}, {}, {}, {}),
+        media=torch.zeros(batch_size, 1, 1, 1),
+        latents=torch.zeros(batch_size, transition_count, 1),
+        next_latents=torch.ones(batch_size, transition_count, 1),
+        timesteps=torch.arange(transition_count).expand(batch_size, -1),
+        old_log_probs=torch.zeros(batch_size, transition_count),
+        transition_mask=mask,
+        sample_id=tuple(f"sample-{index}" for index in range(batch_size)),
+        prompt_id=("prompt-a", "prompt-a", "prompt-b", "prompt-b"),
+        group_id=("group-a", "group-a", "group-b", "group-b"),
+        branch_id=None,
+        media_layout="BCHW",
+        camera_trajectory=None,
+        context=context,
+        selected_timestep_index=None,
+        flash_coefficient=None,
+        branch_step_index=None,
+        trajectory_step_index=None,
+        transition_std_dev=None,
+        recompute_payload={
+            "features": torch.arange(
+                1,
+                batch_size * transition_count + 1,
+                dtype=torch.float32,
+            ).reshape(batch_size, transition_count)
+        },
+        artifact_metadata={},
     )
 
 
-def _probe_batch(fixture: dict):
-    config = fixture["config"]
-    seed_everything(config["seed"])
-    teacher = _adapter(config)
-    target_bias = torch.tensor(
-        config["target_bias"],
-        device=teacher.device,
-        dtype=teacher.color_bias.dtype,
+def _rewards(batch: RolloutBatch) -> RewardBatch:
+    values = torch.tensor([1.0, 3.0, 2.0, 4.0])
+    return RewardBatch(
+        sample_id=batch.sample_id,
+        raw={"score": values},
+        weighted={"score": values},
+        weighted_total=values,
+        valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
+        shared_metadata={"score": {}},
+        sample_metadata={"score": ({}, {}, {}, {})},
     )
-    with torch.no_grad():
-        teacher.color_bias.copy_(target_bias)
-    prompts = ["a red square" for _ in range(config["batch_size"])]
-    metadata = [
-        {"source": "tiny_loss_probe", "target_color": "red"}
-        for _ in range(config["batch_size"])
-    ]
-    batch = teacher.sample(
-        prompts,
-        metadata,
-        {"num_steps": config["num_steps"], "seed": config["seed"]},
+
+
+def _plugin(
+    *,
+    microbatch_size: int,
+    beta: float = 0.0,
+) -> AlgorithmOptimizerPlugin:
+    return AlgorithmOptimizerPlugin(
+        algorithm=GRPOAlgorithm(
+            clip_range=0.2,
+            adv_clip_max=5.0,
+            beta=beta,
+        ),
+        advantage_computer=AdvantageComputer(
+            epsilon=1e-8,
+            output_dtype="float32",
+        ),
+        update_microbatch_size=microbatch_size,
+        precision="fp32",
+        max_grad_norm=None,
+        max_initial_logprob_delta=None,
+        require_initial_clipfrac_zero=False,
+        require_finite_gradients=True,
+        require_nonzero_gradients=True,
     )
+
+
+def _optimizer(
+    plugin: AlgorithmOptimizerPlugin,
+    adapter: _Adapter,
+) -> torch.optim.AdamW:
+    return plugin.build_optimizer(
+        adapter.named_parameters(),
+        SimpleNamespace(
+            learning_rate=1e-2,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_weight_decay=0.0,
+            adam_epsilon=1e-8,
+        ),
+    )
+
+
+def _run_once(*, microbatch_size: int, beta: float = 0.0):
+    adapter = _Adapter()
+    strategy = _strategy(adapter)
+    plugin = _plugin(microbatch_size=microbatch_size, beta=beta)
+    optimizer = _optimizer(plugin, adapter)
+    batch = _batch()
+    try:
+        result = plugin.step(
+            batch=batch,
+            rewards=_rewards(batch),
+            optimizer=optimizer,
+            scaler=None,
+            context=batch.context,
+            strategy=strategy,
+        )
+        return (
+            result,
+            adapter.train_module.delta.detach().clone(),
+            adapter.train_module.delta.grad.detach().clone(),
+            adapter.recompute_calls,
+            adapter.reference_calls,
+        )
+    finally:
+        strategy.close()
+
+
+def test_microbatch_and_full_batch_use_one_active_count_weighting() -> None:
+    full = _run_once(microbatch_size=4)
+    split = _run_once(microbatch_size=3)
+    full_result, full_parameter, full_gradient, full_forwards, _ = full
+    split_result, split_parameter, split_gradient, split_forwards, _ = split
+
+    assert isinstance(full_result, UpdateResult)
+    assert full_result.active_transition_count == 8
+    assert split_result.active_transition_count == 8
+    for name in (
+        "loss",
+        "policy_loss",
+        "reference_kl",
+        "approx_kl",
+        "clipfrac",
+    ):
+        assert getattr(split_result, name) == pytest.approx(
+            getattr(full_result, name),
+            abs=1e-7,
+        )
+    torch.testing.assert_close(split_parameter, full_parameter)
+    torch.testing.assert_close(split_gradient, full_gradient)
+    assert full_forwards == 1
+    assert split_forwards == 2
+
+
+def test_beta_zero_never_requests_reference_statistics() -> None:
+    result, _parameter, _gradient, _forwards, reference_calls = _run_once(
+        microbatch_size=2,
+        beta=0.0,
+    )
+    assert result.reference_kl == 0.0
+    assert reference_calls == 0
+
+
+def test_beta_positive_adds_differentiable_reference_loss() -> None:
+    control = _run_once(microbatch_size=2, beta=0.0)
+    active = _run_once(microbatch_size=2, beta=0.5)
+    active_result, _active_parameter, active_gradient, _forwards, reference_calls = (
+        active
+    )
+    assert reference_calls == 2
+    assert active_result.reference_kl > 0.0
+    assert active_result.loss == pytest.approx(
+        active_result.policy_loss + 0.5 * active_result.reference_kl
+    )
+    assert not torch.equal(active_gradient, control[2])
+
+
+def test_context_identity_failure_precedes_forward_and_mutation() -> None:
+    adapter = _Adapter()
+    strategy = _strategy(adapter)
+    plugin = _plugin(microbatch_size=2)
+    optimizer = _optimizer(plugin, adapter)
+    batch = _batch()
+    initial = adapter.train_module.delta.detach().clone()
+    equal_but_distinct = StepContext(
+        step=batch.context.step,
+        seed=batch.context.seed,
+        rank=batch.context.rank,
+        world_size=batch.context.world_size,
+    )
+    try:
+        with pytest.raises(ValueError, match="RolloutBatch.context object"):
+            plugin.step(
+                batch=batch,
+                rewards=_rewards(batch),
+                optimizer=optimizer,
+                scaler=None,
+                context=equal_but_distinct,
+                strategy=strategy,
+            )
+        assert adapter.recompute_calls == 0
+        torch.testing.assert_close(adapter.train_module.delta, initial)
+        assert optimizer.state == {}
+    finally:
+        strategy.close()
+
+
+def test_each_sample_requires_an_active_transition_before_forward() -> None:
     mask = torch.tensor(
-        fixture["mask"]["transition_mask"],
-        dtype=torch.bool,
-        device=teacher.device,
+        [
+            [True, False],
+            [False, False],
+            [True, True],
+            [False, True],
+        ]
     )
-    batch = batch.replace(transition_mask=mask)
-    batch.validate_strict()
-    return batch, target_bias
+    adapter = _Adapter()
+    strategy = _strategy(adapter)
+    plugin = _plugin(microbatch_size=2)
+    optimizer = _optimizer(plugin, adapter)
+    batch = _batch(transition_mask=mask)
+    try:
+        with pytest.raises(ValueError, match="every sample"):
+            plugin.step(
+                batch=batch,
+                rewards=_rewards(batch),
+                optimizer=optimizer,
+                scaler=None,
+                context=batch.context,
+                strategy=strategy,
+            )
+        assert adapter.recompute_calls == 0
+        assert optimizer.state == {}
+    finally:
+        strategy.close()
 
 
-def _tensor_digest(*tensors: torch.Tensor) -> str:
-    digest = hashlib.sha256()
-    for tensor in tensors:
-        tensor = tensor.detach().cpu().contiguous()
-        digest.update(str(tensor.dtype).encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
-        digest.update(tensor.numpy().tobytes())
-    return digest.hexdigest()
-
-
-def _assert_tensor_record(actual: torch.Tensor, expected: dict) -> None:
-    assert list(actual.shape) == expected["shape"]
-    assert str(actual.dtype) == expected["dtype"]
-    torch.testing.assert_close(
-        actual.detach().cpu().reshape(-1),
-        torch.tensor(expected["values"], dtype=actual.dtype),
-        rtol=1e-6,
-        atol=1e-7,
+def test_algorithm_advantage_dtype_mismatch_fails_before_forward() -> None:
+    adapter = _Adapter()
+    strategy = _strategy(adapter)
+    plugin = _plugin(microbatch_size=2)
+    plugin.algorithm = _MismatchedDtypeAlgorithm(
+        clip_range=0.2,
+        adv_clip_max=5.0,
+        beta=0.0,
     )
+    plugin.update_engine.algorithm = plugin.algorithm
+    optimizer = _optimizer(plugin, adapter)
+    batch = _batch()
+    initial = adapter.train_module.delta.detach().clone()
+    try:
+        with pytest.raises(TypeError, match="ADVANTAGE_DTYPE=float64"):
+            plugin.step(
+                batch=batch,
+                rewards=_rewards(batch),
+                optimizer=optimizer,
+                scaler=None,
+                context=batch.context,
+                strategy=strategy,
+            )
+        assert adapter.recompute_calls == 0
+        torch.testing.assert_close(adapter.train_module.delta, initial)
+        assert optimizer.state == {}
+    finally:
+        strategy.close()
 
 
-def test_v0_6_probe_batch_and_supervised_update_match_fixture(characterization):
-    fixture = characterization
-    config = fixture["config"]
-    batch, target_bias = _probe_batch(fixture)
-    recorded_batch = fixture["batch"]
-
-    _assert_tensor_record(batch.old_log_probs, recorded_batch["old_log_probs"])
-    _assert_tensor_record(batch.timesteps, recorded_batch["timesteps"])
-    _assert_tensor_record(batch.kl, recorded_batch["kl"])
-    _assert_tensor_record(target_bias, recorded_batch["teacher_target_bias"])
-    assert _tensor_digest(batch.latents) == recorded_batch["latents_sha256"]
-    assert (
-        _tensor_digest(batch.next_latents)
-        == recorded_batch["next_latents_sha256"]
+def test_optimizer_plugin_step_has_only_the_six_required_keywords() -> None:
+    signature = inspect.signature(OptimizerPlugin.step)
+    assert tuple(signature.parameters) == (
+        "self",
+        "batch",
+        "rewards",
+        "optimizer",
+        "scaler",
+        "context",
+        "strategy",
     )
-    assert _tensor_digest(batch.media) == recorded_batch["media_sha256"]
-    assert int(batch.transition_mask.sum()) == fixture["mask"][
-        "active_transition_count"
-    ]
-
-    student = _adapter(config)
-    initial = {
-        name: parameter.detach().clone()
-        for name, parameter in student.named_parameters()
-    }
-    new_log_probs = student.recompute_log_probs(batch)
-    _assert_tensor_record(
-        new_log_probs, recorded_batch["student_new_log_probs_at_init"]
-    )
-    old_log_probs = batch.old_log_probs.to(
-        new_log_probs.device, dtype=new_log_probs.dtype
-    )
-    fit_loss = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean()
-    transition_nll = (-new_log_probs).mean()
-    optimizer = torch.optim.AdamW(
-        student.parameters(), lr=float(config["learning_rate"])
-    )
-    optimizer.zero_grad(set_to_none=True)
-    fit_loss.backward()
-
-    recorded_fit = fixture["supervised_fit"]
-    assert float(fit_loss.detach()) == pytest.approx(recorded_fit["fit_loss"])
-    assert float(transition_nll.detach()) == pytest.approx(
-        recorded_fit["transition_nll"]
-    )
-    for name, parameter in student.named_parameters():
-        _assert_tensor_record(parameter.grad, recorded_fit["gradients"][name])
-    optimizer.step()
-    for name, parameter in student.named_parameters():
-        _assert_tensor_record(
-            parameter.detach() - initial[name],
-            recorded_fit["parameter_delta"][name],
-        )
-
-
-def _algorithm(name: str):
-    if name == "grpo":
-        return GRPOAlgorithm(clip_range=10.0, adv_clip_max=5.0, beta=0.0)
-    if name == "flash_grpo":
-        return FlashGRPOAlgorithm(
-            objective_version="legacy_v0",
-            clip_range=10.0,
-            adv_clip_max=5.0,
-            beta=0.0,
-            rectification=None,
-        )
-    if name == "tempflow_grpo":
-        return TempFlowGRPOAlgorithm(
-            objective_version="legacy",
-            clip_range=10.0,
-            adv_clip_max=5.0,
-            beta=0.0,
-            credit_assignment="branch_timestep",
-            noise_weighting=None,
-            preserve_advantage_dtype=False,
-            advantage_dtype="float32",
-        )
-    raise AssertionError(f"unknown characterization algorithm {name!r}")
-
-
-@pytest.mark.parametrize("algorithm_name", ["grpo", "flash_grpo", "tempflow_grpo"])
-def test_v0_6_policy_updates_match_fixture(characterization, algorithm_name):
-    fixture = characterization
-    config = fixture["config"]
-    batch, _target_bias = _probe_batch(fixture)
-    student = _adapter(config)
-    initial = {
-        name: parameter.detach().clone()
-        for name, parameter in student.named_parameters()
-    }
-    advantages = torch.ones_like(batch.old_log_probs, device=student.device)
-    algorithm = _algorithm(algorithm_name)
-    new_log_probs = student.recompute_log_probs(batch)
-    loss, info = algorithm.compute_loss(batch, advantages, new_log_probs)
-    reduction_weight = algorithm.reduction_weight(batch, advantages)
-    optimizer = torch.optim.AdamW(
-        student.parameters(), lr=float(config["learning_rate"])
-    )
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-
-    expected = fixture["algorithms"][algorithm_name]
-    assert float(loss.detach()) == pytest.approx(expected["loss"])
-    assert int(reduction_weight) == expected["active_transition_count"]
-    assert int((~batch.transition_mask).sum()) == expected[
-        "invalid_transition_count"
-    ]
-    for metric_name in ("approx_kl", "clipfrac"):
-        assert float(info[metric_name].detach()) == pytest.approx(
-            expected[metric_name]
-        )
-    for metric_name, expected_value in expected["diagnostics"].items():
-        if isinstance(expected_value, (int, float)):
-            assert float(info[metric_name].detach()) == pytest.approx(expected_value)
-    for name, parameter in student.named_parameters():
-        _assert_tensor_record(parameter.grad, expected["gradients"][name])
-
-    optimizer.step()
-    for name, parameter in student.named_parameters():
-        _assert_tensor_record(
-            parameter.detach() - initial[name],
-            expected["parameter_delta"][name],
-        )
-        _assert_tensor_record(parameter.detach(), expected["updated_parameters"][name])
+    for name, parameter in signature.parameters.items():
+        if name != "self":
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            assert parameter.default is inspect.Parameter.empty

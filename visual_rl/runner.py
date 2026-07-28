@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
@@ -25,6 +25,7 @@ _T = TypeVar("_T")
 _CORE_UPDATE_METRICS = (
     "loss",
     "policy_loss",
+    "reference_kl",
     "approx_kl",
     "clipfrac",
 )
@@ -82,6 +83,8 @@ class ExperimentRunner:
             raise TypeError("validated_env must be a ValidatedRuntimeEnv")
         self.config = config
         self.validated_env = validated_env
+        self.optimizer: Any | None = None
+        self.scaler: Any | None = None
 
     def run(self) -> RunResult:
         """Execute the one shared single/DDP loop and return its committed head."""
@@ -111,9 +114,8 @@ class ExperimentRunner:
                 self.config.runtime.distributed,
                 self.validated_env,
             )
-            context = strategy.context
             configure_deterministic_runtime(self.config.runtime.deterministic)
-            seed_everything(self.config.run.seed)
+            seed_everything(self.config.run.seed + strategy.rank)
 
             def prepare_artifacts() -> tuple[str, int, str | None] | None:
                 nonlocal manager
@@ -188,11 +190,11 @@ class ExperimentRunner:
                 )
 
             runtime_context = RuntimeBuildContext(
-                rank=context.rank,
-                local_rank=context.local_rank,
-                world_size=context.world_size,
-                backend=context.backend,
-                device=context.device,
+                rank=strategy.rank,
+                local_rank=strategy.local_rank,
+                world_size=strategy.world_size,
+                backend=strategy.backend,
+                device=strategy.device,
                 precision=self.config.runtime.precision,
             )
             components = self._run_phase(
@@ -216,10 +218,12 @@ class ExperimentRunner:
                     self.config.optimizer,
                 ),
             )
-            scaler = self._current_gradient_scaler(
-                components.optimizer_plugin,
-                device=context.device,
+            scaler = self._build_gradient_scaler(
+                precision=self.config.runtime.precision,
+                device=strategy.device,
             )
+            self.optimizer = optimizer
+            self.scaler = scaler
             training_contract = TrainingContract(
                 algorithm=self.config.algorithm.name,
                 version=(
@@ -235,7 +239,7 @@ class ExperimentRunner:
                         optimizer=optimizer,
                         scaler=scaler,
                         expected_global_step=start_step,
-                        expected_world_size=context.world_size,
+                        expected_world_size=strategy.world_size,
                         expected_training_contract=training_contract,
                     )
                     apply_training_state(
@@ -244,7 +248,7 @@ class ExperimentRunner:
                         optimizer=optimizer,
                         scaler=scaler,
                         optimizer_config=self.config.optimizer,
-                        rank=context.rank,
+                        rank=strategy.rank,
                     )
                 elif self.config.model.adapter_checkpoint is not None:
                     path = self.config.model.adapter_checkpoint
@@ -280,9 +284,9 @@ class ExperimentRunner:
                     ensure_transaction,
                 )
 
-                dataset_start = (
-                    step * self.config.runtime.batch_size * context.world_size
-                    + context.rank * self.config.runtime.batch_size
+                dataset_start = strategy.dataset_start(
+                    step,
+                    self.config.runtime.batch_size,
                 )
                 prompts, metadata = self._run_phase(
                     strategy,
@@ -296,11 +300,11 @@ class ExperimentRunner:
                     step=step,
                     seed=(
                         self.config.run.seed
-                        + step * context.world_size
-                        + context.rank
+                        + step * strategy.world_size
+                        + strategy.rank
                     ),
-                    rank=context.rank,
-                    world_size=context.world_size,
+                    rank=strategy.rank,
+                    world_size=strategy.world_size,
                 )
                 batch = self._run_phase(
                     strategy,
@@ -324,29 +328,23 @@ class ExperimentRunner:
                     strategy,
                     "update",
                     lambda: components.optimizer_plugin.step(
-                        adapter=components.model,
                         batch=batch,
                         rewards=rewards,
                         optimizer=optimizer,
+                        scaler=scaler,
                         context=step_context,
-                        recompute_policy_stats=(
-                            strategy.recompute_policy_stats
-                        ),
-                        gradient_sync_context=(
-                            strategy.gradient_sync_context
-                        ),
-                        reduce_tensor_weighted_mean=(
-                            strategy.reduce_tensor_weighted_mean
-                        ),
-                        synchronize_failure=strategy.synchronize_failure,
-                        optimizer_step=strategy.atomic_optimizer_step,
+                        strategy=strategy,
                     ),
                 )
-                metrics = self._reduce_artifact_metrics(
+                metrics = self._run_phase(
                     strategy,
-                    update_metrics=update_metrics,
-                    batch=batch,
-                    rewards=rewards,
+                    "metrics",
+                    lambda: self._reduce_artifact_metrics(
+                        strategy,
+                        update_result=update_metrics,
+                        batch=batch,
+                        rewards=rewards,
+                    ),
                 )
                 records = self._run_phase(
                     strategy,
@@ -399,8 +397,8 @@ class ExperimentRunner:
 
                 if should_checkpoint:
                     rank_state = self._capture_rank_state(
-                        rank=context.rank,
-                        device=context.device,
+                        rank=strategy.rank,
+                        device=strategy.device,
                     )
                     gathered_states = strategy.gather_object(rank_state, dst=0)
 
@@ -425,7 +423,7 @@ class ExperimentRunner:
                             training_contract=training_contract,
                             rank_states=rank_states,
                             writer_rank=0,
-                            writer_device=context.device,
+                            writer_device=strategy.device,
                         )
                         committed = transaction
                         manager.commit(
@@ -494,109 +492,59 @@ class ExperimentRunner:
 
         if not isinstance(name, str) or not name:
             raise ValueError("phase name must be a non-empty string")
-        error: BaseException | None = None
-        result: Any = None
-        try:
-            result = operation()
-        except BaseException as exc:
-            error = exc
-        if strategy.context.world_size > 1:
-            strategy.synchronize_failure(error)
-        if error is not None:
-            raise error
-        return result
+        return strategy.run_phase(name, operation)
 
     @staticmethod
-    def _current_gradient_scaler(
-        optimizer_plugin: Any,
+    def _build_gradient_scaler(
         *,
+        precision: str,
         device: Any,
     ) -> Any | None:
-        """Reuse the pre-W04 scaler owner until W04 moves it into Runner."""
+        """Build the Runner-owned scaler exactly once for CUDA fp16."""
 
-        if optimizer_plugin.precision != "fp16":
+        if precision != "fp16":
             return None
         if getattr(device, "type", None) != "cuda":
             raise ValueError("fp16 training requires a CUDA runtime device")
-        return optimizer_plugin.update_engine._get_grad_scaler()
+        import torch
+
+        try:
+            return torch.amp.GradScaler("cuda")
+        except (AttributeError, TypeError):
+            return torch.cuda.amp.GradScaler()
 
     @staticmethod
     def _reduce_artifact_metrics(
         strategy: Any,
         *,
-        update_metrics: Mapping[str, Any],
+        update_result: Any,
         batch: Any,
         rewards: Any,
     ) -> _ArtifactMetrics:
-        if not isinstance(update_metrics, Mapping):
-            raise TypeError("optimizer step metrics must be a mapping")
-        local_values: dict[str, float] = {}
+        from visual_rl.optimizers.update_engine import UpdateResult
+
+        if not isinstance(update_result, UpdateResult):
+            raise TypeError("optimizer step must return UpdateResult")
+        values: dict[str, float] = {}
         for name in _CORE_UPDATE_METRICS:
-            if name not in update_metrics:
-                raise ValueError(f"optimizer metrics are missing {name!r}")
-            value = float(update_metrics[name])
+            value = float(getattr(update_result, name))
             if not math.isfinite(value):
                 raise ValueError(f"optimizer metric {name!r} must be finite")
-            local_values[name] = value
-        local_values["reference_kl"] = float(
-            update_metrics.get("reference_kl", 0.0)
-        )
-        active_count = int(batch.transition_mask.sum().detach().cpu().item())
-        reward_values = tuple(
-            float(item)
-            for item in rewards.weighted_total.detach().cpu().tolist()
-        )
-        contribution = {
-            "values": local_values,
-            "sample_count": batch.batch_size,
-            "active_transition_count": active_count,
-            "reward_values": reward_values,
-        }
-        gathered = strategy.gather_object(contribution, dst=0)
-        aggregate = None
-        if strategy.is_main_process:
-            assert gathered is not None
-            total_samples = sum(item["sample_count"] for item in gathered)
-            total_active = sum(
-                item["active_transition_count"] for item in gathered
-            )
-            all_rewards = tuple(
-                value
-                for item in gathered
-                for value in item["reward_values"]
-            )
-            if total_samples <= 0 or total_active <= 0 or not all_rewards:
-                raise ValueError("global metric reduction requires positive counts")
-            values = {
-                name: sum(
-                    item["values"][name]
-                    * item["active_transition_count"]
-                    for item in gathered
-                )
-                / total_active
-                for name in (*_CORE_UPDATE_METRICS, "reference_kl")
-            }
-            reward_mean = sum(all_rewards) / len(all_rewards)
-            values["reward_mean"] = reward_mean
-            values["reward_std"] = math.sqrt(
-                sum((value - reward_mean) ** 2 for value in all_rewards)
-                / len(all_rewards)
-            )
-            aggregate = (
-                values,
-                total_samples,
-                total_active,
-            )
-        aggregate = strategy.broadcast_object(aggregate)
-        if (
-            not isinstance(aggregate, tuple)
-            or len(aggregate) != 3
-        ):
-            raise RuntimeError("metric reduction returned an invalid payload")
+            values[name] = value
+        for name, value in update_result.diagnostics.items():
+            if name in values:
+                raise ValueError(f"duplicate update metric {name!r}")
+            values[name] = float(value)
+        reward_metrics = strategy.reduce_reward_metrics(rewards)
+        for name, value in reward_metrics.items():
+            if name in values:
+                raise ValueError(f"duplicate reward metric {name!r}")
+            values[name] = float(value)
+        sample_count = batch.batch_size * strategy.world_size
         return _ArtifactMetrics(
-            values=FrozenMapping(aggregate[0]),
-            sample_count=aggregate[1],
-            active_transition_count=aggregate[2],
+            values=FrozenMapping(values),
+            sample_count=sample_count,
+            active_transition_count=update_result.active_transition_count,
         )
 
     @staticmethod

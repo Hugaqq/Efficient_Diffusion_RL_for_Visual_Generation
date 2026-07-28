@@ -38,6 +38,11 @@ class TinyDiffusionAdapter(ModelAdapter):
         self.image_size = image_size
         self.device = torch.device(device)
         self._train_module = torch.nn.Module()
+        self._train_module.register_buffer(
+            "base_color_bias",
+            torch.zeros(self.CHANNELS, device=self.device),
+            persistent=False,
+        )
         self._train_module.register_parameter(
             "color_bias",
             torch.nn.Parameter(torch.zeros(self.CHANNELS, device=self.device)),
@@ -50,6 +55,10 @@ class TinyDiffusionAdapter(ModelAdapter):
     @property
     def color_bias(self):
         return self._train_module.color_bias
+
+    @property
+    def base_color_bias(self):
+        return self._train_module.base_color_bias
 
     @classmethod
     def resolve_params(
@@ -144,7 +153,9 @@ class TinyDiffusionAdapter(ModelAdapter):
             generator=generator,
             device=self.device,
         ) * 0.05
-        bias = self.color_bias.detach().view(1, 1, self.CHANNELS, 1, 1)
+        bias = (
+            self.base_color_bias + self.color_bias.detach()
+        ).view(1, 1, self.CHANNELS, 1, 1)
         next_latents = latents + noise + bias
         timesteps = torch.arange(
             request.num_steps,
@@ -187,7 +198,9 @@ class TinyDiffusionAdapter(ModelAdapter):
             generator=generator,
             device=self.device,
         ) * 0.05
-        bias = self.color_bias.detach().view(1, 1, self.CHANNELS, 1, 1)
+        bias = (
+            self.base_color_bias + self.color_bias.detach()
+        ).view(1, 1, self.CHANNELS, 1, 1)
         next_latents = latents + noise + bias
         selected = torch.tensor(
             request.selected_timestep_index,
@@ -226,7 +239,9 @@ class TinyDiffusionAdapter(ModelAdapter):
             self.image_size,
         )
         generator = self._generator(request.context.seed)
-        bias = self.color_bias.detach().view(self.CHANNELS, 1, 1)
+        bias = (
+            self.base_color_bias + self.color_bias.detach()
+        ).view(self.CHANNELS, 1, 1)
         selected_latents = torch.empty(
             (batch_size, *sample_shape),
             device=self.device,
@@ -302,7 +317,9 @@ class TinyDiffusionAdapter(ModelAdapter):
     ) -> RolloutBatch:
         import torch
 
-        bias = self.color_bias.detach().view(1, 1, self.CHANNELS, 1, 1)
+        bias = (
+            self.base_color_bias + self.color_bias.detach()
+        ).view(1, 1, self.CHANNELS, 1, 1)
         old_log_probs = -(
             (next_latents - latents - bias) ** 2
         ).mean(dim=(2, 3, 4))
@@ -342,22 +359,61 @@ class TinyDiffusionAdapter(ModelAdapter):
         *,
         require_reference: bool = False,
     ) -> PolicyRecomputeStats:
-        if require_reference:
-            raise RunError(
-                "tiny_diffusion reference statistics are added by stage 4"
-            )
+        import torch
+
         was_training = self.train_module.training
         self.train_module.train(True)
         try:
-            bias = self.color_bias.view(1, 1, self.CHANNELS, 1, 1)
+            base_bias = self.base_color_bias.view(
+                1,
+                1,
+                self.CHANNELS,
+                1,
+                1,
+            )
+            adapter_delta = self.color_bias.view(
+                1,
+                1,
+                self.CHANNELS,
+                1,
+                1,
+            )
+            current_mean = batch.latents + base_bias + adapter_delta
             new_log_probs = -(
-                (batch.next_latents - batch.latents - bias) ** 2
+                (batch.next_latents - current_mean) ** 2
             ).mean(dim=(2, 3, 4))
-            result = PolicyRecomputeStats(new_log_probs=new_log_probs)
-            result.validate_against(batch, require_reference=False)
+            if require_reference:
+                reference_mean = self._reference_transition_mean(
+                    batch,
+                    base_bias,
+                )
+                transition_std = torch.full(
+                    tuple(batch.old_log_probs.shape),
+                    0.05,
+                    dtype=current_mean.dtype,
+                    device=current_mean.device,
+                )
+                result = PolicyRecomputeStats(
+                    new_log_probs=new_log_probs,
+                    current_transition_mean=current_mean,
+                    transition_std=transition_std,
+                    reference_transition_mean=reference_mean,
+                )
+            else:
+                result = PolicyRecomputeStats(new_log_probs=new_log_probs)
+            result.validate_against(
+                batch,
+                require_reference=require_reference,
+            )
             return result
         finally:
             self.train_module.train(was_training)
+
+    def _reference_transition_mean(self, batch: RolloutBatch, base_bias):
+        import torch
+
+        with torch.no_grad():
+            return (batch.latents + base_bias).detach()
 
     def _generator(self, seed: int):
         import torch

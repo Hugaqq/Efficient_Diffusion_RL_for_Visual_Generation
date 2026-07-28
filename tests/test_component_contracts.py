@@ -880,5 +880,12 @@ def test_tiny_adapter_uses_one_typed_rollout_and_recompute_path(kind):
     stats = adapter.recompute_policy_stats(batch)
     stats.validate_against(batch, require_reference=False)
     assert stats.new_log_probs.requires_grad
-    with pytest.raises(RunError, match="stage 4"):
-        adapter.recompute_policy_stats(batch, require_reference=True)
+    reference_stats = adapter.recompute_policy_stats(
+        batch,
+        require_reference=True,
+    )
+    reference_stats.validate_against(batch, require_reference=True)
+    assert reference_stats.current_transition_mean.requires_grad
+    assert not reference_stats.reference_transition_mean.requires_grad
+    assert reference_stats.reference_transition_mean.grad_fn is None
+    assert not reference_stats.transition_std.requires_grad
