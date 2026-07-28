@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "algorithm": "flow_grpo_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 17,
+      "source_run": "runs/flow_grpo_sd3_q100_seed17"
+    },
+    {
+      "algorithm": "flow_grpo_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 29,
+      "source_run": "runs/flow_grpo_sd3_q100_seed29"
+    },
+    {
+      "algorithm": "flow_grpo_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 43,
+      "source_run": "runs/flow_grpo_sd3_q100_seed43"
+    },
+    {
+      "algorithm": "tempflow_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 17,
+      "source_run": "runs/tempflow_sd3_q100_seed17"
+    },
+    {
+      "algorithm": "tempflow_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 29,
+      "source_run": "runs/tempflow_sd3_q100_seed29"
+    },
+    {
+      "algorithm": "tempflow_sd3",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 43,
+      "source_run": "runs/tempflow_sd3_q100_seed43"
+    },
+    {
+      "algorithm": "flash_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 17,
+      "source_run": "runs/flash_wan_q100_seed17"
+    },
+    {
+      "algorithm": "flash_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 29,
+      "source_run": "runs/flash_wan_q100_seed29"
+    },
+    {
+      "algorithm": "flash_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 43,
+      "source_run": "runs/flash_wan_q100_seed43"
+    },
+    {
+      "algorithm": "world_r1_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 17,
+      "source_run": "runs/world_r1_wan_q100_seed17"
+    },
+    {
+      "algorithm": "world_r1_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 29,
+      "source_run": "runs/world_r1_wan_q100_seed29"
+    },
+    {
+      "algorithm": "world_r1_wan",
+      "audit_ok": true,
+      "committed_steps": 100,
+      "inspect_ok": true,
+      "seed": 43,
+      "source_run": "runs/world_r1_wan_q100_seed43"
+    }
+  ]
+}

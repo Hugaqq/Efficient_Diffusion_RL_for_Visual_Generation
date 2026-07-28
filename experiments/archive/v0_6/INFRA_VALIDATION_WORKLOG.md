@@ -1,5 +1,7 @@
 # VisualRL 修改与验收台账（历史快照）
 
+> Historical v0.6 evidence; not a v0.7 usage/config contract.
+
 更新时间：2026-07-15
 
 > 状态：本文件冻结合并阶段的修改与验收映射，不再维护当前 backlog。当前状态和顺序只以 `docs/PROJECT_OVERVIEW.md` 与 `experiments/EXPERIMENT_PLAN.md` 为准。本文历史 `P5/P6` 分别表示双卡 correctness/扩展效率；当前计划已将它们迁移为 `MG1/MG2`，避免与后来建立的 P5–P7 单卡优化实验冲突。
