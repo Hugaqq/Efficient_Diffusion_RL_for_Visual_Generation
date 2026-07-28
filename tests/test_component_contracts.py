@@ -19,22 +19,15 @@ import torch
 
 from visual_rl.core.components import builtin_components
 from visual_rl.core.types import (
-    AdvantageResult,
     FrozenMapping,
     MetricContribution,
-    ObjectiveOutput,
-    PolicyLossInputs,
     PolicyRecomputeStats,
     ResolutionContext,
     RewardVector,
     RolloutBatch,
     RolloutRequest,
     RuntimeBuildContext,
-    SampleRecord,
-    StepArtifacts,
-    StepMetrics,
-    StepResult,
-    UpdateResult,
+    StepContext,
     ValidatedRuntimeEnv,
     ValidationCheck,
     ValidationContext,
@@ -226,31 +219,6 @@ EXPECTED_FIELDS = {
     ),
     RewardVector: ("sample_id", "values", "shared_metadata", "sample_metadata"),
     MetricContribution: ("numerator", "denominator"),
-    AdvantageResult: ("base_advantage", "diagnostics"),
-    PolicyLossInputs: (
-        "base_advantage",
-        "algorithm_weight",
-        "active_mask",
-        "clip_range",
-        "reference_kl_weight",
-    ),
-    ObjectiveOutput: (
-        "loss",
-        "policy_loss",
-        "reference_kl",
-        "approx_kl",
-        "clipfrac",
-        "active_transition_count",
-    ),
-    UpdateResult: (
-        "loss",
-        "policy_loss",
-        "reference_kl",
-        "approx_kl",
-        "clipfrac",
-        "active_transition_count",
-        "diagnostics",
-    ),
     ValidationCheck: ("level", "code", "path", "message", "volatile"),
     ResolutionContext: ("config_path", "config_dir"),
     ValidationContext: (
@@ -283,30 +251,6 @@ EXPECTED_FIELDS = {
         "device",
         "precision",
     ),
-    StepMetrics: ("values", "sample_count", "active_transition_count"),
-    StepArtifacts: ("local_records",),
-    StepResult: ("context", "metrics", "artifacts"),
-    SampleRecord: (
-        "run_id",
-        "sample_id",
-        "sample_index",
-        "step",
-        "rank",
-        "prompt",
-        "media_type",
-        "prompt_metadata",
-        "seed",
-        "rollout_type",
-        "timestep_summary",
-        "reward_values",
-        "media_path",
-        "rollout_cache_path",
-        "checkpoint_path",
-        "model_metadata",
-        "prompt_id",
-        "group_id",
-        "branch_id",
-    ),
 }
 
 
@@ -336,20 +280,17 @@ def test_mapping_fields_are_deep_frozen_on_construction():
         raw_launch_env={"RANK": "0"},
     )
     assert isinstance(env.raw_launch_env, FrozenMapping)
-    metrics = StepMetrics(values={"loss": 1.0}, sample_count=2, active_transition_count=8)
-    assert isinstance(metrics.values, FrozenMapping)
-    result = UpdateResult(
-        loss=1.0,
-        policy_loss=1.0,
-        reference_kl=0.0,
-        approx_kl=0.0,
-        clipfrac=0.0,
-        active_transition_count=8,
-        diagnostics={"algorithm/x": 2.0},
+    reward = RewardVector(
+        sample_id=("s0", "s1"),
+        values=torch.tensor([1.0, 2.0]),
+        shared_metadata={"revision": {"name": "v1"}},
+        sample_metadata=({"source": ["a"]}, {"source": ["b"]}),
     )
-    assert isinstance(result.diagnostics, FrozenMapping)
+    assert isinstance(reward.shared_metadata, FrozenMapping)
+    assert isinstance(reward.shared_metadata["revision"], FrozenMapping)
+    assert all(isinstance(item, FrozenMapping) for item in reward.sample_metadata)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        result.loss = 2.0
+        reward.values = torch.zeros(2)
 
 
 def test_metric_contribution_denominator_contract():
@@ -359,6 +300,16 @@ def test_metric_contribution_denominator_contract():
         MetricContribution(numerator=torch.tensor(1.0), denominator=0)
     with pytest.raises(TypeError, match="not bool"):
         MetricContribution(numerator=torch.tensor(1.0), denominator=True)
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        MetricContribution(numerator=1.0, denominator=None)
+    with pytest.raises(ValueError, match="scalar"):
+        MetricContribution(numerator=torch.ones(1), denominator=None)
+    with pytest.raises(ValueError, match="detached"):
+        MetricContribution(
+            numerator=torch.tensor(1.0, requires_grad=True), denominator=None
+        )
+    with pytest.raises(ValueError, match="finite"):
+        MetricContribution(numerator=torch.tensor(float("nan")), denominator=None)
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +326,16 @@ def test_frozen_mapping_deep_freezes_and_round_trips_pickle():
     restored = pickle.loads(pickle.dumps(frozen))
     assert restored == frozen
     assert hash(restored) == hash(frozen)
+    with pytest.raises(TypeError, match="immutable"):
+        frozen._items = (("changed", True),)
+    with pytest.raises(TypeError, match="immutable"):
+        del frozen._items
     with pytest.raises(TypeError, match="keys must be strings"):
         FrozenMapping({1: "x"})
+    with pytest.raises(ValueError, match="duplicate key"):
+        FrozenMapping((("x", 1), ("x", 2)))
+    with pytest.raises(ValueError, match="non-finite"):
+        FrozenMapping({"bad": float("inf")})
     with pytest.raises(TypeError, match="JSON-safe"):
         FrozenMapping({"bad": {1, 2}})
     with pytest.raises(TypeError, match="JSON-safe"):
@@ -434,6 +393,94 @@ def test_to_plain_dict_rejects_non_plain_values_before_writing():
         to_plain_dict(_Mutable(value=1))
 
 
+def test_rollout_request_freezes_inputs_and_validates_row_alignment():
+    metadata = [{"nested": [1]}, {"nested": [2]}]
+    request = RolloutRequest(
+        prompts=("a", "b"),
+        metadata=tuple(metadata),
+        sample_id=("s0", "s1"),
+        prompt_id=("p0", "p1"),
+        group_id=("g0", "g0"),
+        branch_id=(None, 1),
+        context=StepContext(step=0, seed=7, epoch_tag=0),
+        kind="branching",
+        num_steps=4,
+        group_size=2,
+        selected_timestep_index=(0, 3),
+        branch_step_index=(1, 2),
+    )
+    metadata[0]["nested"].append(99)
+    assert request.prompts == ("a", "b")
+    assert request.metadata[0]["nested"] == (1,)
+    assert request.sample_id == ("s0", "s1")
+    assert request.branch_id == (None, 1)
+
+    with pytest.raises(TypeError, match="prompts must be a tuple"):
+        RolloutRequest(
+            prompts=["a"],
+            metadata=({},),
+            sample_id=("s0",),
+            prompt_id=("p0",),
+            group_id=("g0",),
+            branch_id=None,
+            context=StepContext(step=0, seed=7, epoch_tag=0),
+            kind="full_trajectory",
+            num_steps=4,
+            group_size=1,
+        )
+
+    with pytest.raises(ValueError, match="metadata"):
+        RolloutRequest(
+            prompts=("a", "b"),
+            metadata=({},),
+            sample_id=("s0", "s1"),
+            prompt_id=("p0", "p1"),
+            group_id=("g0", "g0"),
+            branch_id=None,
+            context=StepContext(step=0, seed=7, epoch_tag=0),
+            kind="full_trajectory",
+            num_steps=4,
+            group_size=2,
+        )
+    with pytest.raises(ValueError, match="sample_id entries must be unique"):
+        RolloutRequest(
+            prompts=("a", "b"),
+            metadata=({}, {}),
+            sample_id=("s0", "s0"),
+            prompt_id=("p0", "p1"),
+            group_id=("g0", "g0"),
+            branch_id=None,
+            context=StepContext(step=0, seed=7, epoch_tag=0),
+            kind="full_trajectory",
+            num_steps=4,
+            group_size=2,
+        )
+
+
+def test_reward_vector_validates_identity_values_and_metadata():
+    with pytest.raises(ValueError, match=r"shape \[B\]"):
+        RewardVector(
+            sample_id=("s0", "s1"),
+            values=torch.ones(1),
+            shared_metadata={},
+            sample_metadata=({}, {}),
+        )
+    with pytest.raises(ValueError, match="detached"):
+        RewardVector(
+            sample_id=("s0",),
+            values=torch.ones(1, requires_grad=True),
+            shared_metadata={},
+            sample_metadata=({},),
+        )
+    with pytest.raises(ValueError, match="finite"):
+        RewardVector(
+            sample_id=("s0",),
+            values=torch.tensor([float("nan")]),
+            shared_metadata={},
+            sample_metadata=({},),
+        )
+
+
 # ---------------------------------------------------------------------------
 # PolicyRecomputeStats.validate_against
 # ---------------------------------------------------------------------------
@@ -488,9 +535,18 @@ def test_policy_recompute_stats_validate_against_rejects_contract_violations():
     bad = -torch.ones(2, 2)
     bad[0, 0] = float("inf")
     with pytest.raises(ValueError, match="finite at active"):
-        PolicyRecomputeStats(new_log_probs=bad).validate_against(
+        PolicyRecomputeStats(new_log_probs=bad.requires_grad_(True)).validate_against(
             batch, require_reference=False
         )
+    with pytest.raises(ValueError, match="must require gradients"):
+        PolicyRecomputeStats(new_log_probs=-torch.ones(2, 2)).validate_against(
+            batch, require_reference=False
+        )
+    bad_mask_batch = batch.replace(transition_mask=torch.ones(2, 2))
+    with pytest.raises(TypeError, match="bool dtype"):
+        PolicyRecomputeStats(
+            new_log_probs=(-torch.ones(2, 2)).requires_grad_(True)
+        ).validate_against(bad_mask_batch, require_reference=False)
 
 
 def test_policy_recompute_stats_reference_contract():
@@ -527,6 +583,43 @@ def test_policy_recompute_stats_reference_contract():
             current_transition_mean=current,
             transition_std=torch.zeros(2, 2),
             reference_transition_mean=reference,
+        ).validate_against(batch, require_reference=True)
+
+
+def test_policy_recompute_reference_checks_only_active_transition_statistics():
+    batch = _tiny_batch()
+    new_log_probs = (-torch.ones(2, 2)).requires_grad_(True)
+    current = torch.zeros(2, 2, 3, requires_grad=True)
+    reference = torch.zeros(2, 2, 3)
+    std = torch.ones(2, 2)
+    with torch.no_grad():
+        current[0, 1] = float("nan")
+        reference[0, 1] = float("nan")
+        std[0, 1] = 0.0
+    PolicyRecomputeStats(
+        new_log_probs=new_log_probs,
+        current_transition_mean=current,
+        transition_std=std,
+        reference_transition_mean=reference,
+    ).validate_against(batch, require_reference=True)
+
+    bad_current = current.detach().clone().requires_grad_(True)
+    with torch.no_grad():
+        bad_current[0, 0, 0] = float("inf")
+    with pytest.raises(ValueError, match="current_transition_mean.*active"):
+        PolicyRecomputeStats(
+            new_log_probs=new_log_probs,
+            current_transition_mean=bad_current,
+            transition_std=std,
+            reference_transition_mean=reference,
+        ).validate_against(batch, require_reference=True)
+
+    with pytest.raises(TypeError, match="reference_transition_mean.*torch.Tensor"):
+        PolicyRecomputeStats(
+            new_log_probs=new_log_probs,
+            current_transition_mean=current,
+            transition_std=std,
+            reference_transition_mean=[[0.0]],
         ).validate_against(batch, require_reference=True)
 
 
