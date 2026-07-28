@@ -160,6 +160,22 @@ def _tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _normalized_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["run_id"] = "<run>"
+    for record in payload["records"]:
+        record["run_id"] = "<run>"
+    return payload
+
+
+def _metric_rows(path: Path) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    )
+
+
 def test_public_api_from_outside_repo_continuous_and_fresh_resume(
     tmp_path: Path,
 ) -> None:
@@ -214,6 +230,14 @@ def test_public_api_from_outside_repo_continuous_and_fresh_resume(
     assert split_two["audit_commits"] == continuous["audit_commits"] == 2
     assert _tree_digest(Path(split_two["checkpoint"])) == _tree_digest(
         Path(continuous["checkpoint"])
+    )
+    assert _normalized_manifest(
+        Path(split_two["manifest"])
+    ) == _normalized_manifest(Path(continuous["manifest"]))
+    assert _metric_rows(
+        Path(split_two["output_dir"]) / "metrics.jsonl"
+    ) == _metric_rows(
+        Path(continuous["output_dir"]) / "metrics.jsonl"
     )
 
 
@@ -290,13 +314,12 @@ def _public_gloo_worker(
 
 
 @pytest.mark.distributed
-@pytest.mark.skipif(
-    not dist.is_available() or not dist.is_gloo_available(),
-    reason="PyTorch Gloo is unavailable",
-)
 def test_two_rank_gloo_uses_public_api_from_outside_repo(
     tmp_path: Path,
 ) -> None:
+    assert dist.is_available() and dist.is_gloo_available(), (
+        "the dedicated API smoke requires CPU/Gloo"
+    )
     outside_dir = tmp_path / "outside-gloo"
     observer_dir = tmp_path / "observer"
     outside_dir.mkdir()
@@ -325,15 +348,26 @@ def test_two_rank_gloo_uses_public_api_from_outside_repo(
         )
         for rank in range(2)
     )
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=60)
-        if process.is_alive():
-            process.terminate()
+    started = []
+    timed_out = []
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        for process in started:
+            process.join(timeout=60)
+            if process.is_alive():
+                timed_out.append(process.name)
+    finally:
+        for process in started:
+            if process.is_alive():
+                process.terminate()
+        for process in started:
             process.join(timeout=5)
-            pytest.fail("public Gloo API worker timed out")
-        assert process.exitcode == 0
+    assert not timed_out, f"public Gloo API workers timed out: {timed_out}"
+    assert all(process.exitcode == 0 for process in started), tuple(
+        (process.name, process.exitcode) for process in started
+    )
     statuses = []
     for _ in processes:
         try:
@@ -349,6 +383,8 @@ def test_two_rank_gloo_uses_public_api_from_outside_repo(
     assert [row["rank"] for row in rows] == [0, 1]
     assert {row["cwd"] for row in rows} == {str(outside_dir)}
     assert len({row["run_id"] for row in rows}) == 1
+    assert len({row["output_dir"] for row in rows}) == 1
+    assert len({row["manifest"] for row in rows}) == 1
     assert all(row["committed_steps"] == 1 for row in rows)
     assert all(row["status_ok"] and row["audit_ok"] for row in rows)
 
