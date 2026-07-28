@@ -142,6 +142,26 @@ _CATALOG = (
         ),
     ),
     ComponentDescriptor(
+        "model",
+        "minwm_wan_rl",
+        "visual_rl.model_adapters.minwm_wan:MinWMWanAdapter",
+        "model_adapters/minwm_wan.py",
+        "model",
+        "v1",
+        (
+            "torch",
+            "diffusers",
+            "transformers",
+            "peft",
+            "omegaconf",
+            "easydict",
+            "einops",
+            "ftfy",
+            "regex",
+            "flash_attn",
+        ),
+    ),
+    ComponentDescriptor(
         "algorithm",
         "grpo",
         "visual_rl.optimizers.grpo:GRPOAlgorithm",
@@ -212,6 +232,24 @@ _CATALOG = (
         "reward",
         "v1",
         ("numpy",),
+    ),
+    ComponentDescriptor(
+        "reward",
+        "pickscore",
+        "visual_rl.feedback.pickscore:PickScoreRewardClient",
+        "feedback/pickscore.py",
+        "reward",
+        "v1",
+        ("numpy", "PIL", "torch", "transformers"),
+    ),
+    ComponentDescriptor(
+        "reward",
+        "video_hpsv3",
+        "visual_rl.feedback.video_hpsv3:VideoHPSv3RewardClient",
+        "feedback/video_hpsv3.py",
+        "reward",
+        "v1",
+        ("numpy", "PIL", "requests", "torch"),
     ),
     ComponentDescriptor(
         "reward",
@@ -457,10 +495,12 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
     if backend not in {"world_r1", "flash"}:
         errors.append("Wan wan_backend must be one of: flash, world_r1")
     builtin_rollout = ("rollout", config.sample.name) in _CATALOG_BY_KEY
-    if builtin_rollout and backend == "world_r1" and config.sample.name != "full_trajectory":
-        errors.append(
-            "Wan wan_backend=world_r1 only supports full_trajectory rollout"
-        )
+    if (
+        builtin_rollout
+        and backend == "world_r1"
+        and config.sample.name != "full_trajectory"
+    ):
+        errors.append("Wan wan_backend=world_r1 only supports full_trajectory rollout")
     if (
         builtin_rollout
         and backend == "flash"
@@ -480,9 +520,7 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
         "guidance_scale",
         config.sample.guidance_scale,
     )
-    if isinstance(guidance_scale, bool) or not isinstance(
-        guidance_scale, (int, float)
-    ):
+    if isinstance(guidance_scale, bool) or not isinstance(guidance_scale, (int, float)):
         errors.append("Wan guidance_scale must resolve to a number")
         guidance_scale_valid = False
     else:
@@ -524,7 +562,9 @@ def _validate_selected_wan_lora(config: VisualRLConfig, errors: list[str]) -> bo
     targets = extra.get("lora_target_modules")
     if targets is not None:
         if not isinstance(targets, (list, tuple)) or not targets:
-            errors.append("Wan lora_target_modules must be a non-empty list when use_lora=True")
+            errors.append(
+                "Wan lora_target_modules must be a non-empty list when use_lora=True"
+            )
         elif any(not isinstance(item, str) or not item.strip() for item in targets):
             errors.append("Wan lora_target_modules must contain non-empty strings")
         elif len({item.strip() for item in targets}) != len(targets):
@@ -568,16 +608,38 @@ def _validate_selected_flash_contract(
             "legacy_v0, reference_v1"
         )
         return
-    if objective_version == "reference_v1" and config.algorithm.beta != 0:
-        errors.append("Flash-GRPO reference_v1 requires beta=0")
-    if objective_version == "reference_v1" and _builtin_model_capability(
-        config,
-        _FLASH_REFERENCE_COEFFICIENT,
-    ) is False:
+    if config.algorithm.beta != 0:
+        errors.append(
+            "Flash-GRPO requires beta=0 until differentiable "
+            "current/reference KL is recomputed during the update"
+        )
+    if (
+        objective_version == "reference_v1"
+        and _builtin_model_capability(
+            config,
+            _FLASH_REFERENCE_COEFFICIENT,
+        )
+        is False
+    ):
         errors.append(
             "Flash-GRPO reference_v1 requires model capability "
             f"{_FLASH_REFERENCE_COEFFICIENT!r}; built-in model "
             f"{config.model.name!r} does not provide it for this configuration"
+        )
+
+
+def _validate_selected_grpo_contract(
+    config: VisualRLConfig,
+    errors: list[str],
+) -> None:
+    """Reject the rollout-time KL scalar that cannot regularize an update."""
+
+    if config.algorithm.name != "grpo":
+        return
+    if config.algorithm.beta != 0:
+        errors.append(
+            "GRPO requires beta=0 until differentiable current/reference KL is "
+            "recomputed during the update"
         )
 
 
@@ -688,9 +750,7 @@ def _validate_selected_tempflow_contract(
         or not math.isfinite(scale)
         or scale <= 0
     ):
-        errors.append(
-            "TempFlow reference_std_dev_t scale must be finite and positive"
-        )
+        errors.append("TempFlow reference_std_dev_t scale must be finite and positive")
 
     noise_level = config.rollout.get("noise_level", config.sample.noise_level)
     if (
@@ -702,8 +762,7 @@ def _validate_selected_tempflow_contract(
         errors.append("TempFlow noise_level must be a finite positive number")
     elif expected_reference_mode and float(noise_level) != 0.7:
         errors.append(
-            "TempFlow reference_v1 is pinned to the frozen SD3 kernel "
-            "noise_level=0.7"
+            "TempFlow reference_v1 is pinned to the frozen SD3 kernel noise_level=0.7"
         )
 
 
@@ -720,6 +779,7 @@ def static_preflight(config: VisualRLConfig) -> PreflightReport:
         raise StaticPreflightError(str(exc)) from exc
     errors: list[str] = []
     _validate_gradient_checkpointing(config, errors)
+    _validate_selected_grpo_contract(config, errors)
     _validate_selected_flash_contract(config, errors)
     wan_lora_selected = _validate_selected_wan_lora(config, errors)
     _validate_selected_tempflow_contract(config, errors)
@@ -907,7 +967,7 @@ def _commit_marker_payload(marker_path: Path) -> dict[str, Any]:
     if match is None:
         raise ResumePreflightError(
             f"Authoritative commit marker has an invalid name: {marker_path}"
-    )
+        )
     try:
         payload = load_json(marker_path)
         step = payload["completed_steps"]
@@ -983,9 +1043,7 @@ def resume_run_root(path_value: str | os.PathLike[str]) -> Path:
     else:
         raise ResumePreflightError(f"Unsupported resume path shape: {path}")
     if run_root.is_symlink():
-        raise ResumePreflightError(
-            f"Resume run root cannot be a symlink: {run_root}"
-        )
+        raise ResumePreflightError(f"Resume run root cannot be a symlink: {run_root}")
     try:
         resolved_root = run_root.resolve(strict=True)
     except OSError as exc:
@@ -993,9 +1051,7 @@ def resume_run_root(path_value: str | os.PathLike[str]) -> Path:
             f"Resume run root does not exist: {run_root}"
         ) from exc
     if not resolved_root.is_dir():
-        raise ResumePreflightError(
-            f"Resume run root is not a directory: {run_root}"
-        )
+        raise ResumePreflightError(f"Resume run root is not a directory: {run_root}")
     return resolved_root
 
 
@@ -1063,9 +1119,7 @@ def _validate_direct_checkpoint_marker(
     ]
     if not markers:
         raise _missing_transaction_marker(checkpoint)
-    matching = [
-        marker for marker in markers if int(marker["completed_steps"]) == step
-    ]
+    matching = [marker for marker in markers if int(marker["completed_steps"]) == step]
     if len(matching) != 1:
         raise ResumePreflightError(
             f"Direct checkpoint has no unique authoritative commit marker: {checkpoint}"
@@ -1191,7 +1245,9 @@ def resolve_resume_checkpoint(
         resolved_root = run_root.resolve(strict=True)
         resolved_latest = latest.resolve(strict=True)
     except OSError as exc:
-        raise ResumePreflightError(f"Invalid resume manifest path {latest}: {exc}") from exc
+        raise ResumePreflightError(
+            f"Invalid resume manifest path {latest}: {exc}"
+        ) from exc
     if resolved_latest.parent != resolved_root:
         raise ResumePreflightError(
             f"Resume manifest escapes run root {resolved_root}: {latest}"
@@ -1204,9 +1260,7 @@ def resolve_resume_checkpoint(
         expected_name = f"checkpoint_{step:06d}"
         checkpoint = payload.get("checkpoint", expected_name)
         if not isinstance(checkpoint, str) or checkpoint != expected_name:
-            raise ValueError(
-                f"checkpoint must be the relative name {expected_name!r}"
-            )
+            raise ValueError(f"checkpoint must be the relative name {expected_name!r}")
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ResumePreflightError(f"Invalid resume manifest {latest}: {exc}") from exc
     checkpoint_path = _validated_checkpoint_dir(

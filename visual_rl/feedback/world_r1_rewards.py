@@ -82,7 +82,9 @@ def _as_numpy(media: Any) -> np.ndarray:
         return media
     try:
         import torch
-    except ModuleNotFoundError:  # pragma: no cover - torch is an optional runtime dependency
+    except (
+        ModuleNotFoundError
+    ):  # pragma: no cover - torch is an optional runtime dependency
         torch = None
     if torch is not None and isinstance(media, torch.Tensor):
         return media.detach().cpu().numpy()
@@ -128,7 +130,10 @@ def _resolve_layout(
             raise ValueError(
                 f"media_layout must be one of {['auto', *allowed]}, got {requested!r}."
             )
-        if len(shape) != expected_dims[requested] or shape[channel_axes[requested]] != 3:
+        if (
+            len(shape) != expected_dims[requested]
+            or shape[channel_axes[requested]] != 3
+        ):
             raise ValueError(
                 f"media_layout {requested} requires {expected_dims[requested]} dimensions "
                 "with exactly 3 RGB channels."
@@ -150,13 +155,19 @@ def _resolve_layout(
 
 def _rgb_jpeg(image: np.ndarray) -> bytes:
     if image.ndim != 3 or image.shape[-1] != 3:
-        raise ValueError(f"JPEG frames must have shape [height, width, 3], got {image.shape}.")
+        raise ValueError(
+            f"JPEG frames must have shape [height, width, 3], got {image.shape}."
+        )
     if image.shape[0] <= 0 or image.shape[1] <= 0:
         raise ValueError("JPEG frames must have positive height and width.")
     try:
         from PIL import Image
-    except ModuleNotFoundError as exc:  # pragma: no cover - dependency error is environment-specific
-        raise ImportError("World-R1 JPEG encoding requires the 'pillow' package.") from exc
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - dependency error is environment-specific
+        raise ImportError(
+            "World-R1 JPEG encoding requires the 'pillow' package."
+        ) from exc
     buffer = BytesIO()
     Image.fromarray(image).save(buffer, format="JPEG")
     return buffer.getvalue()
@@ -232,6 +243,107 @@ def _validate_camera_trajectory(
     }
 
 
+def _world_r1_camera_matrix_string(matrix: np.ndarray) -> str:
+    return " ".join(
+        "[" + " ".join(format(float(value), ".17g") for value in row) + "]"
+        for row in matrix
+    )
+
+
+def _normalize_reward_camera_trajectory(
+    trajectory: Any,
+    *,
+    expected_frames: int | None,
+    entry: int,
+) -> dict[str, str]:
+    """Convert canonical MinWM w2c/OpenCV metadata to World-R1 wire form."""
+
+    if not isinstance(trajectory, Mapping):
+        return _validate_camera_trajectory(
+            trajectory,
+            expected_frames=expected_frames,
+            entry=entry,
+        )
+    minwm_keys = {"viewmats", "Ks", "convention", "coordinate_system"}
+    if not (set(trajectory) & minwm_keys):
+        return _validate_camera_trajectory(
+            trajectory,
+            expected_frames=expected_frames,
+            entry=entry,
+        )
+    if set(trajectory) != minwm_keys:
+        missing = sorted(minwm_keys - set(trajectory))
+        extra = sorted(set(trajectory) - minwm_keys)
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} must contain exactly "
+            f"{sorted(minwm_keys)}; missing={missing}, extra={extra}."
+        )
+    convention = trajectory["convention"]
+    coordinate_system = trajectory["coordinate_system"]
+    if not isinstance(convention, str) or convention.casefold() not in {
+        "w2c",
+        "world_to_camera",
+    }:
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} must use w2c convention."
+        )
+    if (
+        not isinstance(coordinate_system, str)
+        or coordinate_system.casefold() != "opencv"
+    ):
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} must use OpenCV "
+            "coordinates."
+        )
+    try:
+        viewmats = np.asarray(trajectory["viewmats"], dtype=np.float64)
+        intrinsics = np.asarray(trajectory["Ks"], dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} must contain numeric "
+            "viewmats and Ks."
+        ) from exc
+    if viewmats.ndim != 3 or viewmats.shape[1:] != (4, 4) or viewmats.shape[0] < 1:
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} viewmats must have "
+            "shape [frames, 4, 4]."
+        )
+    if intrinsics.shape != (viewmats.shape[0], 3, 3):
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} Ks must have shape "
+            f"[{viewmats.shape[0]}, 3, 3]."
+        )
+    if not np.isfinite(viewmats).all() or not np.isfinite(intrinsics).all():
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} viewmats and Ks "
+            "must be finite."
+        )
+    if np.any(intrinsics[:, 0, 0] <= 0.0) or np.any(intrinsics[:, 1, 1] <= 0.0):
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} Ks must have "
+            "positive fx and fy."
+        )
+    if not np.allclose(
+        intrinsics[:, 2, :],
+        np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            f"reward_3d MinWM camera_trajectory entry {entry} Ks must use "
+            "homogeneous OpenCV intrinsics with last row [0, 0, 1]."
+        )
+    converted = {
+        f"frame{index}": _world_r1_camera_matrix_string(matrix)
+        for index, matrix in enumerate(viewmats)
+    }
+    return _validate_camera_trajectory(
+        converted,
+        expected_frames=expected_frames,
+        entry=entry,
+    )
+
+
 def _validate_inputs(
     media: Any,
     prompts: list[str],
@@ -274,7 +386,9 @@ def _validate_sample_id(sample_id: Any, *, expected: int) -> list[str]:
             f"strict_v2 sample_id length must be {expected}, got {len(result)}."
         )
     if any(not isinstance(item, str) or not item.strip() for item in result):
-        raise RewardProtocolError("strict_v2 sample_id values must be non-empty strings.")
+        raise RewardProtocolError(
+            "strict_v2 sample_id values must be non-empty strings."
+        )
     if len(set(result)) != len(result):
         raise RewardProtocolError("strict_v2 sample_id values must be unique.")
     return result
@@ -294,7 +408,9 @@ def _float_vector(value: Any, *, expected: int, field: str) -> np.ndarray:
             f"World-R1 response {field!r} shape must be ({expected},), got {array.shape}."
         )
     if not np.isfinite(array).all():
-        raise RewardProtocolError(f"World-R1 response {field!r} contains non-finite values.")
+        raise RewardProtocolError(
+            f"World-R1 response {field!r} contains non-finite values."
+        )
     return array
 
 
@@ -320,8 +436,7 @@ def _json_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(payload)
     if "images" in result:
         result["images"] = [
-            base64.b64encode(bytes(image)).decode("ascii")
-            for image in result["images"]
+            base64.b64encode(bytes(image)).decode("ascii") for image in result["images"]
         ]
     if "videos" in result:
         result["videos"] = [
@@ -329,6 +444,18 @@ def _json_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             for video in result["videos"]
         ]
     return result
+
+
+def _positive_alignment_int(
+    alignment: Mapping[str, Any], field: str, *, entry: int
+) -> int:
+    value = alignment.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            f"metadata[{entry}].minwm_reward_frame_alignment.{field} "
+            "must be a positive integer."
+        )
+    return value
 
 
 def _reject_json_constant(value: str) -> None:
@@ -380,7 +507,9 @@ class _WorldR1RewardClient:
         self.allow_unsafe_pickle = allow_unsafe_pickle
         self.max_response_bytes = validate_max_response_bytes(max_response_bytes)
         self.media_layout = str(media_layout)
-        self.batch_size = self.default_batch_size if batch_size is None else int(batch_size)
+        self.batch_size = (
+            self.default_batch_size if batch_size is None else int(batch_size)
+        )
         self.server_revision = validate_server_revision(server_revision)
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("World-R1 reward timeout must be finite and positive.")
@@ -478,6 +607,8 @@ class _WorldR1RewardClient:
             if identities is not None:
                 payload["protocol_version"] = STRICT_V2
                 payload["sample_id"] = identities[start:stop]
+                if self.server_revision is not None:
+                    payload["server_revision"] = self.server_revision
             payloads.append(payload)
         return payloads, encoding_metadata
 
@@ -544,9 +675,18 @@ class _WorldR1RewardClient:
                     "identity_mode": "server_echo",
                     "sample_id_mode": "server_echo_strict_v2",
                     "server_identity_echo": True,
+                    "server_revision_echo": self.server_revision is not None,
                 }
             )
         result_metadata.update(all_details)
+        if self.protocol_mode == STRICT_V2:
+            result_metadata["sample_evidence"] = [
+                {
+                    "sample_id": echoed_ids[index],
+                    **{key: values[index] for key, values in all_details.items()},
+                }
+                for index in range(expected_total)
+            ]
         return np.asarray(all_values, dtype=np.float32), result_metadata
 
     def _request(self, payload: dict[str, Any]) -> Mapping[str, Any]:
@@ -606,7 +746,9 @@ class _WorldR1RewardClient:
             status = getattr(response, "status_code", None)
             if not isinstance(status, int):
                 close_http_response(response)
-                raise RewardTransportError("World-R1 transport response has no integer status_code.")
+                raise RewardTransportError(
+                    "World-R1 transport response has no integer status_code."
+                )
             if 500 <= status <= 599 and attempt < self.retries:
                 close_http_response(response)
                 self._backoff(attempt)
@@ -696,9 +838,20 @@ class _WorldR1RewardClient:
                 raise RewardProtocolError(
                     "strict_v2 response did not echo protocol_version='strict_v2'."
                 )
-            response_ids = _validate_sample_id(response.get("sample_id"), expected=expected)
+            response_ids = _validate_sample_id(
+                response.get("sample_id"), expected=expected
+            )
             if response_ids != requested_sample_id:
-                raise RewardProtocolError("strict_v2 response sample_id does not match the request.")
+                raise RewardProtocolError(
+                    "strict_v2 response sample_id does not match the request."
+                )
+            if (
+                self.server_revision is not None
+                and response.get("server_revision") != self.server_revision
+            ):
+                raise RewardProtocolError(
+                    "strict_v2 response server_revision does not match the configured scorer."
+                )
             if "valid_mask" not in response:
                 raise RewardProtocolError("strict_v2 response is missing 'valid_mask'.")
             valid = _bool_vector(
@@ -766,7 +919,9 @@ class WorldR1RewardGeneralClient(_WorldR1RewardClient):
             images = array
         else:
             frame_count = shape[1]
-            selected = frame_count // 2 if self.frame_index is None else self.frame_index
+            selected = (
+                frame_count // 2 if self.frame_index is None else self.frame_index
+            )
             if selected < 0 or selected >= frame_count:
                 raise ValueError(
                     f"reward_general frame_index {selected} is outside frame range "
@@ -781,7 +936,9 @@ class WorldR1RewardGeneralClient(_WorldR1RewardClient):
             "input_shape": list(shape),
             "input_layout": layout,
             "selected_frame_index": selected,
-            "selection_policy": "fixed_middle" if self.frame_index is None else "fixed_index",
+            "selection_policy": "fixed_middle"
+            if self.frame_index is None
+            else "fixed_index",
             "jpeg_encoding": dict(self._jpeg_encoding),
         }
 
@@ -807,18 +964,69 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
         timeout: float = 2000.0,
         retries: int = 2,
         require_camera_trajectory: bool = False,
+        frame_indices: Sequence[int] | None = None,
         **kwargs: Any,
     ) -> None:
         if not isinstance(require_camera_trajectory, bool):
             raise TypeError("require_camera_trajectory must be a boolean.")
         self.require_camera_trajectory = require_camera_trajectory
+        if frame_indices is None:
+            self.frame_indices: tuple[int, ...] | None = None
+        else:
+            if isinstance(frame_indices, (str, bytes)) or not isinstance(
+                frame_indices, Sequence
+            ):
+                raise TypeError("frame_indices must be a sequence of integers or None.")
+            resolved_indices = list(frame_indices)
+            if not resolved_indices:
+                raise ValueError("frame_indices must not be empty.")
+            if any(
+                isinstance(index, bool) or not isinstance(index, int)
+                for index in resolved_indices
+            ):
+                raise TypeError("frame_indices must contain only integers.")
+            if any(index < 0 for index in resolved_indices):
+                raise ValueError("frame_indices must contain only non-negative values.")
+            if len(set(resolved_indices)) != len(resolved_indices):
+                raise ValueError("frame_indices must contain unique values.")
+            if any(
+                current >= following
+                for current, following in zip(
+                    resolved_indices,
+                    resolved_indices[1:],
+                    strict=False,
+                )
+            ):
+                raise ValueError("frame_indices must be strictly increasing.")
+            self.frame_indices = tuple(resolved_indices)
         super().__init__(url, timeout=timeout, retries=retries, **kwargs)
+
+    @staticmethod
+    def _camera_conversion_identity() -> dict[str, str]:
+        return {
+            "input_pose_convention": "w2c",
+            "input_coordinate_system": "opencv",
+            "intrinsics_handling": "validated_not_transmitted",
+            "wire_camera_payload": "extrinsics_only_4x4_matrix_strings",
+        }
+
+    def _frame_policy(self) -> dict[str, Any]:
+        return {
+            "mode": (
+                "all_source_frames" if self.frame_indices is None else "fixed_indices"
+            ),
+            "source_frame_count": "runtime_media",
+            "selected_frame_indices": (
+                "all" if self.frame_indices is None else list(self.frame_indices)
+            ),
+        }
 
     def cache_fingerprint(self) -> dict[str, Any] | None:
         fingerprint = super().cache_fingerprint()
         if fingerprint is None:
             return None
         fingerprint["require_camera_trajectory"] = self.require_camera_trajectory
+        fingerprint["camera_conversion"] = self._camera_conversion_identity()
         return fingerprint
 
     def _encode_media(
@@ -838,16 +1046,35 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
             videos = np.transpose(array, (0, 1, 3, 4, 2))
         else:
             videos = array
-        frame_count = int(videos.shape[1])
-        if frame_count <= 0:
+        source_frame_count = int(videos.shape[1])
+        if source_frame_count <= 0:
             raise ValueError("World-R1 3D videos must contain at least one frame.")
+        selected_indices = (
+            list(range(source_frame_count))
+            if self.frame_indices is None
+            else list(self.frame_indices)
+        )
+        if selected_indices[-1] >= source_frame_count:
+            raise ValueError(
+                f"reward_3d frame index {selected_indices[-1]} is outside source "
+                f"frame range 0..{source_frame_count - 1}."
+            )
+        if self.frame_indices is not None:
+            videos = videos[:, selected_indices]
+        selected_frame_count = int(videos.shape[1])
         encoded = [[self._jpeg_encoder(frame) for frame in video] for video in videos]
         return encoded, {
             "input_shape": list(shape),
             "input_layout": layout,
-            "frames_per_video": frame_count,
+            "source_frames_per_video": source_frame_count,
+            "selected_frame_indices": selected_indices,
+            "frames_per_video": selected_frame_count,
+            "selection_policy": (
+                "all_source_frames" if self.frame_indices is None else "fixed_indices"
+            ),
             "promoted_single_frame": len(shape) == 4,
             "jpeg_encoding": dict(self._jpeg_encoding),
+            "camera_conversion": self._camera_conversion_identity(),
         }
 
     def _build_payload(
@@ -858,12 +1085,13 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
     ) -> dict[str, Any]:
         trajectories = []
         for index, (video, item) in enumerate(zip(encoded, metadata, strict=True)):
+            self._validate_minwm_frame_alignment(item, video, entry=index)
             trajectory = item.get("camera_trajectory")
             if trajectory is None and not self.require_camera_trajectory:
                 trajectories.append(None)
                 continue
             trajectories.append(
-                _validate_camera_trajectory(
+                _normalize_reward_camera_trajectory(
                     trajectory,
                     expected_frames=(
                         len(video) if self.protocol_mode == STRICT_V2 else None
@@ -877,6 +1105,49 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
             "camera_trajectories": trajectories,
         }
 
+    def _validate_minwm_frame_alignment(
+        self,
+        metadata: Mapping[str, Any],
+        video: Sequence[bytes],
+        *,
+        entry: int,
+    ) -> None:
+        alignment = metadata.get("minwm_reward_frame_alignment")
+        if alignment is None:
+            return
+        if not isinstance(alignment, Mapping) or alignment.get("contract") != (
+            "minwm_vae_camera_alignment_v1"
+        ):
+            raise ValueError(
+                f"metadata[{entry}].minwm_reward_frame_alignment is invalid."
+            )
+        latent_frames = _positive_alignment_int(alignment, "latent_frames", entry=entry)
+        decoded_frames = _positive_alignment_int(
+            alignment, "decoded_media_frames", entry=entry
+        )
+        temporal_stride = _positive_alignment_int(
+            alignment, "vae_temporal_stride", entry=entry
+        )
+        if decoded_frames != 1 + temporal_stride * (latent_frames - 1):
+            raise ValueError(
+                f"metadata[{entry}] MinWM decoded frame geometry is inconsistent."
+            )
+        expected = tuple(range(0, decoded_frames, temporal_stride))
+        if len(expected) != latent_frames:
+            raise ValueError(
+                f"metadata[{entry}] MinWM camera alignment count is inconsistent."
+            )
+        if self.frame_indices != expected:
+            raise ValueError(
+                "reward_3d frame_indices must match MinWM VAE camera alignment: "
+                f"expected {list(expected)}."
+            )
+        if len(video) != latent_frames:
+            raise ValueError(
+                f"metadata[{entry}] MinWM reward video must contain exactly "
+                f"{latent_frames} aligned frames."
+            )
+
     def _parse_details(
         self,
         details: Any,
@@ -887,7 +1158,9 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
         if details is None:
             return {}
         if isinstance(details, (str, bytes)) or not isinstance(details, Sequence):
-            raise RewardProtocolError("World-R1 3D response details must be a sequence.")
+            raise RewardProtocolError(
+                "World-R1 3D response details must be a sequence."
+            )
         items = list(details)
         if len(items) != expected:
             raise RewardProtocolError(
@@ -925,7 +1198,9 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
                 ordered_items.append((response_index, item))
                 continue
             video_id = item.get("video_id")
-            if isinstance(video_id, bool) or not isinstance(video_id, (int, np.integer)):
+            if isinstance(video_id, bool) or not isinstance(
+                video_id, (int, np.integer)
+            ):
                 raise RewardProtocolError(
                     f"World-R1 3D response details[{response_index}].video_id must be an integer."
                 )

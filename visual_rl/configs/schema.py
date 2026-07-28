@@ -106,6 +106,7 @@ class RewardConfig:
     clients: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {"mock": {"name": "mock"}}
     )
+    schedule: list[dict[str, Any]] = field(default_factory=list)
     cache_dir: str | None = None
     fail_policy: str = "invalid"
 
@@ -549,6 +550,149 @@ def _validate_core_numeric_config(cfg: VisualRLConfig) -> None:
         )
 
 
+_REWARD_SCHEDULE_PHASE_FIELDS = frozenset({"name", "start_step", "end_step", "weights"})
+
+
+def normalize_reward_schedule(
+    schedule: Any,
+    *,
+    weights: Mapping[str, Any],
+    clients: Mapping[str, Any],
+    max_steps: int | None = None,
+) -> list[dict[str, Any]]:
+    """Validate and detach a step-aware reward schedule.
+
+    Phases use zero-based, half-open step intervals.  Omitting a reward from a
+    phase is the only supported way to disable it, which lets the router avoid
+    calling an inactive scorer altogether.
+    """
+
+    if not isinstance(schedule, list):
+        raise TypeError("rewards.schedule must be a list")
+    if not schedule:
+        return []
+    if not isinstance(weights, Mapping):
+        raise TypeError("rewards.weights must be a mapping")
+    if not isinstance(clients, Mapping):
+        raise TypeError("rewards.clients must be a mapping")
+
+    declared_weights = set(weights)
+    declared_clients = set(clients)
+    normalized: list[dict[str, Any]] = []
+    names: set[str] = set()
+    previous_end: int | None = None
+
+    for index, phase in enumerate(schedule):
+        path = f"rewards.schedule[{index}]"
+        if not isinstance(phase, Mapping):
+            raise TypeError(f"{path} must be a mapping")
+        unknown = sorted(set(phase).difference(_REWARD_SCHEDULE_PHASE_FIELDS))
+        missing = sorted(_REWARD_SCHEDULE_PHASE_FIELDS.difference(phase))
+        if unknown:
+            raise ValueError(f"{path} has unknown fields: {unknown}")
+        if missing:
+            raise ValueError(f"{path} is missing required fields: {missing}")
+
+        name = phase["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{path}.name must be a non-empty string")
+        name = name.strip()
+        if name in names:
+            raise ValueError(f"rewards.schedule phase name {name!r} is duplicated")
+        names.add(name)
+
+        start_step = phase["start_step"]
+        end_step = phase["end_step"]
+        for field_name, value in (
+            ("start_step", start_step),
+            ("end_step", end_step),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{path}.{field_name} must be an integer")
+        if start_step < 0:
+            raise ValueError(f"{path}.start_step must be non-negative")
+        if end_step <= start_step:
+            raise ValueError(f"{path}.end_step must be greater than start_step")
+        expected_start = 0 if previous_end is None else previous_end
+        if start_step != expected_start:
+            raise ValueError(
+                "rewards.schedule phases must be contiguous and start at step 0: "
+                f"{path}.start_step is {start_step}, expected {expected_start}"
+            )
+
+        phase_weights = phase["weights"]
+        if not isinstance(phase_weights, Mapping):
+            raise TypeError(f"{path}.weights must be a mapping")
+        if not phase_weights:
+            raise ValueError(f"{path}.weights must not be empty")
+        unknown_weights = sorted(set(phase_weights).difference(declared_weights))
+        if unknown_weights:
+            raise ValueError(
+                f"{path}.weights reference undeclared rewards.weights entries: "
+                f"{unknown_weights}"
+            )
+        unknown_clients = sorted(set(phase_weights).difference(declared_clients))
+        if unknown_clients:
+            raise ValueError(
+                f"{path}.weights reference undeclared rewards.clients entries: "
+                f"{unknown_clients}"
+            )
+
+        normalized_weights: dict[str, float] = {}
+        for reward_name, weight in phase_weights.items():
+            weight_path = f"{path}.weights[{reward_name!r}]"
+            if not isinstance(reward_name, str) or not reward_name:
+                raise ValueError(f"{path}.weights keys must be non-empty strings")
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or not math.isfinite(float(weight))
+            ):
+                raise ValueError(f"{weight_path} must be a finite number")
+            if float(weight) == 0.0:
+                raise ValueError(
+                    f"{weight_path} must be non-zero; omit inactive rewards instead"
+                )
+            normalized_weights[reward_name] = float(weight)
+
+        normalized.append(
+            {
+                "name": name,
+                "start_step": start_step,
+                "end_step": end_step,
+                "weights": normalized_weights,
+            }
+        )
+        previous_end = end_step
+
+    if max_steps is not None and previous_end is not None and previous_end < max_steps:
+        raise ValueError(
+            "rewards.schedule must cover train.max_steps: "
+            f"final end_step is {previous_end}, train.max_steps is {max_steps}"
+        )
+    return normalized
+
+
+def _validate_reward_schedule_config(cfg: VisualRLConfig) -> None:
+    schedule = normalize_reward_schedule(
+        cfg.rewards.schedule,
+        weights=cfg.rewards.weights,
+        clients=cfg.rewards.clients,
+        max_steps=cfg.train.max_steps,
+    )
+    if not schedule:
+        return
+    if cfg.rewards.provider != "reward_router":
+        raise ValueError(
+            "rewards.schedule is only supported by rewards.provider='reward_router'"
+        )
+    if cfg.algorithm.weight_advantages:
+        raise ValueError(
+            "rewards.schedule is incompatible with algorithm.weight_advantages=true; "
+            "scheduled raw reward keys are phase-dependent"
+        )
+
+
 def _validate_runtime_config(cfg: VisualRLConfig) -> None:
     if cfg.train.precision not in {"fp32", "bf16", "fp16"}:
         raise ValueError("train.precision must be one of: fp32, bf16, fp16")
@@ -660,13 +804,125 @@ def _validate_runtime_config(cfg: VisualRLConfig) -> None:
         )
 
 
+def _validate_minwm_runtime_config(cfg: VisualRLConfig) -> None:
+    """Reject the few settings that make the bounded MinWM update invalid."""
+
+    if cfg.model.name != "minwm_wan_rl":
+        return
+    extra = cfg.model.extra
+    if not cfg.use_lora:
+        raise ValueError("minwm_wan_rl requires use_lora=true")
+    if extra.get("stage", "dmd") != "dmd":
+        raise ValueError("minwm_wan_rl currently supports only model.extra.stage=dmd")
+    if extra.get("transition_kernel", "x0_renoise") != "x0_renoise":
+        raise ValueError(
+            "minwm_wan_rl requires model.extra.transition_kernel=x0_renoise"
+        )
+    if cfg.algorithm.name != "grpo" or cfg.sample.name != "full_trajectory":
+        raise ValueError(
+            "minwm_wan_rl currently requires GRPO with full_trajectory rollout"
+        )
+    if float(cfg.sample.guidance_scale) != 1.0:
+        raise ValueError("minwm_wan_rl currently requires sample.guidance_scale=1")
+    timesteps = cfg.rollout.get("denoising_timesteps")
+    if not isinstance(timesteps, (list, tuple)) or len(timesteps) != int(
+        cfg.sample.num_steps
+    ):
+        raise ValueError(
+            "minwm_wan_rl requires rollout.denoising_timesteps to match "
+            "sample.num_steps"
+        )
+    if extra.get("replay_credit_assignment", "sample_one") != "sample_one":
+        raise ValueError(
+            "minwm_wan_rl requires model.extra.replay_credit_assignment=sample_one"
+        )
+    if cfg.train.update_microbatch_size != 1:
+        raise ValueError(
+            "minwm_wan_rl sample_one replay requires train.update_microbatch_size=1"
+        )
+    camera = cfg.rollout.get("camera_control")
+    if not isinstance(camera, Mapping) or not isinstance(camera.get("trajectory"), str):
+        raise ValueError("minwm_wan_rl requires rollout.camera_control.trajectory")
+
+    native_factory = (
+        "visual_rl.model_adapters.minwm_wan_native_backend:"
+        "build_minwm_wan_native_backend"
+    )
+    if extra.get("backend_factory") == native_factory:
+        profile = {
+            "chunk_size": 4,
+            "total_frames": 20,
+            "latent_channels": 16,
+            "latent_height": 60,
+            "latent_width": 104,
+            "local_attn_size": 20,
+            "dtype": "bfloat16",
+        }
+        mismatched = [
+            f"{name}={extra.get(name)!r} (expected {expected!r})"
+            for name, expected in profile.items()
+            if extra.get(name) != expected
+        ]
+        if mismatched:
+            raise ValueError(
+                "minwm_wan_rl native geometry mismatch: " + "; ".join(mismatched)
+            )
+        if (
+            cfg.sample.batch_size != 1
+            or cfg.sample.num_steps != 4
+            or cfg.sample.samples_per_prompt != 4
+            or cfg.train.precision != "bf16"
+            or cfg.rollout.get("num_chunks") != 5
+            or cfg.rollout.get("chunk_size") != 4
+            or list(timesteps) != [1000, 750, 500, 250]
+        ):
+            raise ValueError(
+                "minwm_wan_rl native gate requires batch_size=1, num_steps=4, "
+                "samples_per_prompt=4, precision=bf16, num_chunks=5, "
+                "chunk_size=4, and denoising_timesteps=[1000,750,500,250]"
+            )
+
+    for client_key, declaration in cfg.rewards.clients.items():
+        if not isinstance(declaration, Mapping):
+            continue
+        client_name = declaration.get("name", client_key)
+        if client_name not in {"reward_general", "reward_3d"}:
+            continue
+        params = {
+            key: value
+            for key, value in declaration.items()
+            if key not in {"name", "version", "params", "target"}
+        }
+        nested = declaration.get("params", {})
+        if isinstance(nested, Mapping):
+            params.update(nested)
+        revision = params.get("server_revision")
+        if (
+            params.get("protocol_mode") != "strict_v2"
+            or not isinstance(revision, str)
+            or not revision.strip()
+        ):
+            raise ValueError(
+                f"minwm_wan_rl {client_name} client requires strict_v2 and "
+                "a frozen server_revision"
+            )
+        if client_name == "reward_3d" and params.get("frame_indices") != list(
+            range(0, 77, 4)
+        ):
+            raise ValueError(
+                "minwm_wan_rl reward_3d requires frame_indices=[0,4,...,76]"
+            )
+
+
 def _validate_typed_config(cfg: VisualRLConfig) -> None:
     """Apply every semantic validator to an already type-checked config."""
 
     _validate_algorithm_sample_pair(cfg)
     _validate_evaluation_config(cfg)
     _validate_core_numeric_config(cfg)
+    _validate_reward_schedule_config(cfg)
     _validate_runtime_config(cfg)
+    _validate_minwm_runtime_config(cfg)
 
 
 def validate_config(config: VisualRLConfig) -> None:

@@ -391,7 +391,7 @@ def test_preflight_validates_backend_selected_root_and_dependencies(tmp_path: Pa
     )
 
     config.algorithm.beta = 0.1
-    with pytest.raises(StaticPreflightError, match="reference_v1 requires beta=0"):
+    with pytest.raises(StaticPreflightError, match="requires beta=0"):
         static_preflight(config)
     config.algorithm.beta = 0.0
     config.model.extra["wan_backend"] = "mixed"

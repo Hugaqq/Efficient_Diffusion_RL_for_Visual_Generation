@@ -71,9 +71,7 @@ def test_static_preflight_has_no_runtime_import_or_directory_side_effect(
     }
     assert all(item.version for item in report.components)
     assert all(item["version"] for item in report.to_dict()["components"])
-    assert report.to_dict()["resolved_config_sha256"] == (
-        report.resolved_config_sha256
-    )
+    assert report.to_dict()["resolved_config_sha256"] == (report.resolved_config_sha256)
 
 
 def test_static_preflight_config_fingerprint_and_dict_are_stable(tmp_path):
@@ -85,6 +83,17 @@ def test_static_preflight_config_fingerprint_and_dict_are_stable(tmp_path):
     assert len(first.resolved_config_sha256) == 64
     assert first.resolved_config_sha256 == second.resolved_config_sha256
     assert first.to_dict() == second.to_dict()
+
+
+def test_grpo_nonzero_beta_fails_before_runtime_import(tmp_path) -> None:
+    config = _resolved(tmp_path)
+    config.algorithm.beta = 0.1
+
+    with pytest.raises(
+        StaticPreflightError,
+        match="GRPO requires beta=0 until differentiable current/reference KL",
+    ):
+        static_preflight(config)
 
 
 def test_flash_wan_reference_yaml_still_passes_generic_flash_contract(tmp_path):

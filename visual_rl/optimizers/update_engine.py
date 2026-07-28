@@ -100,10 +100,35 @@ class UpdateEngine:
             .detach()
             .float()
         )
-        delta = new_log_probs - old_log_probs
+        if tuple(old_log_probs.shape) != tuple(new_log_probs.shape):
+            raise ValueError(
+                "old/new log probabilities must have identical shapes for "
+                f"metrics: {tuple(old_log_probs.shape)} != "
+                f"{tuple(new_log_probs.shape)}"
+            )
+        if batch.transition_mask is None:
+            transition_mask = torch.ones_like(new_log_probs, dtype=torch.bool)
+        else:
+            transition_mask = torch.as_tensor(
+                batch.transition_mask,
+                device=new_log_probs.device,
+                dtype=torch.bool,
+            )
+            if tuple(transition_mask.shape) != tuple(new_log_probs.shape):
+                raise ValueError(
+                    "transition_mask must have the same shape as log "
+                    f"probabilities: {tuple(transition_mask.shape)} != "
+                    f"{tuple(new_log_probs.shape)}"
+                )
+        if not bool(transition_mask.any()):
+            raise ValueError("log-prob metrics require at least one active transition")
+
+        active_old = old_log_probs.masked_select(transition_mask)
+        active_new = new_log_probs.masked_select(transition_mask)
+        delta = active_new - active_old
         metrics = {
-            "old_logprob_mean": float(old_log_probs.mean().cpu()),
-            "new_logprob_mean": float(new_log_probs.mean().cpu()),
+            "old_logprob_mean": float(active_old.mean().cpu()),
+            "new_logprob_mean": float(active_new.mean().cpu()),
             "logprob_delta_mean": float(delta.mean().cpu()),
             "logprob_delta_abs_max": float(delta.abs().max().cpu()),
         }
@@ -116,8 +141,15 @@ class UpdateEngine:
                 .detach()
                 .float()
             )
-            metrics["rollout_kl_mean"] = float(kl.mean().cpu())
-            metrics["rollout_kl_abs_max"] = float(kl.abs().max().cpu())
+            if tuple(kl.shape) != tuple(new_log_probs.shape):
+                raise ValueError(
+                    "rollout KL must have the same shape as log probabilities "
+                    f"for metrics: {tuple(kl.shape)} != "
+                    f"{tuple(new_log_probs.shape)}"
+                )
+            active_kl = kl.masked_select(transition_mask)
+            metrics["rollout_kl_mean"] = float(active_kl.mean().cpu())
+            metrics["rollout_kl_abs_max"] = float(active_kl.abs().max().cpu())
         return metrics
 
     def _validate_pre_update(
@@ -376,12 +408,7 @@ class UpdateEngine:
 
     @staticmethod
     def _logprob_element_count(batch: RolloutBatch) -> int:
-        import torch
-
-        old_log_probs = torch.as_tensor(batch.old_log_probs)
-        if old_log_probs.ndim == 0 or old_log_probs.shape[0] != batch.batch_size:
-            raise ValueError("old_log_probs must have a batch dimension")
-        return old_log_probs.numel()
+        return UpdateEngine._default_reduction_weight(batch)
 
     @staticmethod
     def _default_reduction_weight(batch: RolloutBatch) -> int:

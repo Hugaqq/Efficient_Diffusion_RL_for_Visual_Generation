@@ -105,7 +105,9 @@ class FakeTransport:
             wire_payload = json.loads(data)
             payload = dict(wire_payload)
             if "images" in payload:
-                payload["images"] = [base64.b64decode(item) for item in payload["images"]]
+                payload["images"] = [
+                    base64.b64decode(item) for item in payload["images"]
+                ]
             if "videos" in payload:
                 payload["videos"] = [
                     [base64.b64decode(frame) for frame in video]
@@ -206,16 +208,25 @@ def _jpeg_size(data):
 
 
 def _camera_matrix(translation: float = 0.0) -> str:
-    return (
-        "[1 0 0 0] [0 1 0 0] [0 0 1 0] "
-        f"[{translation:.6g} 0 0 1]"
-    )
+    return f"[1 0 0 0] [0 1 0 0] [0 0 1 0] [{translation:.6g} 0 0 1]"
 
 
 def _camera_trajectory(frames: int, *, offset: float = 0.0) -> dict[str, str]:
     return {
         f"frame{index}": _camera_matrix(offset + index * 0.001)
         for index in range(frames)
+    }
+
+
+def _minwm_camera_trajectory(frames: int) -> dict[str, object]:
+    viewmats = np.repeat(np.eye(4, dtype=np.float32)[None], frames, axis=0)
+    viewmats[:, 0, 3] = np.arange(frames, dtype=np.float32) / 10.0
+    intrinsics = np.repeat(np.eye(3, dtype=np.float32)[None], frames, axis=0)
+    return {
+        "viewmats": viewmats.tolist(),
+        "Ks": intrinsics.tolist(),
+        "convention": "w2c",
+        "coordinate_system": "opencv",
     }
 
 
@@ -245,9 +256,7 @@ def test_url_and_error_redaction_remove_deeply_encoded_url_secrets(
 
     displayed = redact_url(url)
     error = redact_error_text(
-        RuntimeError(
-            f"plain={url} encoded={encoded_url} failed: " + "x" * 1000
-        )
+        RuntimeError(f"plain={url} encoded={encoded_url} failed: " + "x" * 1000)
     )
 
     for value in (
@@ -315,7 +324,10 @@ def test_reference_general_payload_is_jpeg_and_uses_fixed_middle_frame():
     assert first.tolist() == pytest.approx([0.25, 0.75])
     assert second.tolist() == pytest.approx(first.tolist())
     assert transport.calls[0]["payload"].keys() == {"images", "prompts"}
-    assert transport.calls[0]["payload"]["images"] == transport.calls[1]["payload"]["images"]
+    assert (
+        transport.calls[0]["payload"]["images"]
+        == transport.calls[1]["payload"]["images"]
+    )
     assert [_jpeg_size(item) for item in transport.calls[0]["payload"]["images"]] == [
         ((6, 4), "RGB"),
         ((6, 4), "RGB"),
@@ -341,9 +353,7 @@ def test_default_json_wire_base64_encodes_jpegs_and_never_loads_pickle(monkeypat
         lambda *_args, **_kwargs: pytest.fail("json_v1 called pickle.loads"),
     )
 
-    values, _ = client.score(
-        np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}]
-    )
+    values, _ = client.score(np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}])
 
     call = transport.calls[0]
     encoded = call["wire_payload"]["images"][0]
@@ -361,14 +371,20 @@ def test_uint8_channel_last_and_torch_channel_first_are_supported():
         "http://localhost:8090", transport=numpy_transport, media_layout="BHWC"
     )
     numpy_client.score(np.zeros((1, 4, 5, 3), dtype=np.uint8), ["p"], [{}])
-    assert _jpeg_size(numpy_transport.calls[0]["payload"]["images"][0]) == ((5, 4), "RGB")
+    assert _jpeg_size(numpy_transport.calls[0]["payload"]["images"][0]) == (
+        (5, 4),
+        "RGB",
+    )
 
     torch_transport = FakeTransport(_response({"outputs": [2.0]}))
     torch_client = WorldR1RewardGeneralClient(
         "http://localhost:8090", transport=torch_transport, media_layout="BCHW"
     )
     torch_client.score(torch.zeros(1, 3, 4, 5, dtype=torch.uint8), ["p"], [{}])
-    assert _jpeg_size(torch_transport.calls[0]["payload"]["images"][0]) == ((5, 4), "RGB")
+    assert _jpeg_size(torch_transport.calls[0]["payload"]["images"][0]) == (
+        (5, 4),
+        "RGB",
+    )
 
 
 @pytest.mark.parametrize(
@@ -433,6 +449,67 @@ def test_reference_3d_payload_camera_trajectory_and_details_are_batch_aligned():
     assert result[TRAJECTORY_COMPARISON_PATHS] == ["/tmp/a.json", ""]
 
 
+def test_reward_3d_aligns_77_decoded_frames_with_20_minwm_camera_poses():
+    selected = list(range(0, 77, 4))
+    media = np.zeros((1, 77, 1, 1, 3), dtype=np.uint8)
+    media[0, :, 0, 0, :] = np.arange(77, dtype=np.uint8)[:, None]
+    client = WorldR1Reward3DClient(
+        "http://localhost:8089",
+        transport=FakeTransport(),
+        media_layout="BFHWC",
+        protocol_mode="strict_v2",
+        server_revision="world-r1-test",
+        require_camera_trajectory=True,
+        frame_indices=selected,
+        jpeg_encoder=lambda frame: bytes([int(frame[0, 0, 0])]),
+    )
+
+    metadata = {
+        "camera_trajectory": _minwm_camera_trajectory(20),
+        "minwm_reward_frame_alignment": {
+            "contract": "minwm_vae_camera_alignment_v1",
+            "latent_frames": 20,
+            "decoded_media_frames": 77,
+            "vae_temporal_stride": 4,
+        },
+    }
+    payloads, evidence = client.prepare_payloads(
+        media,
+        ["move through the scene"],
+        [metadata],
+        sample_id=["sample-0"],
+    )
+
+    assert payloads[0]["videos"] == [[bytes([index]) for index in selected]]
+    assert list(payloads[0]["camera_trajectories"][0]) == [
+        f"frame{index}" for index in range(20)
+    ]
+    assert evidence["selected_frame_indices"] == selected
+    fingerprint = client.cache_fingerprint()
+    assert fingerprint["frame_policy"]["selected_frame_indices"] == selected
+    assert fingerprint["camera_conversion"]["input_pose_convention"] == "w2c"
+
+    wrong = selected.copy()
+    wrong[1] = 5
+    misaligned = WorldR1Reward3DClient(
+        "http://localhost:8089",
+        transport=FakeTransport(),
+        media_layout="BFHWC",
+        protocol_mode="strict_v2",
+        server_revision="world-r1-test",
+        require_camera_trajectory=True,
+        frame_indices=wrong,
+        jpeg_encoder=lambda frame: bytes([int(frame[0, 0, 0])]),
+    )
+    with pytest.raises(ValueError, match="must match MinWM VAE camera alignment"):
+        misaligned.prepare_payloads(
+            media,
+            ["move through the scene"],
+            [metadata],
+            sample_id=["sample-0"],
+        )
+
+
 def test_released_reference_3d_details_support_trusted_order_contract():
     details = [
         {
@@ -447,9 +524,7 @@ def test_released_reference_3d_details_support_trusted_order_contract():
     ]
     client = WorldR1Reward3DClient(
         "http://localhost:8089",
-        transport=FakeTransport(
-            _response({"outputs": [0.6], "details": details})
-        ),
+        transport=FakeTransport(_response({"outputs": [0.6], "details": details})),
         media_layout="BFCHW",
     )
 
@@ -562,7 +637,9 @@ def test_reward_3d_can_require_non_empty_camera_trajectory_mapping(trajectory):
         media_layout="BCHW",
         require_camera_trajectory=True,
     )
-    with pytest.raises(ValueError, match="camera_trajectory must be a non-empty mapping"):
+    with pytest.raises(
+        ValueError, match="camera_trajectory must be a non-empty mapping"
+    ):
         client.prepare_payloads(
             np.zeros((1, 3, 4, 5), dtype=np.uint8),
             ["p"],
@@ -748,6 +825,70 @@ def test_strict_v2_requires_echoed_identity_version_and_boolean_mask():
     assert metadata["sample_id"] == sample_id
     assert metadata["valid_mask"] == [True, False]
     assert metadata["identity_mode"] == "server_echo"
+    assert metadata["server_revision_echo"] is False
+
+
+@pytest.mark.parametrize("echoed_revision", [None, "other-revision"])
+def test_strict_v2_rejects_missing_or_mismatched_server_revision(echoed_revision):
+    sample_id = ["sample-a"]
+    response = {
+        "outputs": [0.1],
+        "protocol_version": "strict_v2",
+        "sample_id": sample_id,
+        "valid_mask": [True],
+    }
+    if echoed_revision is not None:
+        response["server_revision"] = echoed_revision
+    transport = FakeTransport(_response(response))
+    client = WorldR1RewardGeneralClient(
+        "http://localhost:8090",
+        transport=transport,
+        protocol_mode="strict_v2",
+        media_layout="BCHW",
+        server_revision="expected-revision",
+    )
+
+    with pytest.raises(RewardProtocolError, match="server_revision"):
+        client.score(
+            np.zeros((1, 3, 4, 5), dtype=np.uint8),
+            ["prompt"],
+            [{}],
+            sample_id=sample_id,
+        )
+
+    assert transport.calls[0]["payload"]["server_revision"] == "expected-revision"
+
+
+def test_strict_v2_accepts_and_records_matching_server_revision():
+    sample_id = ["sample-a"]
+    transport = FakeTransport(
+        _response(
+            {
+                "outputs": [0.1],
+                "protocol_version": "strict_v2",
+                "sample_id": sample_id,
+                "valid_mask": [True],
+                "server_revision": "expected-revision",
+            }
+        )
+    )
+    client = WorldR1RewardGeneralClient(
+        "http://localhost:8090",
+        transport=transport,
+        protocol_mode="strict_v2",
+        media_layout="BCHW",
+        server_revision="expected-revision",
+    )
+
+    _, metadata = client.score(
+        np.zeros((1, 3, 4, 5), dtype=np.uint8),
+        ["prompt"],
+        [{}],
+        sample_id=sample_id,
+    )
+
+    assert metadata["server_revision"] == "expected-revision"
+    assert metadata["server_revision_echo"] is True
 
 
 def test_strict_v2_chunks_five_items_as_two_two_one_and_preserves_order():
@@ -760,6 +901,7 @@ def test_strict_v2_chunks_five_items_as_two_two_one_and_preserves_order():
                 "protocol_version": "strict_v2",
                 "sample_id": sample_id[:2],
                 "valid_mask": [True, True],
+                "server_revision": "general-hps-v2.1-sha256:fixture",
             }
         ),
         _response(
@@ -768,6 +910,7 @@ def test_strict_v2_chunks_five_items_as_two_two_one_and_preserves_order():
                 "protocol_version": "strict_v2",
                 "sample_id": sample_id[2:4],
                 "valid_mask": [True, True],
+                "server_revision": "general-hps-v2.1-sha256:fixture",
             }
         ),
         _response(
@@ -776,6 +919,7 @@ def test_strict_v2_chunks_five_items_as_two_two_one_and_preserves_order():
                 "protocol_version": "strict_v2",
                 "sample_id": sample_id[4:],
                 "valid_mask": [True],
+                "server_revision": "general-hps-v2.1-sha256:fixture",
             }
         ),
     )
@@ -925,9 +1069,7 @@ def test_injected_transient_transport_errors_are_retried(error):
         media_layout="BCHW",
     )
 
-    values, _ = client.score(
-        np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}]
-    )
+    values, _ = client.score(np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}])
 
     assert values.tolist() == pytest.approx([0.75])
     assert len(transport.calls) == 2
@@ -1077,9 +1219,7 @@ def test_requests_transient_errors_are_retried(exception_name, monkeypatch):
         media_layout="BCHW",
     )
 
-    values, _ = client.score(
-        np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}]
-    )
+    values, _ = client.score(np.zeros((1, 3, 4, 5), dtype=np.uint8), ["p"], [{}])
 
     assert values.tolist() == pytest.approx([0.25])
     assert len(transport.calls) == 2
@@ -1094,9 +1234,7 @@ def test_requests_transient_errors_are_retried(exception_name, monkeypatch):
         _response(
             {
                 "outputs": [1.0],
-                "details": [
-                    {"video_id": 0, "gs_score": 0.1, "meta_score": 0.2}
-                ],
+                "details": [{"video_id": 0, "gs_score": 0.1, "meta_score": 0.2}],
             }
         ),
     ],
@@ -1128,6 +1266,7 @@ def test_router_merges_and_restores_invalid_mask_from_cache(tmp_path):
         "protocol_version": "strict_v2",
         "sample_id": ["a", "b"],
         "valid_mask": [True, False],
+        "server_revision": "strict-invalid-mask-v1",
     }
     transport = FakeTransport(_response(response))
     transport.cache_fingerprint = {"fixture": "invalid-mask-v1"}
@@ -1336,7 +1475,9 @@ def test_response_limit_is_checked_before_json_or_pickle_deserialization(monkeyp
     monkeypatch.setattr(
         world_r1_rewards.pickle,
         "loads",
-        lambda *_args, **_kwargs: pytest.fail("oversized response reached pickle.loads"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized response reached pickle.loads"
+        ),
     )
     with pytest.raises(RewardProtocolError, match="max_response_bytes"):
         legacy_client.score(media, ["p"], [{}])
@@ -1747,7 +1888,9 @@ def test_explicit_injected_fingerprint_is_secret_free_cacheable_and_isolated(tmp
         [1.0],
         [2.0],
     ]
-    assert [transport.calls for transport in (state_a_first, state_a_cached, state_b)] == [
+    assert [
+        transport.calls for transport in (state_a_first, state_a_cached, state_b)
+    ] == [
         1,
         0,
         1,
@@ -1852,8 +1995,9 @@ def test_same_url_different_server_revision_cannot_share_cache(tmp_path, monkeyp
     assert first.weighted_total.tolist() == [0.25]
     assert second.weighted_total.tolist() == [0.75]
     assert len(transport.calls) == 2
-    assert revision_a.client_fingerprints["reward_general"] != (
-        revision_b.client_fingerprints["reward_general"]
+    assert (
+        revision_a.client_fingerprints["reward_general"]
+        != (revision_b.client_fingerprints["reward_general"])
     )
     assert len(list(tmp_path.glob("*.json"))) == 2
 
@@ -2053,9 +2197,7 @@ def test_probe_legacy_http_requires_explicit_policy_and_can_use_opted_in_transpo
             )
         )
 
-    transport = FakeTransport(
-        _response({"outputs": [1.0]}, wire_format=LEGACY_PICKLE)
-    )
+    transport = FakeTransport(_response({"outputs": [1.0]}, wire_format=LEGACY_PICKLE))
     result = run_world_r1_reward_server_probe(
         WorldR1RewardServerProbeConfig(
             reward="reward_general",

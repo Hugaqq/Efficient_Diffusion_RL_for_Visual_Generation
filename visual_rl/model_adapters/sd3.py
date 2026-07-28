@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import inspect
 import math
 from contextlib import contextmanager
@@ -64,16 +65,34 @@ class SD3TempFlowAdapter(ModelAdapter):
             requested=self.gradient_checkpointing_requested,
             effective=None,
         )
-        self.repo_root = resolve_legacy_repo(config.get("repo_root", extra.get("repo_root", "reference_code/TempFlow-GRPO-main")))
-        self.device = torch.device(config.get("device", extra.get("device", "cuda" if torch.cuda.is_available() else "cpu")))
-        self.dtype = resolve_torch_dtype(config.get("dtype", extra.get("dtype", "bfloat16" if self.device.type == "cuda" else "float32")))
+        self.repo_root = resolve_legacy_repo(
+            config.get(
+                "repo_root", extra.get("repo_root", "reference_code/TempFlow-GRPO-main")
+            )
+        )
+        self.device = torch.device(
+            config.get(
+                "device",
+                extra.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
+            )
+        )
+        self.dtype = resolve_torch_dtype(
+            config.get(
+                "dtype",
+                extra.get(
+                    "dtype", "bfloat16" if self.device.type == "cuda" else "float32"
+                ),
+            )
+        )
         self.resolution = int(config.get("resolution", extra.get("resolution", 256)))
         self.max_sequence_length = int(extra.get("max_sequence_length", 128))
         self.use_lora = bool(config.get("use_lora", extra.get("use_lora", True)))
         self.lora_rank = int(extra.get("lora_rank", 32))
         self.lora_alpha = int(extra.get("lora_alpha", self.lora_rank * 2))
         self.lora_path = config.get("lora_path", extra.get("lora_path"))
-        self.lora_targets = list(extra.get("lora_target_modules", DEFAULT_SD3_LORA_TARGETS))
+        self.lora_targets = list(
+            extra.get("lora_target_modules", DEFAULT_SD3_LORA_TARGETS)
+        )
         self.tempflow_reference_mode = bool(
             config.get(
                 "tempflow_reference_mode",
@@ -95,22 +114,32 @@ class SD3TempFlowAdapter(ModelAdapter):
         try:
             from diffusers import StableDiffusion3Pipeline
         except ImportError as exc:  # pragma: no cover - optional train dependency
-            raise ImportError("Install visual-rl[train] to use SD3 TempFlow adapter.") from exc
+            raise ImportError(
+                "Install visual-rl[train] to use SD3 TempFlow adapter."
+            ) from exc
 
         model_path = require_model_path(self.config, self.name)
         with legacy_repo_path(self.repo_root):
-            from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_logprob
+            from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import (
+                pipeline_with_logprob,
+            )
             from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob_perstep import (
                 pipeline_with_logprob as pipeline_with_logprob_perstep,
             )
-            from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
-            from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
+            from flow_grpo.diffusers_patch.sd3_sde_with_logprob import (
+                sde_step_with_logprob,
+            )
+            from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import (
+                encode_prompt,
+            )
 
         self._pipeline_with_logprob = pipeline_with_logprob
         self._pipeline_with_logprob_perstep = pipeline_with_logprob_perstep
         self._sde_step_with_logprob = sde_step_with_logprob
         self._encode_prompt = encode_prompt
-        self.pipeline = StableDiffusion3Pipeline.from_pretrained(model_path, torch_dtype=self.dtype)
+        self.pipeline = StableDiffusion3Pipeline.from_pretrained(
+            model_path, torch_dtype=self.dtype
+        )
         self.pipeline.vae.requires_grad_(False)
         self.pipeline.text_encoder.requires_grad_(False)
         self.pipeline.text_encoder_2.requires_grad_(False)
@@ -151,7 +180,9 @@ class SD3TempFlowAdapter(ModelAdapter):
 
     def _ensure_loaded(self) -> None:
         if self.pipeline is None or self.transformer is None:
-            raise AdapterNotLoadedError("SD3 TempFlow adapter is not loaded. Provide model_path or call load().")
+            raise AdapterNotLoadedError(
+                "SD3 TempFlow adapter is not loaded. Provide model_path or call load()."
+            )
 
     @property
     def train_module(self):
@@ -164,7 +195,9 @@ class SD3TempFlowAdapter(ModelAdapter):
     def parameters(self):
         params = trainable_parameters(self.train_module)
         if not params:
-            raise AdapterNotLoadedError("SD3 TempFlow adapter has no trainable parameters.")
+            raise AdapterNotLoadedError(
+                "SD3 TempFlow adapter has no trainable parameters."
+            )
         return params
 
     def named_parameters(self):
@@ -187,7 +220,12 @@ class SD3TempFlowAdapter(ModelAdapter):
             raise ValueError("SD3 TempFlow branching requires num_steps >= 2")
         return transition_count
 
-    def sample(self, prompts: list[str], metadata: list[dict[str, Any]], rollout_config: dict[str, Any]) -> RolloutBatch:
+    def sample(
+        self,
+        prompts: list[str],
+        metadata: list[dict[str, Any]],
+        rollout_config: dict[str, Any],
+    ) -> RolloutBatch:
         import torch
 
         self._ensure_loaded()
@@ -203,7 +241,9 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         with torch.no_grad(), self._full_sde_generator(generator):
             prompt_embeds, pooled_prompt_embeds = self._encode_text(prompts)
-            neg_prompt_embeds, neg_pooled_prompt_embeds = self._encode_text([""] * len(prompts))
+            neg_prompt_embeds, neg_pooled_prompt_embeds = self._encode_text(
+                [""] * len(prompts)
+            )
             result = self._call_pipeline_with_logprob(
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
@@ -223,7 +263,9 @@ class SD3TempFlowAdapter(ModelAdapter):
                 images, latents, log_probs = result
                 kls = []
             else:
-                raise ValueError(f"Unexpected SD3 TempFlow pipeline result length: {len(result)}")
+                raise ValueError(
+                    f"Unexpected SD3 TempFlow pipeline result length: {len(result)}"
+                )
             log_probs = stack_steps(log_probs, dim=1)
             kls = stack_steps(kls, dim=1) if kls else torch.zeros_like(log_probs)
 
@@ -271,9 +313,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "transition_kernel": self._transition_kernel_identity(),
                 "scheduler_class": self._scheduler_identity(),
                 "transformer_training": bool(self.transformer.training),
-                "recompute_transformer_training": bool(
-                    self.tempflow_reference_mode
-                ),
+                "recompute_transformer_training": bool(self.tempflow_reference_mode),
                 "tempflow_reference_mode": self.tempflow_reference_mode,
             },
             model_tensors={
@@ -291,8 +331,12 @@ class SD3TempFlowAdapter(ModelAdapter):
         self._ensure_loaded()
         self.prepare_for_training()
         guidance_scale = float(batch.model_metadata.get("guidance_scale", 4.5))
-        prompt_embeds, pooled_prompt_embeds = self._batch_embeddings(batch, positive=True)
-        neg_prompt_embeds, neg_pooled_prompt_embeds = self._batch_embeddings(batch, positive=False)
+        prompt_embeds, pooled_prompt_embeds = self._batch_embeddings(
+            batch, positive=True
+        )
+        neg_prompt_embeds, neg_pooled_prompt_embeds = self._batch_embeddings(
+            batch, positive=False
+        )
         latents = batch.latents.to(self.device)
         next_latents = batch.next_latents.to(self.device)
         timesteps = batch.timesteps.to(self.device)
@@ -316,7 +360,10 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         log_probs = []
         transformer_dtype = self._transformer_dtype()
-        legacy_contract = batch.model_metadata.get("trajectory_contract_version") != SD3_TRANSITION_CONTRACT_VERSION
+        legacy_contract = (
+            batch.model_metadata.get("trajectory_contract_version")
+            != SD3_TRANSITION_CONTRACT_VERSION
+        )
         for index in range(latents.shape[1]):
             latent_step = latents[:, index]
             if legacy_contract:
@@ -410,10 +457,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 f"{len(raw_main_states)} != {int(scheduler_timesteps.numel())}"
             )
         if not (
-            len(sde_latents)
-            == len(log_probs)
-            == len(kls)
-            == expected_transition_count
+            len(sde_latents) == len(log_probs) == len(kls) == expected_transition_count
         ):
             raise ValueError(
                 "SD3 branching transition outputs must all equal T-1: "
@@ -475,9 +519,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             gather_indices,
         )
         rows = len(expanded_prompts)
-        transition_count = int(
-            rollout_config.get("transition_count", len(log_probs))
-        )
+        transition_count = int(rollout_config.get("transition_count", len(log_probs)))
         positions = torch.arange(transition_count, dtype=torch.float32)
         global_weights = torch.sqrt(
             (transition_count - positions).clamp_min(1.0) / float(transition_count)
@@ -492,9 +534,12 @@ class SD3TempFlowAdapter(ModelAdapter):
             .detach()
             .cpu()
         )
-        selected_timesteps = scheduler_timestep.to(
-            device=selected_log_probs.device
-        ).reshape(1, 1).expand(rows, 1).clone()
+        selected_timesteps = (
+            scheduler_timestep.to(device=selected_log_probs.device)
+            .reshape(1, 1)
+            .expand(rows, 1)
+            .clone()
+        )
         return RolloutBatch(
             prompts=expanded_prompts,
             metadata=expanded_metadata,
@@ -528,16 +573,20 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "transition_kernel": self._transition_kernel_identity(),
                 "scheduler_class": self._scheduler_identity(),
                 "transformer_training": bool(self.transformer.training),
-                "recompute_transformer_training": bool(
-                    self.tempflow_reference_mode
-                ),
+                "recompute_transformer_training": bool(self.tempflow_reference_mode),
                 "tempflow_reference_mode": self.tempflow_reference_mode,
                 "branch_rng_consumption": "dynamic_branch_count",
             },
             model_tensors={
-                "prompt_embeds": prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
-                "pooled_prompt_embeds": pooled_prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
-                "negative_prompt_embeds": negative_prompt_embeds.repeat_interleave(branch_count, dim=0).detach(),
+                "prompt_embeds": prompt_embeds.repeat_interleave(
+                    branch_count, dim=0
+                ).detach(),
+                "pooled_prompt_embeds": pooled_prompt_embeds.repeat_interleave(
+                    branch_count, dim=0
+                ).detach(),
+                "negative_prompt_embeds": negative_prompt_embeds.repeat_interleave(
+                    branch_count, dim=0
+                ).detach(),
                 "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds.repeat_interleave(
                     branch_count,
                     dim=0,
@@ -664,6 +713,7 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         try:
             from peft.utils.save_and_load import (
+                get_peft_model_state_dict,
                 load_peft_weights,
                 set_peft_model_state_dict,
             )
@@ -677,9 +727,11 @@ class SD3TempFlowAdapter(ModelAdapter):
             for name, parameter in self.transformer.named_parameters()
         }
         try:
+            expected_state = self._get_default_peft_state(get_peft_model_state_dict)
             adapter_state = load_peft_weights(str(adapter_path), device="cpu")
             if not adapter_state:
                 raise ValueError("adapter weight file contains no tensors")
+            self._validate_peft_checkpoint_state(expected_state, adapter_state)
             load_result = set_peft_model_state_dict(
                 self.transformer,
                 adapter_state,
@@ -699,12 +751,87 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "SD3 PEFT checkpoint loading replaced Parameter objects; "
                 "optimizer references would be invalid"
             )
+        restored_state = self._get_default_peft_state(get_peft_model_state_dict)
+        self._validate_peft_checkpoint_state(adapter_state, restored_state)
+        self._validate_peft_checkpoint_values(adapter_state, restored_state)
         unexpected = list(getattr(load_result, "unexpected_keys", ()) or ())
         if unexpected:
             raise RuntimeError(
                 "SD3 PEFT checkpoint contains unexpected keys: "
                 + ", ".join(str(key) for key in unexpected)
             )
+
+    def _get_default_peft_state(self, get_peft_model_state_dict) -> Mapping[str, Any]:
+        parameters = inspect.signature(get_peft_model_state_dict).parameters
+        kwargs = {"adapter_name": "default"} if "adapter_name" in parameters else {}
+        state = get_peft_model_state_dict(self.transformer, **kwargs)
+        if not isinstance(state, Mapping) or not state:
+            raise RuntimeError("PEFT returned an empty SD3 default adapter state")
+        return state
+
+    @classmethod
+    def _validate_peft_checkpoint_state(
+        cls,
+        expected_state: Any,
+        checkpoint_state: Any,
+    ) -> None:
+        expected = cls._peft_state_shapes(expected_state, label="attached adapter")
+        actual = cls._peft_state_shapes(checkpoint_state, label="checkpoint adapter")
+        missing = sorted(set(expected).difference(actual))
+        extra = sorted(set(actual).difference(expected))
+        mismatched = sorted(
+            key
+            for key in expected.keys() & actual.keys()
+            if expected[key] != actual[key]
+        )
+        if missing:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint is missing adapter keys: " + ", ".join(missing)
+            )
+        if extra:
+            raise RuntimeError(
+                "SD3 PEFT checkpoint contains extra adapter keys: " + ", ".join(extra)
+            )
+        if mismatched:
+            details = ", ".join(
+                f"{key}: expected {expected[key]}, got {actual[key]}"
+                for key in mismatched
+            )
+            raise RuntimeError(f"SD3 PEFT checkpoint shape mismatch: {details}")
+
+    @staticmethod
+    def _peft_state_shapes(state: Any, *, label: str) -> dict[str, tuple[int, ...]]:
+        if not isinstance(state, Mapping) or not state:
+            raise RuntimeError(f"SD3 PEFT {label} state must be a non-empty mapping")
+        shapes: dict[str, tuple[int, ...]] = {}
+        for key, value in state.items():
+            if not isinstance(key, str) or not key:
+                raise RuntimeError(f"SD3 PEFT {label} state contains an invalid key")
+            shape = getattr(value, "shape", None)
+            if shape is None:
+                raise RuntimeError(
+                    f"SD3 PEFT {label} state value has no tensor shape: {key}"
+                )
+            shapes[key] = tuple(int(dimension) for dimension in shape)
+        return shapes
+
+    @staticmethod
+    def _validate_peft_checkpoint_values(
+        checkpoint_state: Mapping[str, Any],
+        restored_state: Mapping[str, Any],
+    ) -> None:
+        import torch
+
+        for key, expected in checkpoint_state.items():
+            actual = restored_state[key]
+            expected_tensor = torch.as_tensor(expected).detach().cpu()
+            actual_tensor = (
+                torch.as_tensor(actual).detach().cpu().to(dtype=expected_tensor.dtype)
+            )
+            if not torch.equal(actual_tensor, expected_tensor):
+                raise RuntimeError(
+                    f"SD3 PEFT checkpoint value was not restored exactly: {key}"
+                )
 
     @staticmethod
     def _checkpoint_metadata(path: Path) -> dict[str, Any]:
@@ -746,9 +873,8 @@ class SD3TempFlowAdapter(ModelAdapter):
             checkpoint_path,
         ):
             if (
-                (candidate / "adapter_config.json").is_file()
-                and cls._peft_adapter_weight_path(candidate) is not None
-            ):
+                candidate / "adapter_config.json"
+            ).is_file() and cls._peft_adapter_weight_path(candidate) is not None:
                 return candidate
         return None
 
@@ -774,7 +900,9 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         if isinstance(values, torch.Tensor):
             if values.ndim < 2:
-                raise ValueError("Trajectory tensor must expose a step dimension at axis 1")
+                raise ValueError(
+                    "Trajectory tensor must expose a step dimension at axis 1"
+                )
             return [values[:, index] for index in range(values.shape[1])]
         states = [torch.as_tensor(value) for value in values]
         if not states:
@@ -788,14 +916,12 @@ class SD3TempFlowAdapter(ModelAdapter):
         if not hasattr(scheduler, "timesteps"):
             raise ValueError("SD3 scheduler does not expose active timesteps")
         context = {
-            "scheduler_timesteps": torch.as_tensor(
-                scheduler.timesteps
-            ).detach().clone()
+            "scheduler_timesteps": torch.as_tensor(scheduler.timesteps).detach().clone()
         }
         if hasattr(scheduler, "sigmas"):
-            context["scheduler_sigmas"] = torch.as_tensor(
-                scheduler.sigmas
-            ).detach().clone()
+            context["scheduler_sigmas"] = (
+                torch.as_tensor(scheduler.sigmas).detach().clone()
+            )
         return context
 
     @staticmethod
@@ -855,13 +981,10 @@ class SD3TempFlowAdapter(ModelAdapter):
                 f"scheduler step, got index {step_index}"
             )
         if step_index + 1 >= sigmas.numel():
-            raise ValueError(
-                "TempFlow reference transition is missing sigma_{t+1}"
-            )
+            raise ValueError("TempFlow reference transition is missing sigma_{t+1}")
         scheduled_timestep = torch.as_tensor(timesteps[step_index]).reshape(-1)
-        if (
-            scheduled_timestep.numel() != 1
-            or float(requested_timestep.item()) != float(scheduled_timestep.item())
+        if scheduled_timestep.numel() != 1 or float(requested_timestep.item()) != float(
+            scheduled_timestep.item()
         ):
             raise ValueError(
                 "TempFlow reference transition timestep does not match the indexed "
@@ -873,15 +996,11 @@ class SD3TempFlowAdapter(ModelAdapter):
         sigma_next = sigmas[step_index + 1]
         sigma_max = sigmas[1].to(dtype=sigma.dtype, device=sigma.device)
         if not bool(torch.isfinite(torch.stack([sigma, sigma_next, sigma_max])).all()):
-            raise ValueError(
-                "TempFlow reference transition sigmas must be finite"
-            )
+            raise ValueError("TempFlow reference transition sigmas must be finite")
         denominator_sigma = torch.where(sigma == 1, sigma_max, sigma)
         base_variance = sigma / (1 - denominator_sigma)
         sigma_delta = sigma - sigma_next
-        if not bool((base_variance > 0).item()) or not bool(
-            (sigma_delta > 0).item()
-        ):
+        if not bool((base_variance > 0).item()) or not bool((sigma_delta > 0).item()):
             raise ValueError(
                 "TempFlow reference transition requires positive base variance and "
                 "sigma_t - sigma_{t+1}"
@@ -893,7 +1012,9 @@ class SD3TempFlowAdapter(ModelAdapter):
         try:
             value = float(noise_level)
         except (TypeError, ValueError) as exc:
-            raise ValueError("TempFlow noise_level must be a finite positive number") from exc
+            raise ValueError(
+                "TempFlow noise_level must be a finite positive number"
+            ) from exc
         if not math.isfinite(value) or value <= 0:
             raise ValueError("TempFlow noise_level must be a finite positive number")
         if self.tempflow_reference_mode and value != SD3_REFERENCE_NOISE_LEVEL:
@@ -931,13 +1052,8 @@ class SD3TempFlowAdapter(ModelAdapter):
                 "SD3 trajectory source dtype changed after rollout: "
                 f"{latents.dtype} != {expected_dtype}"
             )
-        expected_target_dtype = batch.model_metadata.get(
-            "trajectory_target_dtype"
-        )
-        if (
-            expected_target_dtype
-            and str(next_latents.dtype) != expected_target_dtype
-        ):
+        expected_target_dtype = batch.model_metadata.get("trajectory_target_dtype")
+        if expected_target_dtype and str(next_latents.dtype) != expected_target_dtype:
             raise ValueError(
                 "SD3 trajectory target dtype changed after rollout: "
                 f"{next_latents.dtype} != {expected_target_dtype}"
@@ -1011,9 +1127,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             hidden_states = torch.cat([latent_step, latent_step])
             model_timestep = torch.cat([timestep, timestep])
             embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-            pooled = torch.cat(
-                [negative_pooled_prompt_embeds, pooled_prompt_embeds]
-            )
+            pooled = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
         else:
             hidden_states = latent_step
             model_timestep = timestep
@@ -1083,9 +1197,10 @@ class SD3TempFlowAdapter(ModelAdapter):
             negative_pooled_prompt_embeds.index_select(0, representative_rows)
         )
 
-        legacy_contract = batch.model_metadata.get(
-            "trajectory_contract_version"
-        ) != SD3_TRANSITION_CONTRACT_VERSION
+        legacy_contract = (
+            batch.model_metadata.get("trajectory_contract_version")
+            != SD3_TRANSITION_CONTRACT_VERSION
+        )
         transformer_dtype = self._transformer_dtype()
         log_probs = []
         for index in range(latents.shape[1]):
@@ -1094,9 +1209,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 representative_rows,
             )
             if legacy_contract:
-                parent_latent_step = parent_latent_step.to(
-                    dtype=transformer_dtype
-                )
+                parent_latent_step = parent_latent_step.to(dtype=transformer_dtype)
             parent_timestep = timesteps[:, index].index_select(
                 0,
                 representative_rows,
@@ -1133,9 +1246,7 @@ class SD3TempFlowAdapter(ModelAdapter):
 
         parent_values = batch.model_tensors.get("parent_prompt_indices")
         if parent_values is None:
-            parent_values = [
-                item.get("parent_prompt_index") for item in batch.metadata
-            ]
+            parent_values = [item.get("parent_prompt_index") for item in batch.metadata]
         parent_ids = torch.as_tensor(parent_values, dtype=torch.long).reshape(-1)
         row_count = len(batch.prompts)
         if parent_ids.numel() != row_count:
@@ -1154,26 +1265,23 @@ class SD3TempFlowAdapter(ModelAdapter):
             raise ValueError("SD3 shared-prefix rollout has no parent groups")
         group_sizes = {len(rows_by_parent[parent]) for parent in ordered_parent_ids}
         if len(group_sizes) != 1:
-            raise ValueError(
-                "SD3 shared-prefix parents must have equal branch counts"
-            )
+            raise ValueError("SD3 shared-prefix parents must have equal branch counts")
         branch_count = next(iter(group_sizes))
         expected_branch_count = batch.model_metadata.get("branch_count")
-        if expected_branch_count is not None and int(expected_branch_count) != branch_count:
+        if (
+            expected_branch_count is not None
+            and int(expected_branch_count) != branch_count
+        ):
             raise ValueError(
                 "SD3 shared-prefix branch count changed after rollout: "
                 f"{branch_count} != {expected_branch_count}"
             )
 
         expected_parent_order = [
-            parent
-            for parent in ordered_parent_ids
-            for _ in range(branch_count)
+            parent for parent in ordered_parent_ids for _ in range(branch_count)
         ]
         if parent_ids.tolist() != expected_parent_order:
-            raise ValueError(
-                "SD3 shared-prefix rows must use parent-major ordering"
-            )
+            raise ValueError("SD3 shared-prefix rows must use parent-major ordering")
 
         representative_rows = torch.as_tensor(
             [rows_by_parent[parent][0] for parent in ordered_parent_ids],
@@ -1243,9 +1351,7 @@ class SD3TempFlowAdapter(ModelAdapter):
     def _full_sde_generator(self, generator):
         """Bind the rollout generator to an upstream full SDE call that omits it."""
 
-        function_globals = self._sde_function_globals(
-            self._pipeline_with_logprob
-        )
+        function_globals = self._sde_function_globals(self._pipeline_with_logprob)
         original = (
             function_globals.get("sde_step_with_logprob")
             if isinstance(function_globals, dict)
@@ -1256,9 +1362,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             return
         if not callable(original):
             if callable(self._sde_step_with_logprob):
-                raise RuntimeError(
-                    "Could not bind the SD3 full-pipeline SDE generator"
-                )
+                raise RuntimeError("Could not bind the SD3 full-pipeline SDE generator")
             yield
             return
 
@@ -1296,9 +1400,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             else None
         )
         if not callable(original):
-            if branch_count is not None and callable(
-                self._sde_step_with_logprob
-            ):
+            if branch_count is not None and callable(self._sde_step_with_logprob):
                 raise RuntimeError(
                     "Could not replace the SD3 per-step branching SDE kernel"
                 )
@@ -1361,14 +1463,14 @@ class SD3TempFlowAdapter(ModelAdapter):
                         parent_count * branch_count
                     )
                 elif timestep_values.numel() == parent_count:
-                    expanded_timestep = timestep_values.repeat_interleave(
-                        branch_count
-                    )
+                    expanded_timestep = timestep_values.repeat_interleave(branch_count)
                 else:
                     raise ValueError(
                         "SD3 branch timestep must be scalar or parent-batched"
                     )
-                active_generator = generator if generator is not None else generator_bound
+                active_generator = (
+                    generator if generator is not None else generator_bound
+                )
                 return ordinary_kernel(
                     scheduler,
                     expanded_output,
@@ -1430,7 +1532,9 @@ class SD3TempFlowAdapter(ModelAdapter):
         branch_count: int,
     ) -> tuple[int, list[int]]:
         if parent_count < 1 or expanded_size % parent_count:
-            raise ValueError("Per-step branching output is not grouped by parent prompt")
+            raise ValueError(
+                "Per-step branching output is not grouped by parent prompt"
+            )
         exploration_k = expanded_size // parent_count
         if branch_count > exploration_k:
             raise ValueError(
@@ -1473,8 +1577,16 @@ class SD3TempFlowAdapter(ModelAdapter):
 
     def _encode_text(self, prompts: list[str]):
         embeds, pooled = self._encode_prompt(
-            [self.pipeline.text_encoder, self.pipeline.text_encoder_2, self.pipeline.text_encoder_3],
-            [self.pipeline.tokenizer, self.pipeline.tokenizer_2, self.pipeline.tokenizer_3],
+            [
+                self.pipeline.text_encoder,
+                self.pipeline.text_encoder_2,
+                self.pipeline.text_encoder_3,
+            ],
+            [
+                self.pipeline.tokenizer,
+                self.pipeline.tokenizer_2,
+                self.pipeline.tokenizer_3,
+            ],
             prompts,
             self.max_sequence_length,
         )
@@ -1483,7 +1595,9 @@ class SD3TempFlowAdapter(ModelAdapter):
     def _transformer_dtype(self):
         import torch
 
-        return next(self.transformer.parameters(), torch.empty((), dtype=torch.float32)).dtype
+        return next(
+            self.transformer.parameters(), torch.empty((), dtype=torch.float32)
+        ).dtype
 
     def _batch_embeddings(self, batch: RolloutBatch, *, positive: bool):
         if positive:

@@ -92,7 +92,7 @@ class ManifestBuilder:
 
     @classmethod
     def _reward_values(cls, rewards: RewardBatch, index: int) -> dict[str, Any]:
-        return {
+        values = {
             "raw": {
                 name: to_jsonable(cls._batch_item(values, index))
                 for name, values in rewards.raw.items()
@@ -106,6 +106,35 @@ class ManifestBuilder:
             ),
             "valid": bool(to_jsonable(cls._batch_item(rewards.valid_mask, index))),
         }
+        if "_schedule" in rewards.metadata:
+            values["schedule"] = to_jsonable(rewards.metadata["_schedule"])
+        provenance = {}
+        shared_keys = (
+            "protocol",
+            "protocol_mode",
+            "protocol_version",
+            "scorer_identity",
+            "identity",
+            "formula",
+            "server_revision",
+            "server_revision_echo",
+        )
+        for name, metadata in rewards.metadata.items():
+            if name.startswith("_") or not isinstance(metadata, Mapping):
+                continue
+            evidence = metadata.get("sample_evidence")
+            if (
+                isinstance(evidence, Sequence)
+                and not isinstance(evidence, (str, bytes))
+                and index < len(evidence)
+            ):
+                provenance[name] = {
+                    **{key: metadata[key] for key in shared_keys if key in metadata},
+                    "sample": evidence[index],
+                }
+        if provenance:
+            values["provenance"] = to_jsonable(provenance)
+        return values
 
     @classmethod
     def _timestep_summary(

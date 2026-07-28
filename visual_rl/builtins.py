@@ -20,12 +20,15 @@ def register_builtin_plugins() -> None:
         PromptColorMarginRewardClient,
         PromptColorRewardClient,
     )
+    from visual_rl.feedback.pickscore import PickScoreRewardClient
     from visual_rl.feedback.provider import RewardRouterFeedbackProvider
+    from visual_rl.feedback.video_hpsv3 import VideoHPSv3RewardClient
     from visual_rl.feedback.world_r1_rewards import (
         WorldR1Reward3DClient,
         WorldR1RewardGeneralClient,
     )
     from visual_rl.model_adapters.mock import MockWanAdapter
+    from visual_rl.model_adapters.minwm_wan import MinWMWanAdapter
     from visual_rl.model_adapters.sd3 import SD3TempFlowAdapter
     from visual_rl.model_adapters.tiny_diffusion import TinyDiffusionAdapter
     from visual_rl.model_adapters.wan import WorldR1WanLegacyAdapter
@@ -39,6 +42,7 @@ def register_builtin_plugins() -> None:
 
     registrations = (
         (MODEL_ADAPTERS, "mock_wan", MockWanAdapter),
+        (MODEL_ADAPTERS, "minwm_wan_rl", MinWMWanAdapter),
         (MODEL_ADAPTERS, "tiny_diffusion", TinyDiffusionAdapter),
         (MODEL_ADAPTERS, "sd3_tempflow", SD3TempFlowAdapter),
         (MODEL_ADAPTERS, "tempflow_sd3_legacy", SD3TempFlowAdapter),
@@ -51,6 +55,8 @@ def register_builtin_plugins() -> None:
         (REWARD_CLIENTS, "prompt_color", PromptColorRewardClient),
         (REWARD_CLIENTS, "prompt_color_margin", PromptColorMarginRewardClient),
         (REWARD_CLIENTS, "prompt_color_guarded", PromptColorGuardedRewardClient),
+        (REWARD_CLIENTS, "pickscore", PickScoreRewardClient),
+        (REWARD_CLIENTS, "video_hpsv3", VideoHPSv3RewardClient),
         (REWARD_CLIENTS, "reward_3d", WorldR1Reward3DClient),
         (REWARD_CLIENTS, "reward_general", WorldR1RewardGeneralClient),
         (FEEDBACK_PROVIDERS, "reward_router", RewardRouterFeedbackProvider),

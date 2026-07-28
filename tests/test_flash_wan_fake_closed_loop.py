@@ -485,7 +485,7 @@ def test_reference_preset_is_explicit_and_passes_static_preflight():
     static_preflight(config)
 
     config.algorithm.beta = 0.01
-    with pytest.raises(StaticPreflightError, match="reference_v1 requires beta=0"):
+    with pytest.raises(StaticPreflightError, match="requires beta=0"):
         static_preflight(config)
     config.algorithm.beta = -0.01
     with pytest.raises(StaticPreflightError, match=r"algorithm.beta must be >= 0.0"):
