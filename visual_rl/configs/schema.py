@@ -804,116 +804,6 @@ def _validate_runtime_config(cfg: VisualRLConfig) -> None:
         )
 
 
-def _validate_minwm_runtime_config(cfg: VisualRLConfig) -> None:
-    """Reject the few settings that make the bounded MinWM update invalid."""
-
-    if cfg.model.name != "minwm_wan_rl":
-        return
-    extra = cfg.model.extra
-    if not cfg.use_lora:
-        raise ValueError("minwm_wan_rl requires use_lora=true")
-    if extra.get("stage", "dmd") != "dmd":
-        raise ValueError("minwm_wan_rl currently supports only model.extra.stage=dmd")
-    if extra.get("transition_kernel", "x0_renoise") != "x0_renoise":
-        raise ValueError(
-            "minwm_wan_rl requires model.extra.transition_kernel=x0_renoise"
-        )
-    if cfg.algorithm.name != "grpo" or cfg.sample.name != "full_trajectory":
-        raise ValueError(
-            "minwm_wan_rl currently requires GRPO with full_trajectory rollout"
-        )
-    if float(cfg.sample.guidance_scale) != 1.0:
-        raise ValueError("minwm_wan_rl currently requires sample.guidance_scale=1")
-    timesteps = cfg.rollout.get("denoising_timesteps")
-    if not isinstance(timesteps, (list, tuple)) or len(timesteps) != int(
-        cfg.sample.num_steps
-    ):
-        raise ValueError(
-            "minwm_wan_rl requires rollout.denoising_timesteps to match "
-            "sample.num_steps"
-        )
-    if extra.get("replay_credit_assignment", "sample_one") != "sample_one":
-        raise ValueError(
-            "minwm_wan_rl requires model.extra.replay_credit_assignment=sample_one"
-        )
-    if cfg.train.update_microbatch_size != 1:
-        raise ValueError(
-            "minwm_wan_rl sample_one replay requires train.update_microbatch_size=1"
-        )
-    camera = cfg.rollout.get("camera_control")
-    if not isinstance(camera, Mapping) or not isinstance(camera.get("trajectory"), str):
-        raise ValueError("minwm_wan_rl requires rollout.camera_control.trajectory")
-
-    native_factory = (
-        "visual_rl.model_adapters.minwm_wan_native_backend:"
-        "build_minwm_wan_native_backend"
-    )
-    if extra.get("backend_factory") == native_factory:
-        profile = {
-            "chunk_size": 4,
-            "total_frames": 20,
-            "latent_channels": 16,
-            "latent_height": 60,
-            "latent_width": 104,
-            "local_attn_size": 20,
-            "dtype": "bfloat16",
-        }
-        mismatched = [
-            f"{name}={extra.get(name)!r} (expected {expected!r})"
-            for name, expected in profile.items()
-            if extra.get(name) != expected
-        ]
-        if mismatched:
-            raise ValueError(
-                "minwm_wan_rl native geometry mismatch: " + "; ".join(mismatched)
-            )
-        if (
-            cfg.sample.batch_size != 1
-            or cfg.sample.num_steps != 4
-            or cfg.sample.samples_per_prompt != 4
-            or cfg.train.precision != "bf16"
-            or cfg.rollout.get("num_chunks") != 5
-            or cfg.rollout.get("chunk_size") != 4
-            or list(timesteps) != [1000, 750, 500, 250]
-        ):
-            raise ValueError(
-                "minwm_wan_rl native gate requires batch_size=1, num_steps=4, "
-                "samples_per_prompt=4, precision=bf16, num_chunks=5, "
-                "chunk_size=4, and denoising_timesteps=[1000,750,500,250]"
-            )
-
-    for client_key, declaration in cfg.rewards.clients.items():
-        if not isinstance(declaration, Mapping):
-            continue
-        client_name = declaration.get("name", client_key)
-        if client_name not in {"reward_general", "reward_3d"}:
-            continue
-        params = {
-            key: value
-            for key, value in declaration.items()
-            if key not in {"name", "version", "params", "target"}
-        }
-        nested = declaration.get("params", {})
-        if isinstance(nested, Mapping):
-            params.update(nested)
-        revision = params.get("server_revision")
-        if (
-            params.get("protocol_mode") != "strict_v2"
-            or not isinstance(revision, str)
-            or not revision.strip()
-        ):
-            raise ValueError(
-                f"minwm_wan_rl {client_name} client requires strict_v2 and "
-                "a frozen server_revision"
-            )
-        if client_name == "reward_3d" and params.get("frame_indices") != list(
-            range(0, 77, 4)
-        ):
-            raise ValueError(
-                "minwm_wan_rl reward_3d requires frame_indices=[0,4,...,76]"
-            )
-
-
 def _validate_typed_config(cfg: VisualRLConfig) -> None:
     """Apply every semantic validator to an already type-checked config."""
 
@@ -922,7 +812,6 @@ def _validate_typed_config(cfg: VisualRLConfig) -> None:
     _validate_core_numeric_config(cfg)
     _validate_reward_schedule_config(cfg)
     _validate_runtime_config(cfg)
-    _validate_minwm_runtime_config(cfg)
 
 
 def validate_config(config: VisualRLConfig) -> None:

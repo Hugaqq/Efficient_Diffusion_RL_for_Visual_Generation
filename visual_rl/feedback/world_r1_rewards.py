@@ -243,107 +243,6 @@ def _validate_camera_trajectory(
     }
 
 
-def _world_r1_camera_matrix_string(matrix: np.ndarray) -> str:
-    return " ".join(
-        "[" + " ".join(format(float(value), ".17g") for value in row) + "]"
-        for row in matrix
-    )
-
-
-def _normalize_reward_camera_trajectory(
-    trajectory: Any,
-    *,
-    expected_frames: int | None,
-    entry: int,
-) -> dict[str, str]:
-    """Convert canonical MinWM w2c/OpenCV metadata to World-R1 wire form."""
-
-    if not isinstance(trajectory, Mapping):
-        return _validate_camera_trajectory(
-            trajectory,
-            expected_frames=expected_frames,
-            entry=entry,
-        )
-    minwm_keys = {"viewmats", "Ks", "convention", "coordinate_system"}
-    if not (set(trajectory) & minwm_keys):
-        return _validate_camera_trajectory(
-            trajectory,
-            expected_frames=expected_frames,
-            entry=entry,
-        )
-    if set(trajectory) != minwm_keys:
-        missing = sorted(minwm_keys - set(trajectory))
-        extra = sorted(set(trajectory) - minwm_keys)
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} must contain exactly "
-            f"{sorted(minwm_keys)}; missing={missing}, extra={extra}."
-        )
-    convention = trajectory["convention"]
-    coordinate_system = trajectory["coordinate_system"]
-    if not isinstance(convention, str) or convention.casefold() not in {
-        "w2c",
-        "world_to_camera",
-    }:
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} must use w2c convention."
-        )
-    if (
-        not isinstance(coordinate_system, str)
-        or coordinate_system.casefold() != "opencv"
-    ):
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} must use OpenCV "
-            "coordinates."
-        )
-    try:
-        viewmats = np.asarray(trajectory["viewmats"], dtype=np.float64)
-        intrinsics = np.asarray(trajectory["Ks"], dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} must contain numeric "
-            "viewmats and Ks."
-        ) from exc
-    if viewmats.ndim != 3 or viewmats.shape[1:] != (4, 4) or viewmats.shape[0] < 1:
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} viewmats must have "
-            "shape [frames, 4, 4]."
-        )
-    if intrinsics.shape != (viewmats.shape[0], 3, 3):
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} Ks must have shape "
-            f"[{viewmats.shape[0]}, 3, 3]."
-        )
-    if not np.isfinite(viewmats).all() or not np.isfinite(intrinsics).all():
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} viewmats and Ks "
-            "must be finite."
-        )
-    if np.any(intrinsics[:, 0, 0] <= 0.0) or np.any(intrinsics[:, 1, 1] <= 0.0):
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} Ks must have "
-            "positive fx and fy."
-        )
-    if not np.allclose(
-        intrinsics[:, 2, :],
-        np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
-        rtol=0.0,
-        atol=1e-9,
-    ):
-        raise ValueError(
-            f"reward_3d MinWM camera_trajectory entry {entry} Ks must use "
-            "homogeneous OpenCV intrinsics with last row [0, 0, 1]."
-        )
-    converted = {
-        f"frame{index}": _world_r1_camera_matrix_string(matrix)
-        for index, matrix in enumerate(viewmats)
-    }
-    return _validate_camera_trajectory(
-        converted,
-        expected_frames=expected_frames,
-        entry=entry,
-    )
-
-
 def _validate_inputs(
     media: Any,
     prompts: list[str],
@@ -444,18 +343,6 @@ def _json_request_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             for video in result["videos"]
         ]
     return result
-
-
-def _positive_alignment_int(
-    alignment: Mapping[str, Any], field: str, *, entry: int
-) -> int:
-    value = alignment.get(field)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(
-            f"metadata[{entry}].minwm_reward_frame_alignment.{field} "
-            "must be a positive integer."
-        )
-    return value
 
 
 def _reject_json_constant(value: str) -> None:
@@ -1085,13 +972,12 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
     ) -> dict[str, Any]:
         trajectories = []
         for index, (video, item) in enumerate(zip(encoded, metadata, strict=True)):
-            self._validate_minwm_frame_alignment(item, video, entry=index)
             trajectory = item.get("camera_trajectory")
             if trajectory is None and not self.require_camera_trajectory:
                 trajectories.append(None)
                 continue
             trajectories.append(
-                _normalize_reward_camera_trajectory(
+                _validate_camera_trajectory(
                     trajectory,
                     expected_frames=(
                         len(video) if self.protocol_mode == STRICT_V2 else None
@@ -1104,49 +990,6 @@ class WorldR1Reward3DClient(_WorldR1RewardClient):
             "prompts": prompts,
             "camera_trajectories": trajectories,
         }
-
-    def _validate_minwm_frame_alignment(
-        self,
-        metadata: Mapping[str, Any],
-        video: Sequence[bytes],
-        *,
-        entry: int,
-    ) -> None:
-        alignment = metadata.get("minwm_reward_frame_alignment")
-        if alignment is None:
-            return
-        if not isinstance(alignment, Mapping) or alignment.get("contract") != (
-            "minwm_vae_camera_alignment_v1"
-        ):
-            raise ValueError(
-                f"metadata[{entry}].minwm_reward_frame_alignment is invalid."
-            )
-        latent_frames = _positive_alignment_int(alignment, "latent_frames", entry=entry)
-        decoded_frames = _positive_alignment_int(
-            alignment, "decoded_media_frames", entry=entry
-        )
-        temporal_stride = _positive_alignment_int(
-            alignment, "vae_temporal_stride", entry=entry
-        )
-        if decoded_frames != 1 + temporal_stride * (latent_frames - 1):
-            raise ValueError(
-                f"metadata[{entry}] MinWM decoded frame geometry is inconsistent."
-            )
-        expected = tuple(range(0, decoded_frames, temporal_stride))
-        if len(expected) != latent_frames:
-            raise ValueError(
-                f"metadata[{entry}] MinWM camera alignment count is inconsistent."
-            )
-        if self.frame_indices != expected:
-            raise ValueError(
-                "reward_3d frame_indices must match MinWM VAE camera alignment: "
-                f"expected {list(expected)}."
-            )
-        if len(video) != latent_frames:
-            raise ValueError(
-                f"metadata[{entry}] MinWM reward video must contain exactly "
-                f"{latent_frames} aligned frames."
-            )
 
     def _parse_details(
         self,

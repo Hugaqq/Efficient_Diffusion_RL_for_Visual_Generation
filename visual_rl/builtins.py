@@ -28,7 +28,6 @@ def register_builtin_plugins() -> None:
         WorldR1RewardGeneralClient,
     )
     from visual_rl.model_adapters.mock import MockWanAdapter
-    from visual_rl.model_adapters.minwm_wan import MinWMWanAdapter
     from visual_rl.model_adapters.sd3 import SD3TempFlowAdapter
     from visual_rl.model_adapters.tiny_diffusion import TinyDiffusionAdapter
     from visual_rl.model_adapters.wan import WorldR1WanLegacyAdapter
@@ -42,7 +41,6 @@ def register_builtin_plugins() -> None:
 
     registrations = (
         (MODEL_ADAPTERS, "mock_wan", MockWanAdapter),
-        (MODEL_ADAPTERS, "minwm_wan_rl", MinWMWanAdapter),
         (MODEL_ADAPTERS, "tiny_diffusion", TinyDiffusionAdapter),
         (MODEL_ADAPTERS, "sd3_tempflow", SD3TempFlowAdapter),
         (MODEL_ADAPTERS, "tempflow_sd3_legacy", SD3TempFlowAdapter),
