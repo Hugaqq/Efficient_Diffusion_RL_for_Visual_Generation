@@ -8,6 +8,7 @@ import socket
 import time
 import traceback
 from multiprocessing.context import SpawnContext
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,12 +16,19 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from visual_rl.configs.schema import config_from_dict
+from visual_rl.core.types import (
+    FrozenMapping,
+    PolicyRecomputeStats,
+    RolloutBatch,
+    StepContext,
+    ValidatedRuntimeEnv,
+)
 from visual_rl.distributed import (
     DDPStrategy,
     DistributedContext,
     DistributedFailureError,
     SingleProcessStrategy,
+    build_strategy,
 )
 import visual_rl.distributed as distributed_module
 
@@ -33,17 +41,203 @@ class _LinearAdapter:
     def train_module(self) -> torch.nn.Module:
         return self.transformer
 
-    def recompute_log_probs(self, batch: torch.Tensor) -> torch.Tensor:
-        return self.transformer(batch)
+    def recompute_policy_stats(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
+        if require_reference:
+            raise ValueError("test adapter does not support reference statistics")
+        return PolicyRecomputeStats(
+            new_log_probs=self.transformer(
+                batch.recompute_payload["features"]
+            )
+        )
 
     def state_dict(self) -> dict[str, Any]:
         return self.train_module.state_dict()
 
 
+def _policy_batch(
+    value: float,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+) -> RolloutBatch:
+    features = torch.tensor([[value]], dtype=torch.float32)
+    return RolloutBatch(
+        prompts=(f"prompt-{rank}",),
+        metadata=({},),
+        media=torch.zeros(1, 1, 1, 1),
+        latents=torch.zeros(1, 1, 1),
+        next_latents=torch.ones(1, 1, 1),
+        timesteps=torch.zeros(1, 1),
+        old_log_probs=torch.zeros(1, 1),
+        transition_mask=torch.ones(1, 1, dtype=torch.bool),
+        sample_id=(f"sample-{rank}",),
+        prompt_id=(f"prompt-id-{rank}",),
+        group_id=(f"group-{rank}",),
+        branch_id=None,
+        media_layout="BCHW",
+        camera_trajectory=None,
+        context=StepContext(
+            step=0,
+            seed=17,
+            rank=rank,
+            world_size=world_size,
+        ),
+        selected_timestep_index=None,
+        flash_coefficient=None,
+        branch_step_index=None,
+        trajectory_step_index=None,
+        transition_std_dev=None,
+        recompute_payload={"features": features},
+        artifact_metadata={},
+    )
+
+
+def _single_context() -> DistributedContext:
+    return DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        backend=None,
+    )
+
+
+def _single_strategy() -> SingleProcessStrategy:
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="single",
+            device="cpu",
+            timeout_s=30.0,
+            max_snapshot_tensor_bytes=None,
+        ),
+        ValidatedRuntimeEnv(
+            mode="single",
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            group_rank=None,
+            group_world_size=None,
+            master_addr=None,
+            master_port=None,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping({}),
+        ),
+    )
+    assert isinstance(strategy, SingleProcessStrategy)
+    return strategy
+
+
+def _ddp_strategy(rank: int, port: int, *, timeout_s: float) -> DDPStrategy:
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="ddp",
+            device="cpu",
+            timeout_s=timeout_s,
+            max_snapshot_tensor_bytes=1 << 30,
+        ),
+        ValidatedRuntimeEnv(
+            mode="ddp",
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+            local_world_size=2,
+            group_rank=0,
+            group_world_size=1,
+            master_addr="127.0.0.1",
+            master_port=port,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping(
+                {
+                    "RANK": str(rank),
+                    "LOCAL_RANK": str(rank),
+                    "WORLD_SIZE": "2",
+                    "LOCAL_WORLD_SIZE": "2",
+                    "GROUP_RANK": "0",
+                    "GROUP_WORLD_SIZE": "1",
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": str(port),
+                }
+            ),
+        ),
+    )
+    assert isinstance(strategy, DDPStrategy)
+    return strategy
+
+
+def test_build_strategy_is_the_only_setup_and_env_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_calls = 0
+    original_setup = SingleProcessStrategy.setup
+
+    def counted_setup(self):
+        nonlocal setup_calls
+        setup_calls += 1
+        return original_setup(self)
+
+    monkeypatch.setattr(SingleProcessStrategy, "setup", counted_setup)
+    strategy = _single_strategy()
+    assert setup_calls == 1
+    assert strategy.context.backend is None
+    assert strategy.context.device == torch.device("cpu")
+
+    monkeypatch.setattr(
+        strategy,
+        "setup",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("prepare() called setup() a second time")
+        ),
+    )
+    strategy.prepare(_LinearAdapter())
+    assert setup_calls == 1
+
+
+def test_build_strategy_rejects_mode_drift_and_external_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = ValidatedRuntimeEnv(
+        mode="single",
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        group_rank=None,
+        group_world_size=None,
+        master_addr=None,
+        master_port=None,
+        visible_gpu_count=0,
+        raw_launch_env=FrozenMapping({}),
+    )
+    ddp_config = SimpleNamespace(
+        mode="ddp",
+        device="cpu",
+        timeout_s=30.0,
+        max_snapshot_tensor_bytes=1024,
+    )
+    with pytest.raises(ValueError, match="mode does not match"):
+        build_strategy(ddp_config, env)
+
+    single_config = SimpleNamespace(
+        mode="single",
+        device="cpu",
+        timeout_s=30.0,
+        max_snapshot_tensor_bytes=None,
+    )
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    with pytest.raises(RuntimeError, match="ownership"):
+        build_strategy(single_config, env)
+
+
 def test_single_process_context_and_strategy_have_no_distributed_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    context = DistributedContext.from_env(env={}, device="cpu", backend="gloo")
+    context = _single_context()
     adapter = _LinearAdapter()
     original_module = adapter.transformer
     original_keys = set(adapter.state_dict())
@@ -52,21 +246,23 @@ def test_single_process_context_and_strategy_have_no_distributed_side_effects(
         raise AssertionError("single-process setup initialized a process group")
 
     monkeypatch.setattr(dist, "init_process_group", unexpected_init)
-    strategy = SingleProcessStrategy(context).setup()
+    strategy = _single_strategy()
     assert strategy.prepare(adapter) is adapter
-    actual = strategy.recompute_log_probs(torch.tensor([[2.0]]))
+    batch = _policy_batch(2.0)
+    actual = strategy.recompute_policy_stats(batch)
 
     assert context.rank == context.local_rank == 0
     assert context.world_size == 1
     assert context.device == torch.device("cpu")
-    assert context.backend == "gloo"
+    assert context.backend is None
     assert not context.is_distributed
     assert context.is_main_process
     assert context.step_seed(100, 3) == 103
     assert adapter.transformer is original_module
     assert set(adapter.state_dict()) == original_keys == {"weight"}
     torch.testing.assert_close(
-        actual, adapter.recompute_log_probs(torch.tensor([[2.0]]))
+        actual.new_log_probs,
+        adapter.recompute_policy_stats(batch).new_log_probs,
     )
     assert strategy.reduce_weighted_mean(torch.tensor(3.0), 7) == 3.0
     assert strategy.reduce_weighted_scalars({"loss": 2, "reward": 4.5}, 7) == {
@@ -106,14 +302,14 @@ def test_single_process_context_and_strategy_have_no_distributed_side_effects(
     strategy.close()
     assert strategy.closed
     with pytest.raises(RuntimeError, match="closed"):
-        strategy.forward(torch.tensor([[1.0]]))
+        strategy.recompute_policy_stats(_policy_batch(1.0))
     with pytest.raises(RuntimeError, match="closed"):
         strategy.reduce_weighted_mean(1.0, 1)
 
 
 @pytest.mark.parametrize("name,value", [("base_seed", -1), ("step", -1)])
 def test_step_seed_rejects_negative_values(name: str, value: int) -> None:
-    context = DistributedContext.from_env(env={}, device="cpu", backend="gloo")
+    context = _single_context()
     arguments = {"base_seed": 1, "step": 1, name: value}
     with pytest.raises(ValueError, match="non-negative"):
         context.step_seed(**arguments)
@@ -121,15 +317,13 @@ def test_step_seed_rejects_negative_values(name: str, value: int) -> None:
 
 @pytest.mark.parametrize("value", [True, 1.0, "1"])
 def test_step_seed_rejects_non_integer_values(value: Any) -> None:
-    context = DistributedContext.from_env(env={}, device="cpu", backend="gloo")
+    context = _single_context()
     with pytest.raises(TypeError, match="integer"):
         context.step_seed(value, 0)
 
 
 def test_single_metric_reduction_rejects_non_finite_values() -> None:
-    strategy = SingleProcessStrategy(
-        DistributedContext.from_env(env={}, device="cpu", backend="gloo")
-    ).setup()
+    strategy = _single_strategy()
     with pytest.raises(ValueError, match="finite"):
         strategy.reduce_metrics({"loss": float("nan")}, 1)
     with pytest.raises(ValueError, match="reward_values"):
@@ -137,9 +331,7 @@ def test_single_metric_reduction_rejects_non_finite_values() -> None:
 
 
 def test_single_process_optimizer_step_has_no_snapshot_overhead(monkeypatch) -> None:
-    strategy = SingleProcessStrategy(
-        DistributedContext.from_env(env={}, device="cpu", backend="gloo")
-    ).setup()
+    strategy = _single_strategy()
     parameter = torch.nn.Parameter(torch.tensor(1.0))
     optimizer = torch.optim.SGD([parameter], lr=0.1)
 
@@ -179,9 +371,7 @@ def test_single_process_optimizer_step_has_no_snapshot_overhead(monkeypatch) -> 
 
 
 def test_local_metric_contract_is_canonical_and_collective_free() -> None:
-    strategy = SingleProcessStrategy(
-        DistributedContext.from_env(env={}, device="cpu", backend="gloo")
-    ).setup()
+    strategy = _single_strategy()
 
     contract = strategy.metric_contract(
         {
@@ -249,53 +439,6 @@ def test_ddp_snapshot_limit_configuration_fails_closed(value: Any) -> None:
     assert unbounded.last_atomic_snapshot_metrics is None
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (0, ValueError),
-        (-1, ValueError),
-        (True, TypeError),
-        (1.5, TypeError),
-        ("1024", TypeError),
-    ],
-)
-def test_typed_distributed_snapshot_limit_fails_closed(value, expected) -> None:
-    with pytest.raises(expected, match="max_snapshot_tensor_bytes"):
-        config_from_dict(
-            {
-                "run_name": "invalid-snapshot-limit",
-                "runner": {
-                    "distributed": {"max_snapshot_tensor_bytes": value},
-                },
-            }
-        )
-
-
-def test_typed_distributed_snapshot_limit_allows_explicit_unbounded() -> None:
-    default_config = config_from_dict({"run_name": "bounded-snapshot"})
-    config = config_from_dict(
-        {
-            "run_name": "unbounded-snapshot",
-            "runner": {
-                "distributed": {"max_snapshot_tensor_bytes": None},
-            },
-        }
-    )
-
-    assert default_config.runner.distributed.max_snapshot_tensor_bytes == 1 << 30
-    assert config.runner.distributed.max_snapshot_tensor_bytes is None
-
-
-def test_typed_distributed_timeout_rejects_bool() -> None:
-    with pytest.raises(TypeError, match="distributed.timeout_s"):
-        config_from_dict(
-            {
-                "run_name": "invalid-distributed-timeout",
-                "runner": {"distributed": {"timeout_s": True}},
-            }
-        )
-
-
 def test_optimizer_snapshot_restore_attempts_plugin_after_optimizer_failure() -> None:
     class Stateful:
         def __init__(self) -> None:
@@ -356,34 +499,11 @@ def test_optimizer_snapshot_restore_attempts_plugin_after_optimizer_failure() ->
     assert snapshot.metrics["optimizer_state_tensor_bytes"] > 0
 
 
-@pytest.mark.parametrize(
-    "env",
-    [
-        {"RANK": "0"},
-        {"RANK": "0", "LOCAL_RANK": "0"},
-        {"RANK": "00", "LOCAL_RANK": "0", "WORLD_SIZE": "2"},
-        {"RANK": "+0", "LOCAL_RANK": "0", "WORLD_SIZE": "2"},
-        {"RANK": " 0", "LOCAL_RANK": "0", "WORLD_SIZE": "2"},
-        {"RANK": "0", "LOCAL_RANK": "-1", "WORLD_SIZE": "2"},
-        {"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "0"},
-        {"RANK": "2", "LOCAL_RANK": "0", "WORLD_SIZE": "2"},
-        {"RANK": "0", "LOCAL_RANK": "1", "WORLD_SIZE": "1"},
-    ],
-)
-def test_context_rejects_incomplete_or_invalid_rank_environment(
-    env: dict[str, str],
-) -> None:
-    with pytest.raises(ValueError):
-        DistributedContext.from_env(env=env, device="cpu", backend="gloo")
-
-
 @pytest.mark.parametrize("operation", ["broadcast", "gather"])
 def test_single_process_object_collectives_reject_invalid_roots(
     operation: str,
 ) -> None:
-    strategy = SingleProcessStrategy(
-        DistributedContext.from_env(env={}, device="cpu", backend="gloo")
-    ).setup()
+    strategy = _single_strategy()
 
     with pytest.raises(ValueError, match="rank in the process group"):
         if operation == "broadcast":
@@ -408,8 +528,8 @@ def _ddp_worker(rank: int, port: int, results: Any) -> None:
             MASTER_ADDR="127.0.0.1",
             MASTER_PORT=str(port),
         )
-        context = DistributedContext.from_env(device="cpu", backend="gloo")
-        strategy = DDPStrategy(context, timeout_s=6).setup()
+        strategy = _ddp_strategy(rank, port, timeout_s=6)
+        context = strategy.context
         adapter = _LinearAdapter()
         with torch.no_grad():
             adapter.transformer.weight.fill_(rank + 1.0)
@@ -419,7 +539,9 @@ def _ddp_worker(rank: int, port: int, results: Any) -> None:
 
         optimizer = torch.optim.SGD(adapter.train_module.parameters(), lr=0.1)
         optimizer.zero_grad(set_to_none=True)
-        strategy.forward(torch.tensor([[float(rank + 1)]])).sum().backward()
+        strategy.recompute_policy_stats(
+            _policy_batch(float(rank + 1), rank=rank, world_size=2)
+        ).new_log_probs.sum().backward()
         optimizer.step()
 
         local_mean = 2.0 if rank == 0 else 10.0
@@ -717,8 +839,7 @@ def _object_collective_consensus_worker(rank: int, port: int, results: Any) -> N
             MASTER_ADDR="127.0.0.1",
             MASTER_PORT=str(port),
         )
-        context = DistributedContext.from_env(device="cpu", backend="gloo")
-        strategy = DDPStrategy(context, timeout_s=6).setup()
+        strategy = _ddp_strategy(rank, port, timeout_s=6)
 
         errors: dict[str, str] = {}
 

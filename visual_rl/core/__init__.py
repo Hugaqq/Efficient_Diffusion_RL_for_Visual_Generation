@@ -1,10 +1,8 @@
 """Core VisualRL data contracts.
 
-``visual_rl.core.types`` is imported eagerly (it is a leaf module with no
-VisualRL imports). The component manifest lives in
-``visual_rl.core.components`` and is exported lazily so that importing base
-classes (e.g. ``visual_rl.model_adapters.base``) never triggers a circular
-import through the manifest's factory imports.
+``visual_rl.core.types`` and ``visual_rl.core.components`` are lightweight
+leaf modules.  The concrete manifest and its only lookup live in
+``visual_rl.builtins`` and are intentionally not re-exported here.
 """
 
 from visual_rl.core.types import (
@@ -25,17 +23,12 @@ from visual_rl.core.types import (
     to_plain_dict,
     validate_step_seed_budget,
 )
-
-_LAZY_COMPONENT_EXPORTS = frozenset(
-    {
-        "CAPABILITY_OWNER",
-        "CAPABILITY_VOCABULARY",
-        "COMPONENT_KINDS",
-        "ComponentKind",
-        "ComponentSpec",
-        "builtin_components",
-        "get_builtin_component",
-    }
+from visual_rl.core.components import (
+    CAPABILITY_OWNER,
+    CAPABILITY_VOCABULARY,
+    COMPONENT_KINDS,
+    ComponentKind,
+    ComponentSpec,
 )
 
 __all__ = [
@@ -58,18 +51,6 @@ __all__ = [
     "ValidatedRuntimeEnv",
     "ValidationCheck",
     "ValidationContext",
-    "builtin_components",
-    "get_builtin_component",
     "to_plain_dict",
     "validate_step_seed_budget",
 ]
-
-
-def __getattr__(name: str):
-    if name in _LAZY_COMPONENT_EXPORTS:
-        from visual_rl.core import components
-
-        value = getattr(components, name)
-        globals()[name] = value
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

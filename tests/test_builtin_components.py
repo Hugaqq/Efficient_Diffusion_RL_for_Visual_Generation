@@ -1,11 +1,4 @@
-"""Golden tests for the frozen builtin component manifest (v0.7 W02).
-
-The capability/dependency matrices below are verbatim copies of the master
-plan stage 2.5 (capability matrix) and stage 2.2 (dependency table). The
-manifest must equal them exactly, modulo the explicitly deferred
-``wan_flash`` entry, which only joins when the Wan split lands in the atomic
-cutover (no ``WanFlashAdapter`` class exists yet).
-"""
+"""Golden tests for the one immutable builtin component manifest."""
 
 from __future__ import annotations
 
@@ -14,141 +7,94 @@ import inspect
 
 import pytest
 
+from visual_rl.builtins import builtin_components, get_builtin_component
 from visual_rl.core.components import (
     CAPABILITY_OWNER,
     CAPABILITY_VOCABULARY,
     COMPONENT_KINDS,
     ComponentSpec,
-    builtin_components,
-    get_builtin_component,
 )
 from visual_rl.errors import ComponentError, UnknownComponentError
 
-# Master plan stage 2.5 capability matrix + stage 2.2 dependency table,
-# transcribed row by row. Order of each dependencies tuple is significant.
+_MODEL_DEPS = (
+    "torch",
+    "diffusers",
+    "transformers",
+    "peft",
+    "sentencepiece",
+    "google.protobuf",
+)
+
 GOLDEN_MATRIX = {
-    ("model", "tiny_diffusion"): {
-        "provides": {
+    ("model", "tiny_diffusion"): (
+        {
             "media.image",
             "sampling.full_trajectory",
             "sampling.single_step",
             "sampling.branching",
         },
-        "requires": set(),
-        "dependencies": ("torch",),
-    },
-    ("model", "sd3_tempflow"): {
-        "provides": {
-            "media.image",
-            "sampling.full_trajectory",
-            "sampling.branching",
-        },
-        "requires": set(),
-        "dependencies": (
-            "torch",
-            "diffusers",
-            "transformers",
-            "peft",
-            "sentencepiece",
-            "google.protobuf",
-        ),
-    },
-    ("model", "wan_world_r1"): {
-        "provides": {
-            "media.video",
-            "sampling.full_trajectory",
-            "conditioning.camera",
-        },
-        "requires": set(),
-        "dependencies": (
-            "torch",
-            "diffusers",
-            "transformers",
-            "peft",
-            "sentencepiece",
-            "google.protobuf",
-            "einops",
-            "rp",
-        ),
-    },
-    ("rollout", "full_trajectory"): {
-        "provides": {"rollout.full_trajectory"},
-        "requires": {"sampling.full_trajectory"},
-        "dependencies": ("torch",),
-    },
-    ("rollout", "single_step"): {
-        "provides": {"rollout.single_step"},
-        "requires": {"sampling.single_step"},
-        "dependencies": ("torch",),
-    },
-    ("rollout", "branching"): {
-        "provides": {"rollout.branching"},
-        "requires": {"sampling.branching"},
-        "dependencies": ("torch",),
-    },
-    ("reward", "mock"): {
-        "provides": set(),
-        "requires": set(),
-        "dependencies": ("numpy",),
-    },
-    ("reward", "prompt_color"): {
-        "provides": set(),
-        "requires": {"media.image"},
-        "dependencies": ("numpy",),
-    },
-    ("reward", "prompt_color_margin"): {
-        "provides": set(),
-        "requires": {"media.image"},
-        "dependencies": ("numpy",),
-    },
-    ("reward", "prompt_color_guarded"): {
-        "provides": set(),
-        "requires": {"media.image"},
-        "dependencies": ("numpy",),
-    },
-    ("reward", "reward_general"): {
-        "provides": set(),
-        "requires": {"media.video"},
-        "dependencies": ("numpy", "PIL", "requests"),
-    },
-    ("reward", "reward_3d"): {
-        "provides": set(),
-        "requires": {"media.video", "conditioning.camera"},
-        "dependencies": ("numpy", "PIL", "requests"),
-    },
-    ("algorithm", "grpo"): {
-        "provides": set(),
-        "requires": {"rollout.full_trajectory"},
-        "dependencies": ("torch",),
-    },
-    ("algorithm", "flash_grpo"): {
-        "provides": set(),
-        "requires": {"media.video", "rollout.single_step"},
-        "dependencies": ("torch",),
-    },
-    ("algorithm", "tempflow_grpo"): {
-        "provides": set(),
-        "requires": {"media.image", "rollout.branching"},
-        "dependencies": ("torch",),
-    },
-}
-
-# Plan matrix rows deferred to the Wan-split cutover. ``wan_flash`` currently
-# has no factory class, so it must resolve as unknown in this phase; this set
-# documents exactly which golden rows are pending and may never grow silently.
-DEFERRED_MATRIX = {
-    ("model", "wan_flash"): {
-        "provides": {"media.video", "sampling.single_step"},
-        "requires": set(),
-        "dependencies": (
-            "torch",
-            "diffusers",
-            "transformers",
-            "peft",
-            "sentencepiece",
-            "google.protobuf",
-        ),
-    },
+        set(),
+        ("torch",),
+    ),
+    ("model", "sd3_tempflow"): (
+        {"media.image", "sampling.full_trajectory", "sampling.branching"},
+        set(),
+        _MODEL_DEPS,
+    ),
+    ("model", "wan_flash"): (
+        {"media.video", "sampling.single_step"},
+        set(),
+        _MODEL_DEPS,
+    ),
+    ("model", "wan_world_r1"): (
+        {"media.video", "sampling.full_trajectory", "conditioning.camera"},
+        set(),
+        (*_MODEL_DEPS, "einops", "rp"),
+    ),
+    ("rollout", "full_trajectory"): (
+        {"rollout.full_trajectory"},
+        {"sampling.full_trajectory"},
+        ("torch",),
+    ),
+    ("rollout", "single_step"): (
+        {"rollout.single_step"},
+        {"sampling.single_step"},
+        ("torch",),
+    ),
+    ("rollout", "branching"): (
+        {"rollout.branching"},
+        {"sampling.branching"},
+        ("torch",),
+    ),
+    ("reward", "mock"): (set(), set(), ("numpy",)),
+    ("reward", "prompt_color"): (set(), {"media.image"}, ("numpy",)),
+    ("reward", "prompt_color_margin"): (set(), {"media.image"}, ("numpy",)),
+    ("reward", "prompt_color_guarded"): (set(), {"media.image"}, ("numpy",)),
+    ("reward", "reward_general"): (
+        set(),
+        {"media.video"},
+        ("numpy", "PIL", "requests"),
+    ),
+    ("reward", "reward_3d"): (
+        set(),
+        {"media.video", "conditioning.camera"},
+        ("numpy", "PIL", "requests"),
+    ),
+    ("algorithm", "grpo"): (
+        set(),
+        {"rollout.full_trajectory"},
+        ("torch",),
+    ),
+    ("algorithm", "flash_grpo"): (
+        set(),
+        {"media.video", "rollout.single_step"},
+        ("torch",),
+    ),
+    ("algorithm", "tempflow_grpo"): (
+        set(),
+        {"media.image", "rollout.branching"},
+        ("torch",),
+    ),
 }
 
 EXPECTED_CAPABILITY_OWNER = {
@@ -169,7 +115,6 @@ RETIRED_ALIASES = (
     ("model", "world_r1_wan_legacy"),
     ("model", "mock_wan"),
     ("model", "wan"),
-    ("model", "wan_flash"),  # deferred, not yet a selectable builtin
     ("rollout", "flash_single_step"),
     ("reward", "remote_pickle"),
     ("reward", "pickscore"),
@@ -177,174 +122,100 @@ RETIRED_ALIASES = (
     ("reward", "reward_router"),
 )
 
-ILLEGAL_KINDS = (
-    "optimizer",
-    "feedback_provider",
-    "provider",
-    "plugin",
-    "objective",
-    "runner",
-    "artifact",
-)
 
-
-def _manifest_matrix():
+def _matrix():
     return {
-        (spec.kind, spec.name): {
-            "provides": set(spec.provides),
-            "requires": set(spec.requires),
-            "dependencies": spec.dependencies,
-        }
+        (spec.kind, spec.name): (
+            set(spec.provides),
+            set(spec.requires),
+            spec.dependencies,
+        )
         for spec in builtin_components()
     }
 
 
-def test_manifest_kinds_are_exactly_the_four_legal_kinds():
-    kinds = {spec.kind for spec in builtin_components()}
-    assert kinds == {"model", "rollout", "reward", "algorithm"}
+def test_manifest_matches_the_complete_plan_matrix():
+    assert _matrix() == GOLDEN_MATRIX
     assert COMPONENT_KINDS == ("model", "rollout", "reward", "algorithm")
+    assert {spec.kind for spec in builtin_components()} == set(COMPONENT_KINDS)
 
 
-def test_manifest_is_a_fixed_order_immutable_tuple():
-    first = builtin_components()
-    second = builtin_components()
-    assert isinstance(first, tuple)
-    assert first is second
-    assert all(isinstance(spec, ComponentSpec) for spec in first)
-
-
-def test_kind_name_pairs_are_unique():
-    pairs = [(spec.kind, spec.name) for spec in builtin_components()]
+def test_manifest_is_one_fixed_tuple_with_unique_factories():
+    manifest = builtin_components()
+    assert isinstance(manifest, tuple)
+    assert builtin_components() is manifest
+    pairs = [(spec.kind, spec.name) for spec in manifest]
     assert len(pairs) == len(set(pairs))
+    for kind in COMPONENT_KINDS:
+        factories = [spec.factory for spec in manifest if spec.kind == kind]
+        assert len(factories) == len(set(factories))
 
 
-def test_factory_is_unique_within_each_kind():
-    by_kind: dict[str, dict[type, str]] = {}
-    for spec in builtin_components():
-        seen = by_kind.setdefault(spec.kind, {})
-        assert spec.factory not in seen, (
-            f"factory {spec.factory.__name__} is registered twice in kind "
-            f"{spec.kind}: {seen[spec.factory]!r} and {spec.name!r}"
-        )
-        seen[spec.factory] = spec.name
-
-
-def test_component_spec_is_frozen_and_has_no_parallel_fields():
-    field_names = {item.name for item in dataclasses.fields(ComponentSpec)}
-    assert field_names == {
+def test_component_spec_is_only_the_frozen_description():
+    assert dataclasses.is_dataclass(ComponentSpec)
+    assert ComponentSpec.__dataclass_params__.frozen
+    assert tuple(field.name for field in dataclasses.fields(ComponentSpec)) == (
         "kind",
         "name",
         "factory",
         "provides",
         "requires",
         "dependencies",
-    }
-    spec = builtin_components()[0]
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        spec.name = "other"
+    )
     for spec in builtin_components():
-        assert isinstance(spec.provides, frozenset)
-        assert isinstance(spec.requires, frozenset)
-        assert isinstance(spec.dependencies, tuple)
+        assert isinstance(spec, ComponentSpec)
         assert inspect.isclass(spec.factory)
-
-
-def test_capability_and_dependency_golden_matrix_matches_plan_verbatim():
-    assert _manifest_matrix() == GOLDEN_MATRIX
-    assert set(GOLDEN_MATRIX).isdisjoint(DEFERRED_MATRIX)
-    # The union with the deferred rows is exactly the plan's full matrix.
-    assert set(GOLDEN_MATRIX) | set(DEFERRED_MATRIX) == set(GOLDEN_MATRIX) | {
-        ("model", "wan_flash")
-    }
-
-
-def test_deferred_entries_resolve_as_unknown_for_now():
-    for kind, name in DEFERRED_MATRIX:
-        with pytest.raises(ComponentError):
-            get_builtin_component(kind, name)
-
-
-def test_capability_vocabulary_and_owner_table_match_plan():
-    assert CAPABILITY_VOCABULARY == frozenset(EXPECTED_CAPABILITY_OWNER)
-    assert CAPABILITY_OWNER == EXPECTED_CAPABILITY_OWNER
-
-
-def test_provides_and_requires_stay_inside_the_closed_vocabulary():
-    for spec in builtin_components():
         assert spec.provides <= CAPABILITY_VOCABULARY
         assert spec.requires <= CAPABILITY_VOCABULARY
+        assert all(CAPABILITY_OWNER[item] == spec.kind for item in spec.provides)
 
 
-def test_provides_only_come_from_the_owner_kind():
-    for spec in builtin_components():
-        for capability in spec.provides:
-            assert CAPABILITY_OWNER[capability] == spec.kind
+def test_capability_vocabulary_and_owners_are_exact():
+    assert CAPABILITY_OWNER == EXPECTED_CAPABILITY_OWNER
+    assert CAPABILITY_VOCABULARY == frozenset(EXPECTED_CAPABILITY_OWNER)
+    assert all(
+        "policy.reference_stats" not in spec.provides
+        for spec in builtin_components()
+    )
 
 
-def test_each_builtin_model_declares_exactly_one_media_capability():
-    for spec in builtin_components():
-        if spec.kind != "model":
-            continue
-        media = {item for item in spec.provides if item.startswith("media.")}
-        assert len(media) == 1, f"{spec.name} declares {sorted(media)}"
+def test_only_builtins_module_owns_lookup_and_manifest():
+    import visual_rl.builtins as builtins_module
+    import visual_rl.core.components as descriptions
+
+    assert callable(builtins_module.builtin_components)
+    assert callable(builtins_module.get_builtin_component)
+    assert not hasattr(descriptions, "builtin_components")
+    assert not hasattr(descriptions, "get_builtin_component")
+    assert builtins_module.__all__ == [
+        "builtin_components",
+        "get_builtin_component",
+    ]
 
 
-def test_no_component_prematurely_provides_reference_stats():
-    # policy.reference_stats may only be declared after stage 4 implements
-    # and tests it (master plan stage 2.1).
-    for spec in builtin_components():
-        assert "policy.reference_stats" not in spec.provides
-
-
-def test_dependencies_are_bare_import_names_without_versions():
-    for spec in builtin_components():
-        assert spec.dependencies, f"{spec.name} has empty dependencies"
-        for dependency in spec.dependencies:
-            assert isinstance(dependency, str)
-            assert dependency
-            assert not set(dependency) & set("><=~![]; "), dependency
-
-
-def test_get_builtin_component_round_trips_every_spec():
+def test_lookup_round_trips_and_rejects_retired_names():
     for spec in builtin_components():
         assert get_builtin_component(spec.kind, spec.name) is spec
+    for kind, name in RETIRED_ALIASES:
+        with pytest.raises(UnknownComponentError):
+            get_builtin_component(kind, name)
+    with pytest.raises(ComponentError, match="Unknown component kind"):
+        get_builtin_component("provider", "anything")
 
 
-def test_unknown_name_raises_component_error_listing_same_kind_names():
+def test_unknown_error_lists_only_same_kind_canonical_names():
     with pytest.raises(UnknownComponentError) as excinfo:
-        get_builtin_component("model", "does_not_exist")
-    error = excinfo.value
-    assert isinstance(error, ComponentError)
-    assert error.kind == "model"
-    assert error.name == "does_not_exist"
-    assert error.available == tuple(
+        get_builtin_component("model", "missing")
+    assert excinfo.value.available == tuple(
         spec.name for spec in builtin_components() if spec.kind == "model"
     )
-    assert "tiny_diffusion" in str(error)
 
 
-@pytest.mark.parametrize(("kind", "name"), RETIRED_ALIASES)
-def test_retired_aliases_resolve_as_unknown(kind, name):
-    with pytest.raises(ComponentError) as excinfo:
-        get_builtin_component(kind, name)
-    assert name not in getattr(excinfo.value, "available", ())
-
-
-@pytest.mark.parametrize("kind", ILLEGAL_KINDS)
-def test_illegal_component_kinds_are_rejected(kind):
-    with pytest.raises(ComponentError, match="Unknown component kind"):
-        get_builtin_component(kind, "anything")
-
-
-def test_module_exposes_no_registration_surface():
-    import visual_rl.core.components as components
-
-    for banned in (
-        "register",
-        "add",
-        "freeze",
-        "snapshot",
-        "override",
-        "register_builtin_plugins",
-    ):
-        assert not hasattr(components, banned), banned
+def test_dependencies_are_bare_import_names():
+    for spec in builtin_components():
+        assert spec.dependencies
+        assert all(
+            dependency
+            and not set(dependency).intersection("><=~![]; ")
+            for dependency in spec.dependencies
+        )

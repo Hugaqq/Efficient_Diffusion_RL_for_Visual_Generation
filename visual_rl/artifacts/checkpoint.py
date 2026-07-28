@@ -1,720 +1,280 @@
-"""Atomic metadata and complete training-state checkpoints."""
+"""Mechanical format-v5 training checkpoints.
+
+This module owns one producer, one side-effect-free reader/validator and one
+atomic mutation boundary.  It deliberately stores no config, data, model,
+reference, source or plugin identity.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
 import hashlib
-import inspect
 import json
 import math
 import os
+from pathlib import Path
 import random
 import secrets
-import shutil
 import stat
-import subprocess
-from copy import deepcopy
-from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from visual_rl.artifacts.serialization import redact_artifact_config, to_jsonable
+from visual_rl.configs.schema import OptimizerConfig
+from visual_rl.errors import ResumeError
 
-CHECKPOINT_FORMAT_VERSION = 4
-CONFIG_FINGERPRINT_VERSION = 2
-_LEGACY_CHECKPOINT_FORMAT_VERSIONS = {1, 2}
-_PRIOR_SAFE_CHECKPOINT_FORMAT_VERSIONS = {3}
-_SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = {
-    *_LEGACY_CHECKPOINT_FORMAT_VERSIONS,
-    *_PRIOR_SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    CHECKPOINT_FORMAT_VERSION,
-}
-_SAFE_CHECKPOINT_FORMAT_VERSIONS = {
-    *_PRIOR_SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    CHECKPOINT_FORMAT_VERSION,
-}
-_HASHED_CHECKPOINT_FORMAT_VERSIONS = {
-    2,
-    *_PRIOR_SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    CHECKPOINT_FORMAT_VERSION,
-}
-_TRAINING_STATE_HASHED_CHECKPOINT_FORMAT_VERSIONS = {CHECKPOINT_FORMAT_VERSION}
-_DISTRIBUTED_CHECKPOINT_FORMAT_VERSIONS = _SAFE_CHECKPOINT_FORMAT_VERSIONS
-_SUPPORTED_CONFIG_FINGERPRINT_VERSIONS = {1, CONFIG_FINGERPRINT_VERSION}
-_CHECKPOINT_CONTROL_FILES = {"checkpoint.json", "training_state.pt"}
-_ADAPTER_HASH_CHUNK_SIZE = 1024 * 1024
-_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES = frozenset({"component-sha256-v1"})
-_SAFE_CONFIG_FINGERPRINT_SCHEME = "component-sha256-v2"
-_SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES = frozenset(
-    {*_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES, _SAFE_CONFIG_FINGERPRINT_SCHEME}
+CHECKPOINT_FORMAT_VERSION = 5
+_CHECKPOINT_ROOT_ENTRIES = frozenset(
+    {"adapter", "training_state.pt", "checkpoint.json"}
 )
-_SEMANTIC_CONFIG_KEYS = {
-    "seed",
-    "use_lora",
-    "per_prompt_stat_tracking",
-    "model",
-    "sample",
-    "rollout",
-    "algorithm",
-    "rewards",
-    "optimizer",
-    "train",
-    "paths",
-}
+_METADATA_KEYS = frozenset(
+    {
+        "format_version",
+        "global_step",
+        "world_size",
+        "training_contract",
+        "adapter_dir",
+        "adapter_tree_sha256",
+        "training_state",
+        "training_state_sha256",
+    }
+)
+_STATE_KEYS = frozenset(
+    {
+        "format_version",
+        "global_step",
+        "world_size",
+        "training_contract",
+        "optimizer_topology",
+        "optimizer",
+        "grad_scaler",
+        "rank_states",
+    }
+)
+_TOPOLOGY_KEYS = frozenset({"parameter_names", "group_roles"})
+_OPTIMIZER_KEYS = frozenset({"state", "param_groups"})
+_CONTRACT_KEYS = frozenset({"algorithm", "version"})
+_RANK_STATE_KEYS = frozenset({"rank", "rng"})
+_RNG_KEYS = frozenset({"python", "numpy", "torch_cpu", "torch_cuda"})
+_NUMPY_RNG_KEYS = frozenset(
+    {
+        "bit_generator",
+        "state",
+        "position",
+        "has_gauss",
+        "cached_gaussian",
+    }
+)
+_GROUP_ROLES = ("trainable_adapter",)
+_SHA256_CHUNK_SIZE = 1024 * 1024
+
+__all__ = [
+    "CheckpointMetadata",
+    "RankState",
+    "TrainingContract",
+    "ValidatedTrainingState",
+    "apply_training_state",
+    "checkpoint_tree_sha256",
+    "load_json",
+    "read_and_validate_training_state",
+    "save_training_state",
+    "strict_json_loads",
+]
+
+
+@dataclass(frozen=True)
+class TrainingContract:
+    """Mechanical objective/update compatibility identifier."""
+
+    algorithm: str
+    version: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.algorithm, str) or not self.algorithm:
+            raise TypeError("training contract algorithm must be a non-empty string")
+        if type(self.version) is not int or self.version < 1:
+            raise ValueError("training contract version must be a positive integer")
+
+    def to_payload(self) -> dict[str, object]:
+        return {"algorithm": self.algorithm, "version": self.version}
+
+
+@dataclass(frozen=True)
+class RankState:
+    """One rank's immutable Python/NumPy/Torch RNG snapshot."""
+
+    rank: int
+    python_state: tuple[Any, ...]
+    numpy_bit_generator: str
+    numpy_state: tuple[int, ...]
+    numpy_position: int
+    numpy_has_gauss: int
+    numpy_cached_gaussian: float
+    torch_cpu: Any
+    torch_cuda: Any | None
+
+    def __post_init__(self) -> None:
+        if type(self.rank) is not int or self.rank < 0:
+            raise ValueError("rank must be a non-negative integer")
+        if type(self.python_state) is not tuple:
+            raise TypeError("python RNG state must be a tuple")
+        try:
+            probe = random.Random()
+            probe.setstate(self.python_state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("python RNG state is invalid") from exc
+        if self.numpy_bit_generator != "MT19937":
+            raise ValueError("NumPy RNG bit_generator must be MT19937")
+        if (
+            type(self.numpy_state) is not tuple
+            or len(self.numpy_state) != 624
+            or any(type(item) is not int or not 0 <= item <= 0xFFFF_FFFF for item in self.numpy_state)
+        ):
+            raise ValueError("NumPy RNG state must contain 624 uint32 integers")
+        if type(self.numpy_position) is not int or not 0 <= self.numpy_position <= 624:
+            raise ValueError("NumPy RNG position must be in [0, 624]")
+        if type(self.numpy_has_gauss) is not int or self.numpy_has_gauss not in {0, 1}:
+            raise ValueError("NumPy RNG has_gauss must be integer 0 or 1")
+        if (
+            isinstance(self.numpy_cached_gaussian, bool)
+            or not isinstance(self.numpy_cached_gaussian, (int, float))
+            or not math.isfinite(float(self.numpy_cached_gaussian))
+        ):
+            raise ValueError("NumPy RNG cached_gaussian must be finite")
+        cpu = _validated_rng_tensor(self.torch_cpu, label="torch_cpu")
+        cuda = (
+            None
+            if self.torch_cuda is None
+            else _validated_rng_tensor(self.torch_cuda, label="torch_cuda")
+        )
+        object.__setattr__(self, "torch_cpu", cpu.clone())
+        object.__setattr__(
+            self,
+            "torch_cuda",
+            None if cuda is None else cuda.clone(),
+        )
+
+    @classmethod
+    def from_rng(
+        cls,
+        *,
+        rank: int,
+        python_state: tuple[Any, ...],
+        numpy_state: tuple[Any, ...],
+        torch_cpu: Any,
+        torch_cuda: Any | None,
+    ) -> RankState:
+        """Build the typed contract from standard library RNG snapshots."""
+
+        if type(numpy_state) is not tuple or len(numpy_state) != 5:
+            raise ValueError("numpy_state must be the five-item np.random state tuple")
+        words = np.asarray(numpy_state[1], dtype=np.uint32)
+        if words.shape != (624,):
+            raise ValueError("NumPy RNG state must contain 624 uint32 words")
+        return cls(
+            rank=rank,
+            python_state=python_state,
+            numpy_bit_generator=str(numpy_state[0]),
+            numpy_state=tuple(int(item) for item in words.tolist()),
+            numpy_position=int(numpy_state[2]),
+            numpy_has_gauss=int(numpy_state[3]),
+            numpy_cached_gaussian=float(numpy_state[4]),
+            torch_cpu=torch_cpu,
+            torch_cuda=torch_cuda,
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "rank": self.rank,
+            "rng": {
+                "python": self.python_state,
+                "numpy": {
+                    "bit_generator": self.numpy_bit_generator,
+                    "state": list(self.numpy_state),
+                    "position": self.numpy_position,
+                    "has_gauss": self.numpy_has_gauss,
+                    "cached_gaussian": float(self.numpy_cached_gaussian),
+                },
+                "torch_cpu": self.torch_cpu.clone(),
+                "torch_cuda": (
+                    None if self.torch_cuda is None else self.torch_cuda.clone()
+                ),
+            },
+        }
+
+
+@dataclass(frozen=True)
+class CheckpointMetadata:
+    """Integrity summary returned to the authoritative commit owner."""
+
+    checkpoint_dir: Path
+    global_step: int
+    world_size: int
+    training_contract: TrainingContract
+    adapter_tree_sha256: str
+    training_state_sha256: str
+    tree_sha256: str
+
+
+class _ApplyToken:
+    __slots__ = ("consumed",)
+
+    def __init__(self) -> None:
+        self.consumed = False
 
 
 @dataclass(frozen=True)
 class ValidatedTrainingState:
-    """A checkpoint state that has passed all side-effect-free validation."""
+    """A fully preflighted format-v5 state, applicable exactly once."""
 
     checkpoint_dir: Path
-    state: dict[str, Any]
-    metadata: dict[str, Any]
-    applicable: bool = True
-
-    @property
-    def step(self) -> int:
-        return int(self.state["step"])
-
-
-def save_json(path: str | Path, data: dict[str, Any]) -> None:
-    path, parent_fd = _open_safe_json_parent(Path(path))
-    temp_name: str | None = None
-    temp_fd: int | None = None
-    try:
-        _validate_file_target(parent_fd, path.name, label="JSON target")
-        temp_name, temp_fd = _create_json_temp(parent_fd, path.name)
-        handle = os.fdopen(temp_fd, "w", encoding="utf-8")
-        temp_fd = None
-        with handle:
-            json.dump(data, handle, indent=2, sort_keys=True, allow_nan=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _validate_file_target(parent_fd, path.name, label="JSON target")
-        os.replace(
-            temp_name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        temp_name = None
-        os.fsync(parent_fd)
-    finally:
-        if temp_fd is not None:
-            os.close(temp_fd)
-        if temp_name is not None:
-            try:
-                os.unlink(temp_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-        os.close(parent_fd)
-
-
-def _open_safe_json_parent(path: Path) -> tuple[Path, int]:
-    """Create and open a parent path without following symlink components."""
-
-    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
-        raise RuntimeError("Secure JSON writes require O_NOFOLLOW and O_DIRECTORY")
-    absolute = path.absolute()
-    if not absolute.name or absolute.name in {".", ".."}:
-        raise ValueError(f"JSON target must name a file: {path}")
-
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    current_fd = os.open(absolute.anchor, directory_flags)
-    try:
-        for part in absolute.parent.parts[1:]:
-            try:
-                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
-            except FileNotFoundError:
-                try:
-                    os.mkdir(part, dir_fd=current_fd)
-                except FileExistsError:
-                    pass
-                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
-        return absolute, current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
-
-
-def _validate_file_target(parent_fd: int, name: str, *, label: str) -> None:
-    try:
-        target_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(target_stat.st_mode):
-        raise RuntimeError(f"{label} must be a regular file, not a symlink: {name}")
-
-
-def _create_json_temp(parent_fd: int, target_name: str) -> tuple[str, int]:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    prefix = f".{target_name[:80]}.tmp-"
-    for _ in range(128):
-        name = f"{prefix}{secrets.token_hex(16)}"
-        try:
-            return name, os.open(name, flags, 0o600, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
-    raise FileExistsError(f"Could not allocate a unique temporary file for {target_name}")
-
-
-def _save_training_state_payload(
-    torch: Any,
-    path: Path,
-    state: dict[str, Any],
-) -> None:
-    path, parent_fd = _open_safe_json_parent(path)
-    temp_name: str | None = None
-    temp_fd: int | None = None
-    try:
-        _validate_file_target(parent_fd, path.name, label="Training state target")
-        temp_name, temp_fd = _create_json_temp(parent_fd, path.name)
-        handle = os.fdopen(temp_fd, "wb")
-        temp_fd = None
-        with handle:
-            torch.save(state, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _validate_file_target(parent_fd, path.name, label="Training state target")
-        os.replace(
-            temp_name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        temp_name = None
-        os.fsync(parent_fd)
-    finally:
-        if temp_fd is not None:
-            os.close(temp_fd)
-        if temp_name is not None:
-            try:
-                os.unlink(temp_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-        os.close(parent_fd)
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"Duplicate JSON key is not allowed: {key!r}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> Any:
-    raise ValueError(f"Non-finite JSON constant is not allowed: {value}")
-
-
-def _parse_finite_json_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError(f"Non-finite JSON number is not allowed: {value}")
-    return parsed
+    global_step: int
+    world_size: int
+    training_contract: TrainingContract
+    metadata: Mapping[str, Any] = field(repr=False, compare=False)
+    state: Mapping[str, Any] = field(repr=False, compare=False)
+    _token: _ApplyToken = field(
+        default_factory=_ApplyToken,
+        repr=False,
+        compare=False,
+    )
 
 
 def strict_json_loads(value: str) -> Any:
-    """Parse RFC-style JSON while rejecting duplicate keys and non-finite values."""
+    """Load finite JSON while rejecting duplicate object keys."""
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = item
+        return result
+
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-finite JSON constant {constant!r} is not allowed")
 
     return json.loads(
         value,
-        object_pairs_hook=_reject_duplicate_json_keys,
-        parse_constant=_reject_json_constant,
-        parse_float=_parse_finite_json_float,
+        object_pairs_hook=pairs_hook,
+        parse_constant=reject_constant,
     )
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
-    path = Path(path)
-    if not hasattr(os, "O_NOFOLLOW"):
-        raise RuntimeError("Secure JSON reads require O_NOFOLLOW")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags)
+    """Read one regular UTF-8 JSON object without following a final symlink."""
+
+    target = Path(path)
+    _require_regular_file(target, label="JSON file")
     try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError(f"JSON document must be a regular file: {path}")
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            fd = -1
-            value = json.load(
-                handle,
-                object_pairs_hook=_reject_duplicate_json_keys,
-                parse_constant=_reject_json_constant,
-                parse_float=_parse_finite_json_float,
-            )
-    finally:
-        if fd >= 0:
-            os.close(fd)
+        value = strict_json_loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"Cannot read finite JSON object: {target}") from exc
     if not isinstance(value, dict):
-        raise ValueError(f"JSON document must contain an object: {path}")
+        raise RuntimeError(f"JSON root must be an object: {target}")
     return value
-
-
-def config_fingerprint(
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None = None,
-    *,
-    version: int = CONFIG_FINGERPRINT_VERSION,
-) -> str:
-    """Hash checkpoint compatibility semantics for the requested version.
-
-    The public helper is side-effect free and trusts declared content hashes.
-    Checkpoint save/load paths additionally validate file-backed data before
-    using the v2 identity.
-    """
-
-    if int(version) == 1:
-        return _payload_sha256(_legacy_config_payload(config, implementation))
-    if int(version) != CONFIG_FINGERPRINT_VERSION:
-        raise ValueError(f"Unsupported config fingerprint version: {version}")
-    return _build_v2_fingerprint_bundle(
-        config,
-        implementation,
-        validate_data=False,
-    )["config_fingerprint"]
-
-
-def _legacy_config_payload(
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Reproduce the original path-sensitive v1 fingerprint payload."""
-
-    source = deepcopy(to_jsonable(config))
-    semantic_keys = {
-        "seed",
-        "use_lora",
-        "per_prompt_stat_tracking",
-        "model",
-        "dataset",
-        "evaluation",
-        "sample",
-        "rollout",
-        "algorithm",
-        "rewards",
-        "optimizer",
-        "train",
-        "paths",
-    }
-    payload = {key: source[key] for key in semantic_keys if key in source}
-    paths = payload.get("paths", {})
-    for key in ("output_dir", "resume_from"):
-        paths.pop(key, None)
-    train = payload.get("train", {})
-    for key in ("max_steps", "save_every"):
-        train.pop(key, None)
-    rewards = payload.get("rewards")
-    if isinstance(rewards, dict) and rewards.get("schedule") == []:
-        rewards.pop("schedule")
-    payload.pop("runner", None)
-    if implementation is not None:
-        payload["implementation"] = to_jsonable(implementation)
-    return payload
-
-
-def _build_v2_fingerprint_bundle(
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None,
-    *,
-    validate_data: bool,
-    fingerprint_scheme: str | None = _SAFE_CONFIG_FINGERPRINT_SCHEME,
-) -> dict[str, Any]:
-    if fingerprint_scheme is not None and (
-        not isinstance(fingerprint_scheme, str)
-        or fingerprint_scheme not in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES
-    ):
-        raise ValueError(f"Unsupported config fingerprint scheme: {fingerprint_scheme}")
-    source = deepcopy(to_jsonable(config))
-    training_semantics = _training_semantics_payload(
-        source,
-        include_reward_batch_partition=(
-            fingerprint_scheme == _SAFE_CONFIG_FINGERPRINT_SCHEME
-        ),
-    )
-    data_identity, data_source = _data_identity_payload(
-        source,
-        validate_data=validate_data,
-    )
-    implementation_identity = to_jsonable(implementation or {})
-    raw_identity_payload = {
-        "training_semantics": training_semantics,
-        "data_identity": data_identity,
-        "implementation": implementation_identity,
-    }
-    component_fingerprints = {
-        "training_semantics_fingerprint": _payload_sha256(training_semantics),
-        "data_identity_fingerprint": _payload_sha256(data_identity),
-        "implementation_identity_fingerprint": _payload_sha256(implementation_identity),
-    }
-    if fingerprint_scheme in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES:
-        fingerprint = _payload_sha256(component_fingerprints)
-    elif fingerprint_scheme is None:
-        fingerprint = _payload_sha256(raw_identity_payload)
-    else:
-        raise ValueError(f"Unsupported config fingerprint scheme: {fingerprint_scheme}")
-
-    persisted_identity = redact_artifact_config(raw_identity_payload)
-    bundle = {
-        "config_fingerprint_version": CONFIG_FINGERPRINT_VERSION,
-        "config_fingerprint": fingerprint,
-        **component_fingerprints,
-        "identity_payload": persisted_identity,
-        "data_identity": persisted_identity["data_identity"],
-        "data_source": redact_artifact_config(data_source),
-    }
-    if fingerprint_scheme is not None:
-        bundle["config_fingerprint_scheme"] = fingerprint_scheme
-    return bundle
-
-
-def _training_semantics_payload(
-    source: dict[str, Any],
-    *,
-    include_reward_batch_partition: bool = False,
-) -> dict[str, Any]:
-    payload = {
-        key: deepcopy(source[key]) for key in _SEMANTIC_CONFIG_KEYS if key in source
-    }
-    if include_reward_batch_partition:
-        _normalize_world_r1_reward_defaults(payload)
-    paths = payload.get("paths", {})
-    for key in ("output_dir", "resume_from"):
-        paths.pop(key, None)
-    train = payload.get("train", {})
-    for key in ("max_steps", "save_every"):
-        train.pop(key, None)
-    runner = source.get("runner") or {}
-    reward_executor = runner.get("reward_executor") or {}
-    if (
-        include_reward_batch_partition
-        and reward_executor.get("mode") == "async"
-        and reward_executor.get("microbatch_size") is not None
-    ):
-        payload["reward_batch_partition"] = {
-            "microbatch_size": reward_executor["microbatch_size"]
-        }
-    return payload
-
-
-def _normalize_world_r1_reward_defaults(payload: dict[str, Any]) -> None:
-    rewards = payload.get("rewards")
-    if not isinstance(rewards, dict):
-        return
-    if rewards.get("schedule") == []:
-        rewards.pop("schedule")
-    clients = rewards.get("clients")
-    if not isinstance(clients, dict):
-        return
-    for key, client in clients.items():
-        if not isinstance(client, dict):
-            continue
-        name = client.get("name", key)
-        if name == "reward_general":
-            default_batch_size = 64
-        elif name == "reward_3d":
-            default_batch_size = 8
-        else:
-            continue
-        if client.get("protocol_mode") == "reference_v1":
-            client.pop("protocol_mode")
-        if client.get("batch_size") == default_batch_size:
-            client.pop("batch_size")
-        if client.get("server_revision", object()) is None:
-            client.pop("server_revision")
-
-
-def _data_identity_payload(
-    source: dict[str, Any],
-    *,
-    validate_data: bool,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    dataset = deepcopy(source.get("dataset") or {})
-    evaluation = deepcopy(source.get("evaluation") or {})
-
-    # ``empty_prompt_policy`` was added after v2 fingerprints shipped.  Its
-    # default reproduces the old strict behavior, so omit only that exact value
-    # to keep existing checkpoints resumable.  Non-default policies remain part
-    # of the data identity and therefore cannot silently cross a resume boundary.
-    if dataset.get("empty_prompt_policy") == "error":
-        dataset.pop("empty_prompt_policy")
-
-    train_path = dataset.pop("path", None)
-    train_prompts = dataset.pop("prompts", None)
-    train_declared_hash = dataset.pop("content_sha256", None)
-    train_hash = _resolve_prompt_content_hash(
-        label="dataset",
-        path=train_path,
-        prompts=train_prompts,
-        declared_hash=train_declared_hash,
-        validate_data=validate_data,
-    )
-    dataset["content_sha256"] = train_hash
-
-    evaluation_path = evaluation.pop("path", None)
-    evaluation_declared_hash = evaluation.pop("content_sha256", None)
-    evaluation_hash = _resolve_prompt_content_hash(
-        label="evaluation",
-        path=evaluation_path,
-        prompts=None,
-        declared_hash=evaluation_declared_hash,
-        validate_data=validate_data,
-    )
-    evaluation["content_sha256"] = evaluation_hash
-
-    return (
-        {
-            "train": dataset,
-            "evaluation": evaluation,
-        },
-        {
-            "train_path": train_path,
-            "evaluation_path": evaluation_path,
-        },
-    )
-
-
-def _resolve_prompt_content_hash(
-    *,
-    label: str,
-    path: str | None,
-    prompts: list[Any] | None,
-    declared_hash: str | None,
-    validate_data: bool,
-) -> str | None:
-    from visual_rl.datasets.prompt_dataset import (
-        prompt_content_sha256,
-        read_prompt_file,
-    )
-
-    if path and prompts:
-        raise RuntimeError(
-            f"Cannot fingerprint {label}: both path and inline prompts are set"
-        )
-
-    actual_hash: str | None = None
-    if prompts:
-        actual_hash = prompt_content_sha256(prompts)
-    elif path and validate_data:
-        try:
-            actual_hash = prompt_content_sha256(read_prompt_file(path))
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot validate {label} data source {path!r}: {exc}"
-            ) from exc
-
-    expected = None if declared_hash is None else str(declared_hash)
-    if expected and actual_hash and actual_hash != expected:
-        raise RuntimeError(
-            f"{label} content SHA256 mismatch: actual {actual_hash} != "
-            f"declared {expected}"
-        )
-    return actual_hash or expected
-
-
-def _payload_sha256(payload: Any) -> str:
-    encoded = json.dumps(
-        to_jsonable(payload),
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def build_implementation_identity(
-    adapter: Any,
-    plugin: Any,
-    *,
-    rollout: Any | None = None,
-    feedback: Any | None = None,
-) -> dict[str, Any]:
-    """Describe the code and trainable parameter contract used by a checkpoint."""
-
-    algorithm = getattr(plugin, "algorithm", None)
-    return {
-        "adapter": _object_identity(adapter),
-        "optimizer_plugin": _object_identity(plugin),
-        "algorithm": _object_identity(algorithm) if algorithm is not None else None,
-        "advantage": _object_identity(getattr(plugin, "advantage_computer", None)),
-        "rollout": _object_identity(rollout),
-        "feedback": _object_identity(feedback),
-        "trainable_parameters": _parameter_signature(adapter),
-        "git_commit": _git_commit(),
-        "git_diff_sha256": _git_diff_hash(),
-        "runtime_tree_sha256": _runtime_tree_hash(),
-        "reference_patch_sha256": _reference_patch_hash(adapter),
-    }
-
-
-def adapter_payload_sha256(checkpoint_dir: str | Path) -> str:
-    """Hash adapter files by normalized relative path and streamed contents."""
-
-    root = validated_checkpoint_directory(
-        checkpoint_dir,
-        checkpoint_dir,
-        label="checkpoint root",
-    )
-    files = sorted(
-        (
-            path
-            for path in _validated_checkpoint_tree_files(root)
-            if path.is_file()
-            and not _is_checkpoint_control_file(path.relative_to(root))
-            and not _is_temporary_checkpoint_path(path.relative_to(root))
-        ),
-        key=lambda path: path.relative_to(root).as_posix(),
-    )
-    if not files:
-        raise RuntimeError(f"Checkpoint adapter payload is empty: {root}")
-
-    digest = hashlib.sha256(b"visual-rl-adapter-payload-tree-v1\0")
-    for path in files:
-        path = validated_checkpoint_file(root, path, label="adapter payload file")
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        size = path.stat().st_size
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(size.to_bytes(16, "big"))
-        bytes_read = 0
-        with path.open("rb") as handle:
-            while chunk := handle.read(_ADAPTER_HASH_CHUNK_SIZE):
-                digest.update(chunk)
-                bytes_read += len(chunk)
-        if bytes_read != size:
-            raise RuntimeError(f"Adapter payload changed while hashing: {path}")
-    return digest.hexdigest()
-
-
-def _file_sha256(path: Path, *, label: str) -> str:
-    digest = hashlib.sha256()
-    expected_size = path.stat().st_size
-    bytes_read = 0
-    with path.open("rb") as handle:
-        while chunk := handle.read(_ADAPTER_HASH_CHUNK_SIZE):
-            digest.update(chunk)
-            bytes_read += len(chunk)
-    if bytes_read != expected_size or path.stat().st_size != expected_size:
-        raise RuntimeError(f"{label} changed while hashing: {path}")
-    return digest.hexdigest()
-
-
-def _required_sha256(value: Any, *, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise RuntimeError(f"{label} must be a lowercase SHA256 digest")
-    return value
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
-def validated_checkpoint_directory(
-    checkpoint_root: str | Path,
-    path: str | Path,
-    *,
-    label: str,
-) -> Path:
-    """Resolve a real directory without following checkpoint symlinks."""
-
-    root = Path(checkpoint_root)
-    candidate = Path(path)
-    try:
-        root_stat = root.lstat()
-        candidate_stat = candidate.lstat()
-    except OSError as exc:
-        raise RuntimeError(f"Missing {label}: {candidate}") from exc
-    if stat.S_ISLNK(root_stat.st_mode) or stat.S_ISLNK(candidate_stat.st_mode):
-        raise RuntimeError(f"Checkpoint {label} must not be a symlink: {candidate}")
-    try:
-        resolved_root = root.resolve(strict=True)
-        resolved_candidate = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"Cannot resolve checkpoint {label}: {candidate}") from exc
-    if not stat.S_ISDIR(root_stat.st_mode) or not stat.S_ISDIR(candidate_stat.st_mode):
-        raise RuntimeError(f"Checkpoint {label} must be a directory: {candidate}")
-    if not _is_within(resolved_candidate, resolved_root):
-        raise RuntimeError(
-            f"Checkpoint {label} escapes checkpoint root {resolved_root}: {candidate}"
-        )
-    return resolved_candidate
-
-
-def validated_checkpoint_file(
-    checkpoint_root: str | Path,
-    path: str | Path,
-    *,
-    label: str,
-) -> Path:
-    """Resolve a regular checkpoint file without following symlinks."""
-
-    root = validated_checkpoint_directory(
-        checkpoint_root,
-        checkpoint_root,
-        label="root",
-    )
-    candidate = Path(path)
-    try:
-        candidate_stat = candidate.lstat()
-    except OSError as exc:
-        raise RuntimeError(f"Missing checkpoint {label}: {candidate}") from exc
-    if stat.S_ISLNK(candidate_stat.st_mode):
-        raise RuntimeError(f"Checkpoint {label} must not be a symlink: {candidate}")
-    try:
-        resolved_candidate = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"Cannot resolve checkpoint {label}: {candidate}") from exc
-    if not stat.S_ISREG(candidate_stat.st_mode):
-        raise RuntimeError(f"Checkpoint {label} must be a regular file: {candidate}")
-    if not _is_within(resolved_candidate, root):
-        raise RuntimeError(
-            f"Checkpoint {label} escapes checkpoint root {root}: {candidate}"
-        )
-    return resolved_candidate
-
-
-def _validated_checkpoint_tree_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    pending = [root]
-    while pending:
-        directory = pending.pop()
-        for child in directory.iterdir():
-            relative = child.relative_to(root)
-            if _is_temporary_checkpoint_path(relative):
-                continue
-            try:
-                child_stat = child.lstat()
-            except OSError as exc:
-                raise RuntimeError(f"Cannot inspect checkpoint payload: {child}") from exc
-            if stat.S_ISLNK(child_stat.st_mode):
-                raise RuntimeError(
-                    f"Checkpoint payload must not contain symlinks: {child}"
-                )
-            resolved_child = child.resolve(strict=True)
-            if not _is_within(resolved_child, root):
-                raise RuntimeError(
-                    f"Checkpoint payload escapes checkpoint root {root}: {child}"
-                )
-            if stat.S_ISDIR(child_stat.st_mode):
-                pending.append(resolved_child)
-            elif stat.S_ISREG(child_stat.st_mode):
-                files.append(resolved_child)
-            else:
-                raise RuntimeError(
-                    f"Checkpoint payload contains a non-regular entry: {child}"
-                )
-    return files
 
 
 def checkpoint_tree_sha256(
@@ -722,86 +282,37 @@ def checkpoint_tree_sha256(
     *,
     trusted_root: str | Path | None = None,
 ) -> str:
-    """Hash a complete checkpoint tree without following links or special files.
+    """Hash a symlink-free directory tree by relative path, kind and bytes."""
 
-    The byte format intentionally matches the v1 artifact commit-marker digest so
-    existing markers remain verifiable.  ``trusted_root`` additionally confines
-    the checkpoint path before any traversal occurs.
-    """
-
-    root = _validated_training_state_directory(
-        checkpoint_dir,
-        trusted_root=trusted_root,
-    )
-    entries: list[tuple[str, Path, bool]] = []
-    pending = [root]
-    while pending:
-        directory = pending.pop()
+    root = _safe_directory(Path(checkpoint_dir), label="checkpoint tree")
+    if trusted_root is not None:
+        boundary = _safe_directory(Path(trusted_root), label="trusted root")
         try:
-            children = list(directory.iterdir())
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot inspect checkpoint tree directory: {directory}"
-            ) from exc
-        for child in children:
-            relative = child.relative_to(root).as_posix()
-            try:
-                child_stat = child.lstat()
-            except OSError as exc:
-                raise RuntimeError(f"Cannot inspect checkpoint tree: {child}") from exc
-            if stat.S_ISLNK(child_stat.st_mode):
-                raise RuntimeError(
-                    f"Checkpoint tree must not contain symlinks: {child}"
-                )
-            if stat.S_ISDIR(child_stat.st_mode):
-                resolved = validated_checkpoint_directory(
-                    root,
-                    child,
-                    label="tree directory",
-                )
-                entries.append((relative, resolved, False))
-                pending.append(resolved)
-            elif stat.S_ISREG(child_stat.st_mode):
-                resolved = validated_checkpoint_file(
-                    root,
-                    child,
-                    label="tree file",
-                )
-                entries.append((relative, resolved, True))
-            else:
-                raise RuntimeError(
-                    f"Checkpoint tree contains a non-regular entry: {child}"
-                )
-
+            root.relative_to(boundary)
+        except ValueError as exc:
+            raise RuntimeError("checkpoint tree escapes trusted root") from exc
     digest = hashlib.sha256()
-    for relative, path, is_file in sorted(entries, key=lambda item: item[0]):
-        digest.update(relative.encode("utf-8"))
+    entries = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
+    for entry in entries:
+        relative = entry.relative_to(root).as_posix().encode("utf-8")
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"checkpoint tree must not contain symlinks: {entry}")
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"D\0")
+            digest.update(relative)
+            digest.update(b"\0")
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(
+                f"checkpoint tree entries must be files/directories: {entry}"
+            )
+        digest.update(b"F\0")
+        digest.update(relative)
         digest.update(b"\0")
-        if is_file:
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            if not hasattr(os, "O_NOFOLLOW"):
-                raise RuntimeError("Secure checkpoint hashing requires O_NOFOLLOW")
-            flags |= os.O_NOFOLLOW
-            fd = os.open(path, flags)
-            try:
-                before = os.fstat(fd)
-                if not stat.S_ISREG(before.st_mode):
-                    raise RuntimeError(
-                        f"Checkpoint tree file is not a regular file: {path}"
-                    )
-                bytes_read = 0
-                with os.fdopen(fd, "rb") as handle:
-                    fd = -1
-                    while chunk := handle.read(_ADAPTER_HASH_CHUNK_SIZE):
-                        digest.update(chunk)
-                        bytes_read += len(chunk)
-                if bytes_read != before.st_size:
-                    raise RuntimeError(
-                        f"Checkpoint tree file changed while hashing: {path}"
-                    )
-            finally:
-                if fd >= 0:
-                    os.close(fd)
+        with entry.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(_SHA256_CHUNK_SIZE), b""):
+                digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -809,1463 +320,1045 @@ def checkpoint_tree_sha256(
 def save_training_state(
     checkpoint_dir: str | Path,
     *,
+    adapter: Any,
     optimizer: Any,
-    plugin: Any,
-    step: int,
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None = None,
-    config_fingerprint_version: int = CONFIG_FINGERPRINT_VERSION,
-    distributed_state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    import torch
+    scaler: Any | None,
+    global_step: int,
+    training_contract: TrainingContract,
+    rank_states: tuple[RankState, ...],
+    writer_rank: int,
+    writer_device: Any,
+) -> CheckpointMetadata:
+    """Write the exact three-entry v5 checkpoint and restore writer RNG."""
 
-    path = Path(checkpoint_dir)
-    path.mkdir(parents=True, exist_ok=True)
-    adapter_payload_hash = adapter_payload_sha256(path)
-    version = int(config_fingerprint_version)
-    if version not in _SUPPORTED_CONFIG_FINGERPRINT_VERSIONS:
-        raise ValueError(f"Unsupported config fingerprint version: {version}")
-    if version == 1:
-        _reject_ambiguous_legacy_reward_partition(
-            config,
-            fingerprint_scheme=None,
-            read_only_audit=False,
-        )
-        fingerprint = config_fingerprint(
-            config,
-            implementation,
-            version=1,
-        )
-        fingerprint_bundle: dict[str, Any] | None = None
-    else:
-        fingerprint_bundle = _build_v2_fingerprint_bundle(
-            config,
-            implementation,
-            validate_data=True,
-        )
-        fingerprint = fingerprint_bundle["config_fingerprint"]
-    optimizer_state = optimizer.state_dict()
-    plugin_state = plugin.state_dict()
-    _validate_optimizer_state(optimizer_state, safe=True)
-    _validate_plugin_state(plugin_state, safe=True)
-    normalized_distributed_state = None
-    if distributed_state is not None:
-        normalized_distributed_state = _validate_distributed_state(
-            distributed_state,
-            require_sorted=False,
-            redact_runtime_secrets=True,
-        )
-    state = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "step": int(step),
-        "optimizer": optimizer_state,
-        "plugin": plugin_state,
-        "rng": capture_rng_state(),
-        "config_fingerprint": fingerprint,
-        "implementation": redact_artifact_config(implementation or {}),
-        "adapter_payload_sha256": adapter_payload_hash,
-    }
-    if normalized_distributed_state is not None:
-        state["distributed_state"] = normalized_distributed_state
-    if fingerprint_bundle is not None:
-        state.update(fingerprint_bundle)
-    target = path / "training_state.pt"
-    _save_training_state_payload(torch, target, state)
-    training_state_hash = _file_sha256(
-        validated_checkpoint_file(
-            path,
-            target,
-            label="training_state.pt",
-        ),
-        label="Checkpoint training state",
+    step = _positive_int(global_step, label="global_step")
+    contract = _require_training_contract(training_contract)
+    states = _validate_rank_states(rank_states)
+    world_size = len(states)
+    if type(writer_rank) is not int or not 0 <= writer_rank < world_size:
+        raise ValueError("writer_rank must identify one rank state")
+    writer_state = states[writer_rank]
+    if writer_state.rank != writer_rank:
+        raise ValueError("writer_rank must identify the same ordered rank state")
+    device = _validate_device(writer_device)
+    _validate_rank_device_topology(states, device)
+    names, _parameters = _validate_live_topology(adapter, optimizer)
+    optimizer_state = _normalized_optimizer_state(
+        optimizer.state_dict(),
+        parameter_names=names,
+        adapter=adapter,
+        live_optimizer=optimizer,
     )
-    metadata = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "step": int(step),
-        "config_fingerprint": fingerprint,
-        "training_state": target.name,
-        "training_state_sha256": training_state_hash,
-        "adapter_payload_sha256": adapter_payload_hash,
-    }
-    if normalized_distributed_state is not None:
-        metadata["distributed_state"] = {
-            "world_size": normalized_distributed_state["world_size"],
-            "backend": normalized_distributed_state["backend"],
+    scaler_state = _normalized_scaler_state(scaler)
+
+    try:
+        root = _prepare_checkpoint_target(Path(checkpoint_dir))
+        adapter_dir = root / "adapter"
+        adapter.save_checkpoint(adapter_dir)
+        _safe_directory(adapter_dir, label="adapter checkpoint")
+        adapter.validate_checkpoint(adapter_dir)
+        adapter_digest = checkpoint_tree_sha256(
+            adapter_dir,
+            trusted_root=root,
+        )
+
+        state = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "global_step": step,
+            "world_size": world_size,
+            "training_contract": contract.to_payload(),
+            "optimizer_topology": {
+                "parameter_names": names,
+                "group_roles": _GROUP_ROLES,
+            },
+            "optimizer": optimizer_state,
+            "grad_scaler": scaler_state,
+            "rank_states": tuple(item.to_payload() for item in states),
         }
-    if fingerprint_bundle is not None:
-        metadata.update(
-            {
-                key: fingerprint_bundle[key]
-                for key in (
-                    "config_fingerprint_version",
-                    "config_fingerprint_scheme",
-                    "training_semantics_fingerprint",
-                    "data_identity_fingerprint",
-                    "implementation_identity_fingerprint",
-                    "data_identity",
-                    "data_source",
-                )
-            }
-        )
-    save_json(path / "checkpoint.json", metadata)
-    return metadata
+        state_path = root / "training_state.pt"
+        _save_torch_payload(state_path, state)
+        state_digest = _sha256_file(state_path)
 
-
-def load_training_state(
-    checkpoint_dir: str | Path,
-    *,
-    optimizer: Any,
-    plugin: Any,
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None = None,
-    allow_unsafe_legacy: bool = False,
-    trusted_root: str | Path | None = None,
-    expected_world_size: int | None = None,
-    expected_rank: int | None = None,
-) -> int:
-    """Compatibility entrypoint that validates and then applies training state."""
-
-    validated = read_and_validate_training_state(
-        checkpoint_dir,
-        config=config,
-        implementation=implementation,
-        allow_unsafe_legacy=allow_unsafe_legacy,
-        trusted_root=trusted_root,
-        expected_world_size=expected_world_size,
-        expected_rank=expected_rank,
-    )
-    return apply_training_state(
-        validated,
-        optimizer=optimizer,
-        plugin=plugin,
-        rank=expected_rank,
-    )
-
-
-def migrate_legacy_checkpoint_to_v4(
-    source_checkpoint: str | Path,
-    destination_checkpoint: str | Path,
-    *,
-    config: dict[str, Any],
-    trusted_root: str | Path,
-    implementation: dict[str, Any] | None = None,
-    destination_root: str | Path | None = None,
-) -> dict[str, Any]:
-    """Explicitly migrate a trusted v1/v2 checkpoint into safe format v4.
-
-    This is intentionally non-in-place and requires a caller-declared trusted
-    source root.  The only ``weights_only=False`` fallback remains inside the
-    named legacy reader reached with ``allow_unsafe_legacy=True``.  Arbitrary
-    legacy objects that cannot satisfy the v4 safe-value contract are rejected.
-    """
-
-    source = _validated_training_state_directory(
-        source_checkpoint,
-        trusted_root=trusted_root,
-    )
-    destination = Path(destination_checkpoint).absolute()
-    try:
-        resolved_destination = destination.resolve(strict=False)
-        resolved_source = source.resolve(strict=True)
-        if (
-            resolved_destination == resolved_source
-            or resolved_source in resolved_destination.parents
-            or resolved_destination in resolved_source.parents
-        ):
-            raise ValueError("Legacy checkpoint migration must not run in place")
-    except OSError as exc:
-        raise RuntimeError(f"Cannot resolve migration destination: {destination}") from exc
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(
-            f"Legacy checkpoint migration destination already exists: {destination}"
-        )
-
-    destination_boundary = Path(destination_root or destination.parent)
-    try:
-        boundary = destination_boundary.resolve(strict=True)
-        boundary_stat = destination_boundary.lstat()
-    except OSError as exc:
-        raise RuntimeError(
-            "Legacy checkpoint migration destination root must already exist: "
-            f"{destination_boundary}"
-        ) from exc
-    if stat.S_ISLNK(boundary_stat.st_mode) or not stat.S_ISDIR(boundary_stat.st_mode):
-        raise RuntimeError(
-            f"Legacy checkpoint destination root is not a safe directory: {boundary}"
-        )
-    try:
-        relative_destination = destination.relative_to(boundary)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Legacy checkpoint destination escapes destination root {boundary}: "
-            f"{destination}"
-        ) from exc
-    if any(part in {"", ".", ".."} for part in relative_destination.parts):
-        raise RuntimeError(
-            f"Legacy checkpoint destination has an unsafe component: {destination}"
-        )
-    current = boundary
-    for part in relative_destination.parts[:-1]:
-        current = current / part
-        try:
-            current.mkdir()
-        except FileExistsError:
-            pass
-        current_stat = current.lstat()
-        if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(
-            current_stat.st_mode
-        ):
-            raise RuntimeError(
-                f"Legacy checkpoint destination parent is unsafe: {current}"
-            )
-
-    from visual_rl.scaling import build_scaling_trigger_decision
-
-    runner_config = config.get("runner") or {}
-    if not isinstance(runner_config, dict):
-        raise TypeError("Migration config runner section must be a dictionary")
-    conditional_scaling = runner_config.get("conditional_scaling") or {}
-    scaling_decision = build_scaling_trigger_decision(conditional_scaling)
-    scaling_path = destination.parent / "trigger_decision.json"
-    if scaling_path.exists() or scaling_path.is_symlink():
-        if load_json(scaling_path) != scaling_decision:
-            raise RuntimeError(
-                "Migration destination has a conflicting scaling trigger decision"
-            )
-
-    validated = read_and_validate_training_state(
-        source,
-        config=config,
-        implementation=implementation,
-        allow_unsafe_legacy=True,
-        trusted_root=trusted_root,
-    )
-    source_version = int(validated.state["format_version"])
-    if source_version not in _LEGACY_CHECKPOINT_FORMAT_VERSIONS:
-        raise ValueError(
-            "Legacy checkpoint migration accepts only format v1/v2 sources, "
-            f"got v{source_version}"
-        )
-    if validated.state.get("distributed_state") is not None:
-        raise RuntimeError(
-            "Legacy distributed checkpoints require a dedicated audited migration"
-        )
-
-    destination.mkdir(mode=0o700)
-    try:
-        for source_file in _validated_checkpoint_tree_files(source):
-            relative = source_file.relative_to(source)
-            if _is_checkpoint_control_file(relative) or _is_temporary_checkpoint_path(
-                relative
-            ):
-                continue
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_file, target, follow_symlinks=False)
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-            fd = os.open(target, flags)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-
-        adapter_hash = adapter_payload_sha256(destination)
-        state = deepcopy(validated.state)
-        state["format_version"] = CHECKPOINT_FORMAT_VERSION
-        state["rng"] = _legacy_rng_to_safe(state["rng"])
-        state["adapter_payload_sha256"] = adapter_hash
-        state["implementation"] = redact_artifact_config(
-            state.get("implementation") or implementation or {}
-        )
-        state["migrated_from_format_version"] = source_version
-        _validate_optimizer_state(state.get("optimizer"), safe=True)
-        _validate_plugin_state(state.get("plugin"), safe=True)
-        _validate_rng_state(state.get("rng"), safe=True)
-        _validate_safe_checkpoint_value(state, label="migrated training state")
-
-        state_path = destination / "training_state.pt"
-        import torch
-
-        _save_training_state_payload(torch, state_path, state)
-        training_state_hash = _file_sha256(
-            validated_checkpoint_file(
-                destination,
-                state_path,
-                label="training_state.pt",
-            ),
-            label="Migrated checkpoint training state",
-        )
-        metadata = deepcopy(validated.metadata)
-        metadata.update(
-            {
-                "format_version": CHECKPOINT_FORMAT_VERSION,
-                "step": int(state["step"]),
-                "config_fingerprint": state["config_fingerprint"],
-                "training_state": "training_state.pt",
-                "training_state_sha256": training_state_hash,
-                "adapter_payload_sha256": adapter_hash,
-                "migrated_from_format_version": source_version,
-            }
-        )
-        save_json(destination / "checkpoint.json", metadata)
-        _fsync_checkpoint_directories(destination)
-        result = dict(metadata)
-        result["checkpoint_tree_sha256"] = checkpoint_tree_sha256(
-            destination,
-            trusted_root=boundary,
-        )
-        save_json(scaling_path, scaling_decision)
-        return result
-    except BaseException:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
-
-
-def _legacy_rng_to_safe(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RuntimeError("Legacy checkpoint RNG state must be a dictionary")
-    migrated = deepcopy(value)
-    numpy_state = migrated.get("numpy")
-    if isinstance(numpy_state, tuple) and len(numpy_state) == 5:
-        vector = numpy_state[1]
-        if hasattr(vector, "tolist"):
-            vector = vector.tolist()
-        migrated["numpy"] = {
-            "bit_generator": str(numpy_state[0]),
-            "state": [int(item) for item in vector],
-            "position": int(numpy_state[2]),
-            "has_gauss": int(numpy_state[3]),
-            "cached_gaussian": float(numpy_state[4]),
+        metadata = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "global_step": step,
+            "world_size": world_size,
+            "training_contract": contract.to_payload(),
+            "adapter_dir": "adapter",
+            "adapter_tree_sha256": adapter_digest,
+            "training_state": "training_state.pt",
+            "training_state_sha256": state_digest,
         }
-    _validate_rng_state(migrated, safe=True)
-    return migrated
-
-
-def _fsync_checkpoint_directories(root: Path) -> None:
-    directories = [path for path in root.rglob("*") if path.is_dir()]
-    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        fd = os.open(directory, flags)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    fd = os.open(root, flags)
-    try:
-        os.fsync(fd)
+        _write_canonical_json(root / "checkpoint.json", metadata)
+        _require_exact_checkpoint_root(root)
+        _fsync_tree(root)
+        tree_digest = checkpoint_tree_sha256(root, trusted_root=root)
+        return CheckpointMetadata(
+            checkpoint_dir=root,
+            global_step=step,
+            world_size=world_size,
+            training_contract=contract,
+            adapter_tree_sha256=adapter_digest,
+            training_state_sha256=state_digest,
+            tree_sha256=tree_digest,
+        )
     finally:
-        os.close(fd)
-    parent_fd = os.open(root.parent, flags)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+        _restore_rank_rng(writer_state, device=device)
 
 
 def read_and_validate_training_state(
     checkpoint_dir: str | Path,
     *,
-    config: dict[str, Any],
-    implementation: dict[str, Any] | None = None,
-    allow_unsafe_legacy: bool = False,
-    trusted_root: str | Path | None = None,
-    expected_world_size: int | None = None,
-    expected_rank: int | None = None,
-    use_checkpoint_implementation_identity: bool = False,
+    adapter: Any,
+    optimizer: Any,
+    scaler: Any | None,
+    expected_global_step: int,
+    expected_world_size: int,
+    expected_training_contract: TrainingContract,
 ) -> ValidatedTrainingState:
-    """Read and validate a checkpoint without mutating optimizer, plugin, or RNG.
-
-    ``use_checkpoint_implementation_identity`` is for read-only artifact audits:
-    it checks a safe-format checkpoint against its integrity-protected persisted
-    identity without claiming that identity matches the current runtime code.
-    Runtime resume callers must keep the default and supply their live identity.
-    """
+    """Safely load and mechanically validate v5 without mutating live state."""
 
     import torch
 
-    checkpoint_dir = _validated_training_state_directory(
-        checkpoint_dir,
-        trusted_root=trusted_root,
+    expected_step = _positive_int(
+        expected_global_step,
+        label="expected_global_step",
     )
-    path = validated_checkpoint_file(
-        checkpoint_dir,
-        checkpoint_dir / "training_state.pt",
-        label="training_state.pt",
-    )
-    metadata_path = validated_checkpoint_file(
-        checkpoint_dir,
-        checkpoint_dir / "checkpoint.json",
-        label="checkpoint.json",
-    )
-    _validated_checkpoint_tree_files(checkpoint_dir)
+    world_size = _world_size(expected_world_size, label="expected_world_size")
+    expected_contract = _require_training_contract(expected_training_contract)
+    root = _safe_directory(Path(checkpoint_dir), label="checkpoint")
+    _require_exact_checkpoint_root(root)
+    metadata = load_json(root / "checkpoint.json")
+    parsed = _validate_metadata(metadata)
+    if parsed["global_step"] != expected_step:
+        raise ResumeError(
+            "checkpoint global_step does not match authoritative marker",
+            path=str(root),
+        )
+    if parsed["world_size"] != world_size:
+        raise ResumeError(
+            "checkpoint world_size does not match the current topology",
+            path=str(root),
+        )
+    if parsed["training_contract"] != expected_contract:
+        raise ResumeError(
+            "checkpoint training_contract is mechanically incompatible",
+            path=str(root),
+        )
 
-    metadata = load_json(metadata_path)
-    if not isinstance(metadata, dict):
-        raise RuntimeError("Checkpoint metadata must be a JSON object")
-    metadata_required = {
-        "format_version",
-        "step",
-        "config_fingerprint",
-        "training_state",
-    }
-    missing_metadata = sorted(metadata_required.difference(metadata))
-    if missing_metadata:
-        raise RuntimeError(f"Checkpoint metadata is missing keys: {missing_metadata}")
-    if metadata.get("training_state") != path.name:
-        raise RuntimeError(
-            "checkpoint.json training_state does not reference training_state.pt"
-        )
-    metadata_format = _checkpoint_format_version(
-        metadata.get("format_version"),
-        label="checkpoint metadata",
+    adapter_dir = root / "adapter"
+    actual_adapter_digest = checkpoint_tree_sha256(
+        adapter_dir,
+        trusted_root=root,
     )
-    if metadata_format in _TRAINING_STATE_HASHED_CHECKPOINT_FORMAT_VERSIONS:
-        expected_training_state_hash = _required_sha256(
-            metadata.get("training_state_sha256"),
-            label=(
-                f"Checkpoint format v{metadata_format} metadata "
-                "training_state_sha256"
-            ),
-        )
-        actual_training_state_hash = _file_sha256(
-            path,
-            label="Checkpoint training state",
-        )
-        if not secrets.compare_digest(
-            actual_training_state_hash,
-            expected_training_state_hash,
-        ):
-            raise RuntimeError(
-                "Checkpoint training_state.pt SHA256 mismatch: "
-                f"actual {actual_training_state_hash}, metadata "
-                f"{expected_training_state_hash}"
-            )
-    actual_adapter_hash: str | None = None
-    if metadata_format in _HASHED_CHECKPOINT_FORMAT_VERSIONS:
-        expected_adapter_hash = metadata.get("adapter_payload_sha256")
-        if not expected_adapter_hash:
-            raise RuntimeError(
-                f"Checkpoint format v{metadata_format} metadata is missing "
-                "adapter_payload_sha256"
-            )
-        actual_adapter_hash = adapter_payload_sha256(checkpoint_dir)
-        if actual_adapter_hash != expected_adapter_hash:
-            raise RuntimeError(
-                "Checkpoint adapter payload SHA256 mismatch: "
-                f"actual {actual_adapter_hash}, metadata "
-                f"{expected_adapter_hash}"
-            )
+    if not secrets.compare_digest(
+        actual_adapter_digest,
+        parsed["adapter_tree_sha256"],
+    ):
+        raise ResumeError("adapter checkpoint tree digest mismatch", path=str(root))
 
-    state = _load_training_state_payload(
-        torch,
-        path,
-        metadata_format=metadata_format,
-        allow_unsafe_legacy=allow_unsafe_legacy,
-    )
-    if not isinstance(state, dict):
-        raise RuntimeError("Checkpoint training state must be a dictionary")
-    required = {
-        "format_version",
-        "step",
-        "optimizer",
-        "plugin",
-        "rng",
-        "config_fingerprint",
-    }
-    missing = sorted(required.difference(state))
-    if missing:
-        raise RuntimeError(f"Checkpoint training state is missing keys: {missing}")
-    state_format = _checkpoint_format_version(
-        state.get("format_version"),
-        label="checkpoint training state",
-    )
-    if state_format != metadata_format:
-        raise RuntimeError(
-            "checkpoint.json format_version does not match training_state.pt"
+    state_path = root / "training_state.pt"
+    actual_state_digest = _sha256_file(state_path)
+    if not secrets.compare_digest(
+        actual_state_digest,
+        parsed["training_state_sha256"],
+    ):
+        raise ResumeError("training_state.pt digest mismatch", path=str(root))
+    try:
+        state = torch.load(
+            state_path,
+            map_location="cpu",
+            weights_only=True,
         )
-    if int(metadata.get("step", -1)) != int(state["step"]):
-        raise RuntimeError("checkpoint.json step does not match training_state.pt")
-    if metadata.get("config_fingerprint") != state.get("config_fingerprint"):
-        raise RuntimeError(
-            "checkpoint.json fingerprint does not match training_state.pt"
+    except Exception as exc:
+        raise ResumeError(
+            "training_state.pt cannot be safely loaded with weights_only=True",
+            path=str(root),
+        ) from exc
+    _validate_safe_value(state, label="training_state")
+    if not isinstance(state, dict) or set(state) != set(_STATE_KEYS):
+        raise ResumeError("training_state.pt has an invalid exact key set")
+    shared = _validate_state_shared_fields(state)
+    if (
+        shared["global_step"] != parsed["global_step"]
+        or shared["world_size"] != parsed["world_size"]
+        or shared["training_contract"] != parsed["training_contract"]
+    ):
+        raise ResumeError(
+            "checkpoint.json and training_state.pt shared fields disagree"
         )
-    _validate_optimizer_state(
-        state.get("optimizer"),
-        safe=state_format in _SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    )
-    _validate_plugin_state(
-        state.get("plugin"),
-        safe=state_format in _SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    )
-    _validate_rng_state(
-        state.get("rng"),
-        safe=state_format in _SAFE_CHECKPOINT_FORMAT_VERSIONS,
-    )
-    if state_format in _SAFE_CHECKPOINT_FORMAT_VERSIONS:
-        _validate_safe_checkpoint_value(state, label="training state")
-    distributed_state = _validate_checkpoint_distributed_state(
-        state,
-        metadata,
-        state_format=state_format,
-        expected_world_size=expected_world_size,
-        expected_rank=expected_rank,
-    )
-    if distributed_state is not None:
-        state["distributed_state"] = distributed_state
-    if state_format in _HASHED_CHECKPOINT_FORMAT_VERSIONS:
-        state_adapter_hash = state.get("adapter_payload_sha256")
-        if not state_adapter_hash:
-            raise RuntimeError(
-                f"Checkpoint format v{state_format} training state is missing "
-                "adapter_payload_sha256"
-            )
-        if state_adapter_hash != metadata.get("adapter_payload_sha256"):
-            raise RuntimeError(
-                "checkpoint.json adapter_payload_sha256 does not match "
-                "training_state.pt"
-            )
-        if state_adapter_hash != actual_adapter_hash:
-            raise RuntimeError(
-                "Checkpoint adapter payload SHA256 does not match training_state.pt"
-            )
 
-    validation_implementation = implementation
-    if use_checkpoint_implementation_identity:
-        if implementation is not None:
-            raise ValueError(
-                "Cannot combine a live implementation identity with the "
-                "checkpoint audit identity"
-            )
-        if state_format not in _SAFE_CHECKPOINT_FORMAT_VERSIONS:
-            raise RuntimeError(
-                "Checkpoint-provided implementation identity is only allowed for "
-                "safe checkpoint formats"
-            )
-        identity_payload = state.get("identity_payload")
-        persisted_implementation = (
-            identity_payload.get("implementation")
-            if isinstance(identity_payload, dict)
-            else None
-        )
-        if not isinstance(persisted_implementation, dict):
-            raise RuntimeError(
-                "Checkpoint has no integrity-protected implementation identity"
-            )
-        validation_implementation = persisted_implementation
+    names, parameters = _validate_live_topology(adapter, optimizer)
+    topology = state["optimizer_topology"]
+    if not isinstance(topology, dict) or set(topology) != set(_TOPOLOGY_KEYS):
+        raise ResumeError("optimizer_topology has an invalid exact key set")
+    parameter_names = topology["parameter_names"]
+    group_roles = topology["group_roles"]
+    if type(parameter_names) is not tuple or parameter_names != names:
+        raise ResumeError("optimizer parameter names/order do not match live Adapter")
+    if type(group_roles) is not tuple or group_roles != _GROUP_ROLES:
+        raise ResumeError("optimizer group_roles must be ('trainable_adapter',)")
+    _validate_optimizer_payload(
+        state["optimizer"],
+        parameter_names=names,
+        parameters=parameters,
+        live_optimizer=optimizer,
+    )
+    _validate_scaler_payload(state["grad_scaler"], scaler)
+    rank_states = _rank_states_from_payload(
+        state["rank_states"],
+        expected_world_size=world_size,
+    )
+    device = parameters[0].device
+    _validate_rank_device_topology(rank_states, device)
 
-    state_version = int(state.get("config_fingerprint_version", 1))
-    metadata_version = int(metadata.get("config_fingerprint_version", 1))
-    if state_version != metadata_version:
-        raise RuntimeError(
-            "checkpoint.json config fingerprint version does not match "
-            "training_state.pt"
-        )
-    if state_version not in _SUPPORTED_CONFIG_FINGERPRINT_VERSIONS:
-        raise RuntimeError(f"Unsupported config fingerprint version: {state_version}")
-
-    if state_version == 1:
-        _reject_ambiguous_legacy_reward_partition(
-            config,
-            fingerprint_scheme=None,
-            read_only_audit=use_checkpoint_implementation_identity,
-        )
-        expected = config_fingerprint(config, validation_implementation, version=1)
-        actual = state.get("config_fingerprint")
-        if actual != expected:
-            raise RuntimeError(
-                "Resume config does not match checkpoint training semantics. "
-                "Resume rejected: checkpoint uses config fingerprint v1. "
-                "Fingerprint mismatch: v1 binds absolute data paths and "
-                "implementation identity. Reuse the original data paths and "
-                "implementation, or use an audited migration workflow. "
-                f"Checkpoint {actual}, current {expected}."
-            )
-    else:
-        _validate_v2_checkpoint_metadata(state, metadata)
-        fingerprint_scheme = state.get("config_fingerprint_scheme")
-        _reject_ambiguous_legacy_reward_partition(
-            config,
-            fingerprint_scheme=fingerprint_scheme,
-            read_only_audit=use_checkpoint_implementation_identity,
-        )
-        current = _build_v2_fingerprint_bundle(
-            config,
-            validation_implementation,
-            validate_data=True,
-            fingerprint_scheme=fingerprint_scheme,
-        )
-        actual = state.get("config_fingerprint")
-        expected = current["config_fingerprint"]
-        if actual != expected:
-            differences = _identity_differences(
-                state.get("identity_payload"),
-                current["identity_payload"],
-            )
-            changed = ", ".join(differences[:8]) or "unknown identity field"
-            if len(differences) > 8:
-                changed += f", and {len(differences) - 8} more"
-            raise RuntimeError(
-                "Resume config does not match checkpoint training semantics. "
-                "Resume rejected: checkpoint config fingerprint v2 mismatch. "
-                f"Changed fields: {changed}. Checkpoint {actual}, current "
-                f"{expected}."
-            )
+    # Adapter validation intentionally happens only after the whole safe payload
+    # and both mechanical digests have passed.
+    try:
+        adapter.validate_checkpoint(adapter_dir)
+    except Exception as exc:
+        raise ResumeError(
+            "adapter checkpoint failed mechanical validation",
+            path=str(adapter_dir),
+        ) from exc
     return ValidatedTrainingState(
-        checkpoint_dir=checkpoint_dir,
-        state=state,
-        metadata=metadata,
-        applicable=not use_checkpoint_implementation_identity,
+        checkpoint_dir=root,
+        global_step=expected_step,
+        world_size=world_size,
+        training_contract=expected_contract,
+        metadata=deepcopy(metadata),
+        state=_clone_safe_value(state),
+    )
+
+
+def _audit_checkpoint_artifacts(
+    checkpoint_dir: str | Path,
+    *,
+    expected_global_step: int,
+) -> None:
+    """Deeply inspect one committed v5 payload without constructing live state."""
+
+    import torch
+
+    expected_step = _positive_int(
+        expected_global_step,
+        label="expected_global_step",
+    )
+    root = _safe_directory(Path(checkpoint_dir), label="checkpoint")
+    _require_exact_checkpoint_root(root)
+    parsed = _validate_metadata(load_json(root / "checkpoint.json"))
+    if parsed["global_step"] != expected_step:
+        raise ResumeError(
+            "checkpoint global_step does not match authoritative marker",
+            path=str(root),
+        )
+    if not secrets.compare_digest(
+        checkpoint_tree_sha256(root / "adapter", trusted_root=root),
+        parsed["adapter_tree_sha256"],
+    ):
+        raise ResumeError("adapter checkpoint tree digest mismatch", path=str(root))
+    state_path = root / "training_state.pt"
+    if not secrets.compare_digest(
+        _sha256_file(state_path),
+        parsed["training_state_sha256"],
+    ):
+        raise ResumeError("training_state.pt digest mismatch", path=str(root))
+    try:
+        state = torch.load(
+            state_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        raise ResumeError(
+            "training_state.pt cannot be safely loaded with weights_only=True",
+            path=str(root),
+        ) from exc
+    _validate_safe_value(state, label="training_state")
+    if not isinstance(state, dict) or set(state) != set(_STATE_KEYS):
+        raise ResumeError("training_state.pt has an invalid exact key set")
+    shared = _validate_state_shared_fields(state)
+    if (
+        shared["global_step"] != parsed["global_step"]
+        or shared["world_size"] != parsed["world_size"]
+        or shared["training_contract"] != parsed["training_contract"]
+    ):
+        raise ResumeError(
+            "checkpoint.json and training_state.pt shared fields disagree"
+        )
+    names = _audit_optimizer_topology(state["optimizer_topology"])
+    _audit_optimizer_payload(state["optimizer"], parameter_names=names)
+    _audit_scaler_payload(state["grad_scaler"])
+    _rank_states_from_payload(
+        state["rank_states"],
+        expected_world_size=parsed["world_size"],
     )
 
 
 def apply_training_state(
     validated: ValidatedTrainingState,
     *,
+    adapter: Any,
     optimizer: Any,
-    plugin: Any,
-    rank: int | None = None,
-) -> int:
-    """Apply optimizer, plugin, and RNG state after adapter restoration."""
+    scaler: Any | None,
+    optimizer_config: OptimizerConfig,
+    rank: int,
+) -> None:
+    """Atomically apply Adapter/AdamW/scaler/RNG and current hyperparameters."""
+
+    import torch
 
     if not isinstance(validated, ValidatedTrainingState):
-        raise TypeError("apply_training_state requires ValidatedTrainingState")
-    if not validated.applicable:
-        raise RuntimeError(
-            "Cannot apply a checkpoint validated with read-only audit identity"
-        )
+        raise TypeError("validated must be a ValidatedTrainingState")
+    if validated._token.consumed:
+        raise ResumeError("validated training state has already been applied")
+    if not isinstance(optimizer_config, OptimizerConfig):
+        raise TypeError("optimizer_config must be an OptimizerConfig")
+    if type(rank) is not int or not 0 <= rank < validated.world_size:
+        raise ValueError("rank is outside the validated checkpoint world_size")
+    validated._token.consumed = True
+
+    root = _safe_directory(validated.checkpoint_dir, label="checkpoint")
+    _require_exact_checkpoint_root(root)
+    parsed = _validate_metadata(load_json(root / "checkpoint.json"))
+    if (
+        parsed["global_step"] != validated.global_step
+        or parsed["world_size"] != validated.world_size
+        or parsed["training_contract"] != validated.training_contract
+    ):
+        raise ResumeError("checkpoint metadata changed after validation")
+    if (
+        checkpoint_tree_sha256(root / "adapter", trusted_root=root)
+        != parsed["adapter_tree_sha256"]
+        or _sha256_file(root / "training_state.pt")
+        != parsed["training_state_sha256"]
+    ):
+        raise ResumeError("checkpoint changed after validation", path=str(root))
+    try:
+        adapter.validate_checkpoint(root / "adapter")
+    except Exception as exc:
+        raise ResumeError("adapter checkpoint changed after validation") from exc
+
+    names, parameters = _validate_live_topology(adapter, optimizer)
     state = validated.state
-    distributed_state = state.get("distributed_state")
-    if distributed_state is None:
-        if rank not in {None, 0}:
-            raise RuntimeError(
-                "Single-process checkpoint only contains rank 0 runtime state"
-            )
-        rng_state = state["rng"]
-    else:
-        world_size = int(distributed_state["world_size"])
-        if rank is None:
-            if world_size != 1:
-                raise RuntimeError(
-                    "Distributed checkpoint restore requires an explicit rank"
-                )
-            rank = 0
-        _validate_expected_rank(rank, world_size=world_size)
-        rng_state = next(
-            entry["rng"]
-            for entry in distributed_state["entries"]
-            if entry["rank"] == rank
-        )
-    optimizer.load_state_dict(state["optimizer"])
-    plugin.load_state_dict(dict(state.get("plugin") or {}))
-    if int(state["format_version"]) in _SAFE_CHECKPOINT_FORMAT_VERSIONS:
-        restore_rng_state(dict(rng_state))
-    else:
-        _restore_rng_state(dict(rng_state))
-    return validated.step
-
-
-def _checkpoint_format_version(value: Any, *, label: str) -> int:
-    try:
-        version = int(value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid {label} format_version: {value!r}") from exc
-    if version not in _SUPPORTED_CHECKPOINT_FORMAT_VERSIONS:
-        raise RuntimeError(f"Unsupported checkpoint format_version: {version}")
-    return version
-
-
-def _validated_training_state_directory(
-    checkpoint_dir: str | Path,
-    *,
-    trusted_root: str | Path | None,
-) -> Path:
-    if trusted_root is None:
-        return validated_checkpoint_directory(
-            checkpoint_dir,
-            checkpoint_dir,
-            label="root",
-        )
-
-    trusted = validated_checkpoint_directory(
-        trusted_root,
-        trusted_root,
-        label="trusted root",
+    topology = state["optimizer_topology"]
+    if topology["parameter_names"] != names:
+        raise ResumeError("live Adapter topology changed after validation")
+    _validate_optimizer_payload(
+        state["optimizer"],
+        parameter_names=names,
+        parameters=parameters,
+        live_optimizer=optimizer,
     )
-    candidate = validated_checkpoint_directory(
-        trusted,
-        checkpoint_dir,
-        label="root",
+    _validate_scaler_payload(state["grad_scaler"], scaler)
+    rank_states = _rank_states_from_payload(
+        state["rank_states"],
+        expected_world_size=validated.world_size,
     )
-    _reject_symlinked_path_components(trusted, checkpoint_dir)
-    return candidate
+    device = parameters[0].device
+    _validate_rank_device_topology(rank_states, device)
+    selected_rank_state = rank_states[rank]
 
-
-def _reject_symlinked_path_components(
-    trusted_root: str | Path,
-    checkpoint_dir: str | Path,
-) -> None:
-    root = Path(trusted_root).absolute()
-    candidate = Path(checkpoint_dir).absolute()
+    adapter_snapshot = tuple(parameter.detach().clone() for parameter in parameters)
+    optimizer_snapshot = _clone_safe_value(optimizer.state_dict())
+    scaler_snapshot = (
+        None if scaler is None else _clone_safe_value(scaler.state_dict())
+    )
+    rng_snapshot = _capture_rank_rng(rank=rank, device=device)
     try:
-        relative = candidate.relative_to(root)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Checkpoint root escapes trusted root {root}: {candidate}"
+        adapter.load_checkpoint(root / "adapter")
+        optimizer.load_state_dict(_clone_safe_value(state["optimizer"]))
+        _apply_current_optimizer_config(optimizer, optimizer_config)
+        if scaler is not None:
+            scaler.load_state_dict(_clone_safe_value(state["grad_scaler"]))
+        _restore_rank_rng(selected_rank_state, device=device)
+    except BaseException as exc:
+        rollback_error: BaseException | None = None
+        try:
+            with torch.no_grad():
+                for parameter, original in zip(
+                    parameters,
+                    adapter_snapshot,
+                    strict=True,
+                ):
+                    parameter.copy_(original)
+            optimizer.load_state_dict(optimizer_snapshot)
+            if scaler is not None:
+                assert scaler_snapshot is not None
+                scaler.load_state_dict(scaler_snapshot)
+            _restore_rank_rng(rng_snapshot, device=device)
+        except BaseException as rollback_exc:
+            rollback_error = rollback_exc
+        if rollback_error is not None:
+            raise ResumeError(
+                "training-state apply failed and rollback also failed",
+                path=str(root),
+            ) from rollback_error
+        raise ResumeError(
+            "training-state apply failed; live state was rolled back",
+            path=str(root),
         ) from exc
 
-    current = root
-    for part in relative.parts:
-        current = current / part
-        try:
-            current_stat = current.lstat()
-        except OSError as exc:
-            raise RuntimeError(f"Missing checkpoint path component: {current}") from exc
-        if stat.S_ISLNK(current_stat.st_mode):
-            raise RuntimeError(
-                f"Checkpoint path must not contain symlinks: {current}"
-            )
+
+def _require_training_contract(value: Any) -> TrainingContract:
+    if not isinstance(value, TrainingContract):
+        raise TypeError("training_contract must be a TrainingContract")
+    return value
 
 
-def _load_training_state_payload(
-    torch: Any,
-    path: Path,
-    *,
-    metadata_format: int,
-    allow_unsafe_legacy: bool,
-) -> Any:
+def _contract_from_payload(value: Any) -> TrainingContract:
+    if not isinstance(value, dict) or set(value) != set(_CONTRACT_KEYS):
+        raise ResumeError("training_contract has an invalid exact key set")
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        if not (
-            allow_unsafe_legacy
-            and metadata_format in _LEGACY_CHECKPOINT_FORMAT_VERSIONS
-        ):
-            raise RuntimeError(
-                "Safe checkpoint loading requires a PyTorch version whose "
-                "torch.load supports weights_only=True"
-            ) from None
-    except Exception:
-        if not (
-            allow_unsafe_legacy
-            and metadata_format in _LEGACY_CHECKPOINT_FORMAT_VERSIONS
-        ):
-            legacy_hint = (
-                " Pass allow_unsafe_legacy=True only for a trusted, audited "
-                "format v1/v2 checkpoint."
-                if metadata_format in _LEGACY_CHECKPOINT_FORMAT_VERSIONS
-                else ""
-            )
-            raise RuntimeError(
-                "Checkpoint training state could not be loaded safely with "
-                f"weights_only=True.{legacy_hint}"
-            ) from None
+        return TrainingContract(
+            algorithm=value["algorithm"],
+            version=value["version"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise ResumeError("training_contract values are invalid") from exc
 
+
+def _positive_int(value: Any, *, label: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _world_size(value: Any, *, label: str) -> int:
+    if type(value) is not int or value not in {1, 2}:
+        raise ValueError(f"{label} must be integer 1 or 2")
+    return value
+
+
+def _validate_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict) or set(metadata) != set(_METADATA_KEYS):
+        raise ResumeError("checkpoint.json has an invalid exact key set")
+    if metadata["format_version"] != 5 or type(metadata["format_version"]) is not int:
+        raise ResumeError("checkpoint format_version must be integer 5")
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except Exception:
-        raise RuntimeError(
-            "Trusted legacy checkpoint could not be loaded with the explicit "
-            "unsafe fallback"
-        ) from None
-
-
-def _validate_optimizer_state(value: Any, *, safe: bool) -> None:
-    if not isinstance(value, dict):
-        raise RuntimeError("Checkpoint optimizer state must be a dictionary")
-    missing = sorted({"state", "param_groups"}.difference(value))
-    if missing:
-        raise RuntimeError(
-            f"Checkpoint optimizer state is missing keys: {missing}"
-        )
-    if not isinstance(value["state"], dict):
-        raise RuntimeError("Checkpoint optimizer state['state'] must be a dictionary")
-    if not isinstance(value["param_groups"], list):
-        raise RuntimeError(
-            "Checkpoint optimizer state['param_groups'] must be a list"
-        )
-    if safe:
-        _validate_safe_checkpoint_value(value, label="optimizer state")
-
-
-def _validate_plugin_state(value: Any, *, safe: bool) -> None:
-    if not isinstance(value, dict):
-        raise RuntimeError("Checkpoint plugin state must be a dictionary")
-    if safe:
-        _validate_safe_checkpoint_value(value, label="plugin state")
-
-
-def _validate_safe_checkpoint_value(value: Any, *, label: str) -> None:
-    import torch
-
-    if value is None or isinstance(value, (bool, int, float, str, torch.Tensor)):
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, (bool, int, float, str)):
-                raise RuntimeError(
-                    f"Checkpoint {label} has an unsafe dictionary key type: "
-                    f"{type(key).__name__}"
-                )
-            _validate_safe_checkpoint_value(item, label=label)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            _validate_safe_checkpoint_value(item, label=label)
-        return
-    raise RuntimeError(
-        f"Checkpoint {label} contains an unsafe value type: {type(value).__name__}"
+        step = _positive_int(metadata["global_step"], label="global_step")
+        world_size = _world_size(metadata["world_size"], label="world_size")
+    except ValueError as exc:
+        raise ResumeError("checkpoint metadata step/world_size is invalid") from exc
+    contract = _contract_from_payload(metadata["training_contract"])
+    if metadata["adapter_dir"] != "adapter":
+        raise ResumeError("checkpoint adapter_dir must be 'adapter'")
+    if metadata["training_state"] != "training_state.pt":
+        raise ResumeError("checkpoint training_state must be 'training_state.pt'")
+    adapter_digest = _sha256(metadata["adapter_tree_sha256"], label="adapter digest")
+    state_digest = _sha256(
+        metadata["training_state_sha256"],
+        label="training-state digest",
     )
+    return {
+        "global_step": step,
+        "world_size": world_size,
+        "training_contract": contract,
+        "adapter_tree_sha256": adapter_digest,
+        "training_state_sha256": state_digest,
+    }
 
 
-def _validate_distributed_state(
+def _validate_state_shared_fields(state: Mapping[str, Any]) -> dict[str, Any]:
+    if state["format_version"] != 5 or type(state["format_version"]) is not int:
+        raise ResumeError("training state format_version must be integer 5")
+    try:
+        global_step = _positive_int(state["global_step"], label="global_step")
+        world_size = _world_size(state["world_size"], label="world_size")
+    except ValueError as exc:
+        raise ResumeError("training state step/world_size is invalid") from exc
+    return {
+        "global_step": global_step,
+        "world_size": world_size,
+        "training_contract": _contract_from_payload(state["training_contract"]),
+    }
+
+
+def _sha256(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(item not in "0123456789abcdef" for item in value)
+    ):
+        raise ResumeError(f"{label} must be lowercase SHA-256")
+    return value
+
+
+def _validate_rank_states(value: Any) -> tuple[RankState, ...]:
+    if type(value) is not tuple or len(value) not in {1, 2}:
+        raise ValueError("rank_states must be a tuple of length 1 or 2")
+    if any(not isinstance(item, RankState) for item in value):
+        raise TypeError("rank_states must contain only RankState values")
+    expected = tuple(range(len(value)))
+    if tuple(item.rank for item in value) != expected:
+        raise ValueError("rank_states must be rank-sorted and cover 0..world_size-1")
+    cuda_presence = {item.torch_cuda is not None for item in value}
+    if len(cuda_presence) != 1:
+        raise ValueError("all rank states must use the same CPU/CUDA RNG topology")
+    return value
+
+
+def _rank_states_from_payload(
     value: Any,
     *,
-    require_sorted: bool,
-    redact_runtime_secrets: bool,
-) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RuntimeError("Checkpoint distributed state must be a dictionary")
-    if not all(isinstance(key, str) for key in value):
-        raise RuntimeError("Checkpoint distributed state keys must be strings")
-    required = {"world_size", "backend", "entries"}
-    missing = sorted(required.difference(value))
-    if missing:
-        raise RuntimeError(
-            f"Checkpoint distributed state is missing keys: {missing}"
-        )
-    extra = sorted(set(value).difference(required))
-    if extra:
-        raise RuntimeError(
-            f"Checkpoint distributed state has unexpected keys: {extra}"
-        )
-
-    world_size = value["world_size"]
-    if isinstance(world_size, bool) or not isinstance(world_size, int):
-        raise RuntimeError("Checkpoint distributed world_size must be an integer")
-    if world_size < 1:
-        raise RuntimeError("Checkpoint distributed world_size must be at least 1")
-
-    backend = value["backend"]
-    if (
-        not isinstance(backend, str)
-        or not backend
-        or backend != backend.strip().lower()
-    ):
-        raise RuntimeError(
-            "Checkpoint distributed backend must be a lowercase non-empty string"
-        )
-
-    raw_entries = value["entries"]
-    if not isinstance(raw_entries, list):
-        raise RuntimeError("Checkpoint distributed entries must be a list")
-    normalized_entries: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    input_ranks: list[int] = []
-    entry_required = {"rank", "rng", "sampler_cursor", "runtime_identity"}
-    for raw_entry in raw_entries:
-        if not isinstance(raw_entry, dict):
-            raise RuntimeError(
-                "Checkpoint distributed entries must be dictionaries"
-            )
-        if not all(isinstance(key, str) for key in raw_entry):
-            raise RuntimeError(
-                "Checkpoint distributed entry keys must be strings"
-            )
-        missing_entry = sorted(entry_required.difference(raw_entry))
-        if missing_entry:
-            raise RuntimeError(
-                "Checkpoint distributed entry is missing keys: "
-                f"{missing_entry}"
-            )
-        extra_entry = sorted(set(raw_entry).difference(entry_required))
-        if extra_entry:
-            raise RuntimeError(
-                "Checkpoint distributed entry has unexpected keys: "
-                f"{extra_entry}"
-            )
-        rank = raw_entry["rank"]
-        if isinstance(rank, bool) or not isinstance(rank, int):
-            raise RuntimeError("Checkpoint distributed rank must be an integer")
-        if rank < 0 or rank >= world_size:
-            raise RuntimeError(
-                f"Checkpoint distributed rank {rank} is outside world_size "
-                f"{world_size}"
-            )
-        if rank in seen:
-            raise RuntimeError(
-                f"Checkpoint distributed entries contain duplicate rank {rank}"
-            )
-        runtime_identity = raw_entry["runtime_identity"]
-        if not isinstance(runtime_identity, dict):
-            raise RuntimeError(
-                "Checkpoint distributed runtime_identity must be a dictionary"
-            )
-        runtime_identity = _validated_runtime_identity(
-            runtime_identity,
-            rank=rank,
-            redact_secrets=redact_runtime_secrets,
-        )
-        _validate_rng_state(raw_entry["rng"], safe=True)
-        _validate_safe_checkpoint_value(
-            raw_entry["sampler_cursor"],
-            label=f"distributed rank {rank} sampler cursor",
-        )
-        _validate_safe_checkpoint_value(
-            runtime_identity,
-            label=f"distributed rank {rank} runtime identity",
-        )
-        seen.add(rank)
-        input_ranks.append(rank)
-        normalized_entries.append(
-            {
-                "rank": rank,
-                "rng": deepcopy(raw_entry["rng"]),
-                "sampler_cursor": deepcopy(raw_entry["sampler_cursor"]),
-                "runtime_identity": runtime_identity,
-            }
-        )
-
-    expected_ranks = list(range(world_size))
-    missing_ranks = sorted(set(expected_ranks).difference(seen))
-    if missing_ranks:
-        raise RuntimeError(
-            f"Checkpoint distributed entries are missing ranks: {missing_ranks}"
-        )
-    if len(normalized_entries) != world_size:
-        raise RuntimeError(
-            "Checkpoint distributed entries must contain exactly one entry per rank"
-        )
-    if require_sorted and input_ranks != expected_ranks:
-        raise RuntimeError(
-            "Checkpoint distributed entries must be sorted by rank"
-        )
-    normalized_entries.sort(key=lambda entry: entry["rank"])
-    normalized = {
-        "world_size": world_size,
-        "backend": backend,
-        "entries": normalized_entries,
-    }
-    _validate_safe_checkpoint_value(normalized, label="distributed state")
-    return normalized
-
-
-def _validated_runtime_identity(
-    value: dict[str, Any],
-    *,
-    rank: int,
-    redact_secrets: bool,
-) -> dict[str, Any]:
-    label = f"distributed rank {rank} runtime identity"
-    try:
-        serialized = json.dumps(
-            value,
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        normalized = json.loads(serialized)
-    except (TypeError, ValueError, OverflowError):
-        raise RuntimeError(f"Checkpoint {label} must be JSON-safe") from None
-    if normalized != value:
-        raise RuntimeError(
-            f"Checkpoint {label} must round-trip through JSON without changes"
-        )
-
-    redacted = redact_artifact_config(normalized)
-    if redact_secrets:
-        return redacted
-    if redacted != normalized:
-        raise RuntimeError(f"Checkpoint {label} contains unredacted secrets")
-    return normalized
-
-
-def _validate_checkpoint_distributed_state(
-    state: dict[str, Any],
-    metadata: dict[str, Any],
-    *,
-    state_format: int,
-    expected_world_size: int | None,
-    expected_rank: int | None,
-) -> dict[str, Any] | None:
-    if "distributed_state" not in state:
-        if "distributed_state" in metadata:
-            raise RuntimeError(
-                "checkpoint.json marks distributed state missing from "
-                "training_state.pt"
-            )
-        world_size = 1
-        distributed_state = None
-    else:
-        raw_state = state["distributed_state"]
-        if state_format not in _DISTRIBUTED_CHECKPOINT_FORMAT_VERSIONS:
-            raise RuntimeError(
-                "Distributed runtime state requires checkpoint format v3 or newer"
-            )
-        distributed_state = _validate_distributed_state(
-            raw_state,
-            require_sorted=True,
-            redact_runtime_secrets=False,
-        )
-        world_size = int(distributed_state["world_size"])
-        marker = metadata.get("distributed_state")
-        expected_marker = {
-            "world_size": world_size,
-            "backend": distributed_state["backend"],
-        }
-        if marker != expected_marker:
-            raise RuntimeError(
-                "checkpoint.json distributed_state does not match "
-                "training_state.pt"
-            )
-
-    if expected_world_size is not None:
-        if isinstance(expected_world_size, bool) or not isinstance(
-            expected_world_size, int
-        ):
-            raise TypeError("expected_world_size must be an integer")
-        if expected_world_size < 1:
-            raise ValueError("expected_world_size must be at least 1")
-        if expected_world_size != world_size:
-            raise RuntimeError(
-                "Checkpoint world size changed: "
-                f"checkpoint {world_size}, expected {expected_world_size}; "
-                "same-world-size resume is required"
-            )
-    if expected_rank is not None:
-        _validate_expected_rank(expected_rank, world_size=world_size)
-    return distributed_state
-
-
-def _validate_expected_rank(rank: Any, *, world_size: int) -> None:
-    if isinstance(rank, bool) or not isinstance(rank, int):
-        raise TypeError("expected rank must be an integer")
-    if rank < 0 or rank >= world_size:
-        raise RuntimeError(
-            f"Checkpoint does not contain rank {rank}; world_size is {world_size}"
-        )
-
-
-def _validate_rng_state(value: Any, *, safe: bool) -> None:
-    import torch
-
-    if not isinstance(value, dict):
-        raise RuntimeError("Checkpoint RNG state must be a dictionary")
-    missing = sorted({"python", "numpy", "torch"}.difference(value))
-    if missing:
-        raise RuntimeError(f"Checkpoint RNG state is missing keys: {missing}")
-    if not isinstance(value["torch"], torch.Tensor):
-        raise RuntimeError("Checkpoint torch RNG state must be a tensor")
-    cuda_state = value.get("cuda")
-    if cuda_state is not None and (
-        not isinstance(cuda_state, list)
-        or not all(isinstance(item, torch.Tensor) for item in cuda_state)
-    ):
-        raise RuntimeError("Checkpoint CUDA RNG state must be a list of tensors")
-    numpy_state = value["numpy"]
-    if safe:
-        extra = sorted(set(value).difference({"python", "numpy", "torch", "cuda"}))
-        if extra:
-            raise RuntimeError(f"Checkpoint RNG state has unexpected keys: {extra}")
-        required = {
-            "bit_generator",
-            "state",
-            "position",
-            "has_gauss",
-            "cached_gaussian",
-        }
-        if not isinstance(numpy_state, dict):
-            raise RuntimeError("Checkpoint NumPy RNG state must be a dictionary")
-        missing_numpy = sorted(required.difference(numpy_state))
-        if missing_numpy:
-            raise RuntimeError(
-                f"Checkpoint NumPy RNG state is missing keys: {missing_numpy}"
-            )
-        if not isinstance(numpy_state["state"], list) or not all(
-            isinstance(item, int) for item in numpy_state["state"]
-        ):
-            raise RuntimeError(
-                "Checkpoint NumPy RNG state vector must be a list of integers"
-            )
-        _validate_safe_checkpoint_value(value, label="RNG state")
+    expected_world_size: int,
+) -> tuple[RankState, ...]:
+    if type(value) is not tuple or len(value) != expected_world_size:
+        raise ResumeError("rank_states tuple length does not match world_size")
+    states: list[RankState] = []
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != set(_RANK_STATE_KEYS):
+            raise ResumeError("rank state has an invalid exact key set")
+        rng = entry["rng"]
+        if not isinstance(rng, dict) or set(rng) != set(_RNG_KEYS):
+            raise ResumeError("rank RNG has an invalid exact key set")
+        numpy_rng = rng["numpy"]
+        if not isinstance(numpy_rng, dict) or set(numpy_rng) != set(_NUMPY_RNG_KEYS):
+            raise ResumeError("NumPy RNG state has an invalid exact key set")
+        words = numpy_rng["state"]
+        if type(words) is not list:
+            raise ResumeError("NumPy RNG state words must be a list")
         try:
-            random.Random().setstate(value["python"])
+            state = RankState(
+                rank=entry["rank"],
+                python_state=rng["python"],
+                numpy_bit_generator=numpy_rng["bit_generator"],
+                numpy_state=tuple(words),
+                numpy_position=numpy_rng["position"],
+                numpy_has_gauss=numpy_rng["has_gauss"],
+                numpy_cached_gaussian=numpy_rng["cached_gaussian"],
+                torch_cpu=rng["torch_cpu"],
+                torch_cuda=rng["torch_cuda"],
+            )
         except (TypeError, ValueError) as exc:
-            raise RuntimeError("Checkpoint Python RNG state is malformed") from exc
-        try:
-            np.random.RandomState().set_state(
-                (
-                    str(numpy_state["bit_generator"]),
-                    np.asarray(numpy_state["state"], dtype=np.uint32),
-                    int(numpy_state["position"]),
-                    int(numpy_state["has_gauss"]),
-                    float(numpy_state["cached_gaussian"]),
-                )
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("Checkpoint NumPy RNG state is malformed") from exc
-        try:
-            torch.Generator(device="cpu").set_state(value["torch"])
-        except RuntimeError as exc:
-            raise RuntimeError("Checkpoint torch RNG state is malformed") from exc
-
-
-def _is_checkpoint_control_file(relative: Path) -> bool:
-    return len(relative.parts) == 1 and relative.name in _CHECKPOINT_CONTROL_FILES
-
-
-def _is_temporary_checkpoint_path(relative: Path) -> bool:
-    for part in relative.parts:
-        if (
-            part.endswith((".tmp", ".temp", ".part", "~"))
-            or ".tmp-" in part
-            or part.startswith((".tmp-", ".temp-"))
-        ):
-            return True
-    return False
-
-
-def _validate_v2_checkpoint_metadata(
-    state: dict[str, Any],
-    metadata: dict[str, Any],
-) -> None:
-    state_required = {
-        "training_semantics_fingerprint",
-        "data_identity_fingerprint",
-        "implementation_identity_fingerprint",
-        "identity_payload",
-        "data_identity",
-        "data_source",
-    }
-    metadata_required = {
-        "training_semantics_fingerprint",
-        "data_identity_fingerprint",
-        "implementation_identity_fingerprint",
-        "data_identity",
-        "data_source",
-    }
-    missing_state = sorted(state_required.difference(state))
-    if missing_state:
-        raise RuntimeError(
-            f"Checkpoint v2 training state is missing keys: {missing_state}"
-        )
-    missing_metadata = sorted(metadata_required.difference(metadata))
-    if missing_metadata:
-        raise RuntimeError(
-            f"Checkpoint v2 metadata is missing keys: {missing_metadata}"
-        )
-    for key in (
-        "config_fingerprint_scheme",
-        "training_semantics_fingerprint",
-        "data_identity_fingerprint",
-        "implementation_identity_fingerprint",
-        "data_identity",
-        "data_source",
-    ):
-        if metadata.get(key) != state.get(key):
-            raise RuntimeError(
-                f"checkpoint.json {key} does not match training_state.pt"
-            )
-    payload = state["identity_payload"]
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("Checkpoint v2 identity_payload must be a dictionary")
-    if payload.get("data_identity") != state.get("data_identity"):
-        raise RuntimeError(
-            "Checkpoint v2 identity payload data_identity does not match "
-            "training_state.pt"
-        )
-    fingerprint_scheme = state.get("config_fingerprint_scheme")
-    if fingerprint_scheme is not None and not isinstance(fingerprint_scheme, str):
-        raise RuntimeError(
-            f"Unsupported config fingerprint scheme: {fingerprint_scheme!r}"
-        )
-    if fingerprint_scheme in _SUPPORTED_SAFE_CONFIG_FINGERPRINT_SCHEMES:
-        if redact_artifact_config(payload) != payload:
-            raise RuntimeError("Checkpoint v2 identity payload contains unredacted secrets")
-        if redact_artifact_config(state.get("data_source")) != state.get("data_source"):
-            raise RuntimeError("Checkpoint v2 data source contains unredacted secrets")
-        component_fingerprints = {
-            key: state.get(key)
-            for key in (
-                "training_semantics_fingerprint",
-                "data_identity_fingerprint",
-                "implementation_identity_fingerprint",
-            )
-        }
-        if any(
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
-            for value in component_fingerprints.values()
-        ):
-            raise RuntimeError("Checkpoint v2 contains an invalid identity fingerprint")
-        expected_components = {
-            "config_fingerprint": _payload_sha256(component_fingerprints)
-        }
-    elif fingerprint_scheme is None:
-        expected_components = {
-            "training_semantics_fingerprint": _payload_sha256(
-                payload.get("training_semantics")
-            ),
-            "data_identity_fingerprint": _payload_sha256(payload.get("data_identity")),
-            "implementation_identity_fingerprint": _payload_sha256(
-                payload.get("implementation")
-            ),
-            "config_fingerprint": _payload_sha256(payload),
-        }
-    else:
-        raise RuntimeError(
-            f"Unsupported config fingerprint scheme: {fingerprint_scheme}"
-        )
-    for key, expected in expected_components.items():
-        if state.get(key) != expected:
-            raise RuntimeError(
-                f"Checkpoint v2 {key} does not match its canonical identity payload"
-            )
-
-
-def _reject_ambiguous_legacy_reward_partition(
-    config: Mapping[str, Any],
-    *,
-    fingerprint_scheme: Any,
-    read_only_audit: bool,
-) -> None:
-    if fingerprint_scheme is not None and not isinstance(fingerprint_scheme, str):
-        raise RuntimeError(
-            f"Unsupported config fingerprint scheme: {fingerprint_scheme!r}"
-        )
-    if read_only_audit or fingerprint_scheme not in {
-        None,
-        *_PRIOR_SAFE_CONFIG_FINGERPRINT_SCHEMES,
-    }:
-        return
-    runner = config.get("runner") or {}
-    if not isinstance(runner, Mapping):
-        return
-    reward_executor = runner.get("reward_executor") or {}
-    if not isinstance(reward_executor, Mapping):
-        return
-    # Legacy schemas accepted only positive integer microbatch sizes. Preserve
-    # their historical validation rule, while refusing ``None`` because it is a
-    # new full-batch sentinel that could otherwise reinterpret the old default 1.
-    microbatch_size = reward_executor.get("microbatch_size")
-    if reward_executor.get("mode") == "async" and (
-        isinstance(microbatch_size, bool)
-        or not isinstance(microbatch_size, int)
-        or microbatch_size < 1
-    ):
-        raise RuntimeError(
-            "Resume rejected: this legacy checkpoint fingerprint did not bind the async "
-            "reward batch partition. Older VisualRL releases defaulted "
-            "microbatch_size to a positive integer. Explicitly restore the "
-            "original resolved microbatch_size, or use an audited checkpoint "
-            "migration."
-        )
-
-
-def _identity_differences(
-    checkpoint: Any,
-    current: Any,
-    path: str = "",
-) -> list[str]:
-    if type(checkpoint) is not type(current):
-        return [path or "identity_payload"]
-    if isinstance(checkpoint, dict):
-        differences: list[str] = []
-        for key in sorted(set(checkpoint) | set(current)):
-            child = f"{path}.{key}" if path else str(key)
-            if key not in checkpoint or key not in current:
-                differences.append(child)
-            else:
-                differences.extend(
-                    _identity_differences(checkpoint[key], current[key], child)
-                )
-        return differences
-    if isinstance(checkpoint, list):
-        if checkpoint == current:
-            return []
-        return [path]
-    if checkpoint != current:
-        return [path]
-    return []
-
-
-def _object_identity(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    cls = type(value)
-    class_name = f"{cls.__module__}.{cls.__qualname__}"
+            raise ResumeError("rank RNG state is invalid") from exc
+        states.append(state)
     try:
-        source = inspect.getsource(cls).encode("utf-8")
-    except (OSError, TypeError):
-        source = class_name.encode("utf-8")
-    identity: dict[str, Any] = {
-        "class": class_name,
-        "source_sha256": hashlib.sha256(source).hexdigest(),
-        "module_sha256": _module_hash(cls),
-    }
-    details = getattr(value, "_visual_rl_identity", None)
-    if details is None:
-        implementation_identity = getattr(value, "implementation_identity", None)
-        if callable(implementation_identity):
-            details = implementation_identity()
-    if details is None:
-        return identity
-    if not isinstance(details, Mapping):
-        raise TypeError("implementation identity details must be a JSON-safe mapping")
-    try:
-        json_details = json.loads(
-            json.dumps(dict(details), sort_keys=True, allow_nan=False)
-        )
+        return _validate_rank_states(tuple(states))
     except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"implementation identity details must be JSON-safe: {exc}"
-        ) from exc
-    for reserved in ("class", "module_sha256"):
-        if reserved in json_details and json_details[reserved] != identity[reserved]:
-            raise ValueError(
-                f"implementation identity details cannot override {reserved!r}"
-            )
-    identity.update(json_details)
-    return identity
+        raise ResumeError("rank_states ordering/topology is invalid") from exc
 
 
-def _parameter_signature(adapter: Any) -> list[dict[str, Any]]:
-    signature = []
-    for name, parameter in adapter.named_parameters():
-        if not getattr(parameter, "requires_grad", True):
-            continue
-        signature.append(
-            {
-                "name": str(name),
-                "shape": list(getattr(parameter, "shape", ())),
-                "dtype": str(getattr(parameter, "dtype", "unknown")),
-            }
-        )
-    return signature
-
-
-@lru_cache(maxsize=1)
-def _git_commit() -> str | None:
-    repo_root = Path(__file__).resolve().parents[2]
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() or None
-
-
-@lru_cache(maxsize=1)
-def _git_diff_hash() -> str | None:
-    repo_root = Path(__file__).resolve().parents[2]
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--", "visual_rl"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return hashlib.sha256(result.stdout).hexdigest()
-
-
-@lru_cache(maxsize=1)
-def _runtime_tree_hash() -> str:
-    package_root = Path(__file__).resolve().parents[1]
-    return _hash_files(package_root, package_root.rglob("*.py"))
-
-
-def _reference_patch_hash(adapter: Any) -> str | None:
-    repo_root = getattr(adapter, "repo_root", None)
-    if repo_root is None:
-        return None
-    root = Path(repo_root)
-    patch_root = root / "flow_grpo" / "diffusers_patch"
-    if not patch_root.exists():
-        return None
-    return _hash_files(root, patch_root.rglob("*.py"))
-
-
-def _module_hash(cls: type[Any]) -> str:
-    module = inspect.getmodule(cls)
-    module_path = Path(getattr(module, "__file__", "")) if module else Path()
-    if not module_path.is_file():
-        return hashlib.sha256(
-            f"{cls.__module__}.{cls.__qualname__}".encode("utf-8")
-        ).hexdigest()
-    return hashlib.sha256(module_path.read_bytes()).hexdigest()
-
-
-def _hash_files(root: Path, files) -> str:
-    digest = hashlib.sha256()
-    for path in sorted((item for item in files if item.is_file()), key=str):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def capture_rng_state() -> dict[str, Any]:
-    """Capture Python, NumPy, torch, and available CUDA RNG state safely."""
-
+def _validated_rng_tensor(value: Any, *, label: str) -> Any:
     import torch
 
-    numpy_state = np.random.get_state()
-    state: dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": {
-            "bit_generator": str(numpy_state[0]),
-            "state": numpy_state[1].astype(np.uint32, copy=False).tolist(),
-            "position": int(numpy_state[2]),
-            "has_gauss": int(numpy_state[3]),
-            "cached_gaussian": float(numpy_state[4]),
-        },
-        "torch": torch.get_rng_state(),
-    }
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    _validate_rng_state(state, safe=True)
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.device.type != "cpu"
+        or value.dtype != torch.uint8
+        or value.ndim != 1
+        or value.numel() < 1
+        or not value.is_contiguous()
+    ):
+        raise ValueError(f"{label} must be contiguous CPU uint8 with shape [N]")
+    if value.requires_grad or value.grad_fn is not None:
+        raise ValueError(f"{label} must be detached")
+    return value
+
+
+def _validate_device(value: Any) -> Any:
+    import torch
+
+    if not isinstance(value, torch.device) or value.type not in {"cpu", "cuda"}:
+        raise TypeError("writer_device must be a CPU or CUDA torch.device")
+    if value.type == "cuda" and value.index is None:
+        raise ValueError("CUDA writer_device must have an explicit index")
+    return value
+
+
+def _validate_rank_device_topology(
+    states: tuple[RankState, ...],
+    device: Any,
+) -> None:
+    device = _validate_device(device)
+    has_cuda = all(item.torch_cuda is not None for item in states)
+    if device.type == "cpu" and has_cuda:
+        raise ResumeError("CUDA RNG checkpoint cannot be used by a CPU runtime")
+    if device.type == "cuda" and not has_cuda:
+        raise ResumeError("CPU RNG checkpoint cannot be used by a CUDA runtime")
+    import torch
+
+    expected_cpu_words = torch.get_rng_state().numel()
+    if any(item.torch_cpu.numel() != expected_cpu_words for item in states):
+        raise ResumeError("Torch CPU RNG state length is incompatible")
+    if device.type == "cuda":
+        expected_cuda_words = torch.cuda.get_rng_state(device=device).numel()
+        if any(
+            item.torch_cuda is None
+            or item.torch_cuda.numel() != expected_cuda_words
+            for item in states
+        ):
+            raise ResumeError("Torch CUDA RNG state length is incompatible")
+
+
+def _validate_live_topology(
+    adapter: Any,
+    optimizer: Any,
+) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+    import torch
+
+    if not isinstance(optimizer, torch.optim.AdamW):
+        raise TypeError("optimizer must be torch.optim.AdamW")
+    named = adapter.named_parameters()
+    if type(named) is not tuple or not named:
+        raise ValueError("adapter.named_parameters() must return a non-empty tuple")
+    names = tuple(item[0] for item in named)
+    parameters = tuple(item[1] for item in named)
+    if (
+        any(not isinstance(name, str) or not name for name in names)
+        or len(set(names)) != len(names)
+        or len({id(parameter) for parameter in parameters}) != len(parameters)
+    ):
+        raise ValueError("adapter trainable parameter names/identities are invalid")
+    if len(optimizer.param_groups) != 1:
+        raise ValueError("v0.7 AdamW must contain exactly one parameter group")
+    if tuple(optimizer.param_groups[0]["params"]) != parameters:
+        raise ValueError(
+            "AdamW parameter identity/order must match adapter.named_parameters()"
+        )
+    if any(parameter.device != parameters[0].device for parameter in parameters):
+        raise ValueError("all trainable Adapter parameters must share one device")
+    return names, parameters
+
+
+def _audit_optimizer_topology(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, dict) or set(value) != set(_TOPOLOGY_KEYS):
+        raise ResumeError("optimizer_topology has an invalid exact key set")
+    names = value["parameter_names"]
+    roles = value["group_roles"]
+    if (
+        type(names) is not tuple
+        or not names
+        or any(not isinstance(name, str) or not name for name in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ResumeError("optimizer parameter_names are invalid")
+    if type(roles) is not tuple or roles != _GROUP_ROLES:
+        raise ResumeError("optimizer group_roles must be ('trainable_adapter',)")
+    return names
+
+
+def _audit_optimizer_payload(
+    value: Any,
+    *,
+    parameter_names: tuple[str, ...],
+) -> None:
+    import torch
+
+    if not isinstance(value, dict) or set(value) != set(_OPTIMIZER_KEYS):
+        raise ResumeError("optimizer state has an invalid exact key set")
+    state = value["state"]
+    groups = value["param_groups"]
+    if not isinstance(state, dict) or type(groups) is not list or len(groups) != 1:
+        raise ResumeError("optimizer must contain one state mapping and one group")
+    group = groups[0]
+    if not isinstance(group, dict):
+        raise ResumeError("optimizer parameter group must be a mapping")
+    ids = group.get("params")
+    if type(ids) is not list or ids != list(range(len(parameter_names))):
+        raise ResumeError("optimizer parameter ids must be canonical 0..N-1")
+    if any(type(item) is not int for item in state) or set(state).difference(ids):
+        raise ResumeError("optimizer state references an unknown parameter id")
+    for parameter_id, entry in state.items():
+        if not isinstance(entry, dict):
+            raise ResumeError("optimizer per-parameter state must be a mapping")
+        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+        if bool(group.get("amsgrad", False)):
+            expected_keys.add("max_exp_avg_sq")
+        if set(entry) != expected_keys:
+            raise ResumeError("AdamW per-parameter state has incompatible keys")
+        step = entry["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.device.type != "cpu"
+            or step.dtype != torch.float32
+            or step.ndim != 0
+            or not step.is_contiguous()
+            or not bool(torch.isfinite(step))
+            or float(step) < 0
+        ):
+            raise ResumeError("AdamW step must be a finite non-negative CPU scalar")
+        moments = tuple(
+            entry[name] for name in sorted(expected_keys.difference({"step"}))
+        )
+        first = moments[0]
+        if (
+            not isinstance(first, torch.Tensor)
+            or first.device.type != "cpu"
+            or not first.is_contiguous()
+            or not bool(torch.isfinite(first).all())
+        ):
+            raise ResumeError("AdamW moment tensor is invalid")
+        if any(
+            not isinstance(moment, torch.Tensor)
+            or moment.device.type != "cpu"
+            or moment.shape != first.shape
+            or moment.dtype != first.dtype
+            or not moment.is_contiguous()
+            or not bool(torch.isfinite(moment).all())
+            for moment in moments[1:]
+        ):
+            raise ResumeError(
+                f"AdamW moment tensors disagree for parameter {parameter_id}"
+            )
+    for name, item in group.items():
+        if name == "params":
+            continue
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ResumeError(
+                f"optimizer parameter-group field {name!r} must be finite"
+            )
+        if isinstance(item, tuple) and any(
+            isinstance(part, float) and not math.isfinite(part) for part in item
+        ):
+            raise ResumeError(
+                f"optimizer parameter-group field {name!r} must be finite"
+            )
+
+
+def _audit_scaler_payload(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ResumeError("checkpoint GradScaler state must be a mapping or None")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise ResumeError("checkpoint GradScaler keys must be non-empty strings")
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ResumeError(
+                f"checkpoint GradScaler field {key!r} must be finite"
+            )
+
+
+def _normalized_optimizer_state(
+    value: Any,
+    *,
+    parameter_names: tuple[str, ...],
+    adapter: Any,
+    live_optimizer: Any,
+) -> dict[str, Any]:
+    normalized = _clone_safe_value(value)
+    _names, parameters = _validate_live_topology(adapter, live_optimizer)
+    _validate_optimizer_payload(
+        normalized,
+        parameter_names=parameter_names,
+        parameters=parameters,
+        live_optimizer=live_optimizer,
+    )
+    return normalized
+
+
+def _validate_optimizer_payload(
+    value: Any,
+    *,
+    parameter_names: tuple[str, ...],
+    parameters: tuple[Any, ...],
+    live_optimizer: Any,
+) -> None:
+    import torch
+
+    if not isinstance(value, dict) or set(value) != set(_OPTIMIZER_KEYS):
+        raise ResumeError("optimizer state has an invalid exact key set")
+    state = value["state"]
+    groups = value["param_groups"]
+    if not isinstance(state, dict) or type(groups) is not list or len(groups) != 1:
+        raise ResumeError("optimizer must contain one state mapping and one group")
+    group = groups[0]
+    live_group = live_optimizer.state_dict()["param_groups"][0]
+    if not isinstance(group, dict) or set(group) != set(live_group):
+        raise ResumeError("optimizer parameter-group key set is incompatible")
+    ids = group["params"]
+    if type(ids) is not list or len(ids) != len(parameter_names):
+        raise ResumeError("optimizer parameter ids do not match Adapter topology")
+    if ids != list(range(len(parameter_names))):
+        raise ResumeError("optimizer parameter ids must be canonical 0..N-1")
+    if any(type(item) is not int for item in state):
+        raise ResumeError("optimizer state keys must be non-bool integers")
+    if set(state).difference(ids):
+        raise ResumeError("optimizer state references an unknown parameter id")
+    mutable_hyperparameters = {"lr", "betas", "eps", "weight_decay", "params"}
+    for key in set(group).difference(mutable_hyperparameters):
+        if group[key] != live_group[key]:
+            raise ResumeError(
+                f"optimizer fixed parameter-group field {key!r} is incompatible"
+            )
+    for index, parameter_id in enumerate(ids):
+        entry = state.get(parameter_id)
+        if entry is None:
+            continue
+        if not isinstance(entry, dict):
+            raise ResumeError("optimizer per-parameter state must be a mapping")
+        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+        if bool(group.get("amsgrad", False)):
+            expected_keys.add("max_exp_avg_sq")
+        if set(entry) != expected_keys:
+            raise ResumeError("AdamW per-parameter state has incompatible keys")
+        step = entry["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.device.type != "cpu"
+            or step.dtype != torch.float32
+            or step.ndim != 0
+            or not step.is_contiguous()
+            or not bool(torch.isfinite(step))
+            or float(step) < 0
+        ):
+            raise ResumeError("AdamW step must be a finite non-negative CPU scalar")
+        for name in expected_keys.difference({"step"}):
+            tensor = entry[name]
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.device.type != "cpu"
+                or tuple(tensor.shape) != tuple(parameters[index].shape)
+                or tensor.dtype != parameters[index].dtype
+                or not tensor.is_contiguous()
+                or not bool(torch.isfinite(tensor).all())
+            ):
+                raise ResumeError(
+                    f"AdamW {name} tensor is incompatible with parameter "
+                    f"{parameter_names[index]!r}"
+                )
+
+
+def _normalized_scaler_state(scaler: Any | None) -> dict[str, Any] | None:
+    if scaler is None:
+        return None
+    state = _clone_safe_value(scaler.state_dict())
+    _validate_scaler_payload(state, scaler)
     return state
 
 
-def restore_rng_state(state: dict[str, Any]) -> None:
-    """Restore a RNG snapshot produced by :func:`capture_rng_state`."""
+def _validate_scaler_payload(value: Any, scaler: Any | None) -> None:
+    if scaler is None:
+        if value is not None:
+            raise ResumeError("checkpoint GradScaler topology does not match runtime")
+        return
+    if not isinstance(value, dict):
+        raise ResumeError("checkpoint GradScaler state must be a mapping")
+    live = scaler.state_dict()
+    if set(value) != set(live):
+        raise ResumeError("checkpoint GradScaler key set does not match runtime")
+    for key, item in value.items():
+        expected = live[key]
+        if type(item) is not type(expected):
+            raise ResumeError(f"checkpoint GradScaler field {key!r} has wrong type")
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ResumeError(f"checkpoint GradScaler field {key!r} must be finite")
 
-    _validate_rng_state(state, safe=True)
-    _restore_rng_state(state)
+
+def _apply_current_optimizer_config(
+    optimizer: Any,
+    config: OptimizerConfig,
+) -> None:
+    if len(optimizer.param_groups) != 1:
+        raise ResumeError("AdamW group topology changed while applying checkpoint")
+    group = optimizer.param_groups[0]
+    group["lr"] = config.learning_rate
+    group["betas"] = (config.adam_beta1, config.adam_beta2)
+    group["weight_decay"] = config.adam_weight_decay
+    group["eps"] = config.adam_epsilon
 
 
-def _rng_state() -> dict[str, Any]:
-    return capture_rng_state()
-
-
-def _restore_rng_state(state: dict[str, Any]) -> None:
+def _capture_rank_rng(*, rank: int, device: Any) -> RankState:
     import torch
 
-    random.setstate(state["python"])
-    numpy_state = state["numpy"]
-    if isinstance(numpy_state, dict):
-        np.random.set_state(
-            (
-                str(numpy_state["bit_generator"]),
-                np.asarray(numpy_state["state"], dtype=np.uint32),
-                int(numpy_state["position"]),
-                int(numpy_state["has_gauss"]),
-                float(numpy_state["cached_gaussian"]),
-            )
+    device = _validate_device(device)
+    cuda = (
+        None
+        if device.type == "cpu"
+        else torch.cuda.get_rng_state(device=device).cpu().contiguous()
+    )
+    return RankState.from_rng(
+        rank=rank,
+        python_state=random.getstate(),
+        numpy_state=np.random.get_state(),
+        torch_cpu=torch.get_rng_state().cpu().contiguous(),
+        torch_cuda=cuda,
+    )
+
+
+def _restore_rank_rng(rank_state: RankState, *, device: Any) -> None:
+    import torch
+
+    if not isinstance(rank_state, RankState):
+        raise TypeError("rank_state must be a RankState")
+    device = _validate_device(device)
+    _validate_rank_device_topology((rank_state,), device)
+    random.setstate(rank_state.python_state)
+    np.random.set_state(
+        (
+            rank_state.numpy_bit_generator,
+            np.asarray(rank_state.numpy_state, dtype=np.uint32),
+            rank_state.numpy_position,
+            rank_state.numpy_has_gauss,
+            float(rank_state.numpy_cached_gaussian),
         )
+    )
+    torch.set_rng_state(rank_state.torch_cpu)
+    if device.type == "cuda":
+        assert rank_state.torch_cuda is not None
+        torch.cuda.set_rng_state(rank_state.torch_cuda, device=device)
+
+
+def _prepare_checkpoint_target(path: Path) -> Path:
+    absolute = path.absolute()
+    if absolute.exists() or absolute.is_symlink():
+        if absolute.is_symlink() or not absolute.is_dir():
+            raise ValueError("checkpoint_dir must be a real directory")
+        if any(absolute.iterdir()):
+            raise ValueError("checkpoint_dir must be empty before save")
     else:
-        np.random.set_state(numpy_state)
-    torch.set_rng_state(state["torch"])
-    if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        parent = _safe_directory(absolute.parent, label="checkpoint parent")
+        absolute = parent / absolute.name
+        absolute.mkdir()
+    return _safe_directory(absolute, label="checkpoint")
+
+
+def _require_exact_checkpoint_root(root: Path) -> None:
+    root = _safe_directory(root, label="checkpoint")
+    children = tuple(root.iterdir())
+    if {item.name for item in children} != set(_CHECKPOINT_ROOT_ENTRIES):
+        raise ResumeError(
+            "v5 checkpoint must contain exactly adapter/, training_state.pt "
+            "and checkpoint.json",
+            path=str(root),
+        )
+    for item in children:
+        metadata = item.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ResumeError("checkpoint root entries must not be symlinks")
+        if item.name == "adapter":
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ResumeError("checkpoint adapter entry must be a directory")
+        elif not stat.S_ISREG(metadata.st_mode):
+            raise ResumeError("checkpoint control entries must be regular files")
+
+
+def _safe_directory(path: Path, *, label: str) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} does not exist: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"{label} must be a real directory: {path}")
+    resolved = path.resolve(strict=True)
+    current = Path(resolved.anchor)
+    for part in resolved.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError(f"{label} path must not contain symlinks: {current}")
+    return resolved
+
+
+def _require_regular_file(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} does not exist: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"{label} must be a regular file: {path}")
+
+
+def _save_torch_payload(path: Path, payload: Mapping[str, Any]) -> None:
+    import torch
+
+    temporary = path.parent / f".{path.name}.tmp-{secrets.token_hex(16)}"
+    try:
+        with temporary.open("xb") as handle:
+            torch.save(dict(payload), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_canonical_json(path: Path, payload: Mapping[str, Any]) -> None:
+    encoded = (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    temporary = path.parent / f".{path.name}.tmp-{secrets.token_hex(16)}"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _sha256_file(path: Path) -> str:
+    _require_regular_file(path, label="checkpoint file")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_SHA256_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_tree(root: Path) -> None:
+    directories = [root, *(item for item in root.rglob("*") if item.is_dir())]
+    for directory in sorted(
+        directories,
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        _fsync_directory(directory)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _clone_safe_value(value: Any) -> Any:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu").contiguous().clone()
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str) and type(key) is not int:
+                raise TypeError("checkpoint mapping keys must be strings or integers")
+            result[key] = _clone_safe_value(item)
+        return result
+    if isinstance(value, list):
+        return [_clone_safe_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_safe_value(item) for item in value)
+    if isinstance(value, (str, bool, int, type(None))):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("checkpoint values must be finite")
+        return value
+    raise TypeError(f"unsupported checkpoint value type: {type(value).__name__}")
+
+
+def _validate_safe_value(value: Any, *, label: str) -> None:
+    try:
+        _clone_safe_value(value)
+    except (TypeError, ValueError) as exc:
+        raise ResumeError(f"{label} contains an unsafe value") from exc

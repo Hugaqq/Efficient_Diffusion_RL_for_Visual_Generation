@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
-from visual_rl.core.types import RolloutBatch
-from visual_rl.core.registry import ALGORITHMS
+from visual_rl.core.types import (
+    FrozenMapping,
+    ResolutionContext,
+    RolloutBatch,
+    RuntimeBuildContext,
+)
+from visual_rl.optimizers.base import (
+    PolicyAlgorithm,
+    _resolve_algorithm_params,
+)
 
 
 @dataclass
-class GRPOAlgorithm:
+class GRPOAlgorithm(PolicyAlgorithm):
+    TRAINING_CONTRACT_VERSION = 1
+    ADVANTAGE_DTYPE = "float32"
+    MIN_GROUP_SIZE = 2
+
     clip_range: float = 0.001
     adv_clip_max: float = 5.0
     beta: float = 0.0
@@ -23,15 +35,36 @@ class GRPOAlgorithm:
             )
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "GRPOAlgorithm":
-        if not isinstance(config, dict):
-            from dataclasses import asdict
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> FrozenMapping:
+        return _resolve_algorithm_params(raw, context, allow_beta=True)
 
-            config = asdict(config)
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> "GRPOAlgorithm":
+        del context
         return cls(
-            clip_range=float(config.get("clip_range", 0.001)),
-            adv_clip_max=float(config.get("adv_clip_max", 5.0)),
-            beta=float(config.get("beta", 0.0)),
+            clip_range=float(resolved["clip_range"]),
+            adv_clip_max=float(resolved["adv_clip_max"]),
+            beta=float(resolved["beta"]),
+        )
+
+    @classmethod
+    def required_capabilities(
+        cls,
+        resolved_params: Mapping[str, object],
+    ) -> frozenset[str]:
+        del cls
+        return (
+            frozenset({"policy.reference_stats"})
+            if float(resolved_params["beta"]) > 0.0
+            else frozenset()
         )
 
     def compute_loss(self, batch: RolloutBatch, rewards, new_log_probs):
@@ -134,6 +167,3 @@ class GRPOAlgorithm:
         if not bool(mask.any()):
             raise ValueError("GRPO requires at least one active transition")
         return mask
-
-
-ALGORITHMS.register("grpo", GRPOAlgorithm)

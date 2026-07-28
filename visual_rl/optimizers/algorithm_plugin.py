@@ -12,30 +12,22 @@ from visual_rl.optimizers.update_engine import UpdateEngine
 class AlgorithmOptimizerPlugin(OptimizerPlugin):
     def __init__(
         self,
-        algorithm,
-        advantage_computer,
-        optimizer_config=None,
-        max_grad_norm=None,
-        update_microbatch_size=None,
-        precision="fp32",
-    ):
+        *,
+        algorithm: Any,
+        advantage_computer: Any,
+        update_microbatch_size: int,
+        precision: str,
+        max_grad_norm: float | None,
+        max_initial_logprob_delta: float | None,
+        require_initial_clipfrac_zero: bool,
+        require_finite_gradients: bool,
+        require_nonzero_gradients: bool,
+    ) -> None:
         self.algorithm = algorithm
         self.advantage_computer = advantage_computer
-        options = dict(optimizer_config or {})
-        max_initial_logprob_delta = options.pop(
-            "max_initial_logprob_delta",
-            None,
-        )
-        self.require_initial_clipfrac_zero = bool(
-            options.pop("require_initial_clipfrac_zero", False)
-        )
-        self.require_finite_gradients = bool(
-            options.pop("require_finite_gradients", True)
-        )
-        self.require_nonzero_gradients = bool(
-            options.pop("require_nonzero_gradients", False)
-        )
-        self.optimizer_config = options
+        self.require_initial_clipfrac_zero = require_initial_clipfrac_zero
+        self.require_finite_gradients = require_finite_gradients
+        self.require_nonzero_gradients = require_nonzero_gradients
         self.objective = AlgorithmPolicyObjective(self.algorithm)
         self.update_engine = UpdateEngine(
             self.advantage_computer,
@@ -53,9 +45,28 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
         self.update_microbatch_size = self.update_engine.update_microbatch_size
         self.precision = self.update_engine.precision
 
-    def build_optimizer(self, parameters: Any, train_config: Any) -> Any:
+    def build_optimizer(
+        self,
+        trainable_named_parameters: tuple[tuple[str, Any], ...],
+        train_config: Any,
+    ) -> Any:
         import torch
 
+        if type(trainable_named_parameters) is not tuple:
+            raise TypeError("trainable_named_parameters must be a tuple")
+        names = tuple(name for name, _parameter in trainable_named_parameters)
+        parameters = tuple(
+            parameter for _name, parameter in trainable_named_parameters
+        )
+        if not parameters:
+            raise ValueError("optimizer requires trainable parameters")
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("trainable parameter names must be non-empty strings")
+        if len(names) != len(set(names)):
+            raise ValueError("trainable parameter names must be unique")
+        identities = tuple(id(parameter) for parameter in parameters)
+        if len(identities) != len(set(identities)):
+            raise ValueError("trainable parameter identities must be unique")
         options = {
             "lr": float(train_config.learning_rate),
             "betas": (
@@ -65,10 +76,18 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
             "weight_decay": float(train_config.adam_weight_decay),
             "eps": float(train_config.adam_epsilon),
         }
-        options.update(self.optimizer_config)
-        if "betas" in options:
-            options["betas"] = tuple(options["betas"])
-        return torch.optim.AdamW(parameters, **options)
+        optimizer = torch.optim.AdamW(parameters, **options)
+        optimizer_ids = tuple(
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
+        if optimizer_ids != identities:
+            raise RuntimeError("AdamW changed trainable parameter identity/order")
+        return optimizer
+
+    def close(self) -> None:
+        """The plugin owns no resources and never closes its algorithm."""
 
     @staticmethod
     def _logprob_metrics(batch, new_log_probs) -> dict[str, float]:
@@ -115,7 +134,7 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
         optimizer: Any,
         context: StepContext,
         *,
-        recompute_log_probs: Callable[[RolloutBatch], Any] | None = None,
+        recompute_policy_stats: Callable[[RolloutBatch], Any] | None = None,
         gradient_sync_context: Callable[[bool], Any] | None = None,
         reduce_tensor_weighted_mean: Callable[[Any, int], Any] | None = None,
         synchronize_failure: Callable[[bool | BaseException | None], bool]
@@ -124,7 +143,7 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
         optimizer_step: Callable[..., Any] | None = None,
     ) -> dict[str, float]:
         routing = {
-            "recompute_log_probs": recompute_log_probs,
+            "recompute_policy_stats": recompute_policy_stats,
             "gradient_sync_context": gradient_sync_context,
             "before_optimizer_step": before_optimizer_step,
             "optimizer_step": optimizer_step,

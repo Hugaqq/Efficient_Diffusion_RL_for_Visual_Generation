@@ -1,123 +1,155 @@
-"""Optimizer plugin interface."""
+"""Final algorithm-factory and optimizer-plugin contracts."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
-from typing import Any, ClassVar, Literal
+from collections.abc import Mapping
+import math
+from typing import ClassVar, Literal, TYPE_CHECKING
 
 from visual_rl.core.types import (
     FrozenMapping,
+    ResolutionContext,
     RewardBatch,
     RolloutBatch,
+    RuntimeBuildContext,
     StepContext,
+    ValidationCheck,
+    ValidationContext,
 )
-from visual_rl.model_adapters.base import ModelAdapter
+
+if TYPE_CHECKING:
+    import torch
+
+    from visual_rl.configs.schema import OptimizerConfig
+    from visual_rl.distributed import DDPStrategy, SingleProcessStrategy
+    from visual_rl.optimizers.update_engine import UpdateResult
 
 
 class PolicyAlgorithm(ABC):
-    """Explicit ABC for every builtin policy algorithm (plan stage 2.2).
-
-    Only construction and the three class constants are frozen at this
-    stage; the runtime loss interface (``weight_normalization_request()`` /
-    ``prepare_loss_inputs()`` / ``diagnostics()``) arrives together with
-    ``PolicyLossInputs`` in the stage-4 atomic migration, which also removes
-    the legacy ``compute_loss()`` path. Checkpoint contract version,
-    advantage dtype and the group-size precondition are read only from these
-    class constants — never from a second config field.
-
-    Declared without abstract methods so the existing algorithm dataclasses
-    can mix this base in during the cutover without breaking instantiation.
-    """
+    """Construction contract for one selected policy algorithm."""
 
     TRAINING_CONTRACT_VERSION: ClassVar[int]
     ADVANTAGE_DTYPE: ClassVar[Literal["float32", "float64"]]
     MIN_GROUP_SIZE: ClassVar[int] = 2
 
-    # ------------------------------------------------------------------
-    # Unified component factory protocol (plan stage 2.2); see
-    # ``ModelAdapter`` for the shared contract.
-    # ------------------------------------------------------------------
-
     @classmethod
     def resolve_params(
         cls,
-        raw: Mapping[str, Any],
-        context: Any,
-    ) -> Mapping[str, Any]:
-        """Whitelist/default/validate/canonicalize component params."""
-
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> Mapping[str, object]:
         if not isinstance(raw, Mapping):
             raise TypeError(
                 f"{cls.__name__}.resolve_params() requires a mapping, "
                 f"got {type(raw).__name__}"
             )
+        del context
         return FrozenMapping(raw)
 
     @classmethod
     def check_environment(
         cls,
-        resolved: Mapping[str, Any],
-        context: Any,
-    ) -> tuple:
-        """Bounded, read-only environment checks; default is no checks."""
-
+        resolved: Mapping[str, object],
+        context: ValidationContext,
+    ) -> tuple[ValidationCheck, ...]:
+        del resolved, context
         return ()
 
     @classmethod
     def from_config(
         cls,
-        resolved: Mapping[str, Any],
-        context: Any,
-    ):
-        """Construct the runtime component from resolved params."""
-
-        raise NotImplementedError(
-            f"{cls.__name__} does not implement from_config() yet"
-        )
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> PolicyAlgorithm:
+        del resolved, context
+        raise NotImplementedError(f"{cls.__name__} must implement from_config()")
 
     @classmethod
-    def required_capabilities(cls, resolved_params: Mapping[str, Any]) -> frozenset:
-        """Conditional capabilities implied by the component's own params."""
-
+    def required_capabilities(
+        cls,
+        resolved_params: Mapping[str, object],
+    ) -> frozenset[str]:
+        del resolved_params
         return frozenset()
+
+    def close(self) -> None:
+        """Release owned resources; pure algorithms are no-op."""
+
+
+def _resolve_algorithm_params(
+    raw: Mapping[str, object],
+    context: ResolutionContext,
+    *,
+    allow_beta: bool,
+) -> FrozenMapping:
+    """Resolve the one shared clipped-surrogate parameter surface."""
+
+    if not isinstance(raw, Mapping):
+        raise TypeError("algorithm params must be a mapping")
+    if not isinstance(context, ResolutionContext):
+        raise TypeError("context must be a ResolutionContext")
+    allowed = {"clip_range", "adv_clip_max"}
+    if allow_beta:
+        allowed.add("beta")
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"unknown algorithm params: {sorted(unknown)}")
+
+    values: dict[str, float] = {
+        "clip_range": _finite_number(
+            "clip_range", raw.get("clip_range", 0.001)
+        ),
+        "adv_clip_max": _finite_number(
+            "adv_clip_max", raw.get("adv_clip_max", 5.0)
+        ),
+    }
+    if not 0.0 < values["clip_range"] < 1.0:
+        raise ValueError("clip_range must satisfy 0 < clip_range < 1")
+    if values["adv_clip_max"] <= 0.0:
+        raise ValueError("adv_clip_max must be positive")
+    if allow_beta:
+        values["beta"] = _finite_number("beta", raw.get("beta", 0.0))
+        if values["beta"] < 0.0:
+            raise ValueError("beta must be non-negative")
+    return FrozenMapping(values)
+
+
+def _finite_number(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number, not bool")
+    resolved = float(value)
+    if not math.isfinite(resolved):
+        raise ValueError(f"{name} must be finite")
+    return resolved
 
 
 class OptimizerPlugin(ABC):
-    """Own one complete policy update while the runner owns orchestration."""
+    """Fixed internal update facade; it is not a selectable component."""
 
     @abstractmethod
-    def build_optimizer(self, parameters: Any, train_config: Any) -> Any:
-        """Return an optimizer with update and checkpoint state methods."""
-
+    def build_optimizer(
+        self,
+        trainable_named_parameters: tuple[
+            tuple[str, "torch.nn.Parameter"],
+            ...,
+        ],
+        config: OptimizerConfig,
+    ) -> "torch.optim.AdamW":
         raise NotImplementedError
 
     @abstractmethod
     def step(
         self,
-        adapter: ModelAdapter,
+        *,
         batch: RolloutBatch,
         rewards: RewardBatch,
-        optimizer: Any,
+        optimizer: "torch.optim.AdamW",
+        scaler: "torch.amp.GradScaler | None",
         context: StepContext,
-        *,
-        recompute_log_probs: Callable[[RolloutBatch], Any] | None = None,
-        gradient_sync_context: Callable[[bool], Any] | None = None,
-        reduce_tensor_weighted_mean: Callable[[Any, int], Any] | None = None,
-        synchronize_failure: Callable[[bool | BaseException | None], bool]
-        | None = None,
-        before_optimizer_step: Callable[[], Any] | None = None,
-        optimizer_step: Callable[..., Any] | None = None,
-    ) -> dict[str, float]:
-        """Run one update with optional forward, accumulation, and step routing."""
-
+        strategy: "SingleProcessStrategy | DDPStrategy",
+    ) -> UpdateResult:
         raise NotImplementedError
 
-    def state_dict(self) -> dict[str, Any]:
-        return {}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state:
-            raise ValueError(
-                f"{type(self).__name__} does not define persistent plugin state."
-            )
+    def close(self) -> None:
+        """Release resources owned by the plugin; the final plugin is pure."""

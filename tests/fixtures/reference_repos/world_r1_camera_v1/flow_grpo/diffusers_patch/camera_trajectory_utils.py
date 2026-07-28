@@ -2,11 +2,11 @@
 
 Same public prompt-to-trajectory surface as the upstream
 ``flow_grpo/diffusers_patch/camera_trajectory_utils.py`` (fixture
-``world_r1_camera_v1``), but NumPy-only: the upstream file imports ``rp`` and
-``torch`` at top level for its optical-flow/noise-wrapping functions, and this
-double deliberately drops those functions so contract tests can build typed
-camera trajectories without the ``rp`` dependency.  Trajectory math, matrix
-string formatting and movement detection are byte-compatible with upstream.
+``world_r1_camera_v1``).  It keeps trajectory generation NumPy-only and exposes
+small tensor-only doubles for the three latent/callback helpers, so contract
+tests exercise the exact call surface without importing ``rp``. Trajectory
+math, matrix string formatting and movement detection are byte-compatible with
+upstream.
 """
 
 import math
@@ -552,3 +552,82 @@ def get_camera_trajectories_for_batch(
         motion_profiles_batch.append(motion_profiles)
 
     return trajectories, detected_movements_batch, expanded_prompts, motion_profiles_batch
+
+
+def prepare_latents_with_camera(
+    prompt,
+    batch_size,
+    num_channels_latents,
+    height,
+    width,
+    num_frames,
+    dtype,
+    device,
+    generator,
+    latents,
+    vae_scale_factor_temporal,
+    frames_per_trajectory,
+    force_camera_movement,
+    remove_camera_keywords_from_prompt,
+    noise_wrap_compute_dtype,
+    noise_downtemp_interp,
+    noise_downspatial_mode,
+    noise_degradation,
+    noise_wrap_flow_scale,
+    camera_trajectories,
+    detected_movements_batch,
+    return_base_latents,
+):
+    """Deterministic tensor-only double for the upstream latent helper."""
+
+    del (
+        prompt,
+        generator,
+        latents,
+        frames_per_trajectory,
+        force_camera_movement,
+        remove_camera_keywords_from_prompt,
+        noise_wrap_compute_dtype,
+        noise_downtemp_interp,
+        noise_downspatial_mode,
+        noise_degradation,
+        noise_wrap_flow_scale,
+        camera_trajectories,
+        detected_movements_batch,
+    )
+    if not return_base_latents:
+        raise AssertionError("fixture requires return_base_latents=True")
+    import torch
+
+    temporal = (num_frames - 1) // vae_scale_factor_temporal + 1
+    base = torch.zeros(
+        batch_size,
+        num_channels_latents,
+        temporal,
+        height // 8,
+        width // 8,
+        dtype=dtype,
+        device=device,
+    )
+    return base + 2.0, base
+
+
+def lowpass_latent_delta(delta, kernel_size):
+    """Expose the exact upstream signature with deterministic fixture math."""
+
+    if kernel_size != 9:
+        raise AssertionError("fixture expects the frozen kernel size")
+    return delta * 0.5
+
+
+def build_stepwise_delta_callback(delta_low, wrap_strength, guidance_steps):
+    """Expose the exact upstream signature and observable callback payload."""
+
+    def callback(_pipe, step, _timestep, callback_kwargs):
+        if step < guidance_steps:
+            callback_kwargs["latents"] = (
+                callback_kwargs["latents"] + wrap_strength * delta_low
+            )
+        return callback_kwargs
+
+    return callback

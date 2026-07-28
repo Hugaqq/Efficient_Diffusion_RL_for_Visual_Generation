@@ -1,138 +1,164 @@
-"""Flash-GRPO single-step rollout engine."""
+"""Flash-GRPO single-step rollout through one typed request."""
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+import random
 
-from visual_rl.core.types import RolloutBatch, StepContext
-from visual_rl.core.registry import ROLLOUT_ENGINES
-from visual_rl.rollout.rectification import scheduler_rectification_weights
-from visual_rl.rollout.timestep_sampler import (
-    expand_prompt_groups,
-    resolve_timestep_indices,
-    select_prompt_timestep_indices,
-    single_step_spec_from_config,
+from visual_rl.core.types import (
+    FrozenMapping,
+    ResolutionContext,
+    RolloutBatch,
+    RuntimeBuildContext,
+    StepContext,
 )
 from visual_rl.model_adapters.base import ModelAdapter
-from visual_rl.rollout.base import RolloutEngine
+from visual_rl.rollout.base import RolloutEngine, _build_rollout_request
+
+
+_STRATEGIES = frozenset(
+    {"iso_temporal", "first", "last", "middle", "seeded_random"}
+)
 
 
 class SingleStepRollout(RolloutEngine):
-    """Expand prompt groups and keep the selected timestep logprob only."""
+    def __init__(
+        self,
+        *,
+        num_steps: int,
+        samples_per_prompt: int,
+        selected_step_strategy: str,
+        timestep_range: tuple[int, int] | None,
+    ) -> None:
+        self.num_steps = num_steps
+        self.samples_per_prompt = samples_per_prompt
+        self.selected_step_strategy = selected_step_strategy
+        self.timestep_range = timestep_range
+
+    @classmethod
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> FrozenMapping:
+        del context
+        if not isinstance(raw, Mapping):
+            raise TypeError("single_step params must be a mapping")
+        allowed = {
+            "num_steps",
+            "samples_per_prompt",
+            "selected_step_strategy",
+            "timestep_range",
+        }
+        unknown = set(raw) - allowed
+        if unknown:
+            raise ValueError(f"unknown single_step params: {sorted(unknown)}")
+        num_steps = _positive_int("num_steps", raw.get("num_steps", 2))
+        samples = _positive_int(
+            "samples_per_prompt", raw.get("samples_per_prompt", 2)
+        )
+        strategy = raw.get("selected_step_strategy", "iso_temporal")
+        if not isinstance(strategy, str) or strategy not in _STRATEGIES:
+            raise ValueError(
+                "selected_step_strategy must be one of "
+                f"{sorted(_STRATEGIES)}"
+            )
+        timestep_range = _resolve_range(raw.get("timestep_range"), num_steps)
+        return FrozenMapping(
+            {
+                "num_steps": num_steps,
+                "samples_per_prompt": samples,
+                "selected_step_strategy": strategy,
+                "timestep_range": timestep_range,
+            }
+        )
+
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> "SingleStepRollout":
+        del context
+        timestep_range = resolved["timestep_range"]
+        return cls(
+            num_steps=int(resolved["num_steps"]),
+            samples_per_prompt=int(resolved["samples_per_prompt"]),
+            selected_step_strategy=str(resolved["selected_step_strategy"]),
+            timestep_range=(
+                None
+                if timestep_range is None
+                else (int(timestep_range[0]), int(timestep_range[1]))
+            ),
+        )
 
     def sample(
         self,
+        *,
         adapter: ModelAdapter,
-        prompts: list[str],
-        metadata: list[dict[str, Any]],
-        context: StepContext | None = None,
+        prompts: tuple[str, ...],
+        metadata: tuple[Mapping[str, object], ...],
+        context: StepContext,
     ) -> RolloutBatch:
-        context = self.resolve_context(context)
-        spec = single_step_spec_from_config(self.config)
-        num_steps = int(self.config.get("num_steps", 2))
-        candidates = resolve_timestep_indices(num_steps, spec.timestep_range)
-        selected_per_prompt = select_prompt_timestep_indices(
-            prompt_count=len(prompts),
-            candidates=candidates,
-            strategy=spec.selected_step_strategy,
-            epoch_tag=context.epoch_tag,
-            seed=context.seed,
+        selected = self._selected_indices(len(prompts), context)
+        request = _build_rollout_request(
+            prompts=prompts,
+            metadata=metadata,
+            context=context,
+            kind="single_step",
+            num_steps=self.num_steps,
+            group_size=self.samples_per_prompt,
+            selected_by_occurrence=selected,
         )
-        expanded_prompts, expanded_metadata, selected_indices, parent_indices = expand_prompt_groups(
-            prompts,
-            metadata,
-            spec.samples_per_prompt,
-            selected_per_prompt,
-        )
+        batch = adapter.sample(request)
+        batch.validate_against(request)
+        return batch
 
-        single_step_config = self.runtime_config(
-            context,
-            rollout_kind="flash_single_step",
-            selected_timestep_indices=selected_indices,
-            selected_timesteps=selected_indices,
-            timestep_candidates=candidates,
-            samples_per_prompt=spec.samples_per_prompt,
-        )
-
-        sample_single_step = getattr(adapter, "sample_single_step", None)
-        if callable(sample_single_step):
-            batch = sample_single_step(expanded_prompts, expanded_metadata, single_step_config)
-        else:
-            batch = adapter.sample(expanded_prompts, expanded_metadata, single_step_config)
-            batch = self._narrow_to_selected_timestep(batch, selected_indices)
-
-        rectification_mode = str(
-            self.config.get("rectification_mode", "scheduler_formula")
-        )
-        timestep_values = None
-        if rectification_mode.lower() == "flash_reference_table":
-            timestep_values = self._single_timestep_values(batch)
-        rectification_weights = scheduler_rectification_weights(
-            selected_indices,
-            num_steps=num_steps,
-            mode=rectification_mode,
-            timestep_values=timestep_values,
-        )
-        batch.model_metadata.update(
-            {
-                "rollout": "single_step",
-                "selected_step_strategy": spec.selected_step_strategy,
-                "selected_timestep_indices": selected_indices,
-                "selected_timesteps": selected_indices,
-                "timestep_candidates": candidates,
-                "samples_per_prompt": spec.samples_per_prompt,
-                "parent_prompt_indices": parent_indices,
-                "num_steps": num_steps,
-                "rectification_mode": rectification_mode,
-                "selected_timestep_values": timestep_values,
-                "flash_rectification_weights": [[value] for value in rectification_weights],
-            }
-        )
-        return self.finalize_batch(
-            batch,
-            context,
-            media_type=getattr(adapter, "media_type", None),
-        )
-
-    @staticmethod
-    def _single_timestep_values(batch: RolloutBatch) -> list[int]:
-        import torch
-
-        timesteps = batch.timesteps
-        if not isinstance(timesteps, torch.Tensor):
-            raise ValueError(
-                "flash_reference_table requires tensor scheduler timesteps"
+    def _selected_indices(
+        self,
+        occurrence_count: int,
+        context: StepContext,
+    ) -> tuple[int, ...]:
+        if occurrence_count < 1:
+            raise ValueError("single_step requires at least one prompt")
+        start, end = self.timestep_range or (0, self.num_steps - 1)
+        candidates = tuple(range(start, end + 1))
+        if self.selected_step_strategy == "iso_temporal":
+            return tuple(
+                candidates[(context.step + index) % len(candidates)]
+                for index in range(occurrence_count)
             )
-        if timesteps.ndim != 2 or timesteps.shape[1] != 1:
-            raise ValueError(
-                "flash_reference_table requires exactly one retained timestep per sample"
-            )
-        return [int(value) for value in timesteps[:, 0].detach().cpu().tolist()]
-
-    @staticmethod
-    def _narrow_to_selected_timestep(batch: RolloutBatch, selected_indices: list[int]) -> RolloutBatch:
-        import torch
-
-        def narrow(value):
-            if value is None or not isinstance(value, torch.Tensor):
-                return value
-            if value.ndim < 2 or value.shape[0] != len(selected_indices):
-                return value
-            if value.shape[1] <= max(selected_indices):
-                raise ValueError(
-                    f"Cannot select timestep {max(selected_indices)} from tensor with second dimension {value.shape[1]}"
-                )
-            return torch.stack([value[row, index : index + 1] for row, index in enumerate(selected_indices)], dim=0)
-
-        return batch.replace(
-            latents=narrow(batch.latents),
-            next_latents=narrow(batch.next_latents),
-            timesteps=narrow(batch.timesteps),
-            old_log_probs=narrow(batch.old_log_probs),
-            kl=narrow(batch.kl),
-            transition_mask=narrow(batch.transition_mask),
+        if self.selected_step_strategy == "first":
+            return (candidates[0],) * occurrence_count
+        if self.selected_step_strategy == "last":
+            return (candidates[-1],) * occurrence_count
+        if self.selected_step_strategy == "middle":
+            return (candidates[len(candidates) // 2],) * occurrence_count
+        generator = random.Random(context.seed)
+        return tuple(
+            generator.choice(candidates) for _ in range(occurrence_count)
         )
 
 
-ROLLOUT_ENGINES.register("single_step", SingleStepRollout)
-ROLLOUT_ENGINES.register("flash_single_step", SingleStepRollout)
+def _positive_int(name: str, value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _resolve_range(
+    value: object,
+    num_steps: int,
+) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        raise ValueError("timestep_range must be null or [start, end]")
+    start, end = value
+    if type(start) is not int or type(end) is not int:
+        raise TypeError("timestep_range values must be integers, not bool")
+    if not 0 <= start <= end < num_steps:
+        raise ValueError(
+            "timestep_range must satisfy 0 <= start <= end < num_steps"
+        )
+    return start, end
