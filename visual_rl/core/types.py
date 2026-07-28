@@ -1045,6 +1045,8 @@ def _freeze_value(value: Any) -> Any:
         return FrozenMapping(value)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("FrozenMapping does not accept non-finite floats")
     if isinstance(value, (str, int, float, bool, type(None), Path)):
         return value
     raise TypeError(
@@ -1060,9 +1062,9 @@ class FrozenMapping(Mapping):
     ``FrozenMapping`` instances stored as fixed tuple pairs, lists become
     tuples; mutating the caller's original containers afterwards cannot
     affect the constructed object. ``MappingProxyType`` is deliberately not
-    used because it cannot be pickled; two-rank ``gather_object()`` and
-    ``pickle.dumps(StepResult)`` must round-trip. Use ``to_plain_dict()`` at
-    the YAML/JSON boundary to recover plain containers.
+    used because it cannot be pickled; two-rank ``gather_object()`` payloads
+    must round-trip. Use ``to_plain_dict()`` at the YAML/JSON boundary to
+    recover plain containers.
     """
 
     __slots__ = ("_items",)
@@ -1070,11 +1072,23 @@ class FrozenMapping(Mapping):
     def __init__(self, source: Any = ()) -> None:
         raw_items = source.items() if isinstance(source, Mapping) else source
         items = []
+        keys = set()
         for key, value in raw_items:
             if not isinstance(key, str):
                 raise TypeError("FrozenMapping keys must be strings")
+            if key in keys:
+                raise ValueError(f"FrozenMapping contains duplicate key {key!r}")
+            keys.add(key)
             items.append((key, _freeze_value(value)))
         object.__setattr__(self, "_items", tuple(items))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        del name, value
+        raise TypeError("FrozenMapping is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("FrozenMapping is immutable")
 
     def __getitem__(self, key: str) -> Any:
         for item_key, value in self._items:
@@ -1089,12 +1103,15 @@ class FrozenMapping(Mapping):
         return len(self._items)
 
     def __eq__(self, other: Any) -> bool:
-        if isinstance(other, FrozenMapping):
-            return self._items == other._items
+        if isinstance(other, Mapping):
+            return dict(self.items()) == dict(other.items())
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self._items)
+        return hash(frozenset(self._items))
+
+    def __reduce__(self):
+        return type(self), (self._items,)
 
     def __repr__(self) -> str:
         return f"FrozenMapping({dict(self._items)!r})"
@@ -1185,6 +1202,74 @@ class RolloutRequest:
     selected_timestep_index: tuple[int, ...] | None = None
     branch_step_index: tuple[int, ...] | None = None
 
+    def __post_init__(self) -> None:
+        for name in ("prompts", "metadata", "sample_id", "prompt_id", "group_id"):
+            if type(getattr(self, name)) is not tuple:
+                raise TypeError(f"{name} must be a tuple")
+        prompts = self.prompts
+        if not prompts or any(not isinstance(item, str) for item in prompts):
+            raise ValueError("prompts must be a non-empty tuple of strings")
+        batch_size = len(prompts)
+
+        metadata = tuple(
+            item if isinstance(item, FrozenMapping) else FrozenMapping(item)
+            for item in self.metadata
+        )
+        if len(metadata) != batch_size:
+            raise ValueError("metadata must contain one mapping per prompt")
+        object.__setattr__(self, "metadata", metadata)
+
+        for name in ("sample_id", "prompt_id", "group_id"):
+            values = getattr(self, name)
+            if len(values) != batch_size:
+                raise ValueError(f"{name} must contain one value per prompt")
+            if any(not isinstance(item, str) or not item for item in values):
+                raise ValueError(f"{name} entries must be non-empty strings")
+            object.__setattr__(self, name, values)
+        if len(set(self.sample_id)) != batch_size:
+            raise ValueError("sample_id entries must be unique")
+
+        if self.branch_id is not None:
+            if type(self.branch_id) is not tuple:
+                raise TypeError("branch_id must be a tuple or None")
+            branch_ids = self.branch_id
+            if len(branch_ids) != batch_size:
+                raise ValueError("branch_id must contain one value per prompt")
+            if any(
+                isinstance(item, bool)
+                or not isinstance(item, (str, int, type(None)))
+                for item in branch_ids
+            ):
+                raise TypeError("branch_id entries must be str, int, or None")
+            object.__setattr__(self, "branch_id", branch_ids)
+
+        if not isinstance(self.context, StepContext):
+            raise TypeError("context must be a StepContext")
+        if self.kind not in {"full_trajectory", "single_step", "branching"}:
+            raise ValueError(f"unknown rollout kind: {self.kind!r}")
+        for name in ("num_steps", "group_size"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer, not bool")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+
+        for name in ("selected_timestep_index", "branch_step_index"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            if type(values) is not tuple:
+                raise TypeError(f"{name} must be a tuple or None")
+            if len(values) != batch_size:
+                raise ValueError(f"{name} must contain one value per prompt")
+            if any(type(item) is not int for item in values):
+                raise TypeError(f"{name} entries must be integers, not bool")
+            if any(not 0 <= item < self.num_steps for item in values):
+                raise ValueError(
+                    f"{name} entries must satisfy 0 <= index < num_steps"
+                )
+            object.__setattr__(self, name, values)
+
 
 @dataclass(frozen=True)
 class PolicyRecomputeStats:
@@ -1238,11 +1323,17 @@ class PolicyRecomputeStats:
         new_log_probs = self.new_log_probs
         if not isinstance(new_log_probs, torch.Tensor):
             raise TypeError("new_log_probs must be a torch.Tensor")
+        if new_log_probs.ndim != 2:
+            raise ValueError("new_log_probs must have shape [B, T]")
+        if not new_log_probs.is_floating_point():
+            raise TypeError("new_log_probs must be a floating-point tensor")
+        if not new_log_probs.requires_grad:
+            raise ValueError("new_log_probs must require gradients")
         mask = batch.transition_mask
         if mask is not None:
-            mask = torch.as_tensor(
-                mask, device=new_log_probs.device, dtype=torch.bool
-            )
+            mask = torch.as_tensor(mask, device=new_log_probs.device)
+            if mask.dtype != torch.bool:
+                raise TypeError("transition_mask must have bool dtype")
             if tuple(mask.shape) != tuple(new_log_probs.shape):
                 raise ValueError(
                     "transition_mask must have the same shape as new_log_probs: "
@@ -1250,7 +1341,10 @@ class PolicyRecomputeStats:
                 )
             active = new_log_probs.masked_select(mask)
         else:
+            mask = torch.ones_like(new_log_probs, dtype=torch.bool)
             active = new_log_probs
+        if not bool(mask.any()):
+            raise ValueError("at least one transition must be active")
         if not bool(torch.isfinite(active).all()):
             raise ValueError(
                 "new_log_probs must be finite at active transition positions"
@@ -1258,11 +1352,20 @@ class PolicyRecomputeStats:
 
         if not require_reference:
             return
-        if not new_log_probs.requires_grad:
-            raise ValueError("new_log_probs must require gradients")
         current_mean = self.current_transition_mean
         reference_mean = self.reference_transition_mean
         transition_std = self.transition_std
+        for name, value in (
+            ("current_transition_mean", current_mean),
+            ("reference_transition_mean", reference_mean),
+            ("transition_std", transition_std),
+        ):
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if not value.is_floating_point():
+                raise TypeError(f"{name} must be a floating-point tensor")
+            if value.device != new_log_probs.device:
+                raise ValueError(f"{name} must be on the new_log_probs device")
         if not current_mean.requires_grad:
             raise ValueError("current_transition_mean must require gradients")
         if reference_mean.requires_grad or reference_mean.grad_fn is not None:
@@ -1289,10 +1392,26 @@ class PolicyRecomputeStats:
                 "transition_std must have the full mean shape, [B, T], or "
                 f"[B, T, 1, ..., 1]; got {std_shape}"
             )
-        if not bool(torch.isfinite(transition_std).all()):
-            raise ValueError("transition_std must be finite")
-        if not bool((transition_std > 0).all()):
-            raise ValueError("transition_std must be strictly positive")
+        mean_mask = mask.reshape(tuple(new_shape) + (1,) * (len(mean_shape) - 2))
+        mean_mask = torch.broadcast_to(mean_mask, mean_shape)
+        for name, value in (
+            ("current_transition_mean", current_mean),
+            ("reference_transition_mean", reference_mean),
+        ):
+            if not bool(torch.isfinite(value.masked_select(mean_mask)).all()):
+                raise ValueError(f"{name} must be finite at active transitions")
+        if std_shape == tuple(new_shape):
+            std_for_mean = transition_std.reshape(broadcast_std)
+        else:
+            std_for_mean = transition_std
+        std_for_mean = torch.broadcast_to(std_for_mean, mean_shape)
+        active_std = std_for_mean.masked_select(mean_mask)
+        if not bool(torch.isfinite(active_std).all()):
+            raise ValueError("transition_std must be finite at active transitions")
+        if not bool((active_std > 0).all()):
+            raise ValueError(
+                "transition_std must be strictly positive at active transitions"
+            )
 
 
 @dataclass(frozen=True)
@@ -1303,6 +1422,43 @@ class RewardVector:
     values: Any  # finite reward vector [B]
     shared_metadata: Mapping[str, Any]  # JSON-safe protocol/revision metadata
     sample_metadata: tuple[Mapping[str, Any], ...]  # per-sample evidence [B]
+
+    def __post_init__(self) -> None:
+        import torch
+
+        if type(self.sample_id) is not tuple:
+            raise TypeError("sample_id must be a tuple")
+        if type(self.sample_metadata) is not tuple:
+            raise TypeError("sample_metadata must be a tuple")
+        sample_id = self.sample_id
+        if not sample_id or any(
+            not isinstance(item, str) or not item for item in sample_id
+        ):
+            raise ValueError("sample_id must be a non-empty tuple of strings")
+        if len(set(sample_id)) != len(sample_id):
+            raise ValueError("sample_id entries must be unique")
+        if not isinstance(self.values, torch.Tensor):
+            raise TypeError("values must be a torch.Tensor")
+        if self.values.ndim != 1 or self.values.shape[0] != len(sample_id):
+            raise ValueError("values must have shape [B] matching sample_id")
+        if not self.values.is_floating_point():
+            raise TypeError("values must be a floating-point tensor")
+        if self.values.requires_grad or self.values.grad_fn is not None:
+            raise ValueError("values must be detached without grad_fn")
+        if not bool(torch.isfinite(self.values).all()):
+            raise ValueError("values must be finite")
+        sample_metadata = tuple(
+            item if isinstance(item, FrozenMapping) else FrozenMapping(item)
+            for item in self.sample_metadata
+        )
+        if len(sample_metadata) != len(sample_id):
+            raise ValueError("sample_metadata must contain one mapping per sample")
+        object.__setattr__(self, "sample_id", sample_id)
+        object.__setattr__(self, "sample_metadata", sample_metadata)
+        if not isinstance(self.shared_metadata, FrozenMapping):
+            object.__setattr__(
+                self, "shared_metadata", FrozenMapping(self.shared_metadata)
+            )
 
 
 @dataclass(frozen=True)
@@ -1317,70 +1473,21 @@ class MetricContribution:
     denominator: int | None
 
     def __post_init__(self) -> None:
+        import torch
+
+        if not isinstance(self.numerator, torch.Tensor):
+            raise TypeError("numerator must be a torch.Tensor")
+        if self.numerator.ndim != 0:
+            raise ValueError("numerator must be a scalar tensor")
+        if self.numerator.requires_grad or self.numerator.grad_fn is not None:
+            raise ValueError("numerator must be detached without grad_fn")
+        if not bool(torch.isfinite(self.numerator)):
+            raise ValueError("numerator must be finite")
         if self.denominator is not None:
             if type(self.denominator) is not int:
                 raise TypeError("denominator must be an integer, not bool")
             if self.denominator <= 0:
                 raise ValueError("denominator must be a positive int or None (SUM)")
-
-
-@dataclass(frozen=True)
-class AdvantageResult:
-    """AdvantageComputer output: the only detached policy signal source."""
-
-    base_advantage: Any  # detached [B]
-    diagnostics: Mapping[str, MetricContribution] = field(
-        default_factory=FrozenMapping
-    )
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.diagnostics, FrozenMapping):
-            object.__setattr__(self, "diagnostics", FrozenMapping(self.diagnostics))
-
-
-@dataclass(frozen=True)
-class PolicyLossInputs:
-    """Per-transition objective inputs declared by the PolicyAlgorithm."""
-
-    base_advantage: Any  # [B, T]
-    algorithm_weight: Any  # [B, T]
-    active_mask: Any  # bool [B, T]
-    clip_range: float
-    reference_kl_weight: float
-
-
-@dataclass(frozen=True)
-class ObjectiveOutput:
-    """PolicyObjective scalar output; ``loss`` is what backward consumes."""
-
-    loss: Any
-    policy_loss: Any
-    reference_kl: Any
-    approx_kl: Any
-    clipfrac: Any
-    active_transition_count: int
-
-
-@dataclass(frozen=True)
-class UpdateResult:
-    """UpdateEngine's only return contract: globally reduced JSON-safe scalars.
-
-    ``reference_kl`` is a scalar zero (not ``None``) when the reference
-    regularizer is disabled. ``diagnostics`` uses ``advantage/`` or
-    ``algorithm/`` namespaced keys and never overrides the six core fields.
-    """
-
-    loss: float
-    policy_loss: float
-    reference_kl: float
-    approx_kl: float
-    clipfrac: float
-    active_transition_count: int
-    diagnostics: Mapping[str, float]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.diagnostics, FrozenMapping):
-            object.__setattr__(self, "diagnostics", FrozenMapping(self.diagnostics))
 
 
 @dataclass(frozen=True)
@@ -1429,7 +1536,7 @@ class ValidatedRuntimeEnv:
     master_addr: str | None
     master_port: int | None
     visible_gpu_count: int
-    raw_launch_env: Mapping[str, Any]
+    raw_launch_env: FrozenMapping
 
     def __post_init__(self) -> None:
         if not isinstance(self.raw_launch_env, FrozenMapping):
@@ -1453,67 +1560,3 @@ class RuntimeBuildContext:
     backend: str | None
     device: Any
     precision: Literal["fp32", "fp16", "bf16"]
-
-
-@dataclass(frozen=True)
-class StepMetrics:
-    """Post-reduction scalar metrics of one step; counts are Python ints."""
-
-    values: Mapping[str, Any]
-    sample_count: int
-    active_transition_count: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.values, FrozenMapping):
-            object.__setattr__(self, "values", FrozenMapping(self.values))
-
-
-@dataclass(frozen=True)
-class SampleRecord:
-    """One JSON-safe manifest record per sample (manifest schema v3)."""
-
-    run_id: str
-    sample_id: str
-    sample_index: int
-    step: int
-    rank: int
-    prompt: str
-    media_type: str
-    prompt_metadata: Mapping[str, Any]
-    seed: int
-    rollout_type: str
-    timestep_summary: Mapping[str, Any]
-    reward_values: Mapping[str, Any]
-    media_path: str | None
-    rollout_cache_path: str | None
-    checkpoint_path: str | None
-    model_metadata: Mapping[str, Any]
-    prompt_id: str
-    group_id: str
-    branch_id: str | int | None
-
-    def __post_init__(self) -> None:
-        for name in (
-            "prompt_metadata",
-            "timestep_summary",
-            "reward_values",
-            "model_metadata",
-        ):
-            if not isinstance(getattr(self, name), FrozenMapping):
-                object.__setattr__(self, name, FrozenMapping(getattr(self, name)))
-
-
-@dataclass(frozen=True)
-class StepArtifacts:
-    """Commit material of one step; holds no tensors or autograd graph."""
-
-    local_records: tuple[SampleRecord, ...]
-
-
-@dataclass(frozen=True)
-class StepResult:
-    """The single ``_execute_step()`` return: identity, scalars, materials."""
-
-    context: StepContext
-    metrics: StepMetrics
-    artifacts: StepArtifacts
