@@ -1,24 +1,20 @@
-"""CPU contracts for routing distributed forwards through UpdateEngine."""
+"""Representative two-rank parity for the one UpdateEngine/Strategy path."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+import json
+import multiprocessing
 import os
 import queue
 import socket
-import time
-import traceback
-from multiprocessing.context import SpawnContext
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from visual_rl.core.types import (
     FrozenMapping,
+    PolicyRecomputeStats,
     RewardBatch,
     RolloutBatch,
     StepContext,
@@ -29,19 +25,184 @@ from visual_rl.distributed import (
     DistributedFailureError,
     build_strategy,
 )
-from visual_rl.optimizers import AdvantageResult, ObjectiveOutput, UpdateEngine
+from visual_rl.optimizers.advantages import AdvantageComputer
 from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
-from visual_rl.optimizers.base import OptimizerPlugin
-from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
+from visual_rl.optimizers.grpo import GRPOAlgorithm
 
 
-def _ddp_strategy(rank: int, port: int) -> DDPStrategy:
+class _TrainModule(torch.nn.Module):
+    def __init__(self, device: torch.device | str = "cpu") -> None:
+        super().__init__()
+        self.delta = torch.nn.Parameter(torch.tensor(0.05, device=device))
+
+
+class _Adapter:
+    def __init__(self, device: torch.device | str = "cpu") -> None:
+        self.train_module = _TrainModule(device)
+
+    def recompute_policy_stats(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
+        if require_reference:
+            raise AssertionError("this parity case has beta=0")
+        return PolicyRecomputeStats(
+            new_log_probs=(
+                self.train_module.delta
+                * batch.recompute_payload["features"]
+            )
+        )
+
+    def named_parameters(self):
+        return tuple(self.train_module.named_parameters())
+
+
+class _FakeScaler:
+    def __init__(self) -> None:
+        self.value = 7
+
+    def scale(self, value):
+        return value
+
+    def unscale_(self, optimizer) -> None:
+        del optimizer
+
+    def step(self, optimizer) -> None:
+        optimizer.step()
+
+    def update(self) -> None:
+        self.value += 1
+
+    def state_dict(self) -> dict[str, int]:
+        return {"value": self.value}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.value = state["value"]
+
+
+def _plugin() -> AlgorithmOptimizerPlugin:
+    return AlgorithmOptimizerPlugin(
+        algorithm=GRPOAlgorithm(
+            clip_range=0.2,
+            adv_clip_max=5.0,
+            beta=0.0,
+        ),
+        advantage_computer=AdvantageComputer(
+            epsilon=1e-8,
+            output_dtype="float32",
+        ),
+        update_microbatch_size=2,
+        precision="fp32",
+        max_grad_norm=None,
+        max_initial_logprob_delta=None,
+        require_initial_clipfrac_zero=False,
+        require_finite_gradients=True,
+        require_nonzero_gradients=True,
+    )
+
+
+def _optimizer(
+    plugin: AlgorithmOptimizerPlugin,
+    adapter: _Adapter,
+) -> torch.optim.AdamW:
+    return plugin.build_optimizer(
+        adapter.named_parameters(),
+        SimpleNamespace(
+            learning_rate=1e-2,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_weight_decay=0.0,
+            adam_epsilon=1e-8,
+        ),
+    )
+
+
+def _batch(
+    *,
+    rank: int,
+    world_size: int,
+    features: torch.Tensor,
+    mask: torch.Tensor,
+) -> RolloutBatch:
+    batch_size, transition_count = features.shape
+    device = features.device
+    mask = mask.to(device=device)
+    context = StepContext(
+        step=0,
+        seed=31 + rank,
+        rank=rank,
+        world_size=world_size,
+    )
+    return RolloutBatch(
+        prompts=tuple(f"rank-{rank}" for _ in range(batch_size)),
+        metadata=tuple({} for _ in range(batch_size)),
+        media=torch.zeros(batch_size, 1, 1, 1, device=device),
+        latents=torch.zeros(batch_size, transition_count, 1, device=device),
+        next_latents=torch.ones(
+            batch_size,
+            transition_count,
+            1,
+            device=device,
+        ),
+        timesteps=torch.arange(
+            transition_count,
+            device=device,
+        ).expand(batch_size, -1),
+        old_log_probs=torch.zeros(
+            batch_size,
+            transition_count,
+            device=device,
+        ),
+        transition_mask=mask,
+        sample_id=tuple(
+            f"rank-{rank}-sample-{index}" for index in range(batch_size)
+        ),
+        prompt_id=tuple(f"rank-{rank}-prompt" for _ in range(batch_size)),
+        group_id=tuple(f"rank-{rank}-group" for _ in range(batch_size)),
+        branch_id=None,
+        media_layout="BCHW",
+        camera_trajectory=None,
+        context=context,
+        selected_timestep_index=None,
+        flash_coefficient=None,
+        branch_step_index=None,
+        trajectory_step_index=None,
+        transition_std_dev=None,
+        recompute_payload={"features": features},
+        artifact_metadata={},
+    )
+
+
+def _rewards(batch: RolloutBatch) -> RewardBatch:
+    values = torch.tensor(
+        [1.0, 3.0],
+        dtype=torch.float32,
+    )
+    return RewardBatch(
+        sample_id=batch.sample_id,
+        raw={"score": values},
+        weighted={"score": values},
+        weighted_total=values,
+        valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
+        shared_metadata={"score": {}},
+        sample_metadata={"score": ({}, {})},
+    )
+
+
+def _ddp_strategy(
+    rank: int,
+    port: int,
+    *,
+    max_snapshot_tensor_bytes: int = 1 << 20,
+) -> DDPStrategy:
     strategy = build_strategy(
         SimpleNamespace(
             mode="ddp",
             device="cpu",
-            timeout_s=8.0,
-            max_snapshot_tensor_bytes=1 << 30,
+            timeout_s=15.0,
+            max_snapshot_tensor_bytes=max_snapshot_tensor_bytes,
         ),
         ValidatedRuntimeEnv(
             mode="ddp",
@@ -72,884 +233,509 @@ def _ddp_strategy(rank: int, port: int) -> DDPStrategy:
     return strategy
 
 
-def _batch() -> RolloutBatch:
-    batch_size, transitions = 4, 2
-    return RolloutBatch(
-        prompts=tuple(f"prompt-{index}" for index in range(batch_size)),
-        metadata=tuple({} for _ in range(batch_size)),
-        media=torch.zeros(batch_size, 1, 1, 1),
-        latents=torch.zeros(batch_size, transitions, 1),
-        next_latents=torch.ones(batch_size, transitions, 1),
-        timesteps=torch.arange(transitions).expand(batch_size, -1),
-        old_log_probs=torch.zeros(batch_size, transitions),
-        transition_mask=torch.ones(batch_size, transitions, dtype=torch.bool),
-        sample_id=tuple(f"sample-{index}" for index in range(batch_size)),
-        prompt_id=tuple(f"prompt-id-{index}" for index in range(batch_size)),
-        group_id=("group-a", "group-a", "group-b", "group-b"),
-        branch_id=tuple(range(batch_size)),
-        media_layout="BCHW",
-        camera_trajectory=None,
-        context=StepContext(step=3, seed=19),
-        selected_timestep_index=None,
-        flash_coefficient=None,
-        branch_step_index=None,
-        trajectory_step_index=None,
-        transition_std_dev=None,
-        recompute_payload={
-            "features": torch.arange(
-                1,
-                batch_size * transitions + 1,
-                dtype=torch.float32,
-            ).reshape(batch_size, transitions)
-        },
-        artifact_metadata={},
+def _nccl_strategy_from_torchrun() -> DDPStrategy:
+    required = (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    )
+    present = tuple(name for name in required if name in os.environ)
+    if present != required:
+        pytest.skip(
+            "requires a complete two-rank torchrun environment; "
+            f"present launch keys: {present}"
+        )
+    if not torch.distributed.is_available():
+        pytest.skip("requires torch.distributed")
+    if not torch.distributed.is_nccl_available():
+        pytest.skip("requires a PyTorch build with NCCL")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible CUDA devices")
+
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        master_port = int(os.environ["MASTER_PORT"])
+    except ValueError as exc:
+        pytest.skip(f"requires integer torchrun topology values: {exc}")
+    if world_size != 2 or local_world_size != 2:
+        pytest.skip(
+            "requires WORLD_SIZE == LOCAL_WORLD_SIZE == 2, got "
+            f"{world_size}/{local_world_size}"
+        )
+    if rank not in (0, 1) or local_rank not in (0, 1):
+        pytest.skip(
+            "requires RANK and LOCAL_RANK in {0, 1}, got "
+            f"{rank}/{local_rank}"
+        )
+    if local_rank >= torch.cuda.device_count():
+        pytest.skip(
+            f"LOCAL_RANK={local_rank} has no visible CUDA device"
+        )
+
+    group_keys = ("GROUP_RANK", "GROUP_WORLD_SIZE")
+    group_present = tuple(name for name in group_keys if name in os.environ)
+    if group_present not in ((), group_keys):
+        pytest.skip(
+            "requires both GROUP_RANK and GROUP_WORLD_SIZE when either is set"
+        )
+    group_rank = None
+    group_world_size = None
+    if group_present:
+        try:
+            group_rank = int(os.environ["GROUP_RANK"])
+            group_world_size = int(os.environ["GROUP_WORLD_SIZE"])
+        except ValueError as exc:
+            pytest.skip(f"requires integer torchrun group values: {exc}")
+        if (group_rank, group_world_size) != (0, 1):
+            pytest.skip(
+                "requires a single-node torchrun group topology 0/1, got "
+                f"{group_rank}/{group_world_size}"
+            )
+
+    launch_env = {
+        name: os.environ[name]
+        for name in (*required, *group_present)
+    }
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="ddp",
+            device="cuda",
+            timeout_s=30.0,
+            max_snapshot_tensor_bytes=1 << 20,
+        ),
+        ValidatedRuntimeEnv(
+            mode="ddp",
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            local_world_size=local_world_size,
+            group_rank=group_rank,
+            group_world_size=group_world_size,
+            master_addr=os.environ["MASTER_ADDR"],
+            master_port=master_port,
+            visible_gpu_count=torch.cuda.device_count(),
+            raw_launch_env=FrozenMapping(launch_env),
+        ),
+    )
+    assert isinstance(strategy, DDPStrategy)
+    assert strategy.backend == "nccl"
+    assert strategy.device == torch.device("cuda", local_rank)
+    return strategy
+
+
+def _rank_case(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if rank == 0:
+        return (
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            torch.tensor([[True, False], [True, False]]),
+        )
+    return (
+        torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
+        torch.tensor([[True, True], [True, False]]),
     )
 
 
-def _rewards(batch: RolloutBatch) -> RewardBatch:
-    values = torch.arange(1, batch.batch_size + 1, dtype=torch.float32)
-    return RewardBatch(
+def _worker(rank: int, port: int, output) -> None:
+    strategy = None
+    try:
+        strategy = _ddp_strategy(rank, port)
+        adapter = _Adapter()
+        strategy.prepare(adapter)
+        plugin = _plugin()
+        optimizer = _optimizer(plugin, adapter)
+        features, mask = _rank_case(rank)
+        batch = _batch(
+            rank=rank,
+            world_size=2,
+            features=features,
+            mask=mask,
+        )
+        result = plugin.step(
+            batch=batch,
+            rewards=_rewards(batch),
+            optimizer=optimizer,
+            scaler=None,
+            context=batch.context,
+            strategy=strategy,
+        )
+        output.put(
+            (
+                rank,
+                {
+                    "loss": result.loss,
+                    "policy_loss": result.policy_loss,
+                    "reference_kl": result.reference_kl,
+                    "approx_kl": result.approx_kl,
+                    "clipfrac": result.clipfrac,
+                    "active_transition_count": (
+                        result.active_transition_count
+                    ),
+                    "diagnostics": dict(result.diagnostics),
+                    "gradient": float(
+                        adapter.train_module.delta.grad.detach()
+                    ),
+                    "parameter": float(
+                        adapter.train_module.delta.detach()
+                    ),
+                },
+            )
+        )
+    except BaseException as exc:
+        output.put((rank, (type(exc).__name__, str(exc))))
+    finally:
+        if strategy is not None:
+            strategy.close()
+
+
+def _atomic_failure_worker(
+    rank: int,
+    port: int,
+    mode: str,
+    output,
+) -> None:
+    strategy = None
+    try:
+        snapshot_limit = 1 if mode == "snapshot" and rank == 1 else 1 << 20
+        strategy = _ddp_strategy(
+            rank,
+            port,
+            max_snapshot_tensor_bytes=snapshot_limit,
+        )
+        parameter = torch.nn.Parameter(torch.tensor(0.05))
+        optimizer = torch.optim.AdamW(
+            [parameter],
+            lr=1e-2,
+            weight_decay=0.0,
+        )
+        scaler = _FakeScaler()
+        operation_calls = 0
+
+        def operation() -> None:
+            nonlocal operation_calls
+            operation_calls += 1
+            parameter.grad = torch.ones_like(parameter)
+            optimizer.step()
+            scaler.value += 1
+            if mode == "operation" and rank == 1:
+                raise RuntimeError("rank-one operation failure")
+
+        error = None
+        try:
+            strategy.atomic_optimizer_step(
+                operation,
+                parameters=(parameter,),
+                optimizer=optimizer,
+                scaler=scaler,
+            )
+        except DistributedFailureError as exc:
+            error = str(exc)
+        if error is None:
+            raise AssertionError("atomic failure case unexpectedly succeeded")
+        output.put(
+            (
+                rank,
+                {
+                    "error": error,
+                    "operation_calls": operation_calls,
+                    "parameter": float(parameter.detach()),
+                    "optimizer_state": optimizer.state_dict()["state"],
+                    "scaler_value": scaler.value,
+                },
+            )
+        )
+    except BaseException as exc:
+        output.put((rank, (type(exc).__name__, str(exc))))
+    finally:
+        if strategy is not None:
+            strategy.close()
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _single_global_case() -> dict:
+    adapter = _Adapter()
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="single",
+            device="cpu",
+            timeout_s=5.0,
+            max_snapshot_tensor_bytes=None,
+        ),
+        ValidatedRuntimeEnv(
+            mode="single",
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            group_rank=None,
+            group_world_size=None,
+            master_addr=None,
+            master_port=None,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping(),
+        ),
+    )
+    strategy.prepare(adapter)
+    plugin = _plugin()
+    optimizer = _optimizer(plugin, adapter)
+    features = torch.cat([_rank_case(0)[0], _rank_case(1)[0]])
+    mask = torch.cat([_rank_case(0)[1], _rank_case(1)[1]])
+    batch = _batch(
+        rank=0,
+        world_size=1,
+        features=features,
+        mask=mask,
+    ).replace(
+        prompts=("rank-0", "rank-0", "rank-1", "rank-1"),
+        metadata=({}, {}, {}, {}),
+        sample_id=(
+            "rank-0-sample-0",
+            "rank-0-sample-1",
+            "rank-1-sample-0",
+            "rank-1-sample-1",
+        ),
+        prompt_id=(
+            "rank-0-prompt",
+            "rank-0-prompt",
+            "rank-1-prompt",
+            "rank-1-prompt",
+        ),
+        group_id=(
+            "rank-0-group",
+            "rank-0-group",
+            "rank-1-group",
+            "rank-1-group",
+        ),
+    )
+    values = torch.tensor([1.0, 3.0, 1.0, 3.0])
+    rewards = RewardBatch(
         sample_id=batch.sample_id,
         raw={"score": values},
         weighted={"score": values},
         weighted_total=values,
-        valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
+        valid_mask=torch.ones(4, dtype=torch.bool),
         shared_metadata={"score": {}},
-        sample_metadata={
-            "score": tuple({} for _ in range(batch.batch_size))
-        },
+        sample_metadata={"score": ({}, {}, {}, {})},
     )
-
-
-class _Advantage:
-    def __call__(self, batch: RolloutBatch, rewards: RewardBatch) -> AdvantageResult:
-        del rewards
-        return AdvantageResult(torch.ones(batch.batch_size), {})
-
-
-class _Objective:
-    def __call__(self, batch, advantages, new_log_probs):
-        loss = (new_log_probs * advantages[:, None]).mean()
-        detached = loss.detach()
-        zero = detached * 0.0
-        return ObjectiveOutput(
-            loss=loss,
-            policy_loss=detached,
-            approx_kl=zero,
-            clipfrac=zero,
-            metrics={},
-        )
-
-
-class _Adapter:
-    def __init__(self, events: list[str] | None = None) -> None:
-        self.parameter = torch.nn.Parameter(torch.tensor(0.25))
-        self.events = events
-        self.default_calls = 0
-
-    def prepare_for_training(self) -> None:
-        return None
-
-    def recompute_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
-        self.default_calls += 1
-        if self.events is not None:
-            self.events.append("forward")
-        return self.parameter * batch.recompute_payload["features"]
-
-    def parameters(self):
-        return [self.parameter]
-
-
-class _CountingSGD(torch.optim.SGD):
-    def __init__(self, parameters, events: list[str] | None = None) -> None:
-        super().__init__(parameters, lr=0.01)
-        self.events = events
-        self.step_calls = 0
-
-    def step(self, closure=None):
-        self.step_calls += 1
-        if self.events is not None:
-            self.events.append("step")
-        return super().step(closure=closure)
-
-
-class _FlashDistributedAdapter:
-    def __init__(self) -> None:
-        self.transformer = torch.nn.Linear(1, 1, bias=False)
-        with torch.no_grad():
-            self.transformer.weight.zero_()
-
-    @property
-    def train_module(self) -> torch.nn.Module:
-        return self.transformer
-
-    def prepare_for_training(self) -> None:
-        return None
-
-    def recompute_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
-        return self.transformer(batch.recompute_payload["features"])
-
-    def parameters(self):
-        return self.transformer.parameters()
-
-
-class _RecordingFlashAlgorithm(FlashGRPOAlgorithm):
-    observed_global_mean: torch.Tensor | None = None
-    observed_prepared_weights: torch.Tensor | None = None
-
-    def apply_global_batch_reduction(
-        self,
-        batch: RolloutBatch,
-        advantages,
-        global_mean: Any,
-    ) -> RolloutBatch:
-        self.observed_global_mean = torch.as_tensor(global_mean).detach().clone()
-        prepared = super().apply_global_batch_reduction(
-            batch,
-            advantages,
-            global_mean,
-        )
-        self.observed_prepared_weights = (
-            prepared.recompute_payload[self._PREPARED_RECTIFICATION_KEY]
-            .detach()
-            .clone()
-        )
-        return prepared
-
-
-class _MicrobatchDistributedAdapter:
-    def __init__(self) -> None:
-        self.transformer = torch.nn.Linear(1, 1, bias=False)
-        with torch.no_grad():
-            self.transformer.weight.fill_(0.25)
-
-    @property
-    def train_module(self) -> torch.nn.Module:
-        return self.transformer
-
-    def prepare_for_training(self) -> None:
-        return None
-
-    def recompute_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
-        features = batch.recompute_payload["features"].unsqueeze(-1)
-        return self.transformer(features).squeeze(-1)
-
-    def parameters(self):
-        return self.transformer.parameters()
-
-
-def _counting_allreduce_hook(
-    state,
-    bucket,
-):
-    state["calls"] += 1
-    buffer = bucket.buffer()
-    dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
-    buffer.div_(state["world_size"])
-    future = torch.futures.Future()
-    future.set_result(buffer)
-    return future
-
-
-def _rank_microbatch_batch(rank: int) -> RolloutBatch:
-    batch = _batch()
-    start = rank * 8 + 1
-    features = torch.arange(start, start + 8, dtype=torch.float32).reshape(4, 2)
-    return batch.replace(
-        prompts=tuple(f"rank-{rank}-prompt-{index}" for index in range(4)),
-        sample_id=tuple(f"rank-{rank}-sample-{index}" for index in range(4)),
-        prompt_id=tuple(
-            f"rank-{rank}-prompt-id-{index}" for index in range(4)
-        ),
-        group_id=tuple(
-            f"rank-{rank}-group-{index // 2}" for index in range(4)
-        ),
-        recompute_payload={"features": features},
-    )
-
-
-def _microbatch_no_sync_worker(rank: int, port: int, results: Any) -> None:
-    strategy: DDPStrategy | None = None
     try:
-        os.environ.update(
-            RANK=str(rank),
-            LOCAL_RANK=str(rank),
-            WORLD_SIZE="2",
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT=str(port),
+        result = plugin.step(
+            batch=batch,
+            rewards=rewards,
+            optimizer=optimizer,
+            scaler=None,
+            context=batch.context,
+            strategy=strategy,
         )
-        strategy = _ddp_strategy(rank, port)
-        context = strategy.context
-        adapter = _MicrobatchDistributedAdapter()
-        strategy.prepare(adapter)
-        hook_state = {"calls": 0, "world_size": context.world_size}
-        strategy.module.register_comm_hook(hook_state, _counting_allreduce_hook)
-        batch = _rank_microbatch_batch(rank)
-        rewards = _rewards(batch)
+        return {
+            "loss": result.loss,
+            "policy_loss": result.policy_loss,
+            "reference_kl": result.reference_kl,
+            "approx_kl": result.approx_kl,
+            "clipfrac": result.clipfrac,
+            "active_transition_count": result.active_transition_count,
+            "diagnostics": dict(result.diagnostics),
+            "gradient": float(adapter.train_module.delta.grad.detach()),
+            "parameter": float(adapter.train_module.delta.detach()),
+        }
+    finally:
+        strategy.close()
 
-        observations: dict[str, dict[str, float | int]] = {}
-        cases = (
-            ("full", None, strategy.gradient_sync_context),
-            ("legacy_microbatch", 2, None),
-            ("no_sync_microbatch", 2, strategy.gradient_sync_context),
+
+@pytest.mark.distributed
+def test_gloo_fixed_batch_matches_single_process() -> None:
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(target=_worker, args=(rank, port, output))
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    rows = {}
+    try:
+        for _ in processes:
+            rank, payload = output.get(timeout=30)
+            rows[rank] = payload
+    except queue.Empty as exc:
+        raise AssertionError("timed out waiting for Gloo workers") from exc
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(isinstance(rows[rank], dict) for rank in range(2)), rows
+
+    expected = _single_global_case()
+    for payload in rows.values():
+        assert payload["active_transition_count"] == 5
+        for name in (
+            "loss",
+            "policy_loss",
+            "reference_kl",
+            "approx_kl",
+            "clipfrac",
+            "gradient",
+            "parameter",
+        ):
+            assert payload[name] == pytest.approx(expected[name], abs=1e-6)
+        assert payload["diagnostics"] == pytest.approx(
+            expected["diagnostics"],
+            abs=1e-6,
         )
-        for name, microbatch_size, sync_context in cases:
-            with torch.no_grad():
-                adapter.transformer.weight.fill_(0.25)
-            adapter.transformer.weight.grad = None
-            optimizer = torch.optim.SGD(adapter.parameters(), lr=0.01)
-            calls_before = int(hook_state["calls"])
-            UpdateEngine(
-                _Advantage(),
-                _Objective(),
-                update_microbatch_size=microbatch_size,
-                require_nonzero_gradients=True,
-            ).step(
-                adapter,
-                batch,
-                rewards,
-                optimizer,
-                batch.context,
-                recompute_log_probs=strategy.recompute_log_probs,
-                gradient_sync_context=sync_context,
-            )
-            gradient = adapter.transformer.weight.grad
-            if gradient is None:
-                raise AssertionError("distributed update produced no gradient")
-            observations[name] = {
-                "gradient": float(gradient.item()),
-                "parameter": float(adapter.transformer.weight.item()),
-                "communication_calls": int(hook_state["calls"]) - calls_before,
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_calls", "message"),
+    (
+        ("snapshot", 0, "optimizer_snapshot"),
+        ("operation", 1, "rank-one operation failure"),
+    ),
+)
+@pytest.mark.distributed
+def test_gloo_atomic_failure_prevents_or_rolls_back_all_mutation(
+    mode: str,
+    expected_calls: int,
+    message: str,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_atomic_failure_worker,
+            args=(rank, port, mode, output),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    rows = {}
+    try:
+        for _ in processes:
+            rank, payload = output.get(timeout=30)
+            rows[rank] = payload
+    except queue.Empty as exc:
+        raise AssertionError("timed out waiting for atomic workers") from exc
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(isinstance(rows[rank], dict) for rank in range(2)), rows
+    for payload in rows.values():
+        assert message in payload["error"]
+        assert payload["operation_calls"] == expected_calls
+        assert payload["parameter"] == pytest.approx(0.05)
+        assert payload["optimizer_state"] == {}
+        assert payload["scaler_value"] == 7
+
+
+@pytest.mark.distributed
+def test_nccl_fixed_batch_matches_single_process() -> None:
+    """Run the fixed global batch through the real two-rank NCCL update path."""
+
+    expected = _single_global_case()
+    strategy = _nccl_strategy_from_torchrun()
+    rank = strategy.rank
+    sentinel = None
+    try:
+        entered = strategy.gather_object(rank, dst=0)
+        adapter = _Adapter(strategy.device)
+        strategy.prepare(adapter)
+        plugin = _plugin()
+        optimizer = _optimizer(plugin, adapter)
+        features, mask = _rank_case(rank)
+        batch = _batch(
+            rank=rank,
+            world_size=2,
+            features=features.to(strategy.device),
+            mask=mask.to(strategy.device),
+        )
+        result = plugin.step(
+            batch=batch,
+            rewards=_rewards(batch),
+            optimizer=optimizer,
+            scaler=None,
+            context=batch.context,
+            strategy=strategy,
+        )
+
+        comparison_error = None
+        try:
+            assert result.active_transition_count == 5
+            actual = {
+                "loss": result.loss,
+                "policy_loss": result.policy_loss,
+                "reference_kl": result.reference_kl,
+                "approx_kl": result.approx_kl,
+                "clipfrac": result.clipfrac,
+                "gradient": float(
+                    adapter.train_module.delta.grad.detach()
+                ),
+                "parameter": float(adapter.train_module.delta.detach()),
             }
+            for name, value in actual.items():
+                assert value == pytest.approx(expected[name], abs=1e-6)
+            assert dict(result.diagnostics) == pytest.approx(
+                expected["diagnostics"],
+                abs=1e-6,
+            )
+        except BaseException as exc:
+            comparison_error = exc
+        strategy.failure_gate(
+            "test.nccl_fixed_batch.compare",
+            comparison_error,
+        )
 
-        strategy.barrier()
+        synchronize_error = None
+        try:
+            torch.cuda.synchronize(strategy.device)
+        except BaseException as exc:
+            synchronize_error = exc
+        strategy.failure_gate(
+            "test.nccl_fixed_batch.synchronize",
+            synchronize_error,
+        )
+        exited = strategy.gather_object(rank, dst=0)
+        if strategy.is_main_process:
+            assert entered == [0, 1]
+            assert exited == [0, 1]
+            sentinel = {
+                "nodeid": (
+                    "tests/test_distributed_update.py::"
+                    "test_nccl_fixed_batch_matches_single_process"
+                ),
+                "world_size": 2,
+                "ranks_entered": entered,
+                "ranks_exited": exited,
+                "marker_advanced": False,
+                "passed": True,
+            }
+    finally:
         strategy.close()
-        results.put(("ok", {"rank": rank, "observations": observations}))
-    except BaseException:
-        if strategy is not None:
-            strategy.close()
-        results.put(("error", traceback.format_exc()))
 
-
-def _free_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def _rank_flash_batch(rank: int, coefficient: Any, step: int) -> RolloutBatch:
-    context = StepContext(step=step, seed=101)
-    coefficients = torch.as_tensor(coefficient, dtype=torch.float32).reshape(-1)
-    batch_size = coefficients.numel()
-    return RolloutBatch(
-        prompts=tuple(
-            f"rank-{rank}-{index}" for index in range(batch_size)
-        ),
-        metadata=tuple({"rank": rank} for _ in range(batch_size)),
-        media=torch.zeros(batch_size, 1, 1, 1),
-        latents=torch.zeros(batch_size, 1, 1),
-        next_latents=torch.ones(batch_size, 1, 1),
-        timesteps=torch.zeros(batch_size, 1),
-        old_log_probs=torch.zeros(batch_size, 1),
-        transition_mask=torch.ones(batch_size, 1, dtype=torch.bool),
-        sample_id=tuple(
-            f"sample-{rank}-{index}" for index in range(batch_size)
-        ),
-        prompt_id=tuple(
-            f"prompt-{rank}-{index}" for index in range(batch_size)
-        ),
-        group_id=("shared",) * batch_size,
-        branch_id=tuple(range(batch_size)),
-        media_layout="BCHW",
-        camera_trajectory=None,
-        context=context,
-        selected_timestep_index=torch.full(
-            (batch_size,), rank, dtype=torch.int64
-        ),
-        flash_coefficient=coefficients[:, None],
-        branch_step_index=None,
-        trajectory_step_index=None,
-        transition_std_dev=None,
-        recompute_payload={
-            "features": torch.ones(batch_size, 1, dtype=torch.float32),
-        },
-        artifact_metadata={"num_steps": 2},
-    )
-
-
-def _flash_global_mean_worker(rank: int, port: int, results: Any) -> None:
-    strategy: DDPStrategy | None = None
-    try:
-        os.environ.update(
-            RANK=str(rank),
-            LOCAL_RANK=str(rank),
-            WORLD_SIZE="2",
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT=str(port),
+    if sentinel is not None:
+        print(
+            "VISUALRL_NCCL_RESULT="
+            + json.dumps(
+                sentinel,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
         )
-        strategy = _ddp_strategy(rank, port)
-        adapter = _FlashDistributedAdapter()
-        strategy.prepare(adapter)
-        observations: list[dict[str, Any]] = []
-
-        coefficient_cases = (
-            ((1.0,), (3.0,)),
-            ((0.1,), (0.7,)),
-            ((1.0,), (3.0, 5.0)),
-        )
-        for step, coefficients_by_rank in enumerate(coefficient_cases):
-            with torch.no_grad():
-                adapter.transformer.weight.zero_()
-            coefficients = coefficients_by_rank[rank]
-            batch = _rank_flash_batch(rank, coefficients, step)
-            rewards = RewardBatch(
-                sample_id=batch.sample_id,
-                raw={"score": torch.ones(batch.batch_size)},
-                weighted={"score": torch.ones(batch.batch_size)},
-                weighted_total=torch.ones(batch.batch_size),
-                valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
-                shared_metadata={"score": {}},
-                sample_metadata={
-                    "score": tuple({} for _ in range(batch.batch_size))
-                },
-            )
-            algorithm = _RecordingFlashAlgorithm(
-                objective_version="reference_v1",
-                clip_range=0.1,
-                beta=0.0,
-            )
-            plugin = AlgorithmOptimizerPlugin(algorithm, _Advantage())
-            optimizer = torch.optim.SGD(adapter.parameters(), lr=0.01)
-            metrics = plugin.step(
-                adapter,
-                batch,
-                rewards,
-                optimizer,
-                batch.context,
-                recompute_log_probs=strategy.recompute_log_probs,
-                reduce_tensor_weighted_mean=(
-                    strategy.reduce_tensor_weighted_mean
-                ),
-                synchronize_failure=strategy.synchronize_failure,
-            )
-            if (
-                algorithm.observed_global_mean is None
-                or algorithm.observed_prepared_weights is None
-            ):
-                raise AssertionError("Flash global preparation was not observed")
-            observations.append(
-                {
-                    "coefficients": list(coefficients),
-                    "global_mean": algorithm.observed_global_mean.item(),
-                    "global_mean_dtype": str(
-                        algorithm.observed_global_mean.dtype
-                    ),
-                    "prepared_weights": (
-                        algorithm.observed_prepared_weights.reshape(-1).tolist()
-                    ),
-                    "metric_weight": metrics[
-                        "flash_rectification_weight_mean"
-                    ],
-                }
-            )
-
-        invalid_batch = _rank_flash_batch(rank, float(rank + 1), 2)
-        if rank == 1:
-            invalid_batch = invalid_batch.replace(
-                flash_coefficient=torch.ones(1, 2)
-            )
-        invalid_rewards = RewardBatch(
-            sample_id=invalid_batch.sample_id,
-            raw={"score": torch.ones(1)},
-            weighted={"score": torch.ones(1)},
-            weighted_total=torch.ones(1),
-            valid_mask=torch.ones(1, dtype=torch.bool),
-            shared_metadata={"score": {}},
-            sample_metadata={"score": ({},)},
-        )
-        invalid_plugin = AlgorithmOptimizerPlugin(
-            _RecordingFlashAlgorithm(objective_version="reference_v1"),
-            _Advantage(),
-        )
-        invalid_optimizer = torch.optim.SGD(adapter.parameters(), lr=0.01)
-        try:
-            invalid_plugin.step(
-                adapter,
-                invalid_batch,
-                invalid_rewards,
-                invalid_optimizer,
-                invalid_batch.context,
-                recompute_log_probs=strategy.recompute_log_probs,
-                reduce_tensor_weighted_mean=(
-                    strategy.reduce_tensor_weighted_mean
-                ),
-                synchronize_failure=strategy.synchronize_failure,
-            )
-        except DistributedFailureError as error:
-            synchronized_prepare_error = str(error)
-        else:
-            raise AssertionError(
-                "rank-local Flash coefficient failure was not synchronized"
-            )
-        strategy.barrier()
-
-        strategy.close()
-        results.put(
-            (
-                "ok",
-                {
-                    "rank": rank,
-                    "observations": observations,
-                    "synchronized_prepare_error": synchronized_prepare_error,
-                },
-            )
-        )
-    except BaseException:
-        if strategy is not None:
-            strategy.close()
-        results.put(("error", traceback.format_exc()))
-
-
-def _run(
-    adapter: _Adapter,
-    *,
-    recompute_log_probs=None,
-    gradient_sync_context=None,
-    before_optimizer_step=None,
-    optimizer_step=None,
-    microbatch_size: int | None = None,
-):
-    batch = _batch()
-    optimizer = _CountingSGD(adapter.parameters())
-    metrics = UpdateEngine(
-        _Advantage(),
-        _Objective(),
-        update_microbatch_size=microbatch_size,
-        require_nonzero_gradients=True,
-    ).step(
-        adapter,
-        batch,
-        _rewards(batch),
-        optimizer,
-        batch.context,
-        recompute_log_probs=recompute_log_probs,
-        gradient_sync_context=gradient_sync_context,
-        before_optimizer_step=before_optimizer_step,
-        optimizer_step=optimizer_step,
-    )
-    return adapter, optimizer, metrics
-
-
-def test_default_single_process_recompute_matches_injected_callable() -> None:
-    default_adapter, _, default_metrics = _run(_Adapter())
-    injected_adapter = _Adapter()
-    injected_adapter, _, injected_metrics = _run(
-        injected_adapter,
-        recompute_log_probs=injected_adapter.recompute_log_probs,
-    )
-
-    assert default_adapter.default_calls == injected_adapter.default_calls == 1
-    torch.testing.assert_close(default_adapter.parameter, injected_adapter.parameter)
-    for key in default_metrics.keys() - {
-        "recompute_time_s",
-        "backward_time_s",
-        "optimizer_time_s",
-    }:
-        assert injected_metrics[key] == pytest.approx(default_metrics[key])
-
-
-def test_every_microbatch_uses_injected_recompute_callable() -> None:
-    adapter = _Adapter()
-    routed_slices: list[list[str]] = []
-
-    def ddp_recompute(micro_batch: RolloutBatch) -> torch.Tensor:
-        routed_slices.append(list(micro_batch.sample_id))
-        return adapter.parameter * micro_batch.recompute_payload["features"]
-
-    _, optimizer, metrics = _run(
-        adapter,
-        recompute_log_probs=ddp_recompute,
-        microbatch_size=2,
-    )
-
-    assert routed_slices == [["sample-0", "sample-1"], ["sample-2", "sample-3"]]
-    assert adapter.default_calls == 0
-    assert optimizer.step_calls == 1
-    assert metrics["update_microbatches"] == 2
-
-
-def test_only_nonfinal_contributing_microbatches_use_no_sync() -> None:
-    adapter = _Adapter()
-
-    class FakeDDP:
-        def __init__(self) -> None:
-            self.no_sync_calls = 0
-            self.entries = 0
-            self.exits = 0
-
-        @contextmanager
-        def no_sync(self):
-            self.no_sync_calls += 1
-            self.entries += 1
-            try:
-                yield
-            finally:
-                self.exits += 1
-
-    fake_ddp = FakeDDP()
-    synchronize_flags: list[bool] = []
-
-    def gradient_sync_context(synchronize_gradients: bool):
-        synchronize_flags.append(synchronize_gradients)
-        return nullcontext() if synchronize_gradients else fake_ddp.no_sync()
-
-    _, optimizer, metrics = _run(
-        adapter,
-        recompute_log_probs=adapter.recompute_log_probs,
-        gradient_sync_context=gradient_sync_context,
-        microbatch_size=2,
-    )
-
-    assert synchronize_flags == [False, True]
-    assert fake_ddp.no_sync_calls == fake_ddp.entries == fake_ddp.exits == 1
-    assert optimizer.step_calls == 1
-    assert metrics["update_microbatches"] == 2
-
-
-def test_no_sync_context_exits_when_microbatch_forward_fails() -> None:
-    adapter = _Adapter()
-    entered = 0
-    exited = 0
-
-    @contextmanager
-    def no_sync():
-        nonlocal entered, exited
-        entered += 1
-        try:
-            yield
-        finally:
-            exited += 1
-
-    def gradient_sync_context(synchronize_gradients: bool):
-        return nullcontext() if synchronize_gradients else no_sync()
-
-    def fail_recompute(_batch: RolloutBatch):
-        raise RuntimeError("microbatch forward failed")
-
-    with pytest.raises(RuntimeError, match="microbatch forward failed"):
-        _run(
-            adapter,
-            recompute_log_probs=fail_recompute,
-            gradient_sync_context=gradient_sync_context,
-            microbatch_size=2,
-        )
-
-    assert entered == exited == 1
-
-
-def test_guard_runs_once_after_backward_and_before_optimizer_step() -> None:
-    events: list[str] = []
-    adapter = _Adapter(events)
-    adapter.parameter.register_hook(
-        lambda gradient: events.append("backward") or gradient
-    )
-    guard_calls = 0
-
-    def guard() -> None:
-        nonlocal guard_calls
-        guard_calls += 1
-        assert adapter.parameter.grad is not None
-        events.append("guard")
-
-    batch = _batch()
-    optimizer = _CountingSGD(adapter.parameters(), events)
-    UpdateEngine(
-        _Advantage(),
-        _Objective(),
-        update_microbatch_size=2,
-        require_nonzero_gradients=True,
-    ).step(
-        adapter,
-        batch,
-        _rewards(batch),
-        optimizer,
-        batch.context,
-        before_optimizer_step=guard,
-    )
-
-    assert guard_calls == 1
-    assert events == [
-        "forward",
-        "backward",
-        "forward",
-        "backward",
-        "guard",
-        "step",
-    ]
-
-
-def test_guard_failure_does_not_step_or_update_parameters() -> None:
-    adapter = _Adapter()
-    batch = _batch()
-    optimizer = _CountingSGD(adapter.parameters())
-    before = adapter.parameter.detach().clone()
-    calls = 0
-
-    def reject_commit() -> None:
-        nonlocal calls
-        calls += 1
-        assert adapter.parameter.grad is not None
-        raise RuntimeError("rank failed before commit")
-
-    with pytest.raises(RuntimeError, match="rank failed before commit"):
-        UpdateEngine(
-            _Advantage(),
-            _Objective(),
-            require_nonzero_gradients=True,
-        ).step(
-            adapter,
-            batch,
-            _rewards(batch),
-            optimizer,
-            batch.context,
-            before_optimizer_step=reject_commit,
-        )
-
-    assert calls == 1
-    assert optimizer.step_calls == 0
-    torch.testing.assert_close(adapter.parameter, before)
-
-
-def test_optimizer_step_callback_is_an_explicit_boundary() -> None:
-    adapter = _Adapter()
-    routed: list[dict[str, Any]] = []
-
-    def route(operation, **state):
-        routed.append(state)
-        return operation()
-
-    _, optimizer, _ = _run(adapter, optimizer_step=route)
-
-    assert optimizer.step_calls == 1
-    assert len(routed) == 1
-    assert routed[0]["optimizer"] is optimizer
-    assert routed[0]["parameters"] == [adapter.parameter]
-    assert routed[0]["scaler"] is None
-
-
-def test_injected_recompute_return_type_is_validated_before_step() -> None:
-    adapter = _Adapter()
-    batch = _batch()
-    optimizer = _CountingSGD(adapter.parameters())
-
-    with pytest.raises(TypeError, match="recompute_log_probs.*torch.Tensor"):
-        UpdateEngine(_Advantage(), _Objective()).step(
-            adapter,
-            batch,
-            _rewards(batch),
-            optimizer,
-            batch.context,
-            recompute_log_probs=lambda _batch: [0.0],
-        )
-
-    assert adapter.default_calls == 0
-    assert optimizer.step_calls == 0
-
-
-def test_algorithm_plugin_forwards_update_routing_hooks() -> None:
-    captured: dict[str, Any] = {}
-
-    class RecordingEngine:
-        def step(self, *args, **kwargs):
-            captured["args"] = args
-            captured["kwargs"] = kwargs
-            return {"loss": 0.0}
-
-    def recompute(_batch):
-        return torch.tensor(0.0)
-
-    def guard():
-        return None
-
-    def optimizer_step(operation, **state):
-        del state
-        return operation()
-
-    plugin = AlgorithmOptimizerPlugin.__new__(AlgorithmOptimizerPlugin)
-    plugin.update_engine = RecordingEngine()
-    result = plugin.step(
-        "adapter",
-        "batch",
-        "rewards",
-        "optimizer",
-        "context",
-        recompute_log_probs=recompute,
-        gradient_sync_context=nullcontext,
-        before_optimizer_step=guard,
-        optimizer_step=optimizer_step,
-    )
-
-    assert result == {"loss": 0.0}
-    assert captured["kwargs"] == {
-        "recompute_log_probs": recompute,
-        "gradient_sync_context": nullcontext,
-        "before_optimizer_step": guard,
-        "optimizer_step": optimizer_step,
-    }
-
-
-def test_legacy_external_plugin_default_step_remains_compatible() -> None:
-    class LegacyPlugin(OptimizerPlugin):
-        def build_optimizer(self, parameters, train_config):
-            del parameters, train_config
-            return object()
-
-        def step(self, adapter, batch, rewards, optimizer, context):
-            del adapter, batch, rewards, optimizer, context
-            return {"legacy": 1.0}
-
-    assert LegacyPlugin().step(None, None, None, None, None) == {"legacy": 1.0}
-
-
-@pytest.mark.skipif(
-    not dist.is_available() or not dist.is_gloo_available(),
-    reason="PyTorch gloo distributed backend is unavailable",
-)
-@pytest.mark.distributed
-def test_flash_reference_uses_global_float32_coefficient_mean_across_ranks() -> None:
-    started = time.monotonic()
-    deadline = started + 12.0
-    process_context: SpawnContext = mp.get_context("spawn")
-    results = process_context.Queue()
-    port = _free_loopback_port()
-    processes = [
-        process_context.Process(
-            target=_flash_global_mean_worker,
-            args=(rank, port, results),
-        )
-        for rank in range(2)
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=max(0.0, deadline - time.monotonic()))
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2)
-            pytest.fail("2-rank Flash coefficient oracle timed out")
-        assert process.exitcode == 0
-
-    received = []
-    for _ in range(2):
-        try:
-            status, payload = results.get(timeout=1)
-        except queue.Empty:
-            pytest.fail("Flash DDP worker exited without returning a result")
-        assert status == "ok", payload
-        received.append(payload)
-
-    by_rank = {item["rank"]: item for item in received}
-    assert set(by_rank) == {0, 1}
-    coefficient_cases = (
-        ((1.0,), (3.0,)),
-        ((0.1,), (0.7,)),
-        ((1.0,), (3.0, 5.0)),
-    )
-    for case_index, coefficients_by_rank in enumerate(coefficient_cases):
-        local_tensors = [
-            torch.tensor(values, dtype=torch.float32)
-            for values in coefficients_by_rank
-        ]
-        if local_tensors[0].numel() == local_tensors[1].numel():
-            expected_global_mean = torch.stack(
-                [values.mean() for values in local_tensors]
-            ).sum(dtype=torch.float32) / 2
-        else:
-            expected_global_mean = torch.cat(local_tensors).mean()
-        for rank in range(2):
-            observation = by_rank[rank]["observations"][case_index]
-            expected_weights = local_tensors[rank] / expected_global_mean
-            assert observation["global_mean_dtype"] == "torch.float32"
-            assert torch.tensor(
-                observation["global_mean"], dtype=torch.float32
-            ).item() == expected_global_mean.item()
-            torch.testing.assert_close(
-                torch.tensor(
-                    observation["prepared_weights"],
-                    dtype=torch.float32,
-                ),
-                expected_weights,
-                rtol=0,
-                atol=0,
-            )
-            assert observation["metric_weight"] == pytest.approx(
-                expected_weights.mean().item()
-            )
-
-    assert by_rank[0]["observations"][0]["prepared_weights"] == [0.5]
-    assert by_rank[1]["observations"][0]["prepared_weights"] == [1.5]
-    for rank in range(2):
-        synchronized_error = by_rank[rank]["synchronized_prepare_error"]
-        assert "rank 1" in synchronized_error
-        assert "coefficient must have shape" in synchronized_error
-    assert time.monotonic() - started < 12.0
-
-
-@pytest.mark.skipif(
-    not dist.is_available() or not dist.is_gloo_available(),
-    reason="PyTorch gloo distributed backend is unavailable",
-)
-@pytest.mark.distributed
-def test_ddp_microbatch_no_sync_matches_full_and_uses_one_reduction() -> None:
-    started = time.monotonic()
-    deadline = started + 12.0
-    process_context: SpawnContext = mp.get_context("spawn")
-    results = process_context.Queue()
-    port = _free_loopback_port()
-    processes = [
-        process_context.Process(
-            target=_microbatch_no_sync_worker,
-            args=(rank, port, results),
-        )
-        for rank in range(2)
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=max(0.0, deadline - time.monotonic()))
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2)
-            pytest.fail("2-rank microbatch no_sync oracle timed out")
-        assert process.exitcode == 0
-
-    received = []
-    for _ in range(2):
-        try:
-            status, payload = results.get(timeout=1)
-        except queue.Empty:
-            pytest.fail("microbatch no_sync worker returned no result")
-        assert status == "ok", payload
-        received.append(payload)
-
-    assert {item["rank"] for item in received} == {0, 1}
-    expected_gradient = 8.5
-    expected_parameter = 0.25 - 0.01 * expected_gradient
-    for payload in received:
-        observations = payload["observations"]
-        full = observations["full"]
-        legacy = observations["legacy_microbatch"]
-        optimized = observations["no_sync_microbatch"]
-        for result in (full, legacy, optimized):
-            assert result["gradient"] == pytest.approx(expected_gradient)
-            assert result["parameter"] == pytest.approx(expected_parameter)
-        assert legacy["gradient"] == pytest.approx(full["gradient"])
-        assert optimized["gradient"] == pytest.approx(full["gradient"])
-        assert legacy["parameter"] == pytest.approx(full["parameter"])
-        assert optimized["parameter"] == pytest.approx(full["parameter"])
-        assert full["communication_calls"] == 1
-        assert legacy["communication_calls"] == 2
-        assert optimized["communication_calls"] == 1
-    assert time.monotonic() - started < 12.0

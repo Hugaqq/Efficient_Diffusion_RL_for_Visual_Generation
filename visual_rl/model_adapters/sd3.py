@@ -573,8 +573,6 @@ class SD3TempFlowAdapter(ModelAdapter):
         *,
         require_reference: bool = False,
     ) -> PolicyRecomputeStats:
-        if require_reference:
-            raise RunError("sd3_tempflow reference stats are added by stage 4")
         self._ensure_loaded()
         payload = []
         for key in _PROMPT_PAYLOAD_KEYS:
@@ -595,6 +593,8 @@ class SD3TempFlowAdapter(ModelAdapter):
         self.train_module.train(True)
         try:
             new_log_probs = []
+            current_means = []
+            transition_stds = []
             for step in range(batch.transition_count):
                 latent = batch.latents[:, step].to(self.device)
                 timestep = batch.timesteps[:, step].to(self.device)
@@ -623,14 +623,110 @@ class SD3TempFlowAdapter(ModelAdapter):
                         "new_log_probs",
                     )
                 )
+                if require_reference:
+                    if len(result) < 4:
+                        raise RunError(
+                            "SD3 transition helper did not return mean/std"
+                        )
+                    current_means.append(
+                        _transition_tensor(
+                            result[2],
+                            batch.batch_size,
+                            "current_transition_mean",
+                        )
+                    )
+                    transition_stds.append(
+                        _transition_tensor(
+                            result[3],
+                            batch.batch_size,
+                            "transition_std",
+                        )
+                    )
             value = torch.cat(new_log_probs, dim=1).to(
                 device=batch.old_log_probs.device
             )
-            stats = PolicyRecomputeStats(new_log_probs=value)
-            stats.validate_against(batch, require_reference=False)
+            if require_reference:
+                reference_means = []
+                with torch.no_grad(), self._disable_lora_reference():
+                    for step in range(batch.transition_count):
+                        latent = batch.latents[:, step].to(self.device)
+                        timestep = batch.timesteps[:, step].to(self.device)
+                        next_latent = batch.next_latents[:, step].to(self.device)
+                        prediction = self._predict_noise(
+                            latent,
+                            timestep,
+                            prompt_embeds,
+                            pooled_prompt_embeds,
+                            negative_prompt_embeds,
+                            negative_pooled_prompt_embeds,
+                        )
+                        result = self._sde_step(
+                            self.pipeline.scheduler,
+                            prediction.float(),
+                            timestep,
+                            latent.float(),
+                            prev_sample=next_latent.float(),
+                        )
+                        if (
+                            not isinstance(result, (tuple, list))
+                            or len(result) < 3
+                        ):
+                            raise RunError(
+                                "SD3 reference transition helper did not "
+                                "return a mean"
+                            )
+                        reference_means.append(
+                            _transition_tensor(
+                                result[2],
+                                batch.batch_size,
+                                "reference_transition_mean",
+                            )
+                        )
+                output_device = batch.old_log_probs.device
+                current_mean = torch.stack(current_means, dim=1).to(
+                    device=output_device
+                )
+                reference_mean = (
+                    torch.stack(reference_means, dim=1)
+                    .to(device=output_device)
+                    .detach()
+                )
+                transition_std = (
+                    torch.stack(transition_stds, dim=1)
+                    .to(device=output_device)
+                    .detach()
+                )
+                stats = PolicyRecomputeStats(
+                    new_log_probs=value,
+                    current_transition_mean=current_mean,
+                    transition_std=transition_std,
+                    reference_transition_mean=reference_mean,
+                )
+            else:
+                stats = PolicyRecomputeStats(new_log_probs=value)
+            stats.validate_against(
+                batch,
+                require_reference=require_reference,
+            )
             return stats
         finally:
             self.train_module.train(was_training)
+
+    @contextmanager
+    def _disable_lora_reference(self):
+        disable_adapter = getattr(self.train_module, "disable_adapter", None)
+        if not callable(disable_adapter):
+            raise RunError(
+                "sd3_tempflow reference statistics require PEFT "
+                "disable_adapter()"
+            )
+        context = disable_adapter()
+        if not hasattr(context, "__enter__") or not hasattr(context, "__exit__"):
+            raise RunError(
+                "sd3_tempflow disable_adapter() must return a context manager"
+            )
+        with context:
+            yield
 
     def _prompt_payload(self, prompts: tuple[str, ...]):
         if not callable(self._encode_prompt):
@@ -935,6 +1031,17 @@ def _scalar_transition(value: object, batch_size: int, name: str):
     if tensor.numel() != batch_size:
         raise RunError(f"SD3 {name} must contain one value per row")
     return tensor.reshape(batch_size, 1)
+
+
+def _transition_tensor(value: object, batch_size: int, name: str):
+    import torch
+
+    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    if tensor.ndim == 0 or tensor.shape[0] != batch_size:
+        raise RunError(f"SD3 {name} must have leading batch dimension B")
+    if not tensor.is_floating_point():
+        raise RunError(f"SD3 {name} must be floating point")
+    return tensor
 
 
 def _stack_scalars(

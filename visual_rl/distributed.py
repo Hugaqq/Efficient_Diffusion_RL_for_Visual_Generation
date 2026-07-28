@@ -1,39 +1,32 @@
-"""Minimal native-PyTorch distributed strategies for policy recomputation."""
+"""The sole single-process/DDP strategy surface used by VisualRL training."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 import copy
 from contextlib import nullcontext
-import math
-import pickle
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+import math
 from numbers import Real
-from time import perf_counter
-from typing import Any
+import pickle
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from visual_rl.core.types import (
+    MetricContribution,
     PolicyRecomputeStats,
+    RewardBatch,
     RolloutBatch,
     ValidatedRuntimeEnv,
 )
 
-_COUNT_METRIC_SUFFIXES = (
-    "_attempts",
-    "_cancelled",
-    "_hits",
-    "_microbatches",
-    "_misses",
-    "_retries",
-    "_shards",
-    "_timeouts",
-)
+
 DEFAULT_MAX_ROLLBACK_SNAPSHOT_TENSOR_BYTES = 1 << 30
+_T = TypeVar("_T")
 
 __all__ = (
     "DDPStrategy",
@@ -45,104 +38,64 @@ __all__ = (
 
 
 class DistributedFailureError(RuntimeError):
-    """Raised on every rank when any rank reports a local failure."""
+    """An ordinary rank-local failure synchronized to every worker."""
+
+
+class _ProcessGroupFatalError(DistributedFailureError):
+    """A collective/reducer failure after which consensus is no longer safe."""
 
 
 class _SnapshotLimitError(RuntimeError):
-    def __init__(self, message: str, metrics: Mapping[str, int | float]) -> None:
-        super().__init__(message)
-        self.metrics = dict(metrics)
+    """The configured DDP rollback-copy budget is insufficient."""
 
 
 @dataclass(slots=True)
 class _OptimizerStepSnapshot:
-    """Distributed-only rollback state for one catchable optimizer update."""
+    """Rank-local rollback data captured before the sole mutable boundary."""
 
-    parameters: list[tuple[torch.nn.Parameter, torch.Tensor]]
+    parameters: tuple[tuple[torch.nn.Parameter, torch.Tensor], ...]
     optimizer_state: dict[str, Any]
     scaler_state: dict[str, Any] | None
-    stateful: Any | None
-    stateful_state: dict[str, Any] | None
-    metrics: dict[str, int]
 
     @classmethod
     def capture(
         cls,
-        parameters: list[torch.nn.Parameter],
-        optimizer: Any,
+        parameters: tuple[torch.nn.Parameter, ...],
+        optimizer: torch.optim.AdamW,
         scaler: Any | None,
-        stateful: Any | None,
+        *,
         max_tensor_bytes: int | None,
     ) -> _OptimizerStepSnapshot:
-        protected_parameters: list[torch.nn.Parameter] = []
-        seen_parameters: set[int] = set()
-        for parameter in parameters:
-            if not isinstance(parameter, torch.nn.Parameter):
-                raise TypeError("distributed update parameters must be Parameters")
-            if id(parameter) not in seen_parameters:
-                protected_parameters.append(parameter)
-                seen_parameters.add(id(parameter))
-        if stateful is not None and not all(
-            callable(getattr(stateful, name, None))
-            for name in ("state_dict", "load_state_dict")
-        ):
-            raise TypeError(
-                "distributed update stateful must define state_dict/load_state_dict"
-            )
         optimizer_state = cls._mapping_state_dict(optimizer, "optimizer")
         scaler_state = (
             None
             if scaler is None
             else cls._mapping_state_dict(scaler, "gradient scaler")
         )
-        stateful_state = (
-            None
-            if stateful is None
-            else cls._mapping_state_dict(stateful, "distributed update stateful")
+        tensor_bytes = (
+            sum(_tensor_storage_bytes(parameter) for parameter in parameters)
+            + _state_tensor_bytes(optimizer_state)
+            + _state_tensor_bytes(scaler_state)
         )
-        metrics = {
-            "parameter_count": len(protected_parameters),
-            "parameter_tensor_bytes": sum(
-                _tensor_storage_bytes(parameter) for parameter in protected_parameters
-            ),
-            "optimizer_state_tensor_bytes": _state_tensor_bytes(optimizer_state),
-            "scaler_state_tensor_bytes": _state_tensor_bytes(scaler_state),
-            "stateful_state_tensor_bytes": _state_tensor_bytes(stateful_state),
-            "snapshot_limit_tensor_bytes": (
-                0 if max_tensor_bytes is None else max_tensor_bytes
-            ),
-            "snapshot_limit_enabled": int(max_tensor_bytes is not None),
-        }
-        metrics["total_tensor_bytes"] = sum(
-            metrics[name]
-            for name in (
-                "parameter_tensor_bytes",
-                "optimizer_state_tensor_bytes",
-                "scaler_state_tensor_bytes",
-                "stateful_state_tensor_bytes",
-            )
-        )
-        if (
-            max_tensor_bytes is not None
-            and metrics["total_tensor_bytes"] > max_tensor_bytes
-        ):
+        if max_tensor_bytes is not None and tensor_bytes > max_tensor_bytes:
             raise _SnapshotLimitError(
                 "Distributed optimizer rollback snapshot requires "
-                f"{metrics['total_tensor_bytes']} tensor bytes, exceeding the "
-                f"per-rank limit of {max_tensor_bytes}; reduce trainable state or "
-                "explicitly configure a larger audited limit",
-                metrics,
+                f"{tensor_bytes} tensor bytes, exceeding the per-rank limit "
+                f"of {max_tensor_bytes}"
             )
+
+        # The byte gate above must precede every clone/deepcopy.
         return cls(
-            parameters=[
+            parameters=tuple(
                 (parameter, parameter.detach().clone())
-                for parameter in protected_parameters
-            ],
-            optimizer_state=copy.deepcopy(optimizer_state),
-            scaler_state=copy.deepcopy(scaler_state),
-            stateful=stateful,
-            stateful_state=copy.deepcopy(stateful_state),
-            metrics=metrics,
+                for parameter in parameters
+            ),
+            optimizer_state=copy.deepcopy(dict(optimizer_state)),
+            scaler_state=(
+                None
+                if scaler_state is None
+                else copy.deepcopy(dict(scaler_state))
+            ),
         )
 
     @staticmethod
@@ -155,63 +108,50 @@ class _OptimizerStepSnapshot:
             raise TypeError(f"{label} state_dict() must return a mapping")
         return state
 
-    def restore(self, optimizer: Any, scaler: Any | None) -> None:
+    def restore(
+        self,
+        optimizer: torch.optim.AdamW,
+        scaler: Any | None,
+    ) -> None:
         errors: list[tuple[str, BaseException]] = []
-
         with torch.no_grad():
             for index, (parameter, value) in enumerate(self.parameters):
                 try:
                     parameter.copy_(value)
                 except BaseException as exc:
                     errors.append((f"parameter[{index}]", exc))
-
         try:
             optimizer.load_state_dict(self.optimizer_state)
         except BaseException as exc:
             errors.append(("optimizer", exc))
-
         if self.scaler_state is not None:
             if scaler is None:
                 errors.append(
                     (
                         "gradient scaler",
-                        RuntimeError(
-                            "optimizer rollback is missing its gradient scaler"
-                        ),
+                        RuntimeError("rollback is missing its gradient scaler"),
                     )
                 )
             else:
                 try:
                     scaler.load_state_dict(self.scaler_state)
-                    per_optimizer_states = getattr(
+                    per_optimizer = getattr(
                         scaler,
                         "_per_optimizer_states",
                         None,
                     )
-                    if hasattr(per_optimizer_states, "clear"):
-                        per_optimizer_states.clear()
+                    if hasattr(per_optimizer, "clear"):
+                        per_optimizer.clear()
                 except BaseException as exc:
                     errors.append(("gradient scaler", exc))
-
-        if self.stateful_state is not None:
-            try:
-                self.stateful.load_state_dict(copy.deepcopy(self.stateful_state))
-            except BaseException as exc:
-                errors.append(("stateful plugin", exc))
-
         if errors:
             details = "; ".join(
-                f"{stage}: {type(error).__name__}: {error}" for stage, error in errors
+                f"{stage}: {type(error).__name__}: {error}"
+                for stage, error in errors
             )
-            rollback_error = RuntimeError("optimizer rollback failed: " + details)
-            for stage, error in errors[1:]:
-                add_note = getattr(rollback_error, "add_note", None)
-                if callable(add_note):
-                    add_note(
-                        f"additional rollback failure in {stage}: "
-                        f"{type(error).__name__}: {error}"
-                    )
-            raise rollback_error from errors[0][1]
+            raise RuntimeError(
+                "distributed optimizer rollback failed: " + details
+            ) from errors[0][1]
 
 
 def _tensor_storage_bytes(value: torch.Tensor) -> int:
@@ -233,15 +173,18 @@ def _state_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
     if isinstance(value, torch.Tensor):
         return _tensor_storage_bytes(value)
     if isinstance(value, Mapping):
-        return sum(_state_tensor_bytes(item, seen) for item in value.values())
-    if isinstance(value, (list, tuple, set, frozenset)):
+        return sum(
+            _state_tensor_bytes(key, seen) + _state_tensor_bytes(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
         return sum(_state_tensor_bytes(item, seen) for item in value)
     return 0
 
 
 @dataclass(frozen=True, slots=True)
 class DistributedContext:
-    """Rank-local tensor/collective context derived from validated Preflight."""
+    """Rank-local topology projected only from validated Preflight state."""
 
     rank: int
     local_rank: int
@@ -257,36 +200,19 @@ class DistributedContext:
     def is_main_process(self) -> bool:
         return self.rank == 0
 
-    def step_seed(self, base_seed: int, step: int) -> int:
-        """Return the rank-specific seed for a non-negative logical step."""
-
-        for name, value in (("base_seed", base_seed), ("step", step)):
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{name} must be an integer")
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
-        return base_seed + step * self.world_size + self.rank
-
-
 
 def build_strategy(
     distributed_config: Any,
     validated_env: ValidatedRuntimeEnv,
 ) -> SingleProcessStrategy | DDPStrategy:
-    """Construct and set up the sole strategy from one validated env snapshot.
-
-    This function never reads ``os.environ`` and never accepts a backend,
-    rank, world-size, or device override. Preflight owns parsing and the
-    mode/device-to-backend mapping; this function only projects those frozen
-    results into the existing numerical Strategy implementations.
-    """
+    """Build the only Strategy from the cached validated environment."""
 
     if not isinstance(validated_env, ValidatedRuntimeEnv):
         raise TypeError("validated_env must be a ValidatedRuntimeEnv")
     mode = getattr(distributed_config, "mode", None)
     requested_device = getattr(distributed_config, "device", None)
     timeout_s = getattr(distributed_config, "timeout_s", None)
-    max_snapshot_tensor_bytes = getattr(
+    snapshot_limit = getattr(
         distributed_config,
         "max_snapshot_tensor_bytes",
         None,
@@ -297,7 +223,7 @@ def build_strategy(
         raise ValueError("distributed device must be 'cpu' or 'cuda'")
     if validated_env.mode != mode:
         raise ValueError("validated runtime mode does not match canonical config")
-    if mode == "single" and max_snapshot_tensor_bytes is not None:
+    if mode == "single" and snapshot_limit is not None:
         raise ValueError(
             "single mode requires max_snapshot_tensor_bytes to be None"
         )
@@ -305,32 +231,30 @@ def build_strategy(
 
     from visual_rl.preflight import backend_for
 
-    backend = backend_for(mode, requested_device)
-    device = _rank_local_device(requested_device, validated_env)
     context = DistributedContext(
         rank=validated_env.rank,
         local_rank=validated_env.local_rank,
         world_size=validated_env.world_size,
-        device=device,
-        backend=backend,
+        device=_rank_local_device(requested_device, validated_env),
+        backend=backend_for(mode, requested_device),
     )
-
     if dist.is_available() and dist.is_initialized():
         raise RuntimeError(
             "VisualRL requires ownership of an uninitialized process group"
         )
+    strategy: SingleProcessStrategy | DDPStrategy
     if mode == "single":
-        strategy: SingleProcessStrategy | DDPStrategy = SingleProcessStrategy(
-            context
-        )
+        strategy = SingleProcessStrategy(context)
     else:
         strategy = DDPStrategy(
             context,
             timeout_s=timeout_s,
-            max_snapshot_tensor_bytes=max_snapshot_tensor_bytes,
+            max_snapshot_tensor_bytes=snapshot_limit,
+            master_addr=validated_env.master_addr,
+            master_port=validated_env.master_port,
         )
     try:
-        strategy.setup()
+        strategy._setup()
     except BaseException:
         try:
             strategy.close()
@@ -342,9 +266,8 @@ def build_strategy(
 
 def _validate_snapshot_shape(env: ValidatedRuntimeEnv) -> None:
     if env.mode == "single":
-        expected = (0, 0, 1, 1)
         actual = (env.rank, env.local_rank, env.world_size, env.local_world_size)
-        if actual != expected:
+        if actual != (0, 0, 1, 1):
             raise ValueError("single validated runtime snapshot has invalid ranks")
         if any(
             value is not None
@@ -359,8 +282,7 @@ def _validate_snapshot_shape(env: ValidatedRuntimeEnv) -> None:
                 "single validated runtime snapshot must not contain launch metadata"
             )
         return
-    expected = (2, 2)
-    if (env.world_size, env.local_world_size) != expected:
+    if (env.world_size, env.local_world_size) != (2, 2):
         raise ValueError("ddp validated runtime snapshot must be single-node size 2")
     if not 0 <= env.rank < 2 or not 0 <= env.local_rank < 2:
         raise ValueError("ddp validated runtime snapshot has invalid ranks")
@@ -368,10 +290,7 @@ def _validate_snapshot_shape(env: ValidatedRuntimeEnv) -> None:
         raise ValueError("ddp validated runtime snapshot is not single-node")
     if not isinstance(env.master_addr, str) or not env.master_addr:
         raise ValueError("ddp validated runtime snapshot requires master_addr")
-    if (
-        type(env.master_port) is not int
-        or not 1 <= env.master_port <= 65535
-    ):
+    if type(env.master_port) is not int or not 1 <= env.master_port <= 65535:
         raise ValueError("ddp validated runtime snapshot requires valid master_port")
 
 
@@ -390,7 +309,7 @@ def _rank_local_device(
 
 
 class _AdapterRecomputeFacade(torch.nn.Module):
-    """Register adapter parameters without replacing adapter-owned module links."""
+    """Register trainable tensors with DDP while preserving Adapter ownership."""
 
     def __init__(self, adapter: Any, train_module: torch.nn.Module) -> None:
         super().__init__()
@@ -409,39 +328,89 @@ class _AdapterRecomputeFacade(torch.nn.Module):
         )
 
 
+class _FinalGradientSyncContext:
+    """Mark a last-slot DDP backward/reducer failure as process-group fatal."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        del exc_type, traceback
+        if exc is None or isinstance(exc, DistributedFailureError):
+            return False
+        raise _ProcessGroupFatalError(
+            "DDP final backward/reducer failed"
+        ) from exc
+
+
 class SingleProcessStrategy:
-    """No-collective strategy preserving the existing one-process execution path."""
+    """Identity/no-op implementation of the one training Strategy contract."""
 
     def __init__(self, context: DistributedContext) -> None:
         if not isinstance(context, DistributedContext):
             raise TypeError("context must be a DistributedContext")
-        self.context = context
-        if self.context.is_distributed:
+        if context.is_distributed or context.backend is not None:
             raise ValueError("SingleProcessStrategy requires WORLD_SIZE=1")
-        if self.context.backend is not None:
-            raise ValueError("SingleProcessStrategy requires backend=None")
+        self._context = context
         self._adapter: Any | None = None
-        self._setup = False
+        self._setup_complete = False
         self._closed = False
 
     @property
-    def is_main_process(self) -> bool:
-        return self.context.is_main_process
+    def rank(self) -> int:
+        return self._context.rank
 
     @property
-    def closed(self) -> bool:
-        return self._closed
+    def local_rank(self) -> int:
+        return self._context.local_rank
 
-    def setup(self) -> SingleProcessStrategy:
+    @property
+    def world_size(self) -> int:
+        return self._context.world_size
+
+    @property
+    def device(self) -> torch.device:
+        return self._context.device
+
+    @property
+    def backend(self) -> str | None:
+        return self._context.backend
+
+    @property
+    def is_main_process(self) -> bool:
+        return self._context.is_main_process
+
+    def _setup(self) -> None:
         self._require_open()
-        if self._setup:
-            return self
-        self._setup = True
-        return self
+        self._setup_complete = True
+
+    def run_phase(
+        self,
+        name: str,
+        operation: Callable[[], _T],
+    ) -> _T:
+        _validate_phase_name(name)
+        if not callable(operation):
+            raise TypeError("phase operation must be callable")
+        try:
+            return operation()
+        except _ProcessGroupFatalError:
+            raise
+        except BaseException as exc:
+            self.failure_gate(name, exc)
+            raise AssertionError("failure_gate returned after a failure") from exc
+
+    def dataset_start(self, step: int, batch_size: int) -> int:
+        for name, value in (("step", step), ("batch_size", batch_size)):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer, not bool")
+        if step < 0 or batch_size <= 0:
+            raise ValueError("step must be non-negative and batch_size positive")
+        return step * batch_size * self.world_size + self.rank * batch_size
 
     def prepare(self, adapter: Any) -> Any:
         self._require_open()
-        if not self._setup:
+        if not self._setup_complete:
             raise RuntimeError("Strategy must be set up before prepare()")
         self._validate_adapter(adapter)
         if self._adapter is not None and self._adapter is not adapter:
@@ -468,149 +437,80 @@ class SingleProcessStrategy:
         )
 
     def gradient_sync_context(self, synchronize_gradients: bool):
-        """Return the accumulation context for one objective-bearing microbatch."""
-
         self._require_prepared()
         if not isinstance(synchronize_gradients, bool):
             raise TypeError("synchronize_gradients must be a bool")
         return nullcontext()
 
-    def reduce_weighted_mean(self, value: Any, weight: Any) -> float:
-        self._require_open()
-        scalar, scalar_weight = self._validated_scalar_and_weight(value, weight)
-        if scalar_weight == 0:
-            raise ValueError("Global reduction weight must be positive")
-        return scalar
+    def sum_active_transition_count(self, local_count: int) -> int:
+        return _positive_count(local_count, name="local active transition count")
 
     def reduce_tensor_weighted_mean(
         self,
         value: torch.Tensor,
         weight: int,
     ) -> torch.Tensor:
-        """Reduce a scalar mean without leaving its tensor dtype or device."""
-
-        self._require_open()
         scalar, _ = self._validated_tensor_mean_and_weight(value, weight)
         return scalar.detach().clone()
 
-    def reduce_weighted_scalar(self, value: Any, weight: Any) -> float:
-        return self.reduce_weighted_mean(value, weight)
-
-    def reduce_weighted_scalars(
+    def reduce_metric_contributions(
         self,
-        values: Mapping[str, Any],
-        weight: Any,
+        contributions: Mapping[str, MetricContribution],
     ) -> dict[str, float]:
-        self._require_open()
-        scalar_weight = self._validated_weight(weight)
-        if scalar_weight == 0:
-            raise ValueError("Global reduction weight must be positive")
-        return self._validated_scalar_mapping(values)
+        prepared = self._prepare_metric_contributions(contributions)
+        return {
+            name: (
+                numerator
+                if denominator is None
+                else numerator / denominator
+            )
+            for name, numerator, denominator in prepared
+        }
 
-    def reduce_metrics(
-        self,
-        metrics: Mapping[str, Any],
-        sample_count: int,
-        reward_values: Any | None = None,
-    ) -> dict[str, float | bool]:
-        """Reduce one rank's metrics using the shared metric-name contract.
-
-        ``count`` and ``*_count`` are sums. Timing metrics named ``time``,
-        ``*_time``, or ``*_time_s`` and ``*_abs_max`` metrics are maxima. Boolean
-        metrics use logical AND. All other metrics are sample-weighted means.
-        Supplying reward values computes global ``reward_mean`` and
-        ``reward_std`` from moments; those names are reserved for that path.
-        """
-
-        self._require_open()
-        scalars, kinds, count, rewards = self._prepare_metrics(
-            metrics,
-            sample_count,
-            reward_values,
+    def reduce_reward_metrics(self, rewards: RewardBatch) -> dict[str, float]:
+        values = self._reward_values(rewards)
+        mean = math.fsum(values) / len(values)
+        variance = max(
+            math.fsum((value - mean) ** 2 for value in values) / len(values),
+            0.0,
         )
-        if any(kind == "mean" for kind in kinds.values()) and count == 0:
-            raise ValueError("Global sample_count must be positive for mean metrics")
-
-        result: dict[str, float | bool] = {}
-        for key in sorted(scalars):
-            if key not in {"reward_mean", "reward_std"} or rewards is None:
-                result[key] = (
-                    bool(scalars[key]) if kinds[key] == "bool_and" else scalars[key]
-                )
-        if rewards is not None:
-            result.update(self._reward_moments(rewards))
-        return result
-
-    def metric_contract(
-        self,
-        metrics: Mapping[str, Any],
-        sample_count: int,
-        reward_values: Any | None = None,
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], bool]:
-        """Validate local metrics and return a small canonical rank contract.
-
-        This helper deliberately performs no collective.  It is suitable for an
-        ``atomic_optimizer_step`` result validator, which owns the synchronization
-        needed to compare the returned contract before committing an update.
-        """
-
-        self._require_open()
-        scalars, kinds, _, rewards = self._prepare_metrics(
-            metrics,
-            sample_count,
-            reward_values,
-        )
-        return self._metric_contract_from_prepared(scalars, kinds, rewards)
-
-    def broadcast_object(self, value: Any, *, src: int = 0) -> Any:
-        """Return ``value`` unchanged in a single-process strategy."""
-
-        self._validate_rank(src, name="src")
-        return value
-
-    def gather_object(self, value: Any, *, dst: int = 0) -> list[Any] | None:
-        """Gather small metadata objects; media remains in rank-local artifacts."""
-
-        self._validate_rank(dst, name="dst")
-        return [value]
-
-    def barrier(self) -> None:
-        self._require_open()
-
-    def synchronize_failure(self, failure: bool | BaseException | None) -> bool:
-        self._require_open()
-        if isinstance(failure, bool):
-            return failure
-        if failure is None:
-            return False
-        if not isinstance(failure, BaseException):
-            raise TypeError("failure must be bool, an exception, or None")
-        raise DistributedFailureError(
-            self._failure_message([(0, failure)])
-        ) from failure
+        return {"reward_mean": mean, "reward_std": math.sqrt(variance)}
 
     def atomic_optimizer_step(
         self,
-        operation: Any,
+        operation: Callable[[], None],
         *,
-        parameters: list[torch.nn.Parameter],
-        optimizer: Any,
-        scaler: Any | None = None,
-        stateful: Any | None = None,
-        validate_result: Any | None = None,
-    ) -> Any:
-        """Run an optimizer operation directly without single-process snapshots."""
+        parameters: tuple[torch.nn.Parameter, ...],
+        optimizer: torch.optim.AdamW,
+        scaler: Any | None,
+    ) -> None:
+        self._validate_optimizer_boundary(
+            operation,
+            parameters=parameters,
+            optimizer=optimizer,
+            scaler=scaler,
+        )
+        operation()
 
-        self._require_open()
-        del parameters, optimizer, scaler, stateful
-        if not callable(operation):
-            raise TypeError("optimizer step operation must be callable")
-        if validate_result is not None and not callable(validate_result):
-            raise TypeError("optimizer result validator must be callable or None")
-        result = operation()
-        if validate_result is not None:
-            validate_result(result)
-        return result
+    def gather_object(self, value: Any, *, dst: int = 0) -> list[Any] | None:
+        self._validate_rank(dst, name="dst")
+        return [value]
+
+    def broadcast_object(self, value: Any, *, src: int = 0) -> Any:
+        self._validate_rank(src, name="src")
+        return value
+
+    def failure_gate(
+        self,
+        phase: str,
+        failure: BaseException | None,
+    ) -> None:
+        _validate_phase_name(phase)
+        if failure is None:
+            return
+        if not isinstance(failure, BaseException):
+            raise TypeError("failure must be an exception or None")
+        raise failure
 
     def close(self) -> None:
         if self._closed:
@@ -624,7 +524,7 @@ class SingleProcessStrategy:
 
     def _require_prepared(self) -> None:
         self._require_open()
-        if not self._setup or self._adapter is None:
+        if not self._setup_complete or self._adapter is None:
             raise RuntimeError(
                 "Distributed strategy must be prepared before policy recompute"
             )
@@ -665,17 +565,8 @@ class SingleProcessStrategy:
                 "adapter.recompute_policy_stats() must return "
                 "PolicyRecomputeStats"
             )
-        stats.validate_against(
-            batch,
-            require_reference=require_reference,
-        )
+        stats.validate_against(batch, require_reference=require_reference)
         return stats
-
-    @staticmethod
-    def _validated_scalar_and_weight(value: Any, weight: Any) -> tuple[float, float]:
-        return SingleProcessStrategy._validated_scalar(
-            value
-        ), SingleProcessStrategy._validated_weight(weight)
 
     @staticmethod
     def _validated_tensor_mean_and_weight(
@@ -690,271 +581,195 @@ class SingleProcessStrategy:
             raise TypeError("Reduced tensor mean must be a real floating tensor")
         if not bool(torch.isfinite(value.detach()).item()):
             raise ValueError("Reduced tensor mean must be finite")
-        if isinstance(weight, bool) or not isinstance(weight, int):
-            raise TypeError("Tensor reduction weight must be a positive integer")
-        if weight <= 0:
-            raise ValueError("Tensor reduction weight must be positive")
-        return value.detach(), weight
+        return value.detach(), _positive_count(weight, name="reduction weight")
 
     @staticmethod
-    def _validated_scalar(value: Any) -> float:
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                raise ValueError("Reduced values must be scalar")
-            value = value.detach().item()
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise TypeError("Reduced values must be real scalars")
-        scalar = float(value)
-        if not math.isfinite(scalar):
-            raise ValueError("Reduced values must be finite")
-        return scalar
-
-    @staticmethod
-    def _validated_weight(weight: Any) -> float:
-        scalar = SingleProcessStrategy._validated_scalar(weight)
-        if scalar < 0:
-            raise ValueError("Reduction weight must be non-negative")
-        return scalar
-
-    @classmethod
-    def _validated_scalar_mapping(
-        cls,
-        values: Mapping[str, Any],
-    ) -> dict[str, float]:
-        if not isinstance(values, Mapping):
-            raise TypeError("values must be a mapping")
-        result: dict[str, float] = {}
-        for key, value in values.items():
-            if not isinstance(key, str) or not key:
-                raise ValueError("Reduced scalar names must be non-empty strings")
-            result[key] = cls._validated_scalar(value)
-        return result
-
-    @classmethod
-    def _prepare_metrics(
-        cls,
-        metrics: Mapping[str, Any],
-        sample_count: int,
-        reward_values: Any | None,
-    ) -> tuple[dict[str, float], dict[str, str], int, list[float] | None]:
-        if not isinstance(metrics, Mapping):
-            raise TypeError("metrics must be a mapping")
-        scalars: dict[str, float] = {}
-        for key, value in metrics.items():
-            if not isinstance(key, str) or not key:
-                raise ValueError("Metric names must be non-empty strings")
-            if isinstance(value, torch.Tensor) and value.numel() == 1:
-                value = value.detach().item()
-            if isinstance(value, bool):
-                if key in {"reward_mean", "reward_std"}:
-                    raise TypeError(f"Metric {key!r} must be a real scalar")
-                scalars[key] = float(value)
-            else:
-                scalars[key] = cls._validated_scalar(value)
-        if isinstance(sample_count, bool) or not isinstance(sample_count, int):
-            raise TypeError("sample_count must be an integer")
-        if sample_count < 0:
-            raise ValueError("sample_count must be non-negative")
-
-        kinds: dict[str, str] = {}
-        for key, value in metrics.items():
-            if isinstance(value, torch.Tensor) and value.numel() == 1:
-                value = value.detach().item()
-            if isinstance(value, bool):
-                kinds[key] = "bool_and"
-            elif (
-                key == "count"
-                or key.endswith("_count")
-                or key.endswith(_COUNT_METRIC_SUFFIXES)
-            ):
-                if scalars[key] < 0:
-                    raise ValueError(f"Count metric {key!r} must be non-negative")
-                kinds[key] = "sum"
-            elif (
-                key == "time"
-                or key.endswith("_time")
-                or key.endswith("_time_s")
-                or ("latency" in key and key.endswith("_s"))
-                or key.endswith("_abs_max")
-                or (key.startswith("peak_") and key.endswith("_bytes"))
-            ):
-                kinds[key] = "max"
-            else:
-                kinds[key] = "mean"
-
-        rewards = cls._validated_reward_values(reward_values)
-        if rewards:
-            cls._reward_moments(rewards)
-        reward_keys = {"reward_mean", "reward_std"}.intersection(scalars)
-        if reward_keys and rewards is None:
-            names = ", ".join(sorted(reward_keys))
-            raise ValueError(f"{names} require reward_values for global reduction")
-        return scalars, kinds, sample_count, rewards
-
-    @staticmethod
-    def _metric_contract_from_prepared(
-        scalars: Mapping[str, float],
-        kinds: Mapping[str, str],
-        rewards: list[float] | None,
-    ) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...], bool]:
-        return (
-            tuple(sorted(scalars)),
-            tuple(sorted(kinds.items())),
-            rewards is not None,
-        )
-
-    @classmethod
-    def _validated_reward_values(cls, values: Any | None) -> list[float] | None:
-        if values is None:
-            return None
-        if isinstance(values, torch.Tensor):
-            values = values.detach().reshape(-1).tolist()
-        elif isinstance(values, (str, bytes, Mapping)):
-            raise TypeError("reward_values must be an iterable of real scalars")
-        else:
-            try:
-                values = list(values)
-            except TypeError as error:
+    def _prepare_metric_contributions(
+        contributions: Mapping[str, MetricContribution],
+    ) -> tuple[tuple[str, float, int | None], ...]:
+        if not isinstance(contributions, Mapping):
+            raise TypeError("metric contributions must be a mapping")
+        prepared: list[tuple[str, float, int | None]] = []
+        for name in sorted(contributions):
+            value = contributions[name]
+            if not isinstance(name, str) or not name:
+                raise ValueError("metric names must be non-empty strings")
+            if not isinstance(value, MetricContribution):
                 raise TypeError(
-                    "reward_values must be an iterable of real scalars"
-                ) from error
-        return [cls._validated_scalar(value) for value in values]
+                    "metric mappings must contain MetricContribution values"
+                )
+            numerator = float(value.numerator.detach().cpu())
+            if not math.isfinite(numerator):
+                raise ValueError("metric numerator must be finite")
+            prepared.append((name, numerator, value.denominator))
+        return tuple(prepared)
 
     @staticmethod
-    def _reward_moments(values: list[float]) -> dict[str, float]:
-        if not values:
-            raise ValueError("Global reward_values must not be empty")
-        total = math.fsum(values)
-        total_squared = math.fsum(value * value for value in values)
-        if not math.isfinite(total) or not math.isfinite(total_squared):
-            raise ValueError("Reward moments must be finite")
-        mean = total / len(values)
-        variance = max(total_squared / len(values) - mean * mean, 0.0)
-        return {"reward_mean": mean, "reward_std": math.sqrt(variance)}
+    def _reward_values(rewards: RewardBatch) -> tuple[float, ...]:
+        if not isinstance(rewards, RewardBatch):
+            raise TypeError("rewards must be a RewardBatch")
+        values = tuple(
+            float(value)
+            for value in rewards.weighted_total.detach().cpu().tolist()
+        )
+        if not values or any(not math.isfinite(value) for value in values):
+            raise ValueError("reward metrics require finite non-empty values")
+        return values
+
+    @staticmethod
+    def _validate_optimizer_boundary(
+        operation: Any,
+        *,
+        parameters: Any,
+        optimizer: Any,
+        scaler: Any | None,
+    ) -> None:
+        if not callable(operation):
+            raise TypeError("optimizer step operation must be callable")
+        if type(parameters) is not tuple or not parameters:
+            raise TypeError("parameters must be a non-empty tuple")
+        if any(not isinstance(item, torch.nn.Parameter) for item in parameters):
+            raise TypeError("parameters must contain only torch.nn.Parameter")
+        identities = tuple(id(item) for item in parameters)
+        if len(identities) != len(set(identities)):
+            raise ValueError("parameters must have unique identities")
+        if not isinstance(optimizer, torch.optim.AdamW):
+            raise TypeError("optimizer must be torch.optim.AdamW")
+        optimizer_ids = tuple(
+            id(parameter)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
+        if optimizer_ids != identities:
+            raise ValueError(
+                "optimizer parameter identity/order must match parameters"
+            )
+        if scaler is not None:
+            required = (
+                "scale",
+                "unscale_",
+                "step",
+                "update",
+                "state_dict",
+                "load_state_dict",
+            )
+            if any(not callable(getattr(scaler, name, None)) for name in required):
+                raise TypeError("scaler must implement the GradScaler contract")
 
     def _validate_rank(self, rank: int, *, name: str) -> None:
-        self._require_open()
-        if isinstance(rank, bool) or not isinstance(rank, int):
-            raise TypeError(f"{name} must be an integer rank")
-        if rank < 0 or rank >= self.context.world_size:
-            raise ValueError(f"{name} must identify a rank in the process group")
-
-    @staticmethod
-    def _failure_message(failures: list[tuple[int, BaseException]]) -> str:
-        details = "; ".join(
-            f"rank {rank}: {type(error).__name__}: {error}" for rank, error in failures
-        )
-        return "Distributed step failed: " + details
+        if type(rank) is not int or not 0 <= rank < self.world_size:
+            raise ValueError(
+                f"{name} must satisfy 0 <= {name} < {self.world_size}"
+            )
 
 
 class DDPStrategy(SingleProcessStrategy):
-    """Native DDP strategy wrapping adapter recomputation through a facade."""
+    """Two-rank single-node DDP implementation of the same Strategy contract."""
 
     def __init__(
         self,
         context: DistributedContext,
         *,
-        timeout_s: float = 30.0,
-        max_snapshot_tensor_bytes: int | None = (
-            DEFAULT_MAX_ROLLBACK_SNAPSHOT_TENSOR_BYTES
-        ),
+        timeout_s: float,
+        max_snapshot_tensor_bytes: int | None,
+        master_addr: str | None,
+        master_port: int | None,
     ) -> None:
-        if not context.is_distributed:
+        if not isinstance(context, DistributedContext) or not context.is_distributed:
             raise ValueError("DDPStrategy requires WORLD_SIZE greater than 1")
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, Real):
             raise TypeError("timeout_s must be a positive number")
         if not math.isfinite(float(timeout_s)) or float(timeout_s) <= 0:
             raise ValueError("timeout_s must be a positive finite number")
         if max_snapshot_tensor_bytes is not None and (
-            isinstance(max_snapshot_tensor_bytes, bool)
-            or not isinstance(max_snapshot_tensor_bytes, int)
+            type(max_snapshot_tensor_bytes) is not int
+            or max_snapshot_tensor_bytes <= 0
         ):
-            raise TypeError(
+            raise ValueError(
                 "max_snapshot_tensor_bytes must be a positive integer or None"
             )
-        if max_snapshot_tensor_bytes is not None and max_snapshot_tensor_bytes <= 0:
-            raise ValueError("max_snapshot_tensor_bytes must be positive")
-
-        self.context = context
-        self.timeout_s = float(timeout_s)
-        self.max_snapshot_tensor_bytes = max_snapshot_tensor_bytes
-        self._last_atomic_snapshot_metrics: dict[str, int | float] | None = None
+        if not isinstance(master_addr, str) or not master_addr:
+            raise ValueError("DDPStrategy requires a validated master_addr")
+        if type(master_port) is not int or not 1 <= master_port <= 65535:
+            raise ValueError("DDPStrategy requires a validated master_port")
+        self._context = context
+        self._timeout_s = float(timeout_s)
+        self._max_snapshot_tensor_bytes = max_snapshot_tensor_bytes
+        host = (
+            f"[{master_addr}]"
+            if ":" in master_addr and not master_addr.startswith("[")
+            else master_addr
+        )
+        self._init_method = f"tcp://{host}:{master_port}"
         self._adapter: Any | None = None
         self._facade: _AdapterRecomputeFacade | None = None
         self._ddp: DistributedDataParallel | None = None
-        self._setup = False
+        self._setup_complete = False
         self._closed = False
         self._owns_process_group = False
 
-    @property
-    def module(self) -> DistributedDataParallel | None:
-        return self._ddp
-
-    @property
-    def last_atomic_snapshot_metrics(self) -> dict[str, int | float] | None:
-        if self._last_atomic_snapshot_metrics is None:
-            return None
-        return dict(self._last_atomic_snapshot_metrics)
-
-    def setup(self) -> DDPStrategy:
+    def _setup(self) -> None:
         self._require_open()
-        if self._setup:
-            return self
         if not dist.is_available():
             raise RuntimeError("torch.distributed is unavailable")
-        if self.context.backend == "gloo" and not dist.is_gloo_available():
+        if self.backend == "gloo" and not dist.is_gloo_available():
             raise RuntimeError("PyTorch was built without the gloo backend")
-        if self.context.backend == "nccl" and not dist.is_nccl_available():
+        if self.backend == "nccl" and not dist.is_nccl_available():
             raise RuntimeError("PyTorch was built without the NCCL backend")
-
-        if self.context.device.type == "cuda":
-            torch.cuda.set_device(self.context.device)
-
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         if dist.is_initialized():
             raise RuntimeError(
                 "VisualRL requires ownership of an uninitialized process group"
             )
-        if self.context.backend is None:
+        if self.backend is None:
             raise RuntimeError("DDP strategy requires a process-group backend")
         dist.init_process_group(
-            backend=self.context.backend,
-            rank=self.context.rank,
-            world_size=self.context.world_size,
-            timeout=timedelta(seconds=self.timeout_s),
+            backend=self.backend,
+            init_method=self._init_method,
+            rank=self.rank,
+            world_size=self.world_size,
+            timeout=timedelta(seconds=self._timeout_s),
         )
         self._owns_process_group = True
-        self._setup = True
-        return self
+        self._setup_complete = True
 
     def prepare(self, adapter: Any) -> Any:
         self._require_open()
-        if not self._setup:
+        if not self._setup_complete:
             raise RuntimeError("Strategy must be set up before prepare()")
         if self._adapter is not None:
             if self._adapter is not adapter:
                 raise RuntimeError("Strategy is already prepared with another adapter")
             return adapter
-
         train_module: torch.nn.Module | None = None
-        local_error: BaseException | None = None
+        error: BaseException | None = None
         try:
             train_module = self._validate_adapter(adapter)
             self._validate_module_device(train_module)
         except BaseException as exc:
-            local_error = exc
-        self.synchronize_failure(local_error)
+            error = exc
+        self.failure_gate("strategy.prepare", error)
         if train_module is None:
             raise RuntimeError("distributed adapter preflight lost local state")
-
         facade = _AdapterRecomputeFacade(adapter, train_module)
-        ddp_kwargs: dict[str, Any] = {}
-        if self.context.device.type == "cuda":
-            ddp_kwargs.update(
-                device_ids=[self.context.local_rank],
-                output_device=self.context.local_rank,
+        # Model/base buffers are constructed from the same validated config on
+        # every rank.  Disabling per-forward buffer broadcasts keeps ordinary
+        # adapter forward/validation failures eligible for the pre-backward
+        # failure gate; the only update-time reducer collective is backward.
+        kwargs: dict[str, Any] = {"broadcast_buffers": False}
+        if self.device.type == "cuda":
+            kwargs.update(
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
             )
-        self._facade = facade
-        self._ddp = DistributedDataParallel(facade, **ddp_kwargs)
+        try:
+            self._facade = facade
+            self._ddp = DistributedDataParallel(facade, **kwargs)
+        except BaseException as exc:
+            raise _ProcessGroupFatalError(
+                "DDP construction failed"
+            ) from exc
         self._adapter = adapter
         return adapter
 
@@ -966,6 +781,7 @@ class DDPStrategy(SingleProcessStrategy):
     ) -> PolicyRecomputeStats:
         self._require_prepared()
         self._validate_recompute_request(batch, require_reference)
+        assert self._ddp is not None
         stats = self._ddp(
             batch,
             require_reference=require_reference,
@@ -977,609 +793,266 @@ class DDPStrategy(SingleProcessStrategy):
         )
 
     def gradient_sync_context(self, synchronize_gradients: bool):
-        """Suppress DDP reductions until the final contributing microbatch."""
-
         self._require_prepared()
         if not isinstance(synchronize_gradients, bool):
             raise TypeError("synchronize_gradients must be a bool")
-        if synchronize_gradients:
-            return nullcontext()
-        return self._ddp.no_sync()
-
-    def reduce_weighted_mean(self, value: Any, weight: Any) -> float:
-        self._require_collectives_ready()
-        validated: tuple[float, float] | None = None
-        local_error: BaseException | None = None
-        try:
-            validated = self._validated_scalar_and_weight(value, weight)
-        except BaseException as exc:
-            local_error = exc
-        self.synchronize_failure(local_error)
-        if validated is None:
-            raise RuntimeError("distributed scalar preflight lost local state")
-        scalar, scalar_weight = validated
-        reduced = torch.tensor(
-            [scalar * scalar_weight, scalar_weight],
-            dtype=torch.float64,
-            device=self.context.device,
+        assert self._ddp is not None
+        return (
+            _FinalGradientSyncContext()
+            if synchronize_gradients
+            else self._ddp.no_sync()
         )
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-        denominator = float(reduced[1].item())
-        if denominator <= 0:
-            raise ValueError("Global reduction weight must be positive")
-        return float((reduced[0] / reduced[1]).item())
+
+    def sum_active_transition_count(self, local_count: int) -> int:
+        count = _positive_count(
+            local_count,
+            name="local active transition count",
+        )
+        reduced = torch.tensor(count, dtype=torch.int64, device=self.device)
+        self._all_reduce(reduced, operation="active-count SUM")
+        result = int(reduced.item())
+        if result <= 0:
+            raise DistributedFailureError(
+                "global active transition count must be positive"
+            )
+        return result
 
     def reduce_tensor_weighted_mean(
         self,
         value: torch.Tensor,
         weight: int,
     ) -> torch.Tensor:
-        """Reduce a scalar tensor mean while preserving reference arithmetic."""
-
-        self._require_collectives_ready()
-        validated: tuple[torch.Tensor, int] | None = None
-        local_error: BaseException | None = None
+        prepared: tuple[torch.Tensor, int] | None = None
+        error: BaseException | None = None
         try:
-            validated = self._validated_tensor_mean_and_weight(value, weight)
-            if validated[0].device != self.context.device:
-                raise ValueError(
-                    "Reduced tensor mean must be on the distributed context device"
-                )
+            prepared = self._validated_tensor_mean_and_weight(value, weight)
         except BaseException as exc:
-            local_error = exc
-        self.synchronize_failure(local_error)
-        if validated is None:
-            raise RuntimeError("distributed tensor reduction preflight lost local state")
-
-        scalar, scalar_weight = validated
-        local_contract = (
-            str(scalar.dtype),
-            scalar.device.type,
-            scalar.device.index,
-            scalar_weight,
-        )
-        contracts: list[tuple[str, str, int | None, int] | None] = [
-            None
-        ] * self.context.world_size
-        dist.all_gather_object(contracts, local_contract)
-        tensor_contracts = [contract[:3] for contract in contracts if contract]
-        if len(tensor_contracts) != self.context.world_size or any(
-            contract != tensor_contracts[0]
-            for contract in tensor_contracts[1:]
-        ):
-            raise ValueError(
-                "Reduced tensor dtype and device must match on every rank"
-            )
-        weights = [contract[3] for contract in contracts if contract]
-        if len(weights) != self.context.world_size:
-            raise RuntimeError("distributed tensor reduction contract was incomplete")
-
-        reduced = scalar.clone()
-        if all(item == weights[0] for item in weights[1:]):
-            # This is the published reference path: reduce each rank-local mean,
-            # then divide by world size in the coefficient tensor's dtype.
-            dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-            reduced.div_(self.context.world_size)
-        else:
-            # Uneven rank batches are a VisualRL extension: preserve the tensor
-            # dtype/device while using the true global sample-weighted mean.
-            numerator_and_count = torch.stack(
-                (
-                    reduced * scalar_weight,
-                    reduced.new_tensor(scalar_weight),
-                )
-            )
-            dist.all_reduce(numerator_and_count, op=dist.ReduceOp.SUM)
-            if not bool(torch.isfinite(numerator_and_count).all().item()):
-                raise ValueError("Reduced tensor sum/count must be finite")
-            if not bool((numerator_and_count[1] > 0).item()):
-                raise ValueError("Global tensor reduction weight must be positive")
-            reduced = numerator_and_count[0] / numerator_and_count[1]
-        if not bool(torch.isfinite(reduced).item()):
-            raise ValueError("Reduced tensor mean must be finite")
-        return reduced.detach()
-
-    def reduce_weighted_scalars(
-        self,
-        values: Mapping[str, Any],
-        weight: Any,
-    ) -> dict[str, float]:
-        self._require_collectives_ready()
-        validated: tuple[dict[str, float], float] | None = None
-        local_error: BaseException | None = None
-        try:
-            validated = (
-                self._validated_scalar_mapping(values),
-                self._validated_weight(weight),
-            )
-        except BaseException as exc:
-            local_error = exc
-        self.synchronize_failure(local_error)
-        if validated is None:
-            raise RuntimeError("distributed scalar mapping preflight lost local state")
-        scalars, scalar_weight = validated
-        key_sets: list[list[str]] = [None] * self.context.world_size  # type: ignore[list-item]
-        dist.all_gather_object(key_sets, sorted(scalars))
-        if any(keys != key_sets[0] for keys in key_sets[1:]):
-            raise ValueError("Reduced scalar keys must match on every rank")
-        keys = key_sets[0]
-        reduced = torch.tensor(
-            [*(scalars[key] * scalar_weight for key in keys), scalar_weight],
-            dtype=torch.float64,
-            device=self.context.device,
-        )
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-        denominator = float(reduced[-1].item())
-        if denominator <= 0:
-            raise ValueError("Global reduction weight must be positive")
-        return {
-            key: float((reduced[index] / reduced[-1]).item())
-            for index, key in enumerate(keys)
-        }
-
-    def reduce_metrics(
-        self,
-        metrics: Mapping[str, Any],
-        sample_count: int,
-        reward_values: Any | None = None,
-    ) -> dict[str, float | bool]:
-        self._require_collectives_ready()
-        prepared: (
-            tuple[
-                dict[str, float],
-                dict[str, str],
-                int,
-                list[float] | None,
-            ]
-            | None
-        ) = None
-        local_error: tuple[str, str] | None = None
-        try:
-            prepared = self._prepare_metrics(metrics, sample_count, reward_values)
-        except BaseException as error:
-            local_error = (type(error).__name__, str(error))
-
-        local_contract = None
-        if prepared is not None:
-            scalars, kinds, _, rewards = prepared
-            local_contract = self._metric_contract_from_prepared(
-                scalars,
-                kinds,
-                rewards,
-            )
-        local_state = (local_error, local_contract)
-        gathered_states: list[Any] = [None] * self.context.world_size
-        dist.all_gather_object(gathered_states, local_state)
-
-        errors = [
-            (rank, state[0])
-            for rank, state in enumerate(gathered_states)
-            if state[0] is not None
-        ]
-        if errors:
-            details = "; ".join(
-                f"rank {rank}: {name}: {message}" for rank, (name, message) in errors
-            )
-            raise ValueError("Invalid distributed metrics: " + details)
-
-        contracts = [state[1] for state in gathered_states]
-        if any(contract != contracts[0] for contract in contracts[1:]):
-            raise ValueError(
-                "Metric keys, reduction kinds, and reward_values presence must "
-                "match on every rank"
-            )
+            error = exc
+        self.failure_gate("tensor_weighted_mean.validate", error)
         if prepared is None:
-            raise RuntimeError("Distributed metric validation lost local state")
-
-        scalars, kinds, count, rewards = prepared
-        mean_keys = sorted(key for key, kind in kinds.items() if kind == "mean")
-        sum_keys = sorted(key for key, kind in kinds.items() if kind == "sum")
-        max_keys = sorted(key for key, kind in kinds.items() if kind == "max")
-        bool_keys = sorted(key for key, kind in kinds.items() if kind == "bool_and")
-        reserved = {"reward_mean", "reward_std"} if rewards is not None else set()
-        mean_keys = [key for key in mean_keys if key not in reserved]
-
-        sum_values = [scalars[key] * count for key in mean_keys]
-        sum_values.extend(scalars[key] for key in sum_keys)
-        if mean_keys:
-            sum_values.append(float(count))
-        if rewards is not None:
-            try:
-                reward_sum = math.fsum(rewards)
-                reward_sum_squared = math.fsum(value * value for value in rewards)
-            except OverflowError as error:
-                raise ValueError("Reward moments must be finite") from error
-            sum_values.extend((reward_sum, reward_sum_squared, float(len(rewards))))
-
-        result: dict[str, float | bool] = {}
-        if sum_values:
-            reduced_sums = torch.tensor(
-                sum_values,
-                dtype=torch.float64,
-                device=self.context.device,
+            raise RuntimeError("tensor reduction preflight lost local state")
+        scalar, count = prepared
+        reduced = torch.stack(
+            (
+                scalar.to(device=self.device) * count,
+                torch.tensor(
+                    float(count),
+                    device=self.device,
+                    dtype=scalar.dtype,
+                ),
             )
-            dist.all_reduce(reduced_sums, op=dist.ReduceOp.SUM)
-            if not bool(torch.isfinite(reduced_sums).all().item()):
-                raise ValueError("Reduced metric sums must be finite")
+        )
+        self._all_reduce(reduced, operation="tensor weighted mean")
+        if not bool(torch.isfinite(reduced).all()) or float(reduced[1]) <= 0:
+            raise DistributedFailureError(
+                "global tensor weighted mean is invalid"
+            )
+        return (reduced[0] / reduced[1]).to(
+            device=value.device,
+            dtype=value.dtype,
+        )
 
-            offset = 0
-            mean_numerators = reduced_sums[offset : offset + len(mean_keys)]
-            offset += len(mean_keys)
-            for key, value in zip(
-                sum_keys,
-                reduced_sums[offset : offset + len(sum_keys)],
-                strict=True,
-            ):
-                result[key] = float(value.item())
-            offset += len(sum_keys)
-            if mean_keys:
-                total_count = float(reduced_sums[offset].item())
-                offset += 1
-                if total_count <= 0:
-                    raise ValueError(
-                        "Global sample_count must be positive for mean metrics"
+    def reduce_metric_contributions(
+        self,
+        contributions: Mapping[str, MetricContribution],
+    ) -> dict[str, float]:
+        prepared: tuple[tuple[str, float, int | None], ...] | None = None
+        error: BaseException | None = None
+        try:
+            prepared = self._prepare_metric_contributions(contributions)
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("metric_contributions.validate", error)
+        if prepared is None:
+            raise RuntimeError("metric contribution preflight lost local state")
+        contract = tuple(
+            (name, denominator is None)
+            for name, _numerator, denominator in prepared
+        )
+        contracts = self._all_gather_object(
+            contract,
+            operation="metric contribution contract",
+        )
+        if any(item != contracts[0] for item in contracts[1:]):
+            raise DistributedFailureError(
+                "metric contribution keys/modes differ across ranks"
+            )
+        packed: list[float] = []
+        for _name, numerator, denominator in prepared:
+            packed.extend(
+                (
+                    numerator,
+                    0.0 if denominator is None else float(denominator),
+                )
+            )
+        reduced = torch.tensor(packed, dtype=torch.float64, device=self.device)
+        self._all_reduce(reduced, operation="metric contribution SUM")
+        if not bool(torch.isfinite(reduced).all()):
+            raise DistributedFailureError(
+                "reduced metric contributions must be finite"
+            )
+        result: dict[str, float] = {}
+        for index, (name, _numerator, denominator) in enumerate(prepared):
+            numerator_sum = float(reduced[2 * index].item())
+            denominator_sum = float(reduced[2 * index + 1].item())
+            if denominator is None:
+                result[name] = numerator_sum
+            else:
+                if denominator_sum <= 0:
+                    raise DistributedFailureError(
+                        f"metric {name!r} has non-positive global denominator"
                     )
-                for key, value in zip(mean_keys, mean_numerators, strict=True):
-                    result[key] = float(value.item() / total_count)
-            if rewards is not None:
-                reward_sum, reward_sum_squared, reward_count = (
-                    float(value.item()) for value in reduced_sums[offset : offset + 3]
-                )
-                if reward_count <= 0:
-                    raise ValueError("Global reward_values must not be empty")
-                reward_mean = reward_sum / reward_count
-                reward_variance = max(
-                    reward_sum_squared / reward_count - reward_mean * reward_mean,
-                    0.0,
-                )
-                result.update(
-                    reward_mean=reward_mean,
-                    reward_std=math.sqrt(reward_variance),
-                )
+                result[name] = numerator_sum / denominator_sum
+        return result
 
-        if max_keys:
-            reduced_maxima = torch.tensor(
-                [scalars[key] for key in max_keys],
+    def reduce_reward_metrics(self, rewards: RewardBatch) -> dict[str, float]:
+        values: tuple[float, ...] | None = None
+        error: BaseException | None = None
+        try:
+            values = self._reward_values(rewards)
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("reward_metrics.validate", error)
+        if values is None:
+            raise RuntimeError("reward metric preflight lost local state")
+        try:
+            packed = torch.tensor(
+                (
+                    math.fsum(values),
+                    math.fsum(value * value for value in values),
+                    float(len(values)),
+                ),
                 dtype=torch.float64,
-                device=self.context.device,
+                device=self.device,
             )
-            dist.all_reduce(reduced_maxima, op=dist.ReduceOp.MAX)
-            if not bool(torch.isfinite(reduced_maxima).all().item()):
-                raise ValueError("Reduced metric maxima must be finite")
-            result.update(
-                (key, float(value.item()))
-                for key, value in zip(max_keys, reduced_maxima, strict=True)
-            )
-
-        if bool_keys:
-            reduced_booleans = torch.tensor(
-                [int(bool(scalars[key])) for key in bool_keys],
-                dtype=torch.int32,
-                device=self.context.device,
-            )
-            dist.all_reduce(reduced_booleans, op=dist.ReduceOp.MIN)
-            result.update(
-                (key, bool(value.item()))
-                for key, value in zip(bool_keys, reduced_booleans, strict=True)
-            )
-        return {key: result[key] for key in sorted(result)}
-
-    def broadcast_object(self, value: Any, *, src: int = 0) -> Any:
-        self._require_collectives_ready()
-        self._synchronize_object_collective_contract(
-            operation="broadcast",
-            root=src,
-            root_name="src",
+        except (OverflowError, RuntimeError, ValueError) as exc:
+            self.failure_gate("reward_metrics.pack", exc)
+            raise AssertionError("failure gate returned") from exc
+        self._all_reduce(packed, operation="reward moment SUM")
+        total, squared, count = (
+            float(value.item()) for value in packed
         )
-        self._preflight_object(
-            value if self.context.rank == src else None,
-            operation="broadcast",
-        )
-        payload = [value if self.context.rank == src else None]
-        dist.broadcast_object_list(payload, src=src)
-        return payload[0]
-
-    def gather_object(self, value: Any, *, dst: int = 0) -> list[Any] | None:
-        """Gather small metadata objects; media remains in rank-local artifacts."""
-
-        self._require_collectives_ready()
-        self._synchronize_object_collective_contract(
-            operation="gather",
-            root=dst,
-            root_name="dst",
-        )
-        self._preflight_object(value, operation="gather")
-        gathered = (
-            [None] * self.context.world_size if self.context.rank == dst else None
-        )
-        dist.gather_object(value, gathered, dst=dst)
-        return gathered
-
-    def barrier(self) -> None:
-        self._require_collectives_ready()
-        dist.barrier()
-
-    def synchronize_failure(self, failure: bool | BaseException | None) -> bool:
-        self._require_collectives_ready()
-        if not isinstance(failure, (bool, BaseException)) and failure is not None:
-            raise TypeError("failure must be bool, an exception, or None")
-
-        if isinstance(failure, bool):
-            failed = torch.tensor(
-                int(failure),
-                dtype=torch.int32,
-                device=self.context.device,
-            )
-            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-            return bool(failed.item())
-
-        failures = self._gather_failure_details(failure)
-        if failures:
-            error = DistributedFailureError(
-                self._format_failure_details("Distributed step failed", failures)
-            )
-            if failure is not None:
-                raise error from failure
-            raise error
-        return False
+        if not all(math.isfinite(value) for value in (total, squared, count)):
+            raise DistributedFailureError("global reward moments must be finite")
+        if count <= 0:
+            raise DistributedFailureError("global reward count must be positive")
+        mean = total / count
+        variance = max(squared / count - mean * mean, 0.0)
+        return {"reward_mean": mean, "reward_std": math.sqrt(variance)}
 
     def atomic_optimizer_step(
         self,
-        operation: Any,
+        operation: Callable[[], None],
         *,
-        parameters: list[torch.nn.Parameter],
-        optimizer: Any,
-        scaler: Any | None = None,
-        stateful: Any | None = None,
-        validate_result: Any | None = None,
-    ) -> Any:
-        """Run and coordinate a catchable optimizer update with rollback.
-
-        Snapshots exist only on the distributed path. A hard process death or a
-        failed process-group collective cannot be rolled back; recovery then resumes
-        from the last authoritative artifact commit marker.  When supplied,
-        ``validate_result`` must be local-only and return a small canonical,
-        pickleable contract.  Validation failures and cross-rank contract mismatches
-        are rolled back inside the same snapshot boundary as the optimizer call.
-        """
-
-        self._require_collectives_ready()
-        callable_error: BaseException | None = None
-        if not callable(operation):
-            callable_error = TypeError("optimizer step operation must be callable")
-        elif validate_result is not None and not callable(validate_result):
-            callable_error = TypeError(
-                "optimizer result validator must be callable or None"
+        parameters: tuple[torch.nn.Parameter, ...],
+        optimizer: torch.optim.AdamW,
+        scaler: Any | None,
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            self._validate_optimizer_boundary(
+                operation,
+                parameters=parameters,
+                optimizer=optimizer,
+                scaler=scaler,
             )
-        self.synchronize_failure(callable_error)
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("optimizer_boundary.validate", error)
 
-        validator_presence: list[bool] = [False] * self.context.world_size
-        dist.all_gather_object(validator_presence, validate_result is not None)
-        if any(value != validator_presence[0] for value in validator_presence[1:]):
-            self.synchronize_failure(
-                ValueError(
-                    "optimizer result validator presence must match on every rank"
-                )
-            )
-
-        self._last_atomic_snapshot_metrics = None
         snapshot: _OptimizerStepSnapshot | None = None
-        snapshot_error: BaseException | None = None
-        snapshot_started = perf_counter()
+        error = None
         try:
             snapshot = _OptimizerStepSnapshot.capture(
                 parameters,
                 optimizer,
                 scaler,
-                stateful,
-                self.max_snapshot_tensor_bytes,
+                max_tensor_bytes=self._max_snapshot_tensor_bytes,
             )
         except BaseException as exc:
-            snapshot_error = exc
-            if isinstance(exc, _SnapshotLimitError):
-                self._last_atomic_snapshot_metrics = dict(exc.metrics)
-        if snapshot is not None:
-            self._last_atomic_snapshot_metrics = dict(snapshot.metrics)
-        if self._last_atomic_snapshot_metrics is not None:
-            self._last_atomic_snapshot_metrics["capture_time_s"] = (
-                perf_counter() - snapshot_started
-            )
-        self.synchronize_failure(snapshot_error)
+            error = exc
+        self.failure_gate("optimizer_snapshot", error)
         if snapshot is None:
-            raise RuntimeError("optimizer rollback snapshot lost local state")
+            raise RuntimeError("optimizer snapshot preflight lost local state")
 
-        result: Any = None
-        step_error: BaseException | None = None
+        operation_error: BaseException | None = None
         try:
-            result = operation()
+            operation()
         except BaseException as exc:
-            step_error = exc
-
-        if self.synchronize_failure(step_error is not None):
-            self._rollback_atomic_failure(
-                snapshot,
-                optimizer,
-                scaler,
-                step_error,
-                failure_heading="Distributed step failed",
-                original_heading="update failure",
-            )
-
-        if validate_result is None:
-            return result
-
-        validation_error: BaseException | None = None
-        serialized_contract: bytes | None = None
-        try:
-            contract = validate_result(result)
-            serialized_contract = pickle.dumps(
-                contract,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        except BaseException as exc:
-            validation_error = exc
-
-        if self.synchronize_failure(validation_error is not None):
-            self._rollback_atomic_failure(
-                snapshot,
-                optimizer,
-                scaler,
-                validation_error,
-                failure_heading="Distributed optimizer result validation failed",
-                original_heading="result validation failure",
-            )
-        if serialized_contract is None:
-            raise RuntimeError("optimizer result validation lost its local contract")
-
-        contracts: list[bytes] = [b""] * self.context.world_size
-        dist.all_gather_object(contracts, serialized_contract)
-        if any(contract != contracts[0] for contract in contracts[1:]):
-            contract_error = ValueError(
-                "optimizer result contracts must match on every rank"
-            )
-            self._rollback_atomic_failure(
-                snapshot,
-                optimizer,
-                scaler,
-                contract_error,
-                failure_heading="Distributed optimizer result validation failed",
-                original_heading="result contract mismatch",
-            )
-        return result
-
-    def _rollback_atomic_failure(
-        self,
-        snapshot: _OptimizerStepSnapshot,
-        optimizer: Any,
-        scaler: Any | None,
-        failure: BaseException | None,
-        *,
-        failure_heading: str,
-        original_heading: str,
-    ) -> None:
-        failures = self._gather_failure_details(failure)
+            operation_error = exc
+        failures = self._synchronize_failure_details(
+            "optimizer_operation",
+            operation_error,
+        )
         if not failures:
-            raise RuntimeError("distributed optimizer failure lost its cause")
+            return
 
         restore_error: BaseException | None = None
-        restore_started = perf_counter()
         try:
             snapshot.restore(optimizer, scaler)
         except BaseException as exc:
             restore_error = exc
-        if self._last_atomic_snapshot_metrics is not None:
-            self._last_atomic_snapshot_metrics["restore_time_s"] = (
-                perf_counter() - restore_started
+        message = self._format_failures(
+            "Distributed optimizer operation failed",
+            failures,
+        )
+        if restore_error is not None:
+            message += (
+                "; local rollback failed: "
+                f"{type(restore_error).__name__}: {restore_error}"
             )
-        restore_failures = self._gather_failure_details(restore_error)
-        if restore_failures:
-            message = self._format_failure_details(
-                "Distributed optimizer rollback failed",
-                restore_failures,
-            )
-            message += "; original " + self._format_failure_details(
-                original_heading,
+        error = DistributedFailureError(message)
+        cause = restore_error if restore_error is not None else operation_error
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    def gather_object(self, value: Any, *, dst: int = 0) -> list[Any] | None:
+        self._require_collectives_ready()
+        self._object_collective_contract("gather", dst, "dst")
+        self._preflight_object(value, operation="gather")
+        gathered = [None] * self.world_size if self.rank == dst else None
+        try:
+            dist.gather_object(value, gathered, dst=dst)
+        except BaseException as exc:
+            raise _ProcessGroupFatalError(
+                "distributed gather_object failed"
+            ) from exc
+        return gathered
+
+    def broadcast_object(self, value: Any, *, src: int = 0) -> Any:
+        self._require_collectives_ready()
+        self._object_collective_contract("broadcast", src, "src")
+        self._preflight_object(
+            value if self.rank == src else None,
+            operation="broadcast",
+        )
+        payload = [value if self.rank == src else None]
+        try:
+            dist.broadcast_object_list(payload, src=src)
+        except BaseException as exc:
+            raise _ProcessGroupFatalError(
+                "distributed broadcast_object failed"
+            ) from exc
+        return payload[0]
+
+    def failure_gate(
+        self,
+        phase: str,
+        failure: BaseException | None,
+    ) -> None:
+        failures = self._synchronize_failure_details(phase, failure)
+        if not failures:
+            return
+        error = DistributedFailureError(
+            self._format_failures(
+                f"Distributed phase {phase!r} failed",
                 failures,
             )
-            error = DistributedFailureError(message)
-            cause = restore_error if restore_error is not None else failure
-            if cause is not None:
-                raise error from cause
-            raise error
-
-        error = DistributedFailureError(
-            self._format_failure_details(failure_heading, failures)
         )
         if failure is not None:
             raise error from failure
         raise error
-
-    def _gather_failure_details(
-        self,
-        failure: BaseException | None,
-    ) -> list[tuple[int, str, str]]:
-        local = None if failure is None else (type(failure).__name__, str(failure))
-        gathered: list[tuple[str, str] | None] = [None] * self.context.world_size
-        dist.all_gather_object(gathered, local)
-        return [
-            (rank, name, message)
-            for rank, item in enumerate(gathered)
-            if item is not None
-            for name, message in [item]
-        ]
-
-    @staticmethod
-    def _format_failure_details(
-        prefix: str,
-        failures: list[tuple[int, str, str]],
-    ) -> str:
-        details = "; ".join(
-            f"rank {rank}: {name}: {message}" for rank, name, message in failures
-        )
-        return f"{prefix}: {details}"
-
-    def _synchronize_object_collective_contract(
-        self,
-        *,
-        operation: str,
-        root: Any,
-        root_name: str,
-    ) -> None:
-        local_error: BaseException | None = None
-        try:
-            self._validate_rank(root, name=root_name)
-        except BaseException as exc:
-            local_error = exc
-
-        local_state = (
-            operation,
-            root_name,
-            int(root) if local_error is None else None,
-            (
-                None
-                if local_error is None
-                else (type(local_error).__name__, str(local_error))
-            ),
-        )
-        gathered_states: list[Any] = [None] * self.context.world_size
-        dist.all_gather_object(gathered_states, local_state)
-
-        invalid = [
-            (rank, state[3])
-            for rank, state in enumerate(gathered_states)
-            if state[3] is not None
-        ]
-        if invalid:
-            details = "; ".join(
-                f"rank {rank}: {name}: {message}" for rank, (name, message) in invalid
-            )
-            error = DistributedFailureError(
-                "Invalid distributed object collective root: " + details
-            )
-            if local_error is not None:
-                raise error from local_error
-            raise error
-
-        contracts = [state[:3] for state in gathered_states]
-        if any(contract != contracts[0] for contract in contracts[1:]):
-            details = "; ".join(
-                f"rank {rank}: {state[0]}({state[1]}={state[2]})"
-                for rank, state in enumerate(gathered_states)
-            )
-            raise DistributedFailureError(
-                "Distributed object collective operation and root rank must match "
-                f"on every rank: {details}"
-            )
-
-    def _preflight_object(self, value: Any, *, operation: str) -> None:
-        local_error: BaseException | None = None
-        try:
-            pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        except BaseException as exc:
-            local_error = TypeError(
-                f"distributed {operation} object is not serializable: {exc}"
-            )
-        self.synchronize_failure(local_error)
 
     def close(self) -> None:
         if self._closed:
@@ -1594,18 +1067,136 @@ class DDPStrategy(SingleProcessStrategy):
 
     def _require_collectives_ready(self) -> None:
         self._require_open()
-        if not self._setup or not dist.is_initialized():
+        if not self._setup_complete or not dist.is_initialized():
             raise RuntimeError("DDP strategy must be set up before collectives")
 
     def _validate_module_device(self, module: torch.nn.Module) -> None:
-        tensors = [*module.parameters(), *module.buffers()]
-        mismatched = [
-            tensor.device for tensor in tensors if tensor.device != self.context.device
-        ]
+        tensors = (*module.parameters(), *module.buffers())
+        mismatched = tuple(
+            tensor.device for tensor in tensors if tensor.device != self.device
+        )
         if mismatched:
             raise ValueError(
-                f"adapter.train_module must already be on {self.context.device}; "
+                f"adapter.train_module must already be on {self.device}; "
                 f"found {mismatched[0]}"
             )
         if not any(parameter.requires_grad for parameter in module.parameters()):
             raise ValueError("adapter.train_module has no trainable parameters")
+
+    def _all_reduce(self, tensor: torch.Tensor, *, operation: str) -> None:
+        self._require_collectives_ready()
+        try:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        except BaseException as exc:
+            raise _ProcessGroupFatalError(
+                f"distributed {operation} failed"
+            ) from exc
+
+    def _all_gather_object(self, value: Any, *, operation: str) -> list[Any]:
+        self._require_collectives_ready()
+        gathered: list[Any] = [None] * self.world_size
+        try:
+            dist.all_gather_object(gathered, value)
+        except BaseException as exc:
+            raise _ProcessGroupFatalError(
+                f"distributed {operation} failed"
+            ) from exc
+        return gathered
+
+    def _synchronize_failure_details(
+        self,
+        phase: str,
+        failure: BaseException | None,
+    ) -> list[tuple[int, str, str]]:
+        _validate_phase_name(phase)
+        if failure is not None and not isinstance(failure, BaseException):
+            raise TypeError("failure must be an exception or None")
+        local = (
+            None
+            if failure is None
+            else (type(failure).__name__, str(failure))
+        )
+        gathered = self._all_gather_object(
+            local,
+            operation=f"failure gate {phase!r}",
+        )
+        return [
+            (rank, name, message)
+            for rank, item in enumerate(gathered)
+            if item is not None
+            for name, message in [item]
+        ]
+
+    @staticmethod
+    def _format_failures(
+        prefix: str,
+        failures: list[tuple[int, str, str]],
+    ) -> str:
+        details = "; ".join(
+            f"rank {rank}: {name}: {message}"
+            for rank, name, message in failures
+        )
+        return f"{prefix}: {details}"
+
+    def _object_collective_contract(
+        self,
+        operation: str,
+        root: Any,
+        root_name: str,
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            self._validate_rank(root, name=root_name)
+        except BaseException as exc:
+            error = exc
+        state = (
+            operation,
+            root_name,
+            root if error is None else None,
+            None if error is None else (type(error).__name__, str(error)),
+        )
+        states = self._all_gather_object(
+            state,
+            operation=f"{operation} contract",
+        )
+        invalid = tuple(
+            (rank, item[3])
+            for rank, item in enumerate(states)
+            if item[3] is not None
+        )
+        if invalid:
+            details = "; ".join(
+                f"rank {rank}: {name}: {message}"
+                for rank, (name, message) in invalid
+            )
+            raise DistributedFailureError(
+                "Invalid distributed object collective root: " + details
+            )
+        contracts = tuple(item[:3] for item in states)
+        if any(item != contracts[0] for item in contracts[1:]):
+            raise DistributedFailureError(
+                "distributed object collective operation/root differ across ranks"
+            )
+
+    def _preflight_object(self, value: Any, *, operation: str) -> None:
+        error: BaseException | None = None
+        try:
+            pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException as exc:
+            error = TypeError(
+                f"distributed {operation} object is not serializable: {exc}"
+            )
+        self.failure_gate(f"{operation}.object", error)
+
+
+def _validate_phase_name(value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError("phase name must be a non-empty string")
+
+
+def _positive_count(value: Any, *, name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer, not bool")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value

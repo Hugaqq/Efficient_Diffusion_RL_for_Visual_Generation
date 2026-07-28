@@ -29,6 +29,7 @@ GOLDEN_MATRIX = {
     ("model", "tiny_diffusion"): (
         {
             "media.image",
+            "policy.reference_stats",
             "sampling.full_trajectory",
             "sampling.single_step",
             "sampling.branching",
@@ -37,7 +38,12 @@ GOLDEN_MATRIX = {
         ("torch",),
     ),
     ("model", "sd3_tempflow"): (
-        {"media.image", "sampling.full_trajectory", "sampling.branching"},
+        {
+            "media.image",
+            "policy.reference_stats",
+            "sampling.full_trajectory",
+            "sampling.branching",
+        },
         set(),
         _MODEL_DEPS,
     ),
@@ -173,10 +179,12 @@ def test_component_spec_is_only_the_frozen_description():
 def test_capability_vocabulary_and_owners_are_exact():
     assert CAPABILITY_OWNER == EXPECTED_CAPABILITY_OWNER
     assert CAPABILITY_VOCABULARY == frozenset(EXPECTED_CAPABILITY_OWNER)
-    assert all(
-        "policy.reference_stats" not in spec.provides
+    providers = {
+        spec.name
         for spec in builtin_components()
-    )
+        if "policy.reference_stats" in spec.provides
+    }
+    assert providers == {"tiny_diffusion", "sd3_tempflow"}
 
 
 def test_only_builtins_module_owns_lookup_and_manifest():

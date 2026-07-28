@@ -49,6 +49,7 @@ _BUILTIN_COMPONENTS: tuple[ComponentSpec, ...] = (
         provides=frozenset(
             {
                 "media.image",
+                "policy.reference_stats",
                 "sampling.full_trajectory",
                 "sampling.single_step",
                 "sampling.branching",
@@ -63,6 +64,7 @@ _BUILTIN_COMPONENTS: tuple[ComponentSpec, ...] = (
         provides=frozenset(
             {
                 "media.image",
+                "policy.reference_stats",
                 "sampling.full_trajectory",
                 "sampling.branching",
             }

@@ -1,0 +1,31 @@
+{
+  "old_log_probs": [
+    [0.0],
+    [-0.2]
+  ],
+  "new_log_probs": [
+    [0.1],
+    [-0.25]
+  ],
+  "advantages": [
+    [1.5],
+    [-0.5]
+  ],
+  "current_mean": [
+    [[0.2, -0.1]],
+    [[0.0, 0.4]]
+  ],
+  "reference_mean": [
+    [[0.0, -0.2]],
+    [[0.1, 0.1]]
+  ],
+  "std_dev": [
+    [0.5],
+    [0.25]
+  ],
+  "clip_range": 0.2,
+  "beta": 0.004,
+  "expected_policy_loss": -0.5910708324315572,
+  "expected_reference_kl": 0.225,
+  "expected_total_loss": -0.5901708324315572
+}

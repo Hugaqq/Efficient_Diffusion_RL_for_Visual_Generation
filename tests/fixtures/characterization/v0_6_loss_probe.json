@@ -411,6 +411,21 @@
     "script": "scripts/loss_probe.py",
     "torch_version": "2.12.0"
   },
+  "v0_7_cutover": {
+    "clipped_surrogate": {
+      "active_transition_count": 3,
+      "approx_kl": 0.03418934221293305,
+      "clipfrac": 0.6666666666666666,
+      "policy_loss": -0.7166666666666667
+    },
+    "flow_reference": {
+      "beta": 0.3,
+      "policy_loss": -1.1,
+      "reference_kl": 1.25,
+      "total_loss": -0.7250000000000001
+    },
+    "note": "Final v0.7 typed objective oracle appended without changing or reinterpreting any v0.6 characterization entry."
+  },
   "supervised_fit": {
     "fit_loss": 0.051034823060035706,
     "gradients": {

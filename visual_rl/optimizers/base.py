@@ -9,6 +9,7 @@ from typing import ClassVar, Literal, TYPE_CHECKING
 
 from visual_rl.core.types import (
     FrozenMapping,
+    MetricContribution,
     ResolutionContext,
     RewardBatch,
     RolloutBatch,
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 
     from visual_rl.configs.schema import OptimizerConfig
     from visual_rl.distributed import DDPStrategy, SingleProcessStrategy
+    from visual_rl.optimizers.advantages import AdvantageResult
+    from visual_rl.optimizers.objective import PolicyLossInputs
     from visual_rl.optimizers.update_engine import UpdateResult
 
 
@@ -72,6 +75,38 @@ class PolicyAlgorithm(ABC):
     ) -> frozenset[str]:
         del resolved_params
         return frozenset()
+
+    @abstractmethod
+    def weight_normalization_request(
+        self,
+        batch: RolloutBatch,
+        advantages: AdvantageResult,
+    ) -> tuple["torch.Tensor", int] | None:
+        """Return a local mean/count request for optional global normalization."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_loss_inputs(
+        self,
+        batch: RolloutBatch,
+        advantages: AdvantageResult,
+        *,
+        normalization_mean: "torch.Tensor | None",
+    ) -> PolicyLossInputs:
+        """Build the algorithm's sole typed loss input."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def diagnostics(
+        self,
+        batch: RolloutBatch,
+        inputs: PolicyLossInputs,
+    ) -> Mapping[str, MetricContribution]:
+        """Return detached reducible algorithm diagnostics."""
+
+        raise NotImplementedError
 
     def close(self) -> None:
         """Release owned resources; pure algorithms are no-op."""
