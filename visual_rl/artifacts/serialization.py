@@ -1,13 +1,14 @@
-"""JSON-safe conversion for experiment artifacts."""
+"""Strict JSON and redacted config helpers for artifact boundaries."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+import json
 from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
+
+from visual_rl.core.types import to_plain_dict
 
 
 _REDACTED = "[REDACTED]"
@@ -20,60 +21,60 @@ _SENSITIVE_KEY = re.compile(
 )
 
 
-def to_jsonable(value: Any) -> Any:
-    """Detach tensor-like values and recursively convert them to JSON data."""
+def canonical_json_text(value: Any) -> str:
+    """Serialize an already validated plain/frozen value deterministically."""
 
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if callable(value):
-        module = getattr(value, "__module__", type(value).__module__)
-        qualname = getattr(
-            value,
-            "__qualname__",
-            getattr(value, "__name__", type(value).__qualname__),
+    return json.dumps(
+        to_plain_dict(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def strict_json_load(path: str | Path) -> Any:
+    """Load JSON while rejecting duplicate keys and non-finite constants."""
+
+    source = Path(path)
+
+    def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"Non-finite JSON value: {value}")
+
+    try:
+        return json.loads(
+            source.read_text(encoding="utf-8"),
+            object_pairs_hook=pairs_hook,
+            parse_constant=reject_constant,
         )
-        return {"callable": f"{module}.{qualname}"}
-    if is_dataclass(value) and not isinstance(value, type):
-        return to_jsonable(asdict(value))
-    if isinstance(value, Mapping):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(item) for item in value]
-
-    converted = value
-    if hasattr(converted, "detach"):
-        converted = converted.detach()
-    if hasattr(converted, "cpu"):
-        converted = converted.cpu()
-    if hasattr(converted, "tolist"):
-        return to_jsonable(converted.tolist())
-    if hasattr(converted, "item"):
-        try:
-            return to_jsonable(converted.item())
-        except (TypeError, ValueError):
-            pass
-
-    raise TypeError(f"Unsupported artifact value type: {type(value).__name__}")
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read strict JSON from {source}: {error}") from error
 
 
 def redact_artifact_config(value: Any) -> Any:
-    """Return a JSON-safe config copy without persisted credentials or URL paths."""
+    """Return a plain config copy without credentials or URL path/query data."""
 
-    return _redact_jsonable(to_jsonable(value), key=None)
+    return _redact_plain(to_plain_dict(value), key=None)
 
 
-def _redact_jsonable(value: Any, *, key: str | None) -> Any:
+def _redact_plain(value: Any, *, key: str | None) -> Any:
     if key is not None and _is_sensitive_key(key):
         return _REDACTED
     if isinstance(value, dict):
         return {
-            str(item_key): _redact_jsonable(item, key=str(item_key))
+            item_key: _redact_plain(item, key=item_key)
             for item_key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact_jsonable(item, key=key) for item in value]
+        return [_redact_plain(item, key=key) for item in value]
     if isinstance(value, str) and _looks_like_http_url(value):
         return _redact_url(value)
     return value

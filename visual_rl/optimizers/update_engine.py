@@ -9,7 +9,12 @@ import math
 from time import perf_counter
 from typing import Any
 
-from visual_rl.core.types import RewardBatch, RolloutBatch, StepContext
+from visual_rl.core.types import (
+    PolicyRecomputeStats,
+    RewardBatch,
+    RolloutBatch,
+    StepContext,
+)
 
 
 class UpdateEngine:
@@ -132,24 +137,6 @@ class UpdateEngine:
             "logprob_delta_mean": float(delta.mean().cpu()),
             "logprob_delta_abs_max": float(delta.abs().max().cpu()),
         }
-        if batch.kl is not None:
-            kl = (
-                torch.as_tensor(
-                    batch.kl,
-                    device=new_log_probs.device,
-                )
-                .detach()
-                .float()
-            )
-            if tuple(kl.shape) != tuple(new_log_probs.shape):
-                raise ValueError(
-                    "rollout KL must have the same shape as log probabilities "
-                    f"for metrics: {tuple(kl.shape)} != "
-                    f"{tuple(new_log_probs.shape)}"
-                )
-            active_kl = kl.masked_select(transition_mask)
-            metrics["rollout_kl_mean"] = float(active_kl.mean().cpu())
-            metrics["rollout_kl_abs_max"] = float(active_kl.abs().max().cpu())
         return metrics
 
     def _validate_pre_update(
@@ -378,7 +365,9 @@ class UpdateEngine:
         if not isinstance(advantages, torch.Tensor):
             advantages = torch.as_tensor(advantages)
         if not isinstance(new_log_probs, torch.Tensor):
-            raise TypeError("recompute_log_probs must return a torch.Tensor")
+            raise TypeError(
+                "PolicyRecomputeStats.new_log_probs must be a torch.Tensor"
+            )
         # Explicit float64 advantages are part of the TempFlow reference contract.
         dtype = torch.float64 if advantages.dtype == torch.float64 else torch.float32
         return (
@@ -585,7 +574,7 @@ class UpdateEngine:
         optimizer: Any,
         context: StepContext,
         *,
-        recompute_log_probs: Callable[[RolloutBatch], Any] | None = None,
+        recompute_policy_stats: Callable[[RolloutBatch], Any] | None = None,
         gradient_sync_context: Callable[[bool], Any] | None = None,
         reduce_tensor_weighted_mean: Callable[[Any, int], Any] | None = None,
         synchronize_failure: Callable[[bool | BaseException | None], bool]
@@ -603,7 +592,7 @@ class UpdateEngine:
                 rewards,
                 optimizer,
                 context,
-                recompute_log_probs=recompute_log_probs,
+                recompute_policy_stats=recompute_policy_stats,
                 gradient_sync_context=gradient_sync_context,
                 reduce_tensor_weighted_mean=reduce_tensor_weighted_mean,
                 synchronize_failure=synchronize_failure,
@@ -630,7 +619,7 @@ class UpdateEngine:
         optimizer: Any,
         context: StepContext,
         *,
-        recompute_log_probs: Callable[[RolloutBatch], Any] | None = None,
+        recompute_policy_stats: Callable[[RolloutBatch], Any] | None = None,
         gradient_sync_context: Callable[[bool], Any] | None = None,
         reduce_tensor_weighted_mean: Callable[[Any, int], Any] | None = None,
         synchronize_failure: Callable[[bool | BaseException | None], bool]
@@ -640,10 +629,14 @@ class UpdateEngine:
     ) -> dict[str, float]:
         import torch
 
-        if recompute_log_probs is None:
-            recompute_log_probs = getattr(adapter, "recompute_log_probs", None)
-        if not callable(recompute_log_probs):
-            raise TypeError("recompute_log_probs must be callable")
+        if recompute_policy_stats is None:
+            recompute_policy_stats = getattr(
+                adapter,
+                "recompute_policy_stats",
+                None,
+            )
+        if not callable(recompute_policy_stats):
+            raise TypeError("recompute_policy_stats must be callable")
         if gradient_sync_context is not None and not callable(
             gradient_sync_context
         ):
@@ -802,7 +795,6 @@ class UpdateEngine:
             advantage_result.metrics,
         )
 
-        adapter.prepare_for_training()
         scaler = self._get_grad_scaler()
         gradients_initialized = False
         loss_metric = 0.0
@@ -839,7 +831,13 @@ class UpdateEngine:
             with sync_context:
                 started = perf_counter()
                 with self._autocast_context(device):
-                    new_log_probs = recompute_log_probs(micro_batch)
+                    recompute = recompute_policy_stats(micro_batch)
+                    if not isinstance(recompute, PolicyRecomputeStats):
+                        raise TypeError(
+                            "recompute_policy_stats must return "
+                            "PolicyRecomputeStats"
+                        )
+                    new_log_probs = recompute.new_log_probs
                 recompute_time_s += perf_counter() - started
                 objective_advantages, objective_log_probs = self._objective_inputs(
                     micro_advantages, new_log_probs

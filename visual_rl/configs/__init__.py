@@ -1,34 +1,47 @@
-"""Public typed configuration API."""
+"""Internal canonical configuration types.
 
+Configuration is loaded only through :func:`visual_rl.load`; no loader,
+preset, layered source, override, or descriptor is exported here.
+"""
+
+from visual_rl.configs.resolver import resolve_config
 from visual_rl.configs.schema import (
+    AdvantageConfig,
+    AlgorithmConfig,
+    ArtifactsConfig,
+    ComponentSelectionConfig,
+    DatasetConfig,
+    DistributedConfig,
+    ModelConfig,
+    OptimizerConfig,
+    ResumeConfig,
+    RewardComponentConfig,
+    RewardConfig,
+    RewardExecutionConfig,
+    RolloutCacheConfig,
+    RunConfig,
+    RuntimeConfig,
     VisualRLConfig,
-    config_from_dict,
-    load_config,
-    validate_config,
 )
-from visual_rl.configs.sources import (
-    ConfigDocument,
-    ExperimentSpec,
-    KeyOverride,
-    SourceRef,
-    list_packaged_presets,
-    read_experiment_spec,
-    read_packaged_preset,
-)
-from visual_rl.configs.resolver import ResolvedExperiment, resolve_experiment
+from visual_rl.core.types import to_plain_dict
 
-__all__ = [
-    "ConfigDocument",
-    "ExperimentSpec",
-    "KeyOverride",
-    "ResolvedExperiment",
-    "SourceRef",
+__all__ = (
+    "AdvantageConfig",
+    "AlgorithmConfig",
+    "ArtifactsConfig",
+    "ComponentSelectionConfig",
+    "DatasetConfig",
+    "DistributedConfig",
+    "ModelConfig",
+    "OptimizerConfig",
+    "ResumeConfig",
+    "RewardComponentConfig",
+    "RewardConfig",
+    "RewardExecutionConfig",
+    "RolloutCacheConfig",
+    "RunConfig",
+    "RuntimeConfig",
     "VisualRLConfig",
-    "config_from_dict",
-    "list_packaged_presets",
-    "load_config",
-    "read_experiment_spec",
-    "read_packaged_preset",
-    "resolve_experiment",
-    "validate_config",
-]
+    "resolve_config",
+    "to_plain_dict",
+)

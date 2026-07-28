@@ -5,9 +5,7 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 import math
-import os
 import pickle
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -19,9 +17,12 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
+from visual_rl.core.types import (
+    PolicyRecomputeStats,
+    RolloutBatch,
+    ValidatedRuntimeEnv,
+)
 
-_RANK_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
-_NON_NEGATIVE_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _COUNT_METRIC_SUFFIXES = (
     "_attempts",
     "_cancelled",
@@ -33,6 +34,14 @@ _COUNT_METRIC_SUFFIXES = (
     "_timeouts",
 )
 DEFAULT_MAX_ROLLBACK_SNAPSHOT_TENSOR_BYTES = 1 << 30
+
+__all__ = (
+    "DDPStrategy",
+    "DistributedContext",
+    "DistributedFailureError",
+    "SingleProcessStrategy",
+    "build_strategy",
+)
 
 
 class DistributedFailureError(RuntimeError):
@@ -232,13 +241,13 @@ def _state_tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
 
 @dataclass(frozen=True, slots=True)
 class DistributedContext:
-    """Validated rank, device, and backend information for one process."""
+    """Rank-local tensor/collective context derived from validated Preflight."""
 
     rank: int
     local_rank: int
     world_size: int
     device: torch.device
-    backend: str
+    backend: str | None
 
     @property
     def is_distributed(self) -> bool:
@@ -258,105 +267,126 @@ class DistributedContext:
                 raise ValueError(f"{name} must be non-negative")
         return base_seed + step * self.world_size + self.rank
 
-    @classmethod
-    def from_env(
-        cls,
-        *,
-        env: Mapping[str, str] | None = None,
-        device: str | torch.device | None = None,
-        backend: str | None = None,
-    ) -> DistributedContext:
-        """Build a context from the complete torchrun rank environment.
 
-        An absent rank environment selects a single process. A partial or malformed
-        rank environment is rejected instead of silently falling back.
-        """
 
-        source = os.environ if env is None else env
-        present = [key for key in _RANK_ENV_KEYS if key in source]
-        if present and len(present) != len(_RANK_ENV_KEYS):
-            missing = [key for key in _RANK_ENV_KEYS if key not in source]
+def build_strategy(
+    distributed_config: Any,
+    validated_env: ValidatedRuntimeEnv,
+) -> SingleProcessStrategy | DDPStrategy:
+    """Construct and set up the sole strategy from one validated env snapshot.
+
+    This function never reads ``os.environ`` and never accepts a backend,
+    rank, world-size, or device override. Preflight owns parsing and the
+    mode/device-to-backend mapping; this function only projects those frozen
+    results into the existing numerical Strategy implementations.
+    """
+
+    if not isinstance(validated_env, ValidatedRuntimeEnv):
+        raise TypeError("validated_env must be a ValidatedRuntimeEnv")
+    mode = getattr(distributed_config, "mode", None)
+    requested_device = getattr(distributed_config, "device", None)
+    timeout_s = getattr(distributed_config, "timeout_s", None)
+    max_snapshot_tensor_bytes = getattr(
+        distributed_config,
+        "max_snapshot_tensor_bytes",
+        None,
+    )
+    if mode not in {"single", "ddp"}:
+        raise ValueError("distributed mode must be 'single' or 'ddp'")
+    if requested_device not in {"cpu", "cuda"}:
+        raise ValueError("distributed device must be 'cpu' or 'cuda'")
+    if validated_env.mode != mode:
+        raise ValueError("validated runtime mode does not match canonical config")
+    if mode == "single" and max_snapshot_tensor_bytes is not None:
+        raise ValueError(
+            "single mode requires max_snapshot_tensor_bytes to be None"
+        )
+    _validate_snapshot_shape(validated_env)
+
+    from visual_rl.preflight import backend_for
+
+    backend = backend_for(mode, requested_device)
+    device = _rank_local_device(requested_device, validated_env)
+    context = DistributedContext(
+        rank=validated_env.rank,
+        local_rank=validated_env.local_rank,
+        world_size=validated_env.world_size,
+        device=device,
+        backend=backend,
+    )
+
+    if dist.is_available() and dist.is_initialized():
+        raise RuntimeError(
+            "VisualRL requires ownership of an uninitialized process group"
+        )
+    if mode == "single":
+        strategy: SingleProcessStrategy | DDPStrategy = SingleProcessStrategy(
+            context
+        )
+    else:
+        strategy = DDPStrategy(
+            context,
+            timeout_s=timeout_s,
+            max_snapshot_tensor_bytes=max_snapshot_tensor_bytes,
+        )
+    try:
+        strategy.setup()
+    except BaseException:
+        try:
+            strategy.close()
+        except BaseException:
+            pass
+        raise
+    return strategy
+
+
+def _validate_snapshot_shape(env: ValidatedRuntimeEnv) -> None:
+    if env.mode == "single":
+        expected = (0, 0, 1, 1)
+        actual = (env.rank, env.local_rank, env.world_size, env.local_world_size)
+        if actual != expected:
+            raise ValueError("single validated runtime snapshot has invalid ranks")
+        if any(
+            value is not None
+            for value in (
+                env.group_rank,
+                env.group_world_size,
+                env.master_addr,
+                env.master_port,
+            )
+        ):
             raise ValueError(
-                "Incomplete distributed environment: missing " + ", ".join(missing)
+                "single validated runtime snapshot must not contain launch metadata"
             )
+        return
+    expected = (2, 2)
+    if (env.world_size, env.local_world_size) != expected:
+        raise ValueError("ddp validated runtime snapshot must be single-node size 2")
+    if not 0 <= env.rank < 2 or not 0 <= env.local_rank < 2:
+        raise ValueError("ddp validated runtime snapshot has invalid ranks")
+    if env.group_rank not in (None, 0) or env.group_world_size not in (None, 1):
+        raise ValueError("ddp validated runtime snapshot is not single-node")
+    if not isinstance(env.master_addr, str) or not env.master_addr:
+        raise ValueError("ddp validated runtime snapshot requires master_addr")
+    if (
+        type(env.master_port) is not int
+        or not 1 <= env.master_port <= 65535
+    ):
+        raise ValueError("ddp validated runtime snapshot requires valid master_port")
 
-        if present:
-            rank = cls._parse_rank_value("RANK", source["RANK"])
-            local_rank = cls._parse_rank_value("LOCAL_RANK", source["LOCAL_RANK"])
-            world_size = cls._parse_rank_value("WORLD_SIZE", source["WORLD_SIZE"])
-        else:
-            rank = 0
-            local_rank = 0
-            world_size = 1
 
-        if world_size < 1:
-            raise ValueError("WORLD_SIZE must be at least 1")
-        if rank >= world_size:
-            raise ValueError("RANK must be smaller than WORLD_SIZE")
-        if world_size == 1 and (rank != 0 or local_rank != 0):
-            raise ValueError("Single-process rank values must all be zero")
-
-        resolved_device = cls._resolve_device(device, local_rank)
-        resolved_backend = cls._resolve_backend(backend, resolved_device)
-        return cls(
-            rank=rank,
-            local_rank=local_rank,
-            world_size=world_size,
-            device=resolved_device,
-            backend=resolved_backend,
+def _rank_local_device(
+    requested: str,
+    env: ValidatedRuntimeEnv,
+) -> torch.device:
+    if requested == "cpu":
+        return torch.device("cpu")
+    index = 0 if env.mode == "single" else env.local_rank
+    if env.visible_gpu_count <= index:
+        raise RuntimeError(
+            "validated runtime snapshot does not expose the requested CUDA device"
         )
-
-    @staticmethod
-    def _parse_rank_value(name: str, raw: Any) -> int:
-        if not isinstance(raw, str) or _NON_NEGATIVE_INTEGER.fullmatch(raw) is None:
-            raise ValueError(f"{name} must be a canonical non-negative integer")
-        return int(raw)
-
-    @staticmethod
-    def _resolve_device(
-        requested: str | torch.device | None,
-        local_rank: int,
-    ) -> torch.device:
-        if requested is None:
-            device = (
-                torch.device("cuda", local_rank)
-                if torch.cuda.is_available()
-                else torch.device("cpu")
-            )
-        else:
-            device = torch.device(requested)
-            if device.type == "cuda" and device.index is None:
-                device = torch.device("cuda", local_rank)
-
-        if device.type not in {"cpu", "cuda"}:
-            raise ValueError("Distributed device must be CPU or CUDA")
-        if device.type == "cpu" and device.index is not None:
-            raise ValueError("CPU device must not have an index")
-        if device.type == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA device requested but CUDA is unavailable")
-            if device.index != local_rank:
-                raise ValueError("CUDA device index must match LOCAL_RANK")
-            if local_rank >= torch.cuda.device_count():
-                raise ValueError(
-                    "LOCAL_RANK does not identify an available CUDA device"
-                )
-        return device
-
-    @staticmethod
-    def _resolve_backend(requested: str | None, device: torch.device) -> str:
-        backend = (
-            ("nccl" if device.type == "cuda" else "gloo")
-            if requested is None
-            else requested
-        )
-        if not isinstance(backend, str) or not backend or backend != backend.lower():
-            raise ValueError("Distributed backend must be a lowercase non-empty string")
-        if device.type == "cpu" and backend == "nccl":
-            raise ValueError("NCCL cannot be used with a CPU device")
-        if backend not in {"gloo", "nccl"}:
-            raise ValueError("Distributed backend must be 'gloo' or 'nccl'")
-        return backend
+    return torch.device("cuda", index)
 
 
 class _AdapterRecomputeFacade(torch.nn.Module):
@@ -367,17 +397,29 @@ class _AdapterRecomputeFacade(torch.nn.Module):
         self.train_module = train_module
         object.__setattr__(self, "_adapter", adapter)
 
-    def forward(self, batch: Any) -> Any:
-        return self._adapter.recompute_log_probs(batch)
+    def forward(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
+        return self._adapter.recompute_policy_stats(
+            batch,
+            require_reference=require_reference,
+        )
 
 
 class SingleProcessStrategy:
     """No-collective strategy preserving the existing one-process execution path."""
 
-    def __init__(self, context: DistributedContext | None = None) -> None:
-        self.context = context or DistributedContext.from_env()
+    def __init__(self, context: DistributedContext) -> None:
+        if not isinstance(context, DistributedContext):
+            raise TypeError("context must be a DistributedContext")
+        self.context = context
         if self.context.is_distributed:
             raise ValueError("SingleProcessStrategy requires WORLD_SIZE=1")
+        if self.context.backend is not None:
+            raise ValueError("SingleProcessStrategy requires backend=None")
         self._adapter: Any | None = None
         self._setup = False
         self._closed = False
@@ -392,24 +434,38 @@ class SingleProcessStrategy:
 
     def setup(self) -> SingleProcessStrategy:
         self._require_open()
+        if self._setup:
+            return self
         self._setup = True
         return self
 
     def prepare(self, adapter: Any) -> Any:
         self._require_open()
-        self.setup()
+        if not self._setup:
+            raise RuntimeError("Strategy must be set up before prepare()")
         self._validate_adapter(adapter)
         if self._adapter is not None and self._adapter is not adapter:
             raise RuntimeError("Strategy is already prepared with another adapter")
         self._adapter = adapter
         return adapter
 
-    def forward(self, batch: Any) -> Any:
+    def recompute_policy_stats(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
         self._require_prepared()
-        return self._adapter.recompute_log_probs(batch)
-
-    def recompute_log_probs(self, batch: Any) -> Any:
-        return self.forward(batch)
+        self._validate_recompute_request(batch, require_reference)
+        stats = self._adapter.recompute_policy_stats(
+            batch,
+            require_reference=require_reference,
+        )
+        return self._validate_recompute_result(
+            stats,
+            batch,
+            require_reference=require_reference,
+        )
 
     def gradient_sync_context(self, synchronize_gradients: bool):
         """Return the accumulation context for one objective-bearing microbatch."""
@@ -569,18 +625,51 @@ class SingleProcessStrategy:
     def _require_prepared(self) -> None:
         self._require_open()
         if not self._setup or self._adapter is None:
-            raise RuntimeError("Distributed strategy must be prepared before forward")
+            raise RuntimeError(
+                "Distributed strategy must be prepared before policy recompute"
+            )
 
     @staticmethod
     def _validate_adapter(adapter: Any) -> torch.nn.Module:
         if adapter is None or not callable(
-            getattr(adapter, "recompute_log_probs", None)
+            getattr(adapter, "recompute_policy_stats", None)
         ):
-            raise TypeError("adapter must define recompute_log_probs(batch)")
+            raise TypeError(
+                "adapter must define recompute_policy_stats("
+                "batch, *, require_reference=False)"
+            )
         module = getattr(adapter, "train_module", None)
         if not isinstance(module, torch.nn.Module):
             raise TypeError("adapter.train_module must be a torch.nn.Module")
         return module
+
+    @staticmethod
+    def _validate_recompute_request(
+        batch: RolloutBatch,
+        require_reference: bool,
+    ) -> None:
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("batch must be a RolloutBatch")
+        if not isinstance(require_reference, bool):
+            raise TypeError("require_reference must be a bool")
+
+    @staticmethod
+    def _validate_recompute_result(
+        stats: Any,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool,
+    ) -> PolicyRecomputeStats:
+        if not isinstance(stats, PolicyRecomputeStats):
+            raise TypeError(
+                "adapter.recompute_policy_stats() must return "
+                "PolicyRecomputeStats"
+            )
+        stats.validate_against(
+            batch,
+            require_reference=require_reference,
+        )
+        return stats
 
     @staticmethod
     def _validated_scalar_and_weight(value: Any, weight: Any) -> tuple[float, float]:
@@ -822,21 +911,25 @@ class DDPStrategy(SingleProcessStrategy):
             torch.cuda.set_device(self.context.device)
 
         if dist.is_initialized():
-            self._validate_existing_process_group()
-        else:
-            dist.init_process_group(
-                backend=self.context.backend,
-                rank=self.context.rank,
-                world_size=self.context.world_size,
-                timeout=timedelta(seconds=self.timeout_s),
+            raise RuntimeError(
+                "VisualRL requires ownership of an uninitialized process group"
             )
-            self._owns_process_group = True
+        if self.context.backend is None:
+            raise RuntimeError("DDP strategy requires a process-group backend")
+        dist.init_process_group(
+            backend=self.context.backend,
+            rank=self.context.rank,
+            world_size=self.context.world_size,
+            timeout=timedelta(seconds=self.timeout_s),
+        )
+        self._owns_process_group = True
         self._setup = True
         return self
 
     def prepare(self, adapter: Any) -> Any:
         self._require_open()
-        self.setup()
+        if not self._setup:
+            raise RuntimeError("Strategy must be set up before prepare()")
         if self._adapter is not None:
             if self._adapter is not adapter:
                 raise RuntimeError("Strategy is already prepared with another adapter")
@@ -865,9 +958,23 @@ class DDPStrategy(SingleProcessStrategy):
         self._adapter = adapter
         return adapter
 
-    def forward(self, batch: Any) -> Any:
+    def recompute_policy_stats(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool = False,
+    ) -> PolicyRecomputeStats:
         self._require_prepared()
-        return self._ddp(batch)
+        self._validate_recompute_request(batch, require_reference)
+        stats = self._ddp(
+            batch,
+            require_reference=require_reference,
+        )
+        return self._validate_recompute_result(
+            stats,
+            batch,
+            require_reference=require_reference,
+        )
 
     def gradient_sync_context(self, synchronize_gradients: bool):
         """Suppress DDP reductions until the final contributing microbatch."""
@@ -1484,20 +1591,6 @@ class DDPStrategy(SingleProcessStrategy):
             dist.destroy_process_group()
         self._owns_process_group = False
         self._closed = True
-
-    def _validate_existing_process_group(self) -> None:
-        backend = str(dist.get_backend()).lower()
-        if backend != self.context.backend:
-            raise RuntimeError(
-                f"Existing process group backend is {backend!r}, expected "
-                f"{self.context.backend!r}"
-            )
-        if dist.get_rank() != self.context.rank:
-            raise RuntimeError("Existing process group rank does not match context")
-        if dist.get_world_size() != self.context.world_size:
-            raise RuntimeError(
-                "Existing process group world size does not match context"
-            )
 
     def _require_collectives_ready(self) -> None:
         self._require_open()

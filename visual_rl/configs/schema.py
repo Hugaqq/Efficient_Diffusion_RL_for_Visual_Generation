@@ -1,860 +1,744 @@
-"""Strict typed configuration for the simplified VisualRL mainline."""
+"""The one frozen canonical configuration schema for VisualRL v0.7."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
-import json
+from dataclasses import dataclass, field
 import math
+import os
 from pathlib import Path
-import re
-import types
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal
 
-
-@dataclass
-class ModelConfig:
-    name: str = "mock_wan"
-    model_path: str = ""
-    model_family: str = "wan"
-    latent_shape: list[int] = field(default_factory=lambda: [4, 2, 2, 2])
-    media_shape: list[int] = field(default_factory=lambda: [4, 3, 16, 16])
-    extra: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DatasetConfig:
-    path: str | None = None
-    prompts: list[str] = field(default_factory=list)
-    repeat_per_prompt: int = 1
-    split_name: str = "train"
-    content_sha256: str | None = None
-    require_unique: bool = False
-    sampling_strategy: str = "sequential"
-    sampling_seed: int = 0
-    empty_prompt_policy: str = "error"
-
-
-@dataclass
-class EvaluationConfig:
-    path: str | None = None
-    prompts: list[str] = field(default_factory=list)
-    content_sha256: str | None = None
-    split_name: str = "heldout"
-    seeds: list[int] = field(default_factory=lambda: [1701, 1702, 1703])
-    max_prompts: int | None = None
-
-
-@dataclass
-class SampleConfig:
-    name: str = "full_trajectory"
-    batch_size: int = 1
-    num_steps: int = 2
-    guidance_scale: float = 4.5
-    samples_per_prompt: int = 2
-    kl_reward: float = 0.0
-    global_std: bool = False
-    max_group_std: bool = False
-    noise_level: float | None = 0.7
-    sde_window_size: int | None = None
-    sde_window_range: list[int] | None = None
-    sde_type: str | None = "flow_sde"
-    diffusion_clip: bool = False
-    diffusion_clip_value: float = 0.45
-
-
-@dataclass
-class AlgorithmConfig:
-    name: str = "grpo"
-    objective_version: str = "legacy"
-    clip_range: float = 0.001
-    adv_clip_max: float = 5.0
-    beta: float = 0.0
-    advantage_mode: str = "grpo"
-    advantage_epsilon: float = 1e-6
-    advantage_dtype: str = "float32"
-    weight_advantages: bool = False
-    credit_assignment: str = "all"
-    noise_weighting: dict[str, Any] = field(default_factory=dict)
-    branch: dict[str, Any] = field(default_factory=dict)
-    rectification: dict[str, Any] = field(default_factory=dict)
-    params: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TrainConfig:
-    learning_rate: float = 1e-4
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_weight_decay: float = 1e-4
-    adam_epsilon: float = 1e-8
-    max_grad_norm: float | None = None
-    lora_path: str | None = None
-    max_steps: int = 1
-    save_every: int = 1
-    precision: str = "fp32"
-    update_microbatch_size: int | None = None
-
-
-@dataclass
-class RewardConfig:
-    provider: str = "reward_router"
-    provider_params: dict[str, Any] = field(default_factory=dict)
-    replace_defaults: bool = False
-    weights: dict[str, float] = field(default_factory=lambda: {"mock": 1.0})
-    clients: dict[str, dict[str, Any]] = field(
-        default_factory=lambda: {"mock": {"name": "mock"}}
-    )
-    schedule: list[dict[str, Any]] = field(default_factory=list)
-    cache_dir: str | None = None
-    fail_policy: str = "invalid"
-
-
-@dataclass
-class RewardExecutorConfig:
-    """Execution policy for synchronous or bounded asynchronous scoring."""
-
-    mode: str = "sync"
-    max_workers: int = 4
-    microbatch_size: int | None = None
-    timeout_s: float = 30.0
-    max_retries: int = 0
-    submit_timeout_s: float = 30.0
-    max_in_flight: int | None = None
-    require_hard_timeout: bool = False
-
-
-@dataclass
-class ConditionalScalingConfig:
-    """Evidence-gated stages that are intentionally unavailable by default."""
-
-    split_roles: bool = False
-    fsdp2: bool = False
-
-
-@dataclass
-class DistributedConfig:
-    """Native torchrun/DDP runtime options; rank identity comes from the environment."""
-
-    backend: str | None = None
-    device: str | None = None
-    timeout_s: float = 30.0
-    max_snapshot_tensor_bytes: int | None = 1 << 30
-
-
-@dataclass
-class OptimizerConfig:
-    name: str = "algorithm"
-    params: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ProjectPaths:
-    output_dir: str = "runs/default"
-    pretrained_model: str | None = None
-    resume_from: str | None = None
-
-
-@dataclass
-class RunnerConfig:
-    auto_load_model: bool = True
-    strict_rollout_validation: bool = False
-    disable_rollout_cache: bool = False
-    rollout_cache_dir: str | None = None
-    show_progress: bool = True
-    progress_interval: int = 1
-    progress_leave: bool = False
-    deterministic_run_dir: bool = True
-    deterministic_runtime: bool = False
-    checkpoint_keep_last: int | None = None
-    rollout_cache_keep_last: int | None = None
-    rollout_cache_max_bytes: int | None = None
-    artifact_max_bytes: int | None = None
-    reward_executor: RewardExecutorConfig = field(default_factory=RewardExecutorConfig)
-    conditional_scaling: ConditionalScalingConfig = field(
-        default_factory=ConditionalScalingConfig
-    )
-    distributed: DistributedConfig = field(default_factory=DistributedConfig)
-
-
-@dataclass
-class VisualRLConfig:
-    run_name: str
-    seed: int = 42
-    use_lora: bool = True
-    per_prompt_stat_tracking: bool = True
-    model: ModelConfig = field(default_factory=ModelConfig)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-    sample: SampleConfig = field(default_factory=SampleConfig)
-    rollout: dict[str, Any] = field(default_factory=dict)
-    algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
-    rewards: RewardConfig = field(default_factory=RewardConfig)
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
-    runner: RunnerConfig = field(default_factory=RunnerConfig)
-    paths: ProjectPaths = field(default_factory=ProjectPaths)
-
-
-_EXTERNAL_TARGET_PATTERN = re.compile(
-    r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$"
+from visual_rl.core.types import (
+    FrozenMapping,
+    UINT32_MAX,
+    validate_step_seed_budget,
 )
-_EXTERNAL_SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
-_EXTERNAL_PROVIDER_FIELDS = frozenset(
+from visual_rl.errors import ConfigError
+
+__all__ = (
+    "AdvantageConfig",
+    "AlgorithmConfig",
+    "ArtifactsConfig",
+    "ComponentSelectionConfig",
+    "DatasetConfig",
+    "DistributedConfig",
+    "ModelConfig",
+    "OptimizerConfig",
+    "ResumeConfig",
+    "RewardComponentConfig",
+    "RewardConfig",
+    "RewardExecutionConfig",
+    "RolloutCacheConfig",
+    "RunConfig",
+    "RuntimeConfig",
+    "VisualRLConfig",
+    "config_from_mapping",
+)
+
+SamplingStrategy = Literal["sequential", "deterministic_shuffle"]
+EmptyPromptPolicy = Literal["error", "skip"]
+Precision = Literal["fp32", "fp16", "bf16"]
+DistributedMode = Literal["single", "ddp"]
+DistributedDevice = Literal["cpu", "cuda"]
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    seed: int
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    name: str
+    adapter_checkpoint: Path | None
+    params: FrozenMapping
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    path: Path | None
+    prompts: tuple[str, ...] | None
+    split: str
+    repeat_per_prompt: int
+    require_unique: bool
+    sampling_strategy: SamplingStrategy
+    sampling_seed: int
+    empty_prompt_policy: EmptyPromptPolicy
+
+
+@dataclass(frozen=True)
+class ComponentSelectionConfig:
+    name: str
+    params: FrozenMapping
+
+
+@dataclass(frozen=True)
+class RewardComponentConfig:
+    name: str
+    weight: float
+    params: FrozenMapping
+
+
+@dataclass(frozen=True)
+class RewardExecutionConfig:
+    microbatch_size: int | None
+    max_retries: int
+
+
+@dataclass(frozen=True)
+class RewardConfig:
+    components: tuple[RewardComponentConfig, ...]
+    execution: RewardExecutionConfig
+    cache_dir: Path | None
+
+
+@dataclass(frozen=True)
+class AdvantageConfig:
+    epsilon: float
+
+
+@dataclass(frozen=True)
+class AlgorithmConfig:
+    name: str
+    params: FrozenMapping
+    advantage: AdvantageConfig
+
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    learning_rate: float
+    adam_beta1: float
+    adam_beta2: float
+    adam_weight_decay: float
+    adam_epsilon: float
+    max_grad_norm: float | None
+    max_initial_logprob_delta: float | None
+    require_initial_clipfrac_zero: bool
+    require_finite_gradients: bool
+    require_nonzero_gradients: bool
+
+
+@dataclass(frozen=True)
+class RolloutCacheConfig:
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class DistributedConfig:
+    mode: DistributedMode
+    device: DistributedDevice
+    timeout_s: float
+    max_snapshot_tensor_bytes: int | None
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    max_steps: int
+    batch_size: int
+    precision: Precision
+    update_microbatch_size: int
+    deterministic: bool
+    progress: bool
+    rollout_cache: RolloutCacheConfig
+    distributed: DistributedConfig
+
+
+@dataclass(frozen=True)
+class ArtifactsConfig:
+    output_dir: Path
+    checkpoint_every: int
+    checkpoint_keep_last: int | None
+
+
+@dataclass(frozen=True)
+class ResumeConfig:
+    from_: Path | None = field(metadata={"plain_name": "from"})
+
+
+@dataclass(frozen=True)
+class VisualRLConfig:
+    schema_version: int
+    run: RunConfig
+    model: ModelConfig
+    dataset: DatasetConfig
+    rollout: ComponentSelectionConfig
+    reward: RewardConfig
+    algorithm: AlgorithmConfig
+    optimizer: OptimizerConfig
+    runtime: RuntimeConfig
+    artifacts: ArtifactsConfig
+    resume: ResumeConfig
+
+
+_ROOT_FIELDS = frozenset(
     {
-        "controls",
-        "dependencies",
-        "params",
-        "reward_name",
-        "source_sha256",
-        "target",
-        "version",
-        "weight",
+        "schema_version",
+        "run",
+        "model",
+        "dataset",
+        "rollout",
+        "reward",
+        "algorithm",
+        "optimizer",
+        "runtime",
+        "artifacts",
+        "resume",
     }
 )
 
 
-@dataclass(frozen=True)
-class ExternalProviderMetadata:
-    target: str
-    version: str
-    source_sha256: str
-    dependencies: tuple[str, ...]
-    params: dict[str, Any]
-    reward_name: str
-    weight: float
-    controls: Any = None
+def config_from_mapping(
+    values: Mapping[str, Any],
+    *,
+    config_dir: Path,
+) -> VisualRLConfig:
+    """Build and validate the canonical config from already-resolved values.
 
+    Component-owned ``params`` must already have passed the selected
+    component's ``resolve_params()``. This function owns only the global
+    schema and cross-section invariants; it performs no filesystem I/O.
+    """
 
-def _json_canonical(value: Any, *, label: str) -> Any:
-    try:
-        return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{label} must be JSON-safe: {exc}") from exc
+    root = _mapping(values, path="")
+    _exact_keys(root, _ROOT_FIELDS, path="")
+    if _integer(root["schema_version"], path="schema_version") != 1:
+        _fail("schema_version must equal 1", path="schema_version")
+    if not isinstance(config_dir, Path) or not config_dir.is_absolute():
+        raise TypeError("config_dir must be an absolute Path")
 
+    run_raw = _section(root, "run", {"seed"})
+    run = RunConfig(seed=_uint32(run_raw["seed"], path="run.seed"))
 
-def external_provider_metadata(
-    provider_name: str,
-    provider_params: Mapping[str, Any],
-    weights: Mapping[str, float],
-) -> ExternalProviderMetadata:
-    """Validate and canonicalize the shared external-provider declaration."""
-
-    if not isinstance(provider_name, str) or not provider_name:
-        raise ValueError("External provider name must be a non-empty string")
-    if not isinstance(provider_params, Mapping):
-        raise TypeError("External provider_params must be a mapping")
-    unknown = sorted(set(provider_params).difference(_EXTERNAL_PROVIDER_FIELDS))
-    if unknown:
-        raise ValueError(f"Unknown external provider_params fields: {unknown}")
-
-    target = provider_params.get("target")
-    if not isinstance(target, str) or not _EXTERNAL_TARGET_PATTERN.fullmatch(target):
-        raise ValueError(
-            f"External provider {provider_name!r} has invalid target {target!r}; "
-            "expected module:attribute"
-        )
-    version = provider_params.get("version")
-    if not isinstance(version, str) or not version.strip():
-        raise ValueError(
-            f"External provider {provider_name!r} requires a non-empty version"
-        )
-    source_sha256 = provider_params.get("source_sha256")
-    if not isinstance(source_sha256, str) or not _EXTERNAL_SHA256_PATTERN.fullmatch(
-        source_sha256
-    ):
-        raise ValueError(
-            f"External provider {provider_name!r} requires a 64-character source_sha256"
-        )
-
-    raw_dependencies = provider_params.get("dependencies", ())
-    if not isinstance(raw_dependencies, (list, tuple)) or any(
-        not isinstance(item, str) or not item.strip() for item in raw_dependencies
-    ):
-        raise ValueError(
-            f"External provider {provider_name!r} has an invalid dependency declaration"
-        )
-    dependencies = tuple(raw_dependencies)
-
-    raw_params = provider_params.get("params", {})
-    if not isinstance(raw_params, Mapping):
-        raise TypeError(
-            f"External provider {provider_name!r} params must be a JSON-safe mapping"
-        )
-    params = _json_canonical(
-        dict(raw_params), label=f"External provider {provider_name!r} params"
-    )
-    controls = (
-        None
-        if "controls" not in provider_params
-        else _json_canonical(
-            provider_params["controls"],
-            label=f"External provider {provider_name!r} controls",
-        )
+    model_raw = _section(root, "model", {"name", "adapter_checkpoint", "params"})
+    model = ModelConfig(
+        name=_name(model_raw["name"], path="model.name"),
+        adapter_checkpoint=_optional_path(
+            model_raw["adapter_checkpoint"],
+            base=config_dir,
+            path="model.adapter_checkpoint",
+        ),
+        params=_params(model_raw["params"], path="model.params"),
     )
 
-    reward_name = provider_params.get("reward_name", provider_name)
-    if not isinstance(reward_name, str) or not reward_name.strip():
-        raise ValueError(
-            f"External provider {provider_name!r} requires a non-empty reward_name"
+    dataset_raw = _section(
+        root,
+        "dataset",
+        {
+            "path",
+            "prompts",
+            "split",
+            "repeat_per_prompt",
+            "require_unique",
+            "sampling_strategy",
+            "sampling_seed",
+            "empty_prompt_policy",
+        },
+    )
+    dataset_path = _optional_path(
+        dataset_raw["path"], base=config_dir, path="dataset.path"
+    )
+    empty_policy = _literal(
+        dataset_raw["empty_prompt_policy"],
+        ("error", "skip"),
+        path="dataset.empty_prompt_policy",
+    )
+    prompts = _inline_prompts(
+        dataset_raw["prompts"],
+        empty_policy=empty_policy,
+        require_unique=_boolean(
+            dataset_raw["require_unique"], path="dataset.require_unique"
+        ),
+    )
+    if (dataset_path is None) == (prompts is None):
+        _fail(
+            "dataset.path and dataset.prompts must contain exactly one non-null value",
+            path="dataset",
         )
-    reward_name = reward_name.strip()
-    if not isinstance(weights, Mapping) or set(weights) != {reward_name}:
-        raise ValueError(
-            "rewards.weights must contain exactly one external reward entry for "
-            f"{reward_name!r}"
-        )
-    canonical_weight = weights[reward_name]
-    if (
-        isinstance(canonical_weight, bool)
-        or not isinstance(canonical_weight, (int, float))
-        or not math.isfinite(float(canonical_weight))
-    ):
-        raise ValueError(f"rewards.weights[{reward_name!r}] must be a finite number")
-    weight = float(canonical_weight)
-
-    legacy_weight = provider_params.get("weight", weight)
-    if (
-        isinstance(legacy_weight, bool)
-        or not isinstance(legacy_weight, (int, float))
-        or not math.isfinite(float(legacy_weight))
-    ):
-        raise ValueError("External provider legacy weight must be a finite number")
-    if float(legacy_weight) != weight:
-        raise ValueError(
-            "External provider legacy weight does not match canonical "
-            f"rewards.weights[{reward_name!r}]"
-        )
-
-    return ExternalProviderMetadata(
-        target=target,
-        version=version.strip(),
-        source_sha256=source_sha256.lower(),
-        dependencies=dependencies,
-        params=params,
-        reward_name=reward_name,
-        weight=weight,
-        controls=controls,
+    dataset = DatasetConfig(
+        path=dataset_path,
+        prompts=prompts,
+        split=_nonempty_text(dataset_raw["split"], path="dataset.split"),
+        repeat_per_prompt=_positive_int(
+            dataset_raw["repeat_per_prompt"], path="dataset.repeat_per_prompt"
+        ),
+        require_unique=_boolean(
+            dataset_raw["require_unique"], path="dataset.require_unique"
+        ),
+        sampling_strategy=_literal(
+            dataset_raw["sampling_strategy"],
+            ("sequential", "deterministic_shuffle"),
+            path="dataset.sampling_strategy",
+        ),
+        sampling_seed=_uint32(
+            dataset_raw["sampling_seed"], path="dataset.sampling_seed"
+        ),
+        empty_prompt_policy=empty_policy,
     )
 
+    rollout_raw = _section(root, "rollout", {"name", "params"})
+    rollout = ComponentSelectionConfig(
+        name=_name(rollout_raw["name"], path="rollout.name"),
+        params=_params(rollout_raw["params"], path="rollout.params"),
+    )
 
-_ALGORITHM_SAMPLE_PAIRS = {
-    "grpo": {"full_trajectory"},
-    "flash_grpo": {"single_step"},
-    "tempflow_grpo": {"branching"},
-}
-
-
-def _validate_value_type(value: Any, expected: Any, *, section: str) -> None:
-    if expected is Any:
-        return
-
-    origin = get_origin(expected)
-    if origin in (Union, types.UnionType):
-        for option in get_args(expected):
-            try:
-                _validate_value_type(value, option, section=section)
-            except TypeError:
-                continue
-            return
-        raise TypeError(f"{section} has an invalid type: {type(value).__name__}")
-    if expected is type(None):
-        if value is None:
-            return
-        raise TypeError(f"{section} must be None")
-    if origin is list:
-        if not isinstance(value, list):
-            raise TypeError(f"{section} must be a list")
-        (item_type,) = get_args(expected) or (Any,)
-        for index, item in enumerate(value):
-            _validate_value_type(item, item_type, section=f"{section}[{index}]")
-        return
-    if origin is dict:
-        if not isinstance(value, dict):
-            raise TypeError(f"{section} must be a mapping")
-        key_type, value_type = get_args(expected) or (Any, Any)
-        for key, item in value.items():
-            _validate_value_type(key, key_type, section=f"{section} key")
-            _validate_value_type(item, value_type, section=f"{section}.{key}")
-        return
-    if expected is float:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return
-        raise TypeError(f"{section} must be a float")
-    if expected is int:
-        if isinstance(value, int) and not isinstance(value, bool):
-            return
-        raise TypeError(f"{section} must be an int")
-    if expected is bool:
-        if isinstance(value, bool):
-            return
-        raise TypeError(f"{section} must be a bool")
-    if isinstance(expected, type) and isinstance(value, expected):
-        return
-    expected_name = getattr(expected, "__name__", str(expected))
-    raise TypeError(f"{section} must be {expected_name}")
-
-
-def _build_dataclass(cls, src: Mapping[str, Any], *, section: str = "config"):
-    if not isinstance(src, Mapping):
-        raise TypeError(f"{section} must be a mapping")
-    non_string_keys = [key for key in src if not isinstance(key, str)]
-    if non_string_keys:
-        raise TypeError(f"{section} field names must be strings")
-
-    kwargs = {}
-    field_by_name = {item.name: item for item in fields(cls)}
-    unknown = sorted(set(src).difference(field_by_name))
-    if unknown:
-        raise ValueError(f"Unknown fields in {section}: {unknown}")
-    type_hints = get_type_hints(cls)
-    for name, item in field_by_name.items():
-        if name not in src:
-            if item.default is MISSING and item.default_factory is MISSING:
-                raise ValueError(f"Missing required field {section}.{name}")
-            continue
-        value = src[name]
-        expected = type_hints[name]
-        if isinstance(expected, type) and is_dataclass(expected):
-            kwargs[name] = _build_dataclass(
-                expected, value, section=f"{section}.{name}"
+    reward_raw = _section(
+        root, "reward", {"components", "execution", "cache_dir"}
+    )
+    raw_components = reward_raw["components"]
+    if not isinstance(raw_components, (list, tuple)) or not raw_components:
+        _fail("reward.components must be a non-empty sequence", path="reward.components")
+    components: list[RewardComponentConfig] = []
+    names: set[str] = set()
+    for index, raw_component in enumerate(raw_components):
+        item_path = f"reward.components[{index}]"
+        item = _mapping(raw_component, path=item_path)
+        _exact_keys(item, {"name", "weight", "params"}, path=item_path)
+        name = _name(item["name"], path=f"{item_path}.name")
+        if name in names:
+            _fail(
+                f"reward component name {name!r} is duplicated",
+                path=f"{item_path}.name",
             )
-        else:
-            _validate_value_type(value, expected, section=f"{section}.{name}")
-            kwargs[name] = value
-    return cls(**kwargs)
+        names.add(name)
+        components.append(
+            RewardComponentConfig(
+                name=name,
+                weight=_finite_float(item["weight"], path=f"{item_path}.weight"),
+                params=_params(item["params"], path=f"{item_path}.params"),
+            )
+        )
+    if not any(component.weight != 0.0 for component in components):
+        _fail(
+            "reward.components must contain at least one non-zero weight",
+            path="reward.components",
+        )
+    execution_raw = _mapping(reward_raw["execution"], path="reward.execution")
+    _exact_keys(
+        execution_raw, {"microbatch_size", "max_retries"}, path="reward.execution"
+    )
+    max_retries = _integer(
+        execution_raw["max_retries"], path="reward.execution.max_retries"
+    )
+    if not 0 <= max_retries <= 10:
+        _fail(
+            "reward.execution.max_retries must be between 0 and 10",
+            path="reward.execution.max_retries",
+        )
+    reward = RewardConfig(
+        components=tuple(components),
+        execution=RewardExecutionConfig(
+            microbatch_size=_optional_positive_int(
+                execution_raw["microbatch_size"],
+                path="reward.execution.microbatch_size",
+            ),
+            max_retries=max_retries,
+        ),
+        cache_dir=_optional_path(
+            reward_raw["cache_dir"], base=config_dir, path="reward.cache_dir"
+        ),
+    )
 
+    algorithm_raw = _section(root, "algorithm", {"name", "params", "advantage"})
+    advantage_raw = _mapping(
+        algorithm_raw["advantage"], path="algorithm.advantage"
+    )
+    _exact_keys(advantage_raw, {"epsilon"}, path="algorithm.advantage")
+    advantage_epsilon = _positive_float(
+        advantage_raw["epsilon"], path="algorithm.advantage.epsilon"
+    )
+    algorithm = AlgorithmConfig(
+        name=_name(algorithm_raw["name"], path="algorithm.name"),
+        params=_params(algorithm_raw["params"], path="algorithm.params"),
+        advantage=AdvantageConfig(epsilon=advantage_epsilon),
+    )
 
-def _validate_algorithm_sample_pair(cfg: VisualRLConfig) -> None:
-    algorithm_name = cfg.algorithm.name
-    sample_name = cfg.sample.name
-    allowed_samples = _ALGORITHM_SAMPLE_PAIRS.get(algorithm_name)
-    if allowed_samples is None or sample_name in allowed_samples:
-        return
+    optimizer_raw = _section(
+        root,
+        "optimizer",
+        {
+            "learning_rate",
+            "adam_beta1",
+            "adam_beta2",
+            "adam_weight_decay",
+            "adam_epsilon",
+            "max_grad_norm",
+            "max_initial_logprob_delta",
+            "require_initial_clipfrac_zero",
+            "require_finite_gradients",
+            "require_nonzero_gradients",
+        },
+    )
+    adam_beta1 = _finite_float(
+        optimizer_raw["adam_beta1"], path="optimizer.adam_beta1"
+    )
+    adam_beta2 = _finite_float(
+        optimizer_raw["adam_beta2"], path="optimizer.adam_beta2"
+    )
+    for path, value in (
+        ("optimizer.adam_beta1", adam_beta1),
+        ("optimizer.adam_beta2", adam_beta2),
+    ):
+        if not 0.0 <= value < 1.0:
+            _fail(f"{path} must be in [0, 1)", path=path)
+    adam_weight_decay = _finite_float(
+        optimizer_raw["adam_weight_decay"],
+        path="optimizer.adam_weight_decay",
+    )
+    if adam_weight_decay < 0.0:
+        _fail(
+            "optimizer.adam_weight_decay must be non-negative",
+            path="optimizer.adam_weight_decay",
+        )
+    optimizer = OptimizerConfig(
+        learning_rate=_positive_float(
+            optimizer_raw["learning_rate"], path="optimizer.learning_rate"
+        ),
+        adam_beta1=adam_beta1,
+        adam_beta2=adam_beta2,
+        adam_weight_decay=adam_weight_decay,
+        adam_epsilon=_positive_float(
+            optimizer_raw["adam_epsilon"], path="optimizer.adam_epsilon"
+        ),
+        max_grad_norm=_optional_positive_float(
+            optimizer_raw["max_grad_norm"], path="optimizer.max_grad_norm"
+        ),
+        max_initial_logprob_delta=_optional_positive_float(
+            optimizer_raw["max_initial_logprob_delta"],
+            path="optimizer.max_initial_logprob_delta",
+        ),
+        require_initial_clipfrac_zero=_boolean(
+            optimizer_raw["require_initial_clipfrac_zero"],
+            path="optimizer.require_initial_clipfrac_zero",
+        ),
+        require_finite_gradients=_boolean(
+            optimizer_raw["require_finite_gradients"],
+            path="optimizer.require_finite_gradients",
+        ),
+        require_nonzero_gradients=_boolean(
+            optimizer_raw["require_nonzero_gradients"],
+            path="optimizer.require_nonzero_gradients",
+        ),
+    )
 
-    expected = ", ".join(f"{name!r}" for name in sorted(allowed_samples))
-    raise ValueError(
-        f"Incompatible config: algorithm.name={algorithm_name!r} requires "
-        f"sample.name in {{{expected}}}, got sample.name={sample_name!r}."
+    runtime_raw = _section(
+        root,
+        "runtime",
+        {
+            "max_steps",
+            "batch_size",
+            "precision",
+            "update_microbatch_size",
+            "deterministic",
+            "progress",
+            "rollout_cache",
+            "distributed",
+        },
+    )
+    rollout_cache_raw = _mapping(
+        runtime_raw["rollout_cache"], path="runtime.rollout_cache"
+    )
+    _exact_keys(rollout_cache_raw, {"enabled"}, path="runtime.rollout_cache")
+    distributed_raw = _mapping(
+        runtime_raw["distributed"], path="runtime.distributed"
+    )
+    _exact_keys(
+        distributed_raw,
+        {"mode", "device", "timeout_s", "max_snapshot_tensor_bytes"},
+        path="runtime.distributed",
+    )
+    mode = _literal(
+        distributed_raw["mode"], ("single", "ddp"), path="runtime.distributed.mode"
+    )
+    device = _literal(
+        distributed_raw["device"],
+        ("cpu", "cuda"),
+        path="runtime.distributed.device",
+    )
+    precision = _literal(
+        runtime_raw["precision"], ("fp32", "fp16", "bf16"), path="runtime.precision"
+    )
+    if device == "cpu" and precision != "fp32":
+        _fail(
+            "CPU runtime only supports fp32 precision",
+            path="runtime.precision",
+        )
+    max_snapshot_tensor_bytes = _optional_positive_int(
+        distributed_raw["max_snapshot_tensor_bytes"],
+        path="runtime.distributed.max_snapshot_tensor_bytes",
+    )
+    if mode == "single" and max_snapshot_tensor_bytes is not None:
+        _fail(
+            "single mode requires max_snapshot_tensor_bytes to be null",
+            path="runtime.distributed.max_snapshot_tensor_bytes",
+        )
+    max_steps = _positive_int(runtime_raw["max_steps"], path="runtime.max_steps")
+    runtime = RuntimeConfig(
+        max_steps=max_steps,
+        batch_size=_positive_int(
+            runtime_raw["batch_size"], path="runtime.batch_size"
+        ),
+        precision=precision,
+        update_microbatch_size=_positive_int(
+            runtime_raw["update_microbatch_size"],
+            path="runtime.update_microbatch_size",
+        ),
+        deterministic=_boolean(
+            runtime_raw["deterministic"], path="runtime.deterministic"
+        ),
+        progress=_boolean(runtime_raw["progress"], path="runtime.progress"),
+        rollout_cache=RolloutCacheConfig(
+            enabled=_boolean(
+                rollout_cache_raw["enabled"],
+                path="runtime.rollout_cache.enabled",
+            )
+        ),
+        distributed=DistributedConfig(
+            mode=mode,
+            device=device,
+            timeout_s=_positive_float(
+                distributed_raw["timeout_s"],
+                path="runtime.distributed.timeout_s",
+            ),
+            max_snapshot_tensor_bytes=max_snapshot_tensor_bytes,
+        ),
+    )
+
+    artifacts_raw = _section(
+        root,
+        "artifacts",
+        {"output_dir", "checkpoint_every", "checkpoint_keep_last"},
+    )
+    output_dir = _required_path(
+        artifacts_raw["output_dir"], base=config_dir, path="artifacts.output_dir"
+    )
+    artifacts = ArtifactsConfig(
+        output_dir=output_dir,
+        checkpoint_every=_positive_int(
+            artifacts_raw["checkpoint_every"],
+            path="artifacts.checkpoint_every",
+        ),
+        checkpoint_keep_last=_optional_positive_int(
+            artifacts_raw["checkpoint_keep_last"],
+            path="artifacts.checkpoint_keep_last",
+        ),
+    )
+
+    resume_raw = _section(root, "resume", {"from"})
+    resume_from = _optional_path(
+        resume_raw["from"], base=config_dir, path="resume.from"
+    )
+    if resume_from is not None and resume_from != output_dir:
+        _fail(
+            "resume.from must resolve to the same path as artifacts.output_dir",
+            path="resume.from",
+        )
+    if resume_from is not None and model.adapter_checkpoint is not None:
+        _fail(
+            "resume.from and model.adapter_checkpoint are mutually exclusive",
+            path="resume",
+        )
+    resume = ResumeConfig(from_=resume_from)
+
+    if reward.cache_dir is not None and _paths_overlap(
+        reward.cache_dir, artifacts.output_dir
+    ):
+        _fail(
+            "reward.cache_dir and artifacts.output_dir must not overlap",
+            path="reward.cache_dir",
+        )
+
+    world_size = 1 if runtime.distributed.mode == "single" else 2
+    try:
+        validate_step_seed_budget(run.seed, runtime.max_steps, world_size)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc), key="run.seed") from exc
+
+    return VisualRLConfig(
+        schema_version=1,
+        run=run,
+        model=model,
+        dataset=dataset,
+        rollout=rollout,
+        reward=reward,
+        algorithm=algorithm,
+        optimizer=optimizer,
+        runtime=runtime,
+        artifacts=artifacts,
+        resume=resume,
     )
 
 
-def _validate_evaluation_config(cfg: VisualRLConfig) -> None:
-    evaluation = cfg.evaluation
-    if evaluation.path and evaluation.prompts:
-        raise ValueError("evaluation config cannot provide both prompts and path")
-    if not isinstance(evaluation.split_name, str) or not evaluation.split_name.strip():
-        raise ValueError("evaluation.split_name must be non-empty")
-    if not evaluation.seeds:
-        raise ValueError("evaluation.seeds must contain at least one seed")
-    if evaluation.max_prompts is not None and evaluation.max_prompts < 1:
-        raise ValueError("evaluation.max_prompts must be positive when provided")
+def _section(
+    root: Mapping[str, Any],
+    key: str,
+    expected: set[str],
+) -> Mapping[str, Any]:
+    section = _mapping(root[key], path=key)
+    _exact_keys(section, expected, path=key)
+    return section
 
 
-def _validate_positive_integer(path: str, value: Any) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{path} must be an integer")
-    if value <= 0:
-        raise ValueError(f"{path} must be positive")
+def _mapping(value: Any, *, path: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        _fail("expected a mapping", path=path or "<root>")
+    if any(not isinstance(key, str) for key in value):
+        _fail("mapping keys must be strings", path=path or "<root>")
+    return value
 
 
-def _validate_finite_number(
+def _exact_keys(
+    value: Mapping[str, Any],
+    expected: set[str] | frozenset[str],
+    *,
     path: str,
+) -> None:
+    actual = set(value)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing or unknown:
+        pieces = []
+        if missing:
+            pieces.append(f"missing keys {missing}")
+        if unknown:
+            pieces.append(f"unknown keys {unknown}")
+        _fail("; ".join(pieces), path=path or "<root>")
+
+
+def _params(value: Any, *, path: str) -> FrozenMapping:
+    mapping = _mapping(value, path=path)
+    try:
+        return value if isinstance(value, FrozenMapping) else FrozenMapping(mapping)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc), key=path) from exc
+
+
+def _boolean(value: Any, *, path: str) -> bool:
+    if type(value) is not bool:
+        _fail("expected a bool", path=path)
+    return value
+
+
+def _integer(value: Any, *, path: str) -> int:
+    if type(value) is not int:
+        _fail("expected an integer, not bool", path=path)
+    return value
+
+
+def _positive_int(value: Any, *, path: str) -> int:
+    result = _integer(value, path=path)
+    if result <= 0:
+        _fail("expected a positive integer", path=path)
+    return result
+
+
+def _optional_positive_int(value: Any, *, path: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, path=path)
+
+
+def _uint32(value: Any, *, path: str) -> int:
+    result = _integer(value, path=path)
+    if not 0 <= result <= UINT32_MAX:
+        _fail("expected a canonical uint32 integer", path=path)
+    return result
+
+
+def _finite_float(value: Any, *, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail("expected a finite number, not bool", path=path)
+    result = float(value)
+    if not math.isfinite(result):
+        _fail("expected a finite number", path=path)
+    return result
+
+
+def _positive_float(value: Any, *, path: str) -> float:
+    result = _finite_float(value, path=path)
+    if result <= 0.0:
+        _fail("expected a positive finite number", path=path)
+    return result
+
+
+def _optional_positive_float(value: Any, *, path: str) -> float | None:
+    if value is None:
+        return None
+    return _positive_float(value, path=path)
+
+
+def _nonempty_text(value: Any, *, path: str) -> str:
+    if not isinstance(value, str):
+        _fail("expected a string", path=path)
+    result = value.strip()
+    if not result or "\r" in result or "\n" in result:
+        _fail("expected a non-empty single-line string", path=path)
+    return result
+
+
+def _name(value: Any, *, path: str) -> str:
+    return _nonempty_text(value, path=path)
+
+
+def _literal(value: Any, allowed: tuple[str, ...], *, path: str):
+    if not isinstance(value, str) or value not in allowed:
+        _fail(f"expected one of {list(allowed)}", path=path)
+    return value
+
+
+def _optional_path(value: Any, *, base: Path, path: str) -> Path | None:
+    if value is None:
+        return None
+    return _required_path(value, base=base, path=path)
+
+
+def _required_path(value: Any, *, base: Path, path: str) -> Path:
+    if not isinstance(value, (str, Path)) or isinstance(value, bool):
+        _fail("expected a filesystem path", path=path)
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    # Lexically normalize without stat/symlink resolution. Filesystem and
+    # path-policy checks belong exclusively to Preflight.
+    return Path(os.path.abspath(candidate))
+
+
+def _inline_prompts(
     value: Any,
     *,
-    minimum: float | None = None,
-    maximum: float | None = None,
-    minimum_inclusive: bool = True,
-    maximum_inclusive: bool = True,
-) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{path} must be numeric")
-    resolved = float(value)
-    if not math.isfinite(resolved):
-        raise ValueError(f"{path} must be finite")
-    if minimum is not None and (
-        resolved < minimum if minimum_inclusive else resolved <= minimum
-    ):
-        relation = ">=" if minimum_inclusive else ">"
-        raise ValueError(f"{path} must be {relation} {minimum}")
-    if maximum is not None and (
-        resolved > maximum if maximum_inclusive else resolved >= maximum
-    ):
-        relation = "<=" if maximum_inclusive else "<"
-        raise ValueError(f"{path} must be {relation} {maximum}")
-
-
-def _validate_core_numeric_config(cfg: VisualRLConfig) -> None:
-    """Fail before runtime construction on invalid training semantics."""
-
-    _validate_positive_integer("sample.batch_size", cfg.sample.batch_size)
-    _validate_positive_integer("sample.num_steps", cfg.sample.num_steps)
-    # SD3 and Wan intentionally support no-CFG values at and below 1.0.
-    _validate_finite_number("sample.guidance_scale", cfg.sample.guidance_scale)
-
-    _validate_finite_number(
-        "algorithm.clip_range",
-        cfg.algorithm.clip_range,
-        minimum=0.0,
-        maximum=1.0,
-    )
-    _validate_finite_number(
-        "algorithm.adv_clip_max",
-        cfg.algorithm.adv_clip_max,
-        minimum=0.0,
-    )
-    _validate_finite_number(
-        "algorithm.beta",
-        cfg.algorithm.beta,
-        minimum=0.0,
-    )
-    _validate_finite_number(
-        "algorithm.advantage_epsilon",
-        cfg.algorithm.advantage_epsilon,
-        minimum=0.0,
-        minimum_inclusive=False,
-    )
-
-    _validate_finite_number(
-        "train.learning_rate",
-        cfg.train.learning_rate,
-        minimum=0.0,
-    )
-    _validate_positive_integer("train.max_steps", cfg.train.max_steps)
-    for name in ("adam_beta1", "adam_beta2"):
-        _validate_finite_number(
-            f"train.{name}",
-            getattr(cfg.train, name),
-            minimum=0.0,
-            maximum=1.0,
-            maximum_inclusive=False,
+    empty_policy: EmptyPromptPolicy,
+    require_unique: bool,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        _fail("dataset.prompts must be a sequence or null", path="dataset.prompts")
+    canonical: list[str] = []
+    for index, item in enumerate(value):
+        item_path = f"dataset.prompts[{index}]"
+        if not isinstance(item, str):
+            _fail("prompt must be a string", path=item_path)
+        if "\r" in item or "\n" in item:
+            _fail("prompt must not contain CR/LF", path=item_path)
+        prompt = item.strip()
+        if not prompt:
+            if empty_policy == "skip":
+                continue
+            _fail("empty prompt is forbidden by empty_prompt_policy", path=item_path)
+        canonical.append(prompt)
+    if not canonical:
+        _fail("dataset.prompts must remain non-empty", path="dataset.prompts")
+    if require_unique and len(set(canonical)) != len(canonical):
+        _fail(
+            "dataset.prompts must be unique before repeat expansion",
+            path="dataset.prompts",
         )
-    _validate_finite_number(
-        "train.adam_weight_decay",
-        cfg.train.adam_weight_decay,
-        minimum=0.0,
-    )
-    _validate_finite_number(
-        "train.adam_epsilon",
-        cfg.train.adam_epsilon,
-        minimum=0.0,
-        minimum_inclusive=False,
-    )
-    if cfg.train.max_grad_norm is not None:
-        _validate_finite_number(
-            "train.max_grad_norm",
-            cfg.train.max_grad_norm,
-            minimum=0.0,
-            minimum_inclusive=False,
-        )
+    return tuple(canonical)
 
 
-_REWARD_SCHEDULE_PHASE_FIELDS = frozenset({"name", "start_step", "end_step", "weights"})
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
 
 
-def normalize_reward_schedule(
-    schedule: Any,
-    *,
-    weights: Mapping[str, Any],
-    clients: Mapping[str, Any],
-    max_steps: int | None = None,
-) -> list[dict[str, Any]]:
-    """Validate and detach a step-aware reward schedule.
-
-    Phases use zero-based, half-open step intervals.  Omitting a reward from a
-    phase is the only supported way to disable it, which lets the router avoid
-    calling an inactive scorer altogether.
-    """
-
-    if not isinstance(schedule, list):
-        raise TypeError("rewards.schedule must be a list")
-    if not schedule:
-        return []
-    if not isinstance(weights, Mapping):
-        raise TypeError("rewards.weights must be a mapping")
-    if not isinstance(clients, Mapping):
-        raise TypeError("rewards.clients must be a mapping")
-
-    declared_weights = set(weights)
-    declared_clients = set(clients)
-    normalized: list[dict[str, Any]] = []
-    names: set[str] = set()
-    previous_end: int | None = None
-
-    for index, phase in enumerate(schedule):
-        path = f"rewards.schedule[{index}]"
-        if not isinstance(phase, Mapping):
-            raise TypeError(f"{path} must be a mapping")
-        unknown = sorted(set(phase).difference(_REWARD_SCHEDULE_PHASE_FIELDS))
-        missing = sorted(_REWARD_SCHEDULE_PHASE_FIELDS.difference(phase))
-        if unknown:
-            raise ValueError(f"{path} has unknown fields: {unknown}")
-        if missing:
-            raise ValueError(f"{path} is missing required fields: {missing}")
-
-        name = phase["name"]
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"{path}.name must be a non-empty string")
-        name = name.strip()
-        if name in names:
-            raise ValueError(f"rewards.schedule phase name {name!r} is duplicated")
-        names.add(name)
-
-        start_step = phase["start_step"]
-        end_step = phase["end_step"]
-        for field_name, value in (
-            ("start_step", start_step),
-            ("end_step", end_step),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise TypeError(f"{path}.{field_name} must be an integer")
-        if start_step < 0:
-            raise ValueError(f"{path}.start_step must be non-negative")
-        if end_step <= start_step:
-            raise ValueError(f"{path}.end_step must be greater than start_step")
-        expected_start = 0 if previous_end is None else previous_end
-        if start_step != expected_start:
-            raise ValueError(
-                "rewards.schedule phases must be contiguous and start at step 0: "
-                f"{path}.start_step is {start_step}, expected {expected_start}"
-            )
-
-        phase_weights = phase["weights"]
-        if not isinstance(phase_weights, Mapping):
-            raise TypeError(f"{path}.weights must be a mapping")
-        if not phase_weights:
-            raise ValueError(f"{path}.weights must not be empty")
-        unknown_weights = sorted(set(phase_weights).difference(declared_weights))
-        if unknown_weights:
-            raise ValueError(
-                f"{path}.weights reference undeclared rewards.weights entries: "
-                f"{unknown_weights}"
-            )
-        unknown_clients = sorted(set(phase_weights).difference(declared_clients))
-        if unknown_clients:
-            raise ValueError(
-                f"{path}.weights reference undeclared rewards.clients entries: "
-                f"{unknown_clients}"
-            )
-
-        normalized_weights: dict[str, float] = {}
-        for reward_name, weight in phase_weights.items():
-            weight_path = f"{path}.weights[{reward_name!r}]"
-            if not isinstance(reward_name, str) or not reward_name:
-                raise ValueError(f"{path}.weights keys must be non-empty strings")
-            if (
-                isinstance(weight, bool)
-                or not isinstance(weight, (int, float))
-                or not math.isfinite(float(weight))
-            ):
-                raise ValueError(f"{weight_path} must be a finite number")
-            if float(weight) == 0.0:
-                raise ValueError(
-                    f"{weight_path} must be non-zero; omit inactive rewards instead"
-                )
-            normalized_weights[reward_name] = float(weight)
-
-        normalized.append(
-            {
-                "name": name,
-                "start_step": start_step,
-                "end_step": end_step,
-                "weights": normalized_weights,
-            }
-        )
-        previous_end = end_step
-
-    if max_steps is not None and previous_end is not None and previous_end < max_steps:
-        raise ValueError(
-            "rewards.schedule must cover train.max_steps: "
-            f"final end_step is {previous_end}, train.max_steps is {max_steps}"
-        )
-    return normalized
-
-
-def _validate_reward_schedule_config(cfg: VisualRLConfig) -> None:
-    schedule = normalize_reward_schedule(
-        cfg.rewards.schedule,
-        weights=cfg.rewards.weights,
-        clients=cfg.rewards.clients,
-        max_steps=cfg.train.max_steps,
-    )
-    if not schedule:
-        return
-    if cfg.rewards.provider != "reward_router":
-        raise ValueError(
-            "rewards.schedule is only supported by rewards.provider='reward_router'"
-        )
-    if cfg.algorithm.weight_advantages:
-        raise ValueError(
-            "rewards.schedule is incompatible with algorithm.weight_advantages=true; "
-            "scheduled raw reward keys are phase-dependent"
-        )
-
-
-def _validate_runtime_config(cfg: VisualRLConfig) -> None:
-    if cfg.train.precision not in {"fp32", "bf16", "fp16"}:
-        raise ValueError("train.precision must be one of: fp32, bf16, fp16")
-    if (
-        cfg.train.update_microbatch_size is not None
-        and cfg.train.update_microbatch_size < 1
-    ):
-        raise ValueError("train.update_microbatch_size must be positive")
-    for name in (
-        "checkpoint_keep_last",
-        "rollout_cache_keep_last",
-        "rollout_cache_max_bytes",
-        "artifact_max_bytes",
-    ):
-        value = getattr(cfg.runner, name)
-        if value is not None and value < 0:
-            raise ValueError(f"runner.{name} must be non-negative")
-
-    executor = cfg.runner.reward_executor
-    if executor.mode not in {"sync", "async"}:
-        raise ValueError("runner.reward_executor.mode must be one of: sync, async")
-    if isinstance(executor.max_workers, bool) or not isinstance(
-        executor.max_workers, int
-    ):
-        raise TypeError("runner.reward_executor.max_workers must be an integer")
-    if executor.max_workers < 1:
-        raise ValueError("runner.reward_executor.max_workers must be positive")
-    if executor.microbatch_size is not None:
-        if isinstance(executor.microbatch_size, bool) or not isinstance(
-            executor.microbatch_size, int
-        ):
-            raise TypeError(
-                "runner.reward_executor.microbatch_size must be an integer or null"
-            )
-        if executor.microbatch_size < 1:
-            raise ValueError(
-                "runner.reward_executor.microbatch_size must be positive when provided"
-            )
-    if executor.max_in_flight is not None:
-        if isinstance(executor.max_in_flight, bool) or not isinstance(
-            executor.max_in_flight, int
-        ):
-            raise TypeError(
-                "runner.reward_executor.max_in_flight must be an integer or null"
-            )
-        if executor.max_in_flight < 1:
-            raise ValueError(
-                "runner.reward_executor.max_in_flight must be positive when provided"
-            )
-    if isinstance(executor.max_retries, bool) or not isinstance(
-        executor.max_retries, int
-    ):
-        raise TypeError("runner.reward_executor.max_retries must be an integer")
-    if executor.max_retries < 0:
-        raise ValueError("runner.reward_executor.max_retries must be non-negative")
-    if isinstance(executor.timeout_s, bool) or not isinstance(
-        executor.timeout_s, (int, float)
-    ):
-        raise TypeError("runner.reward_executor.timeout_s must be numeric")
-    if not math.isfinite(executor.timeout_s) or executor.timeout_s <= 0:
-        raise ValueError("runner.reward_executor.timeout_s must be finite and positive")
-    if isinstance(executor.submit_timeout_s, bool) or not isinstance(
-        executor.submit_timeout_s, (int, float)
-    ):
-        raise TypeError("runner.reward_executor.submit_timeout_s must be numeric")
-    if not math.isfinite(executor.submit_timeout_s) or executor.submit_timeout_s < 0:
-        raise ValueError(
-            "runner.reward_executor.submit_timeout_s must be finite and non-negative"
-        )
-    if not isinstance(executor.require_hard_timeout, bool):
-        raise TypeError("runner.reward_executor.require_hard_timeout must be a bool")
-    scaling = cfg.runner.conditional_scaling
-    if scaling.split_roles:
-        raise ValueError(
-            "runner.conditional_scaling.split_roles is evidence-gated and is not "
-            "enabled in the simplified core"
-        )
-    if scaling.fsdp2:
-        raise ValueError(
-            "runner.conditional_scaling.fsdp2 is evidence-gated and is not enabled "
-            "in the simplified core"
-        )
-    distributed = cfg.runner.distributed
-    if distributed.backend not in {None, "gloo", "nccl"}:
-        raise ValueError("runner.distributed.backend must be one of: gloo, nccl, null")
-    if distributed.device is not None and (
-        not isinstance(distributed.device, str) or not distributed.device.strip()
-    ):
-        raise ValueError(
-            "runner.distributed.device must be a non-empty device string or null"
-        )
-    if isinstance(distributed.timeout_s, bool) or not isinstance(
-        distributed.timeout_s, (int, float)
-    ):
-        raise TypeError("runner.distributed.timeout_s must be numeric")
-    if not math.isfinite(distributed.timeout_s) or distributed.timeout_s <= 0:
-        raise ValueError("runner.distributed.timeout_s must be finite and positive")
-    snapshot_limit = distributed.max_snapshot_tensor_bytes
-    if snapshot_limit is not None and (
-        isinstance(snapshot_limit, bool) or not isinstance(snapshot_limit, int)
-    ):
-        raise TypeError(
-            "runner.distributed.max_snapshot_tensor_bytes must be a positive "
-            "integer or null"
-        )
-    if snapshot_limit is not None and snapshot_limit <= 0:
-        raise ValueError(
-            "runner.distributed.max_snapshot_tensor_bytes must be positive"
-        )
-
-
-def _validate_typed_config(cfg: VisualRLConfig) -> None:
-    """Apply every semantic validator to an already type-checked config."""
-
-    _validate_algorithm_sample_pair(cfg)
-    _validate_evaluation_config(cfg)
-    _validate_core_numeric_config(cfg)
-    _validate_reward_schedule_config(cfg)
-    _validate_runtime_config(cfg)
-
-
-def validate_config(config: VisualRLConfig) -> None:
-    """Side-effect-free validation for direct or subsequently mutated configs.
-
-    ``VisualRLConfig`` remains a convenient mutable Python API.  Rebuilding a
-    detached copy through the schema closes the gap between configs produced by
-    :func:`config_from_dict` and configs constructed (or edited) directly.
-    """
-
-    if not isinstance(config, VisualRLConfig):
-        raise TypeError("config must be a VisualRLConfig")
-    detached = _build_dataclass(
-        VisualRLConfig,
-        deepcopy(config_to_dict(config)),
-    )
-    _validate_typed_config(detached)
-
-
-def config_from_dict(values: Mapping[str, Any]) -> VisualRLConfig:
-    """Validate detached values and construct the typed runtime config."""
-
-    if not isinstance(values, Mapping):
-        raise TypeError("config must be a mapping")
-    cfg = _build_dataclass(VisualRLConfig, deepcopy(dict(values)))
-    _validate_typed_config(cfg)
-    return cfg
-
-
-def load_config(path: str | Path) -> VisualRLConfig:
-    """Load either a resolver envelope or a legacy full-config YAML file."""
-
-    from visual_rl.configs.resolver import resolve_experiment
-    from visual_rl.configs.sources import read_experiment_spec
-
-    return resolve_experiment(read_experiment_spec(path)).config
-
-
-def config_to_dict(config: VisualRLConfig) -> dict[str, Any]:
-    return asdict(config)
-
-
-def section_to_dict(section: Any) -> dict[str, Any]:
-    if is_dataclass(section):
-        return asdict(section)
-    return dict(section)
+def _fail(message: str, *, path: str) -> None:
+    raise ConfigError(f"{path}: {message}", key=path)

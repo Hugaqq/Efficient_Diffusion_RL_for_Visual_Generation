@@ -9,6 +9,7 @@ import socket
 import time
 import traceback
 from multiprocessing.context import SpawnContext
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,11 +17,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from visual_rl.core.types import RewardBatch, RolloutBatch, StepContext
+from visual_rl.core.types import (
+    FrozenMapping,
+    RewardBatch,
+    RolloutBatch,
+    StepContext,
+    ValidatedRuntimeEnv,
+)
 from visual_rl.distributed import (
     DDPStrategy,
-    DistributedContext,
     DistributedFailureError,
+    build_strategy,
 )
 from visual_rl.optimizers import AdvantageResult, ObjectiveOutput, UpdateEngine
 from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
@@ -28,41 +35,89 @@ from visual_rl.optimizers.base import OptimizerPlugin
 from visual_rl.optimizers.flash_grpo import FlashGRPOAlgorithm
 
 
+def _ddp_strategy(rank: int, port: int) -> DDPStrategy:
+    strategy = build_strategy(
+        SimpleNamespace(
+            mode="ddp",
+            device="cpu",
+            timeout_s=8.0,
+            max_snapshot_tensor_bytes=1 << 30,
+        ),
+        ValidatedRuntimeEnv(
+            mode="ddp",
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+            local_world_size=2,
+            group_rank=0,
+            group_world_size=1,
+            master_addr="127.0.0.1",
+            master_port=port,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping(
+                {
+                    "RANK": str(rank),
+                    "LOCAL_RANK": str(rank),
+                    "WORLD_SIZE": "2",
+                    "LOCAL_WORLD_SIZE": "2",
+                    "GROUP_RANK": "0",
+                    "GROUP_WORLD_SIZE": "1",
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": str(port),
+                }
+            ),
+        ),
+    )
+    assert isinstance(strategy, DDPStrategy)
+    return strategy
+
+
 def _batch() -> RolloutBatch:
     batch_size, transitions = 4, 2
     return RolloutBatch(
-        prompts=[f"prompt-{index}" for index in range(batch_size)],
-        metadata=[{} for _ in range(batch_size)],
-        media=torch.zeros(batch_size, 1),
+        prompts=tuple(f"prompt-{index}" for index in range(batch_size)),
+        metadata=tuple({} for _ in range(batch_size)),
+        media=torch.zeros(batch_size, 1, 1, 1),
         latents=torch.zeros(batch_size, transitions, 1),
         next_latents=torch.ones(batch_size, transitions, 1),
         timesteps=torch.arange(transitions).expand(batch_size, -1),
         old_log_probs=torch.zeros(batch_size, transitions),
-        sample_id=[f"sample-{index}" for index in range(batch_size)],
-        prompt_id=[f"prompt-id-{index}" for index in range(batch_size)],
-        group_id=["group-a", "group-a", "group-b", "group-b"],
-        branch_id=list(range(batch_size)),
         transition_mask=torch.ones(batch_size, transitions, dtype=torch.bool),
-        context=StepContext(step=3, seed=19, epoch_tag=0),
-        model_tensors={
+        sample_id=tuple(f"sample-{index}" for index in range(batch_size)),
+        prompt_id=tuple(f"prompt-id-{index}" for index in range(batch_size)),
+        group_id=("group-a", "group-a", "group-b", "group-b"),
+        branch_id=tuple(range(batch_size)),
+        media_layout="BCHW",
+        camera_trajectory=None,
+        context=StepContext(step=3, seed=19),
+        selected_timestep_index=None,
+        flash_coefficient=None,
+        branch_step_index=None,
+        trajectory_step_index=None,
+        transition_std_dev=None,
+        recompute_payload={
             "features": torch.arange(
                 1,
                 batch_size * transitions + 1,
                 dtype=torch.float32,
             ).reshape(batch_size, transitions)
         },
+        artifact_metadata={},
     )
 
 
 def _rewards(batch: RolloutBatch) -> RewardBatch:
     values = torch.arange(1, batch.batch_size + 1, dtype=torch.float32)
     return RewardBatch(
+        sample_id=batch.sample_id,
         raw={"score": values},
         weighted={"score": values},
         weighted_total=values,
         valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
-        metadata={},
-        sample_id=list(batch.sample_id),
+        shared_metadata={"score": {}},
+        sample_metadata={
+            "score": tuple({} for _ in range(batch.batch_size))
+        },
     )
 
 
@@ -99,7 +154,7 @@ class _Adapter:
         self.default_calls += 1
         if self.events is not None:
             self.events.append("forward")
-        return self.parameter * batch.model_tensors["features"]
+        return self.parameter * batch.recompute_payload["features"]
 
     def parameters(self):
         return [self.parameter]
@@ -132,7 +187,7 @@ class _FlashDistributedAdapter:
         return None
 
     def recompute_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
-        return self.transformer(batch.model_tensors["features"])
+        return self.transformer(batch.recompute_payload["features"])
 
     def parameters(self):
         return self.transformer.parameters()
@@ -155,7 +210,7 @@ class _RecordingFlashAlgorithm(FlashGRPOAlgorithm):
             global_mean,
         )
         self.observed_prepared_weights = (
-            prepared.model_tensors[self._PREPARED_RECTIFICATION_KEY]
+            prepared.recompute_payload[self._PREPARED_RECTIFICATION_KEY]
             .detach()
             .clone()
         )
@@ -176,7 +231,7 @@ class _MicrobatchDistributedAdapter:
         return None
 
     def recompute_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
-        features = batch.model_tensors["features"].unsqueeze(-1)
+        features = batch.recompute_payload["features"].unsqueeze(-1)
         return self.transformer(features).squeeze(-1)
 
     def parameters(self):
@@ -201,11 +256,15 @@ def _rank_microbatch_batch(rank: int) -> RolloutBatch:
     start = rank * 8 + 1
     features = torch.arange(start, start + 8, dtype=torch.float32).reshape(4, 2)
     return batch.replace(
-        prompts=[f"rank-{rank}-prompt-{index}" for index in range(4)],
-        sample_id=[f"rank-{rank}-sample-{index}" for index in range(4)],
-        prompt_id=[f"rank-{rank}-prompt-id-{index}" for index in range(4)],
-        group_id=[f"rank-{rank}-group-{index // 2}" for index in range(4)],
-        model_tensors={"features": features},
+        prompts=tuple(f"rank-{rank}-prompt-{index}" for index in range(4)),
+        sample_id=tuple(f"rank-{rank}-sample-{index}" for index in range(4)),
+        prompt_id=tuple(
+            f"rank-{rank}-prompt-id-{index}" for index in range(4)
+        ),
+        group_id=tuple(
+            f"rank-{rank}-group-{index // 2}" for index in range(4)
+        ),
+        recompute_payload={"features": features},
     )
 
 
@@ -219,8 +278,8 @@ def _microbatch_no_sync_worker(rank: int, port: int, results: Any) -> None:
             MASTER_ADDR="127.0.0.1",
             MASTER_PORT=str(port),
         )
-        context = DistributedContext.from_env(device="cpu", backend="gloo")
-        strategy = DDPStrategy(context, timeout_s=8).setup()
+        strategy = _ddp_strategy(rank, port)
+        context = strategy.context
         adapter = _MicrobatchDistributedAdapter()
         strategy.prepare(adapter)
         hook_state = {"calls": 0, "world_size": context.world_size}
@@ -279,31 +338,42 @@ def _free_loopback_port() -> int:
 
 
 def _rank_flash_batch(rank: int, coefficient: Any, step: int) -> RolloutBatch:
-    context = StepContext(step=step, seed=101, epoch_tag=0)
+    context = StepContext(step=step, seed=101)
     coefficients = torch.as_tensor(coefficient, dtype=torch.float32).reshape(-1)
     batch_size = coefficients.numel()
     return RolloutBatch(
-        prompts=[f"rank-{rank}-{index}" for index in range(batch_size)],
-        metadata=[{"rank": rank} for _ in range(batch_size)],
-        media=torch.zeros(batch_size, 1),
+        prompts=tuple(
+            f"rank-{rank}-{index}" for index in range(batch_size)
+        ),
+        metadata=tuple({"rank": rank} for _ in range(batch_size)),
+        media=torch.zeros(batch_size, 1, 1, 1),
         latents=torch.zeros(batch_size, 1, 1),
         next_latents=torch.ones(batch_size, 1, 1),
         timesteps=torch.zeros(batch_size, 1),
         old_log_probs=torch.zeros(batch_size, 1),
-        sample_id=[f"sample-{rank}-{index}" for index in range(batch_size)],
-        prompt_id=[f"prompt-{rank}-{index}" for index in range(batch_size)],
-        group_id=["shared"] * batch_size,
-        branch_id=list(range(batch_size)),
         transition_mask=torch.ones(batch_size, 1, dtype=torch.bool),
+        sample_id=tuple(
+            f"sample-{rank}-{index}" for index in range(batch_size)
+        ),
+        prompt_id=tuple(
+            f"prompt-{rank}-{index}" for index in range(batch_size)
+        ),
+        group_id=("shared",) * batch_size,
+        branch_id=tuple(range(batch_size)),
+        media_layout="BCHW",
+        camera_trajectory=None,
         context=context,
-        model_metadata={
-            "selected_timestep_indices": [rank] * batch_size,
-            "num_steps": 2,
-        },
-        model_tensors={
-            "coefficient": coefficients[:, None],
+        selected_timestep_index=torch.full(
+            (batch_size,), rank, dtype=torch.int64
+        ),
+        flash_coefficient=coefficients[:, None],
+        branch_step_index=None,
+        trajectory_step_index=None,
+        transition_std_dev=None,
+        recompute_payload={
             "features": torch.ones(batch_size, 1, dtype=torch.float32),
         },
+        artifact_metadata={"num_steps": 2},
     )
 
 
@@ -317,8 +387,7 @@ def _flash_global_mean_worker(rank: int, port: int, results: Any) -> None:
             MASTER_ADDR="127.0.0.1",
             MASTER_PORT=str(port),
         )
-        context = DistributedContext.from_env(device="cpu", backend="gloo")
-        strategy = DDPStrategy(context, timeout_s=8).setup()
+        strategy = _ddp_strategy(rank, port)
         adapter = _FlashDistributedAdapter()
         strategy.prepare(adapter)
         observations: list[dict[str, Any]] = []
@@ -334,11 +403,15 @@ def _flash_global_mean_worker(rank: int, port: int, results: Any) -> None:
             coefficients = coefficients_by_rank[rank]
             batch = _rank_flash_batch(rank, coefficients, step)
             rewards = RewardBatch(
+                sample_id=batch.sample_id,
                 raw={"score": torch.ones(batch.batch_size)},
                 weighted={"score": torch.ones(batch.batch_size)},
                 weighted_total=torch.ones(batch.batch_size),
                 valid_mask=torch.ones(batch.batch_size, dtype=torch.bool),
-                sample_id=list(batch.sample_id),
+                shared_metadata={"score": {}},
+                sample_metadata={
+                    "score": tuple({} for _ in range(batch.batch_size))
+                },
             )
             algorithm = _RecordingFlashAlgorithm(
                 objective_version="reference_v1",
@@ -383,17 +456,16 @@ def _flash_global_mean_worker(rank: int, port: int, results: Any) -> None:
         invalid_batch = _rank_flash_batch(rank, float(rank + 1), 2)
         if rank == 1:
             invalid_batch = invalid_batch.replace(
-                model_tensors={
-                    **invalid_batch.model_tensors,
-                    "coefficient": torch.ones(1, 2),
-                }
+                flash_coefficient=torch.ones(1, 2)
             )
         invalid_rewards = RewardBatch(
+            sample_id=invalid_batch.sample_id,
             raw={"score": torch.ones(1)},
             weighted={"score": torch.ones(1)},
             weighted_total=torch.ones(1),
             valid_mask=torch.ones(1, dtype=torch.bool),
-            sample_id=list(invalid_batch.sample_id),
+            shared_metadata={"score": {}},
+            sample_metadata={"score": ({},)},
         )
         invalid_plugin = AlgorithmOptimizerPlugin(
             _RecordingFlashAlgorithm(objective_version="reference_v1"),
@@ -492,7 +564,7 @@ def test_every_microbatch_uses_injected_recompute_callable() -> None:
 
     def ddp_recompute(micro_batch: RolloutBatch) -> torch.Tensor:
         routed_slices.append(list(micro_batch.sample_id))
-        return adapter.parameter * micro_batch.model_tensors["features"]
+        return adapter.parameter * micro_batch.recompute_payload["features"]
 
     _, optimizer, metrics = _run(
         adapter,

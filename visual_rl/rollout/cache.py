@@ -1,98 +1,180 @@
-"""Rollout cache for recovering reward/training work without rerolling."""
+"""Safe, rank-local format-v3 rollout cache."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import errno
 import hashlib
-import json
-from dataclasses import asdict
 import os
 from pathlib import Path
 import secrets
 import stat
 from typing import Any
 
-from visual_rl.artifacts.serialization import to_jsonable
-from visual_rl.core.types import RolloutBatch, StepContext
+from visual_rl.artifacts.serialization import (
+    canonical_json_text,
+    strict_json_load,
+)
+from visual_rl.core.types import RolloutBatch, StepContext, to_plain_dict
+
 
 CACHE_SCHEMA = "visual_rl.rollout_cache"
-CACHE_VERSION = 2
-_SUPPORTED_CACHE_VERSIONS = {1, CACHE_VERSION}
+CACHE_VERSION = 3
+_SUPPORTED_CACHE_VERSIONS = frozenset({CACHE_VERSION})
 _DIGEST_CHUNK_SIZE = 1024 * 1024
-_TENSOR_FIELDS = {
-    "latents",
-    "next_latents",
-    "timesteps",
-    "old_log_probs",
-    "kl",
-    "transition_mask",
-    "model_tensors",
-}
-_LEGACY_TENSOR_FIELDS = _TENSOR_FIELDS | {
-    "branch_id",
-    "branch_ids",
-    "context",
-    "seed",
-    "epoch_tag",
-}
+_METADATA_KEYS = frozenset(
+    {
+        "schema",
+        "version",
+        "kind",
+        "step",
+        "generation",
+        "tensor_path",
+        "tensor_sha256",
+        "media_path",
+        "media_sha256",
+        "prompts",
+        "metadata",
+        "sample_id",
+        "prompt_id",
+        "group_id",
+        "branch_id",
+        "media_layout",
+        "context",
+        "artifact_metadata",
+    }
+)
+_TENSOR_KEYS = frozenset(
+    {
+        "schema",
+        "version",
+        "kind",
+        "generation",
+        "latents",
+        "next_latents",
+        "timesteps",
+        "old_log_probs",
+        "transition_mask",
+        "camera_trajectory",
+        "selected_timestep_index",
+        "flash_coefficient",
+        "branch_step_index",
+        "trajectory_step_index",
+        "transition_std_dev",
+        "recompute_payload",
+    }
+)
+_MEDIA_KEYS = frozenset(
+    {"schema", "version", "kind", "generation", "media"}
+)
+_TENSOR_VALUE_KEYS = _TENSOR_KEYS.difference(
+    {"schema", "version", "kind", "generation", "recompute_payload"}
+)
 
 
 class RolloutCache:
-    def __init__(self, root: str | Path | None):
-        self.root = Path(root) if root else None
-        if self.root:
-            _initialize_cache_root(self.root)
+    """Persist one exact ``RolloutBatch`` per logical step."""
 
-    def save(self, step: int, batch, rewards: Any | None = None) -> dict[str, str]:
+    def __init__(
+        self,
+        root: str | Path | None,
+        *,
+        output_dir: str | Path,
+    ) -> None:
+        self.output_dir = _validated_existing_directory(
+            Path(output_dir),
+            label="rollout cache output_dir",
+        )
+        self.root: Path | None
+        if root is None:
+            self.root = None
+            return
+        requested = Path(root).absolute()
+        _require_lexically_below(requested, self.output_dir)
+        _initialize_cache_root(requested)
+        resolved = _validated_existing_directory(
+            requested,
+            label="rollout cache root",
+        )
+        if resolved == self.output_dir or not resolved.is_relative_to(
+            self.output_dir
+        ):
+            raise ValueError("rollout cache root must be below output_dir")
+        self.root = resolved
+
+    def save(
+        self,
+        batch: RolloutBatch,
+    ) -> tuple[str | None, str | None]:
+        """Save v3 media/tensors and return output-relative POSIX paths."""
+
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("RolloutCache.save() requires a RolloutBatch")
         if self.root is None:
-            return {}
+            return None, None
         import torch
 
-        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-            raise ValueError("Rollout cache step must be a non-negative integer")
-        if not isinstance(batch, RolloutBatch):
-            raise TypeError("Rollout cache can only save RolloutBatch values")
-        batch.validate_lightweight(strict=True)
         root = _validated_cache_root(self.root)
+        step = batch.context.step
         base = root / f"batch_{step:06d}"
         generation = secrets.token_hex(16)
+        tensor_path = base.with_suffix(".pt")
+        media_path = base.with_suffix(".media.pt")
+        metadata_path = base.with_suffix(".json")
         tensor_payload = {
             "schema": CACHE_SCHEMA,
             "version": CACHE_VERSION,
             "kind": "tensors",
             "generation": generation,
-            "latents": batch.latents,
-            "next_latents": batch.next_latents,
-            "timesteps": batch.timesteps,
-            "old_log_probs": batch.old_log_probs,
-            "kl": batch.kl,
-            "transition_mask": batch.transition_mask,
-            "model_tensors": batch.model_tensors,
+            "latents": _portable_tensor(batch.latents),
+            "next_latents": _portable_tensor(batch.next_latents),
+            "timesteps": _portable_tensor(batch.timesteps),
+            "old_log_probs": _portable_tensor(batch.old_log_probs),
+            "transition_mask": _portable_tensor(batch.transition_mask),
+            "camera_trajectory": _portable_optional_tensor(
+                batch.camera_trajectory
+            ),
+            "selected_timestep_index": _portable_optional_tensor(
+                batch.selected_timestep_index
+            ),
+            "flash_coefficient": _portable_optional_tensor(
+                batch.flash_coefficient
+            ),
+            "branch_step_index": _portable_optional_tensor(
+                batch.branch_step_index
+            ),
+            "trajectory_step_index": _portable_optional_tensor(
+                batch.trajectory_step_index
+            ),
+            "transition_std_dev": _portable_optional_tensor(
+                batch.transition_std_dev
+            ),
+            "recompute_payload": {
+                name: _portable_tensor(value)
+                for name, value in batch.recompute_payload.items()
+            },
         }
-        _validate_tensor_payload(tensor_payload)
-        tensor_path = base.with_suffix(".pt")
-        media_path = base.with_suffix(".media.pt")
         media_payload = {
             "schema": CACHE_SCHEMA,
             "version": CACHE_VERSION,
             "kind": "media",
             "generation": generation,
-            "media": batch.media,
+            "media": _portable_tensor(batch.media),
         }
+        _validate_tensor_payload(tensor_payload)
         _validate_media_payload(media_payload)
-        tensor_sha256 = _atomic_torch_save(
+        tensor_digest = _atomic_torch_save(
             torch,
             tensor_payload,
             tensor_path,
             root=root,
         )
-        media_sha256 = _atomic_torch_save(
+        media_digest = _atomic_torch_save(
             torch,
             media_payload,
             media_path,
             root=root,
         )
-
         metadata = {
             "schema": CACHE_SCHEMA,
             "version": CACHE_VERSION,
@@ -100,41 +182,35 @@ class RolloutCache:
             "step": step,
             "generation": generation,
             "tensor_path": tensor_path.name,
-            "tensor_sha256": tensor_sha256,
-            "prompts": batch.prompts,
-            "metadata": batch.metadata,
-            "model_metadata": batch.model_metadata,
+            "tensor_sha256": tensor_digest,
             "media_path": media_path.name,
-            "media_sha256": media_sha256,
-            "sample_id": to_jsonable(batch.sample_id),
-            "prompt_id": to_jsonable(batch.prompt_id),
-            "group_id": to_jsonable(batch.group_id),
-            "branch_id": to_jsonable(batch.branch_id),
+            "media_sha256": media_digest,
+            "prompts": to_plain_dict(batch.prompts),
+            "metadata": to_plain_dict(batch.metadata),
+            "sample_id": to_plain_dict(batch.sample_id),
+            "prompt_id": to_plain_dict(batch.prompt_id),
+            "group_id": to_plain_dict(batch.group_id),
+            "branch_id": to_plain_dict(batch.branch_id),
             "media_layout": batch.media_layout,
-            "context": asdict(batch.context) if batch.context is not None else None,
+            "context": to_plain_dict(batch.context),
+            "artifact_metadata": to_plain_dict(batch.artifact_metadata),
         }
-        if rewards is not None:
-            metadata["reward_metadata"] = rewards.metadata
-            metadata["weighted_total"] = rewards.weighted_total.detach().cpu().tolist()
-        metadata = to_jsonable(metadata)
         _validate_metadata_payload(metadata, expected_step=step)
-        metadata_path = base.with_suffix(".json")
         _atomic_json_save(metadata, metadata_path, root=root)
-        return {
-            "rollout_cache_path": str(tensor_path),
-            "media_path": str(media_path),
-            "metadata_path": str(metadata_path),
-        }
+        _fsync_directory(root)
+        return (
+            _output_relative(media_path, self.output_dir),
+            _output_relative(tensor_path, self.output_dir),
+        )
 
-    def load(self, step: int, *, map_location: Any = "cpu") -> RolloutBatch:
-        """Load a cached batch, including caches written before formal identity."""
+    def load(self, step: int) -> RolloutBatch:
+        """Safely load one exact v3 batch on CPU."""
 
+        step = _non_negative_step(step)
         if self.root is None:
-            raise ValueError("RolloutCache has no root directory")
+            raise RuntimeError("rollout cache is disabled")
         import torch
 
-        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-            raise ValueError("Rollout cache step must be a non-negative integer")
         root = _validated_cache_root(self.root)
         base = root / f"batch_{step:06d}"
         metadata_path = _validated_cache_file(
@@ -142,358 +218,439 @@ class RolloutCache:
             base.with_suffix(".json"),
             label="metadata",
         )
-        with metadata_path.open("r", encoding="utf-8") as handle:
-            metadata_payload = json.load(handle)
-        metadata_version = _validate_metadata_payload(
-            metadata_payload,
-            expected_step=step,
-        )
-        tensor_path = _validated_cache_file(
+        try:
+            metadata = strict_json_load(metadata_path)
+        except ValueError as exc:
+            raise RuntimeError("rollout cache metadata is invalid") from exc
+        _validate_metadata_payload(metadata, expected_step=step)
+        tensor_path = _declared_step_file(
             root,
             base.with_suffix(".pt"),
+            metadata["tensor_path"],
             label="tensor payload",
         )
-        tensor_payload, tensor_sha256 = _safe_torch_load(
+        media_path = _declared_step_file(
+            root,
+            base.with_suffix(".media.pt"),
+            metadata["media_path"],
+            label="media payload",
+        )
+        tensor_digest = _sha256_path(tensor_path)
+        media_digest = _sha256_path(media_path)
+        if tensor_digest != metadata["tensor_sha256"]:
+            raise RuntimeError("rollout cache tensor payload digest mismatch")
+        if media_digest != metadata["media_sha256"]:
+            raise RuntimeError("rollout cache media payload digest mismatch")
+        tensor_payload = _safe_torch_load(
             torch,
             tensor_path,
-            map_location=map_location,
-            label="tensor payload",
-            calculate_digest=metadata_version == CACHE_VERSION,
-        )
-        tensor_version = _validate_tensor_payload(tensor_payload)
-        _validate_payload_publication(
-            metadata_payload,
-            metadata_version=metadata_version,
-            payload=tensor_payload,
-            payload_version=tensor_version,
-            actual_sha256=tensor_sha256,
-            digest_key="tensor_sha256",
             label="tensor payload",
         )
-        media_path = _resolve_media_path(
-            root,
-            base,
-            metadata_payload.get("media_path"),
-        )
-        media_payload, media_sha256 = _safe_torch_load(
+        media_payload = _safe_torch_load(
             torch,
             media_path,
-            map_location=map_location,
-            label="media payload",
-            calculate_digest=metadata_version == CACHE_VERSION,
-        )
-        media = _validate_media_payload(media_payload)
-        media_version = _payload_version(media_payload)
-        _validate_payload_publication(
-            metadata_payload,
-            metadata_version=metadata_version,
-            payload=media_payload,
-            payload_version=media_version,
-            actual_sha256=media_sha256,
-            digest_key="media_sha256",
             label="media payload",
         )
-
-        context_payload = metadata_payload.get("context") or tensor_payload.get(
-            "context"
-        )
-        context = (
-            StepContext(**context_payload)
-            if isinstance(context_payload, dict)
-            else _legacy_context(metadata_payload, tensor_payload)
-        )
-        branch_id = metadata_payload.get("branch_id")
-        if branch_id is None:
-            branch_id = tensor_payload.get(
-                "branch_id",
-                tensor_payload.get("branch_ids"),
+        _validate_tensor_payload(tensor_payload)
+        _validate_media_payload(media_payload)
+        if (
+            tensor_payload["generation"] != metadata["generation"]
+            or media_payload["generation"] != metadata["generation"]
+        ):
+            raise RuntimeError(
+                "rollout cache generation does not match metadata publication"
             )
-        batch = RolloutBatch(
-            prompts=metadata_payload["prompts"],
-            metadata=metadata_payload["metadata"],
-            media=media,
-            latents=tensor_payload.get("latents"),
-            next_latents=tensor_payload.get("next_latents"),
-            timesteps=tensor_payload.get("timesteps"),
-            old_log_probs=tensor_payload.get("old_log_probs"),
-            kl=tensor_payload.get("kl"),
-            sample_id=metadata_payload.get("sample_id"),
-            prompt_id=metadata_payload.get("prompt_id"),
-            group_id=metadata_payload.get("group_id"),
-            branch_id=branch_id,
-            transition_mask=tensor_payload.get("transition_mask"),
-            media_layout=metadata_payload.get("media_layout"),
-            context=context,
-            model_metadata=metadata_payload.get("model_metadata") or {},
-            model_tensors=tensor_payload.get("model_tensors") or {},
-        )
-        batch.validate_lightweight(strict=True)
+        context_payload = metadata["context"]
+        try:
+            context = StepContext(**context_payload)
+            batch = RolloutBatch(
+                prompts=tuple(metadata["prompts"]),
+                metadata=tuple(metadata["metadata"]),
+                media=media_payload["media"],
+                latents=tensor_payload["latents"],
+                next_latents=tensor_payload["next_latents"],
+                timesteps=tensor_payload["timesteps"],
+                old_log_probs=tensor_payload["old_log_probs"],
+                transition_mask=tensor_payload["transition_mask"],
+                sample_id=tuple(metadata["sample_id"]),
+                prompt_id=tuple(metadata["prompt_id"]),
+                group_id=tuple(metadata["group_id"]),
+                branch_id=(
+                    None
+                    if metadata["branch_id"] is None
+                    else tuple(metadata["branch_id"])
+                ),
+                media_layout=metadata["media_layout"],
+                camera_trajectory=tensor_payload["camera_trajectory"],
+                context=context,
+                selected_timestep_index=tensor_payload[
+                    "selected_timestep_index"
+                ],
+                flash_coefficient=tensor_payload["flash_coefficient"],
+                branch_step_index=tensor_payload["branch_step_index"],
+                trajectory_step_index=tensor_payload[
+                    "trajectory_step_index"
+                ],
+                transition_std_dev=tensor_payload["transition_std_dev"],
+                recompute_payload=tensor_payload["recompute_payload"],
+                artifact_metadata=metadata["artifact_metadata"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "rollout cache does not contain a valid RolloutBatch"
+            ) from exc
+        if batch.context.step != step:
+            raise RuntimeError("rollout cache context step disagrees with filename")
         return batch
 
-    def load_batch(self, step: int, *, map_location: Any = "cpu") -> RolloutBatch:
-        """Explicit alias for callers that distinguish batch and reward caches."""
-
-        return self.load(step, map_location=map_location)
-
-    def validate_step(
-        self,
-        step: int,
-        *,
-        map_location: Any = "cpu",
-    ) -> dict[str, Any]:
-        """Read-only audit of one published cache generation.
-
-        ``load`` remains the authority for schema, safe ``weights_only`` tensor
-        loading, generation matching, digest verification and ``RolloutBatch``
-        validation. This wrapper only adds a stable inspection report; it never
-        falls back to the pre-v2 triplet assumptions or repairs cache files.
-        """
-
-        if self.root is None:
-            raise RuntimeError("rollout cache is disabled")
-        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
-            raise ValueError("Rollout cache step must be a non-negative integer")
-        try:
-            batch = self.load(step, map_location=map_location)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"rollout cache step {step} metadata is corrupt or invalid"
-            ) from exc
-        except RuntimeError as exc:
-            message = str(exc)
-            if "media payload" in message:
-                raise RuntimeError(
-                    f"rollout cache step {step} media payload is corrupt or invalid"
-                ) from exc
-            if "tensor payload" in message:
-                raise RuntimeError(
-                    f"rollout cache step {step} tensor payload is corrupt or invalid"
-                ) from exc
-            if "metadata" in message:
-                raise RuntimeError(
-                    f"rollout cache step {step} metadata is corrupt or invalid"
-                ) from exc
-            raise
-
-        root = _validated_cache_root(self.root)
-        base = root / f"batch_{step:06d}"
-        paths = {
-            "tensor": _validated_cache_file(
-                root,
-                base.with_suffix(".pt"),
-                label="tensor payload",
-            ),
-            "media": _validated_cache_file(
-                root,
-                base.with_suffix(".media.pt"),
-                label="media payload",
-            ),
-            "metadata": _validated_cache_file(
-                root,
-                base.with_suffix(".json"),
-                label="metadata",
-            ),
-        }
-        try:
-            with paths["metadata"].open("r", encoding="utf-8") as handle:
-                metadata = json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"rollout cache step {step} metadata is corrupt or invalid"
-            ) from exc
-        version = _validate_metadata_payload(metadata, expected_step=step)
-        digests = {name: _sha256_path(path) for name, path in paths.items()}
-        if version == CACHE_VERSION:
-            if digests["tensor"] != metadata["tensor_sha256"]:
-                raise RuntimeError(
-                    f"rollout cache step {step} tensor payload is corrupt or invalid"
-                )
-            if digests["media"] != metadata["media_sha256"]:
-                raise RuntimeError(
-                    f"rollout cache step {step} media payload is corrupt or invalid"
-                )
-
-        return {
-            "step": step,
-            "valid": True,
-            "schema": metadata.get("schema"),
-            "version": version,
-            "generation": metadata.get("generation"),
-            "prompt_count": len(batch.prompts),
-            "sample_count": batch.batch_size,
-            "files": {
-                name: {
-                    "path": str(path),
-                    "size": path.stat().st_size,
-                    "sha256": digests[name],
-                }
-                for name, path in paths.items()
-            },
-        }
-
     def truncate_from_step(self, start_step: int) -> None:
+        """Remove only validated v3 step files at or after ``start_step``."""
+
+        start = _non_negative_step(start_step)
         if self.root is None:
             return
-        if start_step < 0:
-            raise ValueError("start_step must be non-negative")
         root = _validated_cache_root(self.root)
         candidates: list[Path] = []
-        for path in root.glob("batch_*"):
-            prefix = path.name.split(".", maxsplit=1)[0]
-            try:
-                step = int(prefix.removeprefix("batch_"))
-            except ValueError:
-                continue
-            if step >= start_step:
+        for path in root.iterdir():
+            step = _cache_entry_step(path.name)
+            if step is not None and step >= start:
                 candidates.append(path)
-
-        validated = [
+        validated = tuple(
             _validated_cache_file(root, path, label="truncate entry")
             for path in candidates
-        ]
+        )
         for path in validated:
             path.unlink()
+        _fsync_directory(root)
+
+
+def _validate_metadata_payload(payload: Any, *, expected_step: int) -> None:
+    if not isinstance(payload, dict) or set(payload) != set(_METADATA_KEYS):
+        raise RuntimeError("rollout cache metadata has an invalid exact key set")
+    _validate_header(payload, expected_kind="metadata")
+    if payload["step"] != expected_step or type(payload["step"]) is not int:
+        raise RuntimeError("rollout cache metadata step does not match filename")
+    if payload["tensor_path"] != f"batch_{expected_step:06d}.pt":
+        raise RuntimeError("rollout cache tensor_path is not the step-local file")
+    if payload["media_path"] != f"batch_{expected_step:06d}.media.pt":
+        raise RuntimeError("rollout cache media_path is not the step-local file")
+    _hex(payload["generation"], length=32, label="generation")
+    _hex(payload["tensor_sha256"], length=64, label="tensor_sha256")
+    _hex(payload["media_sha256"], length=64, label="media_sha256")
+    for name in ("prompts", "metadata", "sample_id", "prompt_id", "group_id"):
+        if not isinstance(payload[name], list) or not payload[name]:
+            raise RuntimeError(f"rollout cache {name} must be a non-empty list")
+    count = len(payload["prompts"])
+    if any(
+        len(payload[name]) != count
+        for name in ("metadata", "sample_id", "prompt_id", "group_id")
+    ):
+        raise RuntimeError("rollout cache row metadata lengths disagree")
+    if any(not isinstance(item, str) for item in payload["prompts"]):
+        raise RuntimeError("rollout cache prompts must contain strings")
+    if any(not isinstance(item, dict) for item in payload["metadata"]):
+        raise RuntimeError("rollout cache metadata rows must be objects")
+    for name in ("sample_id", "prompt_id", "group_id"):
+        if any(not isinstance(item, str) or not item for item in payload[name]):
+            raise RuntimeError(f"rollout cache {name} entries must be strings")
+    branch_id = payload["branch_id"]
+    if branch_id is not None and (
+        not isinstance(branch_id, list)
+        or len(branch_id) != count
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (str, int, type(None)))
+            for item in branch_id
+        )
+    ):
+        raise RuntimeError("rollout cache branch_id rows are invalid")
+    if payload["media_layout"] not in {"BCHW", "BFCHW", "BFHWC"}:
+        raise RuntimeError("rollout cache media_layout is invalid")
+    context = payload["context"]
+    if not isinstance(context, dict) or set(context) != {
+        "step",
+        "seed",
+        "rank",
+        "world_size",
+    }:
+        raise RuntimeError("rollout cache context has an invalid exact key set")
+    try:
+        StepContext(**context)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("rollout cache context is invalid") from exc
+    if not isinstance(payload["artifact_metadata"], dict):
+        raise RuntimeError("rollout cache artifact_metadata must be an object")
+
+
+def _validate_tensor_payload(payload: Any) -> None:
+    import torch
+
+    if not isinstance(payload, dict) or set(payload) != set(_TENSOR_KEYS):
+        raise RuntimeError(
+            "rollout cache tensor payload has an invalid exact key set"
+        )
+    _validate_header(payload, expected_kind="tensors")
+    _hex(payload["generation"], length=32, label="tensor generation")
+    for name in _TENSOR_VALUE_KEYS:
+        value = payload[name]
+        if value is not None and not isinstance(value, torch.Tensor):
+            raise RuntimeError(
+                f"rollout cache tensor field {name!r} must be a tensor or None"
+            )
+        if isinstance(value, torch.Tensor):
+            _validate_tensor(value, label=name)
+    recompute = payload["recompute_payload"]
+    if not isinstance(recompute, dict):
+        raise RuntimeError("rollout cache recompute_payload must be an object")
+    for name, value in recompute.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, torch.Tensor)
+        ):
+            raise RuntimeError(
+                "rollout cache recompute_payload must map names to tensors"
+            )
+        _validate_tensor(value, label=f"recompute_payload.{name}")
+
+
+def _validate_media_payload(payload: Any) -> None:
+    import torch
+
+    if not isinstance(payload, dict) or set(payload) != set(_MEDIA_KEYS):
+        raise RuntimeError("rollout cache media payload has an invalid exact key set")
+    _validate_header(payload, expected_kind="media")
+    _hex(payload["generation"], length=32, label="media generation")
+    media = payload["media"]
+    if not isinstance(media, torch.Tensor) or media.ndim not in {4, 5}:
+        raise RuntimeError(
+            "rollout cache media payload must contain BCHW/BFCHW/BFHWC tensor"
+        )
+    _validate_tensor(media, label="media")
+
+
+def _validate_header(payload: Mapping[str, Any], *, expected_kind: str) -> None:
+    if payload.get("schema") != CACHE_SCHEMA:
+        raise RuntimeError(
+            f"unsupported rollout cache schema: {payload.get('schema')!r}"
+        )
+    version = payload.get("version")
+    if type(version) is not int or version not in _SUPPORTED_CACHE_VERSIONS:
+        raise RuntimeError(f"unsupported rollout cache version: {version!r}")
+    if payload.get("kind") != expected_kind:
+        raise RuntimeError(
+            f"rollout cache kind must be {expected_kind!r}"
+        )
+
+
+def _validate_tensor(value: Any, *, label: str) -> None:
+    import torch
+
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.device.type != "cpu"
+        or not value.is_contiguous()
+        or value.requires_grad
+        or value.grad_fn is not None
+    ):
+        raise RuntimeError(
+            f"rollout cache {label} must be detached contiguous CPU tensor"
+        )
+
+
+def _portable_tensor(value: Any) -> Any:
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("rollout cache tensor fields must be torch.Tensor values")
+    if value.requires_grad or value.grad_fn is not None:
+        raise ValueError("rollout cache tensor fields must be detached")
+    return value.detach().to(device="cpu").contiguous().clone()
+
+
+def _portable_optional_tensor(value: Any | None) -> Any | None:
+    return None if value is None else _portable_tensor(value)
+
+
+def _safe_torch_load(torch: Any, path: Path, *, label: str) -> Any:
+    try:
+        return torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError:
+        raise RuntimeError(
+            "safe rollout cache loading requires weights_only=True support"
+        ) from None
+    except Exception:
+        raise RuntimeError(
+            f"rollout cache {label} could not be loaded with weights_only=True"
+        ) from None
+
+
+def _declared_step_file(
+    root: Path,
+    expected: Path,
+    declared: Any,
+    *,
+    label: str,
+) -> Path:
+    if not isinstance(declared, str) or declared != expected.name:
+        raise RuntimeError(
+            f"rollout cache {label} must name the expected step-local file"
+        )
+    return _validated_cache_file(root, expected, label=label)
+
+
+def _non_negative_step(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("rollout cache step must be a non-negative integer")
+    return value
+
+
+def _cache_entry_step(name: str) -> int | None:
+    if not name.startswith("batch_"):
+        return None
+    stem, separator, suffix = name.partition(".")
+    if not separator or suffix not in {"pt", "media.pt", "json"}:
+        return None
+    digits = stem.removeprefix("batch_")
+    if len(digits) != 6 or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _output_relative(path: Path, output_dir: Path) -> str:
+    try:
+        relative = path.relative_to(output_dir)
+    except ValueError as exc:
+        raise RuntimeError("rollout cache artifact escapes output_dir") from exc
+    value = relative.as_posix()
+    if value.startswith("/") or ".." in relative.parts:
+        raise RuntimeError("rollout cache artifact path is unsafe")
+    return value
+
+
+def _require_lexically_below(path: Path, output_dir: Path) -> None:
+    try:
+        relative = path.relative_to(output_dir)
+    except ValueError as exc:
+        raise ValueError("rollout cache root must be below output_dir") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("rollout cache root must be below output_dir")
+
+
+def _validated_existing_directory(path: Path, *, label: str) -> Path:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} does not exist: {current}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"{label} path must not contain symlinks: {current}")
+    if not stat.S_ISDIR(absolute.lstat().st_mode):
+        raise RuntimeError(f"{label} must be a directory")
+    return absolute.resolve(strict=True)
 
 
 def _validated_cache_root(root: Path) -> Path:
-    absolute = Path(os.path.abspath(root))
-    current = Path(absolute.anchor)
-    components = [current]
-    for part in absolute.parts[1:]:
-        current /= part
-        components.append(current)
-
-    for component in components:
-        try:
-            component_stat = component.lstat()
-        except OSError as exc:
-            raise RuntimeError(
-                f"Rollout cache root path does not exist: {component}"
-            ) from exc
-        if stat.S_ISLNK(component_stat.st_mode):
-            raise RuntimeError(
-                f"Rollout cache root path must not contain symlinks: {component}"
-            )
-
-    root_stat = components[-1].lstat()
-    if not stat.S_ISDIR(root_stat.st_mode):
-        raise RuntimeError(f"Rollout cache root must be a directory: {root}")
-    try:
-        return absolute.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"Cannot resolve rollout cache root: {root}") from exc
+    return _validated_existing_directory(root, label="rollout cache root")
 
 
 def _initialize_cache_root(root: Path) -> None:
-    absolute = Path(os.path.abspath(root))
-    directory_flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        directory_flags |= os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
-
-    current_fd = os.open(absolute.anchor, directory_flags)
+    absolute = root.absolute()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor, flags)
     try:
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
             current /= part
             try:
-                component_stat = os.stat(
+                metadata = os.stat(
                     part,
-                    dir_fd=current_fd,
+                    dir_fd=descriptor,
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
                 try:
-                    os.mkdir(part, dir_fd=current_fd)
+                    os.mkdir(part, dir_fd=descriptor)
                 except FileExistsError:
                     pass
             else:
-                if stat.S_ISLNK(component_stat.st_mode):
+                if stat.S_ISLNK(metadata.st_mode):
                     raise RuntimeError(
-                        "Rollout cache root path must not contain symlinks: "
+                        "rollout cache root path must not contain symlinks: "
                         f"{current}"
                     )
-                if not stat.S_ISDIR(component_stat.st_mode):
+                if not stat.S_ISDIR(metadata.st_mode):
                     raise RuntimeError(
-                        f"Rollout cache root must be a directory: {current}"
+                        f"rollout cache root must be a directory: {current}"
                     )
-
             try:
-                child_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                child = os.open(part, flags, dir_fd=descriptor)
             except OSError as exc:
                 if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise RuntimeError(
-                        "Rollout cache root path must not contain symlinks: "
+                        "rollout cache root path must not contain symlinks: "
                         f"{current}"
                     ) from exc
                 raise
-            os.close(current_fd)
-            current_fd = child_fd
+            os.close(descriptor)
+            descriptor = child
     finally:
-        os.close(current_fd)
+        os.close(descriptor)
 
 
 def _validated_cache_file(root: Path, path: Path, *, label: str) -> Path:
     try:
-        path_stat = path.lstat()
+        metadata = path.lstat()
     except OSError as exc:
-        raise RuntimeError(f"Missing rollout cache {label}: {path}") from exc
-    if stat.S_ISLNK(path_stat.st_mode):
-        raise RuntimeError(f"Rollout cache {label} must not be a symlink: {path}")
-    if not stat.S_ISREG(path_stat.st_mode):
-        raise RuntimeError(
-            f"Rollout cache {label} must be a regular file: {path}"
-        )
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeError(f"Cannot resolve rollout cache {label}: {path}") from exc
-    if resolved != root and root not in resolved.parents:
-        raise RuntimeError(f"Rollout cache {label} escapes cache root: {path}")
+        raise RuntimeError(f"missing rollout cache {label}: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"rollout cache {label} must not be a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"rollout cache {label} must be a regular file")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise RuntimeError(f"rollout cache {label} escapes cache root")
     return resolved
 
 
 def _prepare_cache_output(
     root: Path,
     path: Path,
-    *,
-    label: str,
 ) -> tuple[int, Path, tuple[int, int]]:
-    parent = path.parent.resolve(strict=True)
-    if parent != root:
-        raise RuntimeError(f"Rollout cache {label} must be written in {root}")
-
+    if path.parent.resolve(strict=True) != root:
+        raise RuntimeError("rollout cache output must be inside its root")
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     for _attempt in range(100):
-        tmp = root / f".{path.name}.tmp-{secrets.token_hex(12)}"
+        temporary = root / f".{path.name}.tmp-{secrets.token_hex(12)}"
         try:
-            fd = os.open(tmp, flags, 0o600)
+            descriptor = os.open(temporary, flags, 0o600)
         except FileExistsError:
             continue
-        opened_stat = os.fstat(fd)
-        return fd, tmp, (opened_stat.st_dev, opened_stat.st_ino)
-    raise FileExistsError(
-        f"Unable to allocate rollout cache temporary file for {path}"
-    )
+        metadata = os.fstat(descriptor)
+        return descriptor, temporary, (metadata.st_dev, metadata.st_ino)
+    raise FileExistsError("unable to allocate rollout cache temporary file")
 
 
 def _cleanup_owned_temp(path: Path, identity: tuple[int, int]) -> None:
     try:
-        path_stat = path.lstat()
-    except FileNotFoundError:
-        return
+        metadata = path.lstat()
     except OSError:
         return
-    if stat.S_ISLNK(path_stat.st_mode):
-        return
-    if (path_stat.st_dev, path_stat.st_ino) != identity:
+    if stat.S_ISLNK(metadata.st_mode) or (
+        metadata.st_dev,
+        metadata.st_ino,
+    ) != identity:
         return
     try:
         path.unlink()
@@ -503,370 +660,73 @@ def _cleanup_owned_temp(path: Path, identity: tuple[int, int]) -> None:
 
 def _atomic_torch_save(
     torch: Any,
-    payload: Any,
+    payload: Mapping[str, Any],
     path: Path,
     *,
     root: Path,
 ) -> str:
-    fd, tmp, identity = _prepare_cache_output(root, path, label=path.name)
+    descriptor, temporary, identity = _prepare_cache_output(root, path)
     try:
-        with os.fdopen(fd, "wb", closefd=False) as handle:
-            torch.save(payload, handle)
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            torch.save(dict(payload), handle)
             handle.flush()
-            os.fsync(fd)
-        digest = _sha256_path(tmp)
-        os.replace(tmp, path)
+            os.fsync(descriptor)
+        digest = _sha256_path(temporary)
+        os.replace(temporary, path)
         return digest
     finally:
-        _cleanup_owned_temp(tmp, identity)
-        os.close(fd)
+        _cleanup_owned_temp(temporary, identity)
+        os.close(descriptor)
 
 
-def _atomic_json_save(payload: dict[str, Any], path: Path, *, root: Path) -> None:
-    fd, tmp, identity = _prepare_cache_output(root, path, label=path.name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
-            json.dump(
-                payload,
-                handle,
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
-            )
-            handle.flush()
-            os.fsync(fd)
-        os.replace(tmp, path)
-    finally:
-        _cleanup_owned_temp(tmp, identity)
-        os.close(fd)
-
-
-def _safe_torch_load(
-    torch: Any,
+def _atomic_json_save(
+    payload: Mapping[str, Any],
     path: Path,
     *,
-    map_location: Any,
-    label: str,
-    calculate_digest: bool,
-) -> tuple[Any, str | None]:
-    digest = None
+    root: Path,
+) -> None:
+    descriptor, temporary, identity = _prepare_cache_output(root, path)
     try:
-        if calculate_digest:
-            with path.open("rb") as handle:
-                digest = _sha256_handle(handle)
-                handle.seek(0)
-                payload = torch.load(
-                    handle,
-                    map_location=map_location,
-                    weights_only=True,
-                )
-        else:
-            payload = torch.load(
-                path,
-                map_location=map_location,
-                weights_only=True,
-            )
-    except TypeError:
-        raise RuntimeError(
-            "Safe rollout cache loading requires a PyTorch version whose "
-            "torch.load supports weights_only=True"
-        ) from None
-    except Exception:
-        raise RuntimeError(
-            f"Rollout cache {label} could not be loaded safely with "
-            "weights_only=True"
-        ) from None
-    return payload, digest
+        encoded = (canonical_json_text(payload) + "\n").encode("utf-8")
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(descriptor)
+        os.replace(temporary, path)
+    finally:
+        _cleanup_owned_temp(temporary, identity)
+        os.close(descriptor)
 
 
 def _sha256_path(path: Path) -> str:
-    with path.open("rb") as handle:
-        return _sha256_handle(handle)
-
-
-def _sha256_handle(handle: Any) -> str:
     digest = hashlib.sha256()
-    while chunk := handle.read(_DIGEST_CHUNK_SIZE):
-        digest.update(chunk)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_DIGEST_CHUNK_SIZE), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
-def _schema_kind(payload: Any, *, expected_kind: str, label: str) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    schema_keys = {"schema", "version", "kind"}
-    present = schema_keys.intersection(payload)
-    if not present:
-        return None
-    if present != schema_keys:
-        raise RuntimeError(f"Rollout cache {label} has an incomplete schema header")
-    if payload["schema"] != CACHE_SCHEMA:
-        raise RuntimeError(f"Unsupported rollout cache schema: {payload['schema']!r}")
-    version = payload["version"]
+def _hex(value: Any, *, length: int, label: str) -> None:
     if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version not in _SUPPORTED_CACHE_VERSIONS
+        not isinstance(value, str)
+        or len(value) != length
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
     ):
         raise RuntimeError(
-            f"Unsupported rollout cache version: {version!r}"
+            f"rollout cache {label} must be {length} lowercase hex digits"
         )
-    if payload["kind"] != expected_kind:
-        raise RuntimeError(
-            f"Rollout cache {label} kind must be {expected_kind!r}"
-        )
-    return version
 
 
-def _validate_metadata_payload(
-    payload: Any,
-    *,
-    expected_step: int,
-) -> int | None:
-    if not isinstance(payload, dict):
-        raise RuntimeError("Rollout cache metadata must be a JSON object")
-    version = _schema_kind(
-        payload,
-        expected_kind="metadata",
-        label="metadata",
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
     )
-    required = {"prompts", "metadata", "model_metadata"}
-    if version is not None:
-        required.update({"step", "tensor_path", "media_path"})
-        if payload.get("step") != expected_step:
-            raise RuntimeError("Rollout cache metadata step does not match filename")
-        expected_tensor = f"batch_{expected_step:06d}.pt"
-        if payload.get("tensor_path") != expected_tensor:
-            raise RuntimeError(
-                "Rollout cache metadata tensor_path does not match the expected "
-                "step-local file"
-            )
-    if version == CACHE_VERSION:
-        required.update(
-            {
-                "generation",
-                "tensor_sha256",
-                "media_sha256",
-            }
-        )
-    missing = sorted(required.difference(payload))
-    if missing:
-        raise RuntimeError(f"Rollout cache metadata is missing keys: {missing}")
-    prompts = payload["prompts"]
-    metadata = payload["metadata"]
-    if not isinstance(prompts, list) or not all(
-        isinstance(item, str) for item in prompts
-    ):
-        raise RuntimeError("Rollout cache prompts must be a list of strings")
-    if not isinstance(metadata, list) or not all(
-        isinstance(item, dict) for item in metadata
-    ):
-        raise RuntimeError("Rollout cache metadata entries must be dictionaries")
-    if len(prompts) != len(metadata):
-        raise RuntimeError(
-            "Rollout cache prompts and metadata must have the same length"
-        )
-    if not isinstance(payload["model_metadata"], dict):
-        raise RuntimeError("Rollout cache model_metadata must be a dictionary")
-    if version == CACHE_VERSION:
-        _validate_hex_identity(
-            payload["generation"],
-            length=32,
-            label="generation",
-        )
-        for key in ("tensor_sha256", "media_sha256"):
-            _validate_hex_identity(payload[key], length=64, label=key)
-    return version
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
-def _validate_tensor_payload(payload: Any) -> int | None:
-    import torch
-
-    if not isinstance(payload, dict):
-        raise RuntimeError("Rollout cache tensor payload must be a dictionary")
-    version = _schema_kind(
-        payload,
-        expected_kind="tensors",
-        label="tensor payload",
-    )
-    allowed = _TENSOR_FIELDS | (
-        {"schema", "version", "kind"} if version is not None else set()
-    )
-    if version == CACHE_VERSION:
-        allowed.add("generation")
-    if version is None:
-        allowed = _LEGACY_TENSOR_FIELDS
-    unknown = sorted(set(payload).difference(allowed))
-    if unknown:
-        raise RuntimeError(f"Rollout cache tensor payload has unknown keys: {unknown}")
-    if version is not None:
-        missing = sorted(_TENSOR_FIELDS.difference(payload))
-        if missing:
-            raise RuntimeError(
-                f"Rollout cache tensor payload is missing keys: {missing}"
-            )
-    if version == CACHE_VERSION:
-        if "generation" not in payload:
-            raise RuntimeError(
-                "Rollout cache tensor payload is missing key: generation"
-            )
-        _validate_hex_identity(
-            payload["generation"],
-            length=32,
-            label="tensor payload generation",
-        )
-    for name in _TENSOR_FIELDS.difference({"model_tensors"}):
-        value = payload.get(name)
-        if value is not None and not isinstance(value, torch.Tensor):
-            raise RuntimeError(
-                f"Rollout cache tensor field {name!r} must be a tensor or None"
-            )
-    model_tensors = payload.get("model_tensors", {})
-    if not isinstance(model_tensors, dict):
-        raise RuntimeError("Rollout cache model_tensors must be a dictionary")
-    _validate_safe_tensor_tree(model_tensors, label="model_tensors")
-    for name in ("branch_id", "branch_ids"):
-        value = payload.get(name)
-        if value is not None:
-            _validate_safe_tensor_tree(value, label=name)
-    context = payload.get("context")
-    if context is not None and not isinstance(context, dict):
-        raise RuntimeError("Rollout cache legacy context must be a dictionary")
-    if context is not None:
-        _validate_safe_tensor_tree(context, label="context")
-    return version
-
-
-def _validate_media_payload(payload: Any) -> Any:
-    import torch
-
-    media = payload
-    if isinstance(payload, dict):
-        if not _schema_kind(payload, expected_kind="media", label="media payload"):
-            raise RuntimeError("Rollout cache media payload has no valid schema header")
-        version = _payload_version(payload)
-        allowed = {"schema", "version", "kind", "media"}
-        if version == CACHE_VERSION:
-            allowed.add("generation")
-        unknown = sorted(set(payload).difference(allowed))
-        if unknown:
-            raise RuntimeError(f"Rollout cache media payload has unknown keys: {unknown}")
-        if "media" not in payload:
-            raise RuntimeError("Rollout cache media payload is missing key: media")
-        if version == CACHE_VERSION:
-            if "generation" not in payload:
-                raise RuntimeError(
-                    "Rollout cache media payload is missing key: generation"
-                )
-            _validate_hex_identity(
-                payload["generation"],
-                length=32,
-                label="media payload generation",
-            )
-        media = payload["media"]
-    if not isinstance(media, torch.Tensor):
-        raise RuntimeError("Rollout cache media payload must contain a tensor")
-    if media.ndim not in {4, 5}:
-        raise RuntimeError("Rollout cache media tensor must have BCHW or BFCHW shape")
-    return media
-
-
-def _payload_version(payload: Any) -> int | None:
-    if not isinstance(payload, dict):
-        return None
-    version = payload.get("version")
-    return version if isinstance(version, int) and not isinstance(version, bool) else None
-
-
-def _validate_payload_publication(
-    metadata: dict[str, Any],
-    *,
-    metadata_version: int | None,
-    payload: Any,
-    payload_version: int | None,
-    actual_sha256: str | None,
-    digest_key: str,
-    label: str,
-) -> None:
-    if payload_version != metadata_version:
-        raise RuntimeError(
-            f"Rollout cache {label} version does not match metadata publication"
-        )
-    if metadata_version != CACHE_VERSION:
-        return
-    if not isinstance(payload, dict) or (
-        payload.get("generation") != metadata["generation"]
-    ):
-        raise RuntimeError(
-            f"Rollout cache {label} generation does not match metadata publication"
-        )
-    if actual_sha256 != metadata[digest_key]:
-        raise RuntimeError(
-            f"Rollout cache {label} digest does not match metadata publication"
-        )
-
-
-def _validate_hex_identity(value: Any, *, length: int, label: str) -> None:
-    if not isinstance(value, str) or len(value) != length:
-        raise RuntimeError(f"Rollout cache {label} must be {length} lowercase hex digits")
-    if value != value.lower() or any(character not in "0123456789abcdef" for character in value):
-        raise RuntimeError(f"Rollout cache {label} must be {length} lowercase hex digits")
-
-
-def _validate_safe_tensor_tree(value: Any, *, label: str) -> None:
-    import torch
-
-    if value is None or isinstance(value, (bool, int, float, str, torch.Tensor)):
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise RuntimeError(
-                    f"Rollout cache {label} keys must be strings"
-                )
-            _validate_safe_tensor_tree(item, label=label)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            _validate_safe_tensor_tree(item, label=label)
-        return
-    raise RuntimeError(
-        f"Rollout cache {label} contains an unsafe value type: "
-        f"{type(value).__name__}"
-    )
-
-
-def _resolve_media_path(
-    root: Path,
-    base: Path,
-    declared: Any,
-) -> Path:
-    expected = base.with_suffix(".media.pt")
-    if declared is not None:
-        if not isinstance(declared, str):
-            raise RuntimeError("Rollout cache media_path must be a string")
-        candidate = Path(declared)
-        if candidate.is_absolute() or candidate.parts != (expected.name,):
-            raise RuntimeError(
-                "Rollout cache media_path must name the expected step-local file"
-            )
-    return _validated_cache_file(root, expected, label="media payload")
-
-
-def _legacy_context(
-    metadata_payload: dict[str, Any],
-    tensor_payload: dict[str, Any],
-) -> StepContext | None:
-    seed = metadata_payload.get("seed", tensor_payload.get("seed"))
-    epoch_tag = metadata_payload.get(
-        "epoch_tag",
-        tensor_payload.get("epoch_tag"),
-    )
-    if seed is None and epoch_tag is None:
-        return None
-    resolved_epoch = int(epoch_tag or 0)
-    return StepContext(
-        step=int(metadata_payload.get("step", resolved_epoch)),
-        seed=int(seed or 0),
-        epoch_tag=resolved_epoch,
-    )
+__all__ = ("CACHE_SCHEMA", "CACHE_VERSION", "RolloutCache")
