@@ -784,36 +784,46 @@ class UpdateEngine:
                     f"update.microbatch.{index}",
                     recompute_and_objective,
                 )
-                for name in _CORE_FIELDS:
-                    core_numerators[name] += (
-                        getattr(output, name).detach().to(
-                            device=strategy.device,
-                            dtype=torch.float64,
+                def prepare_backward() -> torch.Tensor:
+                    nonlocal local_clip_numerator, local_delta_max
+                    for name in _CORE_FIELDS:
+                        core_numerators[name] += (
+                            getattr(output, name).detach().to(
+                                device=strategy.device,
+                                dtype=torch.float64,
+                            )
+                            * active_count
                         )
-                        * active_count
+                    local_delta_max = max(
+                        local_delta_max,
+                        self._active_logprob_delta_max(
+                            micro_batch,
+                            micro_inputs,
+                            objective_stats,
+                        ),
                     )
-                local_delta_max = max(
-                    local_delta_max,
-                    self._active_logprob_delta_max(
-                        micro_batch,
-                        micro_inputs,
-                        objective_stats,
-                    ),
-                )
-                local_clip_numerator += (
-                    float(output.clipfrac.detach().cpu()) * active_count
-                )
-                scaled_loss = (
-                    output.loss
-                    * strategy.world_size
-                    * active_count
-                    / global_active_count
+                    local_clip_numerator += (
+                        float(output.clipfrac.detach().cpu()) * active_count
+                    )
+                    scaled_loss = (
+                        output.loss
+                        * strategy.world_size
+                        * active_count
+                        / global_active_count
+                    )
+                    return (
+                        scaled_loss
+                        if scaler is None
+                        else scaler.scale(scaled_loss)
+                    )
+
+                backward_loss = self._local_then_gate(
+                    strategy,
+                    f"update.backward_prepare.{index}",
+                    prepare_backward,
                 )
                 try:
-                    if scaler is None:
-                        scaled_loss.backward()
-                    else:
-                        scaler.scale(scaled_loss).backward()
+                    backward_loss.backward()
                 except BaseException as exc:
                     if is_last_slot:
                         raise

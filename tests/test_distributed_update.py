@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import queue
 import socket
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -456,6 +457,72 @@ def _atomic_failure_worker(
             strategy.close()
 
 
+def _final_backward_prepare_failure_worker(
+    rank: int,
+    port: int,
+    output,
+) -> None:
+    strategy = None
+    try:
+        strategy = _ddp_strategy(rank, port)
+        adapter = _Adapter()
+        strategy.prepare(adapter)
+        plugin = _plugin()
+        optimizer = _optimizer(plugin, adapter)
+        features, mask = _rank_case(rank)
+        batch = _batch(
+            rank=rank,
+            world_size=2,
+            features=features,
+            mask=mask,
+        )
+        if rank == 1:
+
+            def fail_backward_preparation(*_args) -> float:
+                raise RuntimeError(
+                    "injected rank-one final-slot backward preparation failure"
+                )
+
+            plugin.update_engine._active_logprob_delta_max = (
+                fail_backward_preparation
+            )
+
+        started = time.monotonic()
+        caught: DistributedFailureError | None = None
+        try:
+            plugin.step(
+                batch=batch,
+                rewards=_rewards(batch),
+                optimizer=optimizer,
+                scaler=None,
+                context=batch.context,
+                strategy=strategy,
+            )
+        except DistributedFailureError as exc:
+            caught = exc
+        elapsed = time.monotonic() - started
+        if caught is None:
+            raise AssertionError(
+                "final-slot backward preparation failure unexpectedly succeeded"
+            )
+        output.put(
+            (
+                rank,
+                {
+                    "error": str(caught),
+                    "elapsed": elapsed,
+                    "parameter": float(adapter.train_module.delta.detach()),
+                    "optimizer_state": optimizer.state_dict()["state"],
+                },
+            )
+        )
+    except BaseException as exc:
+        output.put((rank, (type(exc).__name__, str(exc))))
+    finally:
+        if strategy is not None:
+            strategy.close()
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -646,6 +713,50 @@ def test_gloo_atomic_failure_prevents_or_rolls_back_all_mutation(
 
 
 @pytest.mark.distributed
+def test_gloo_final_slot_backward_prepare_failure_is_synchronized() -> None:
+    """Gate rank-local preparation before either rank enters DDP backward."""
+
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    port = _free_port()
+    processes = [
+        context.Process(
+            target=_final_backward_prepare_failure_worker,
+            args=(rank, port, output),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    rows = {}
+    try:
+        for _ in processes:
+            rank, payload = output.get(timeout=30)
+            rows[rank] = payload
+    except queue.Empty as exc:
+        raise AssertionError(
+            "timed out waiting for backward preparation workers"
+        ) from exc
+    finally:
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(isinstance(rows[rank], dict) for rank in range(2)), rows
+    for payload in rows.values():
+        assert (
+            "injected rank-one final-slot backward preparation failure"
+            in payload["error"]
+        )
+        assert payload["elapsed"] < 10.0
+        assert payload["parameter"] == pytest.approx(0.05)
+        assert payload["optimizer_state"] == {}
+
+
+@pytest.mark.distributed
 def test_nccl_fixed_batch_matches_single_process() -> None:
     """Run the fixed global batch through the real two-rank NCCL update path."""
 
@@ -724,6 +835,92 @@ def test_nccl_fixed_batch_matches_single_process() -> None:
                 "ranks_entered": entered,
                 "ranks_exited": exited,
                 "marker_advanced": False,
+                "passed": True,
+            }
+    finally:
+        strategy.close()
+
+    if sentinel is not None:
+        print(
+            "VISUALRL_NCCL_RESULT="
+            + json.dumps(
+                sentinel,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+
+
+@pytest.mark.distributed
+def test_nccl_one_rank_update_failure_synchronizes() -> None:
+    """Synchronize and roll back a rank-one failure after optimizer mutation."""
+
+    strategy = _nccl_strategy_from_torchrun()
+    rank = strategy.rank
+    sentinel = None
+    try:
+        entered = strategy.gather_object(rank, dst=0)
+        parameter = torch.nn.Parameter(
+            torch.tensor(0.05, device=strategy.device)
+        )
+        optimizer = torch.optim.AdamW(
+            [parameter],
+            lr=1e-2,
+            weight_decay=0.0,
+        )
+        scaler = _FakeScaler()
+        operation_calls = 0
+
+        def operation() -> None:
+            nonlocal operation_calls
+            operation_calls += 1
+            parameter.grad = torch.ones_like(parameter)
+            optimizer.step()
+            scaler.value += 1
+            if rank == 1:
+                raise RuntimeError("injected rank-one NCCL update failure")
+
+        caught: DistributedFailureError | None = None
+        try:
+            strategy.atomic_optimizer_step(
+                operation,
+                parameters=(parameter,),
+                optimizer=optimizer,
+                scaler=scaler,
+            )
+        except DistributedFailureError as exc:
+            caught = exc
+
+        validation_error = None
+        try:
+            assert caught is not None
+            assert "injected rank-one NCCL update failure" in str(caught)
+            assert operation_calls == 1
+            assert float(parameter.detach().cpu()) == pytest.approx(0.05)
+            assert optimizer.state_dict()["state"] == {}
+            assert scaler.value == 7
+        except BaseException as exc:
+            validation_error = exc
+        strategy.failure_gate(
+            "test.nccl_update_failure.validate",
+            validation_error,
+        )
+
+        exited = strategy.gather_object(rank, dst=0)
+        if strategy.is_main_process:
+            assert entered == [0, 1]
+            assert exited == [0, 1]
+            sentinel = {
+                "nodeid": (
+                    "tests/test_distributed_update.py::"
+                    "test_nccl_one_rank_update_failure_synchronizes"
+                ),
+                "world_size": 2,
+                "ranks_entered": entered,
+                "ranks_exited": exited,
+                "marker_advanced": False,
+                "rollback_verified": True,
                 "passed": True,
             }
     finally:

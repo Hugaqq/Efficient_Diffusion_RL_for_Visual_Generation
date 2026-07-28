@@ -533,6 +533,27 @@ def test_chain_reader_rejects_old_commit_version_and_unknown_fields(tmp_path) ->
         read_authoritative_commit_chain(run_dir)
 
 
+def test_chain_reader_rejects_non_float_dynamic_core_metric(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        _stage(manager, transaction, 0, checkpoint_path="checkpoint_000001")
+        manager.commit(
+            transaction,
+            checkpoint_path=_checkpoint(
+                transaction.staging_dir / "checkpoint_000001",
+                "one",
+            ),
+        )
+    marker_path = run_dir / "commits" / "commit_000001.json"
+    marker = _read_json(marker_path)
+    marker["steps"][0]["core_metric_row"]["loss"] = 1
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    with pytest.raises(ArtifactError, match="finite Python floats"):
+        read_authoritative_commit_chain(run_dir)
+
+
 def test_stage_rejects_noncontiguous_steps_and_unsafe_paths(tmp_path) -> None:
     run_dir = tmp_path / "run"
     with ArtifactManager(run_dir, "run-test", config={}) as manager:
@@ -541,6 +562,32 @@ def test_stage_rejects_noncontiguous_steps_and_unsafe_paths(tmp_path) -> None:
             _stage(manager, transaction, 1)
         with pytest.raises(ValueError, match="normalized relative"):
             replace(_record(0), media_path="../escape")
+
+
+@pytest.mark.parametrize("invalid_value", [True, 1])
+def test_core_metric_v3_accepts_only_finite_python_floats(
+    tmp_path,
+    invalid_value,
+) -> None:
+    run_dir = tmp_path / "run"
+    metrics = SimpleNamespace(
+        values=FrozenMapping({"loss": invalid_value}),
+        sample_count=1,
+        active_transition_count=2,
+    )
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        with pytest.raises(ValueError, match="finite Python floats"):
+            manager.stage_records(
+                transaction,
+                step=0,
+                records=(_record(0),),
+                metrics=metrics,
+            )
+        assert not (
+            transaction.staging_dir / "step_000000"
+        ).exists()
+        manager.abort(transaction)
 
 
 def test_projection_rebuild_never_reads_journal_or_staging(

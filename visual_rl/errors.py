@@ -32,6 +32,62 @@ __all__ = [
 ]
 
 
+def attach_cleanup_notes(
+    primary: BaseException,
+    cleanup_errors: tuple[BaseException, ...],
+) -> None:
+    """Attach stable, non-sensitive cleanup diagnostics to a primary error.
+
+    Cleanup must never replace the exception that stopped training.  Only the
+    exception type and the fixed owner label assigned by the Runner are
+    retained; messages, paths, configuration values, and credentials are
+    deliberately excluded.
+    """
+
+    if not isinstance(primary, BaseException):
+        raise TypeError("primary must be an exception")
+    if type(cleanup_errors) is not tuple or any(
+        not isinstance(error, BaseException) for error in cleanup_errors
+    ):
+        raise TypeError("cleanup_errors must be a tuple of exceptions")
+    projected = tuple(
+        (
+            type(error).__name__,
+            _cleanup_owner(error),
+        )
+        for error in cleanup_errors
+    )
+    if not projected:
+        return
+    note = "VisualRL cleanup failures: " + ", ".join(
+        f"{error_type}@{owner}" for error_type, owner in projected
+    )
+    try:
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+            return
+    except BaseException:
+        pass
+    try:
+        setattr(primary, "_visual_rl_cleanup_notes", projected)
+    except BaseException:
+        return
+
+
+def _cleanup_owner(error: BaseException) -> str:
+    owner = getattr(error, "_visual_rl_cleanup_owner", "unknown")
+    if owner not in {
+        "coordinator",
+        "components",
+        "progress",
+        "artifact_manager",
+        "unknown",
+    }:
+        return "unknown"
+    return owner
+
+
 class VisualRLError(Exception):
     """Internal base class for every stable VisualRL exception.
 

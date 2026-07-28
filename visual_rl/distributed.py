@@ -331,6 +331,9 @@ class _AdapterRecomputeFacade(torch.nn.Module):
 class _FinalGradientSyncContext:
     """Mark a last-slot DDP backward/reducer failure as process-group fatal."""
 
+    def __init__(self, mark_fatal: Callable[[], None]) -> None:
+        self._mark_fatal = mark_fatal
+
     def __enter__(self) -> None:
         return None
 
@@ -338,6 +341,7 @@ class _FinalGradientSyncContext:
         del exc_type, traceback
         if exc is None or isinstance(exc, DistributedFailureError):
             return False
+        self._mark_fatal()
         raise _ProcessGroupFatalError(
             "DDP final backward/reducer failed"
         ) from exc
@@ -392,13 +396,23 @@ class SingleProcessStrategy:
         _validate_phase_name(name)
         if not callable(operation):
             raise TypeError("phase operation must be callable")
+        result: _T | None = None
+        failure: BaseException | None = None
         try:
-            return operation()
-        except _ProcessGroupFatalError:
+            result = operation()
+        except DistributedFailureError:
+            # Strategy collectives already synchronized this error (or made
+            # the process group unusable); a second failure collective would
+            # be both redundant and unsafe.
             raise
         except BaseException as exc:
-            self.failure_gate(name, exc)
-            raise AssertionError("failure_gate returned after a failure") from exc
+            failure = exc
+        # DDP inherits this method, so every rank reaches the same success/
+        # failure consensus even when only one local operation failed.
+        self.failure_gate(name, failure)
+        if failure is not None:
+            raise AssertionError("failure_gate returned after a failure") from failure
+        return result  # type: ignore[return-value]
 
     def dataset_start(self, step: int, batch_size: int) -> int:
         for name, value in (("step", step), ("batch_size", batch_size)):
@@ -516,6 +530,7 @@ class SingleProcessStrategy:
         if self._closed:
             return
         self._adapter = None
+        self._setup_complete = False
         self._closed = True
 
     def _require_open(self) -> None:
@@ -707,6 +722,7 @@ class DDPStrategy(SingleProcessStrategy):
         self._setup_complete = False
         self._closed = False
         self._owns_process_group = False
+        self._process_group_fatal = False
 
     def _setup(self) -> None:
         self._require_open()
@@ -724,20 +740,25 @@ class DDPStrategy(SingleProcessStrategy):
             )
         if self.backend is None:
             raise RuntimeError("DDP strategy requires a process-group backend")
-        dist.init_process_group(
-            backend=self.backend,
-            init_method=self._init_method,
-            rank=self.rank,
-            world_size=self.world_size,
-            timeout=timedelta(seconds=self._timeout_s),
-        )
+        try:
+            dist.init_process_group(
+                backend=self.backend,
+                init_method=self._init_method,
+                rank=self.rank,
+                world_size=self.world_size,
+                timeout=timedelta(seconds=self._timeout_s),
+            )
+        except BaseException as exc:
+            self._mark_process_group_fatal()
+            self._owns_process_group = dist.is_initialized()
+            raise _ProcessGroupFatalError(
+                "distributed process-group initialization failed"
+            ) from exc
         self._owns_process_group = True
         self._setup_complete = True
 
     def prepare(self, adapter: Any) -> Any:
-        self._require_open()
-        if not self._setup_complete:
-            raise RuntimeError("Strategy must be set up before prepare()")
+        self._require_collectives_ready()
         if self._adapter is not None:
             if self._adapter is not adapter:
                 raise RuntimeError("Strategy is already prepared with another adapter")
@@ -767,6 +788,7 @@ class DDPStrategy(SingleProcessStrategy):
             self._facade = facade
             self._ddp = DistributedDataParallel(facade, **kwargs)
         except BaseException as exc:
+            self._mark_process_group_fatal()
             raise _ProcessGroupFatalError(
                 "DDP construction failed"
             ) from exc
@@ -779,6 +801,7 @@ class DDPStrategy(SingleProcessStrategy):
         *,
         require_reference: bool = False,
     ) -> PolicyRecomputeStats:
+        self._require_collectives_ready()
         self._require_prepared()
         self._validate_recompute_request(batch, require_reference)
         assert self._ddp is not None
@@ -793,28 +816,49 @@ class DDPStrategy(SingleProcessStrategy):
         )
 
     def gradient_sync_context(self, synchronize_gradients: bool):
+        self._require_collectives_ready()
         self._require_prepared()
         if not isinstance(synchronize_gradients, bool):
             raise TypeError("synchronize_gradients must be a bool")
         assert self._ddp is not None
         return (
-            _FinalGradientSyncContext()
+            _FinalGradientSyncContext(self._mark_process_group_fatal)
             if synchronize_gradients
             else self._ddp.no_sync()
         )
 
     def sum_active_transition_count(self, local_count: int) -> int:
-        count = _positive_count(
-            local_count,
-            name="local active transition count",
-        )
-        reduced = torch.tensor(count, dtype=torch.int64, device=self.device)
-        self._all_reduce(reduced, operation="active-count SUM")
-        result = int(reduced.item())
-        if result <= 0:
-            raise DistributedFailureError(
-                "global active transition count must be positive"
+        reduced: torch.Tensor | None = None
+        error: BaseException | None = None
+        try:
+            count = _positive_count(
+                local_count,
+                name="local active transition count",
             )
+            reduced = torch.tensor(
+                count,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("active_count.prepare", error)
+        if reduced is None:
+            raise RuntimeError("active-count preparation lost local state")
+        self._all_reduce(reduced, operation="active-count SUM")
+        result: int | None = None
+        error = None
+        try:
+            result = int(reduced.item())
+            if result <= 0:
+                raise ValueError(
+                    "global active transition count must be positive"
+                )
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("active_count.finalize", error)
+        if result is None:
+            raise RuntimeError("active-count reduction lost its result")
         return result
 
     def reduce_tensor_weighted_mean(
@@ -832,25 +876,40 @@ class DDPStrategy(SingleProcessStrategy):
         if prepared is None:
             raise RuntimeError("tensor reduction preflight lost local state")
         scalar, count = prepared
-        reduced = torch.stack(
-            (
-                scalar.to(device=self.device) * count,
-                torch.tensor(
-                    float(count),
-                    device=self.device,
-                    dtype=scalar.dtype,
-                ),
+        reduced: torch.Tensor | None = None
+        error = None
+        try:
+            reduced = torch.stack(
+                (
+                    scalar.to(device=self.device) * count,
+                    torch.tensor(
+                        float(count),
+                        device=self.device,
+                        dtype=scalar.dtype,
+                    ),
+                )
             )
-        )
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("tensor_weighted_mean.pack", error)
+        if reduced is None:
+            raise RuntimeError("tensor reduction packing lost local state")
         self._all_reduce(reduced, operation="tensor weighted mean")
-        if not bool(torch.isfinite(reduced).all()) or float(reduced[1]) <= 0:
-            raise DistributedFailureError(
-                "global tensor weighted mean is invalid"
+        result: torch.Tensor | None = None
+        error = None
+        try:
+            if not bool(torch.isfinite(reduced).all()) or float(reduced[1]) <= 0:
+                raise ValueError("global tensor weighted mean is invalid")
+            result = (reduced[0] / reduced[1]).to(
+                device=value.device,
+                dtype=value.dtype,
             )
-        return (reduced[0] / reduced[1]).to(
-            device=value.device,
-            dtype=value.dtype,
-        )
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("tensor_weighted_mean.finalize", error)
+        if result is None:
+            raise RuntimeError("tensor reduction lost its result")
+        return result
 
     def reduce_metric_contributions(
         self,
@@ -877,32 +936,53 @@ class DDPStrategy(SingleProcessStrategy):
             raise DistributedFailureError(
                 "metric contribution keys/modes differ across ranks"
             )
-        packed: list[float] = []
-        for _name, numerator, denominator in prepared:
-            packed.extend(
-                (
-                    numerator,
-                    0.0 if denominator is None else float(denominator),
-                )
-            )
-        reduced = torch.tensor(packed, dtype=torch.float64, device=self.device)
-        self._all_reduce(reduced, operation="metric contribution SUM")
-        if not bool(torch.isfinite(reduced).all()):
-            raise DistributedFailureError(
-                "reduced metric contributions must be finite"
-            )
-        result: dict[str, float] = {}
-        for index, (name, _numerator, denominator) in enumerate(prepared):
-            numerator_sum = float(reduced[2 * index].item())
-            denominator_sum = float(reduced[2 * index + 1].item())
-            if denominator is None:
-                result[name] = numerator_sum
-            else:
-                if denominator_sum <= 0:
-                    raise DistributedFailureError(
-                        f"metric {name!r} has non-positive global denominator"
+        reduced: torch.Tensor | None = None
+        error = None
+        try:
+            packed: list[float] = []
+            for _name, numerator, denominator in prepared:
+                packed.extend(
+                    (
+                        numerator,
+                        0.0 if denominator is None else float(denominator),
                     )
-                result[name] = numerator_sum / denominator_sum
+                )
+            reduced = torch.tensor(
+                packed,
+                dtype=torch.float64,
+                device=self.device,
+            )
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("metric_contributions.pack", error)
+        if reduced is None:
+            raise RuntimeError("metric contribution packing lost local state")
+        self._all_reduce(reduced, operation="metric contribution SUM")
+        result: dict[str, float] | None = None
+        error = None
+        try:
+            if not bool(torch.isfinite(reduced).all()):
+                raise ValueError(
+                    "reduced metric contributions must be finite"
+                )
+            finalized: dict[str, float] = {}
+            for index, (name, _numerator, denominator) in enumerate(prepared):
+                numerator_sum = float(reduced[2 * index].item())
+                denominator_sum = float(reduced[2 * index + 1].item())
+                if denominator is None:
+                    finalized[name] = numerator_sum
+                else:
+                    if denominator_sum <= 0:
+                        raise ValueError(
+                            f"metric {name!r} has non-positive global denominator"
+                        )
+                    finalized[name] = numerator_sum / denominator_sum
+            result = finalized
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("metric_contributions.finalize", error)
+        if result is None:
+            raise RuntimeError("metric contribution reduction lost its result")
         return result
 
     def reduce_reward_metrics(self, rewards: RewardBatch) -> dict[str, float]:
@@ -915,6 +995,8 @@ class DDPStrategy(SingleProcessStrategy):
         self.failure_gate("reward_metrics.validate", error)
         if values is None:
             raise RuntimeError("reward metric preflight lost local state")
+        packed: torch.Tensor | None = None
+        error = None
         try:
             packed = torch.tensor(
                 (
@@ -925,20 +1007,36 @@ class DDPStrategy(SingleProcessStrategy):
                 dtype=torch.float64,
                 device=self.device,
             )
-        except (OverflowError, RuntimeError, ValueError) as exc:
-            self.failure_gate("reward_metrics.pack", exc)
-            raise AssertionError("failure gate returned") from exc
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("reward_metrics.pack", error)
+        if packed is None:
+            raise RuntimeError("reward metric packing lost local state")
         self._all_reduce(packed, operation="reward moment SUM")
-        total, squared, count = (
-            float(value.item()) for value in packed
-        )
-        if not all(math.isfinite(value) for value in (total, squared, count)):
-            raise DistributedFailureError("global reward moments must be finite")
-        if count <= 0:
-            raise DistributedFailureError("global reward count must be positive")
-        mean = total / count
-        variance = max(squared / count - mean * mean, 0.0)
-        return {"reward_mean": mean, "reward_std": math.sqrt(variance)}
+        result: dict[str, float] | None = None
+        error = None
+        try:
+            total, squared, count = (
+                float(value.item()) for value in packed
+            )
+            if not all(
+                math.isfinite(value) for value in (total, squared, count)
+            ):
+                raise ValueError("global reward moments must be finite")
+            if count <= 0:
+                raise ValueError("global reward count must be positive")
+            mean = total / count
+            variance = max(squared / count - mean * mean, 0.0)
+            result = {
+                "reward_mean": mean,
+                "reward_std": math.sqrt(variance),
+            }
+        except BaseException as exc:
+            error = exc
+        self.failure_gate("reward_metrics.finalize", error)
+        if result is None:
+            raise RuntimeError("reward metric reduction lost its result")
+        return result
 
     def atomic_optimizer_step(
         self,
@@ -948,6 +1046,7 @@ class DDPStrategy(SingleProcessStrategy):
         optimizer: torch.optim.AdamW,
         scaler: Any | None,
     ) -> None:
+        self._require_collectives_ready()
         error: BaseException | None = None
         try:
             self._validate_optimizer_boundary(
@@ -1015,6 +1114,7 @@ class DDPStrategy(SingleProcessStrategy):
         try:
             dist.gather_object(value, gathered, dst=dst)
         except BaseException as exc:
+            self._mark_process_group_fatal()
             raise _ProcessGroupFatalError(
                 "distributed gather_object failed"
             ) from exc
@@ -1031,6 +1131,7 @@ class DDPStrategy(SingleProcessStrategy):
         try:
             dist.broadcast_object_list(payload, src=src)
         except BaseException as exc:
+            self._mark_process_group_fatal()
             raise _ProcessGroupFatalError(
                 "distributed broadcast_object failed"
             ) from exc
@@ -1057,18 +1158,36 @@ class DDPStrategy(SingleProcessStrategy):
     def close(self) -> None:
         if self._closed:
             return
+        # Process-group teardown is the final best-effort cleanup boundary.
+        # It must never mask the training or synchronized cleanup exception.
         self._ddp = None
         self._facade = None
         self._adapter = None
-        if self._owns_process_group and dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
-        self._owns_process_group = False
-        self._closed = True
+        try:
+            if (
+                self._owns_process_group
+                and dist.is_available()
+                and dist.is_initialized()
+            ):
+                dist.destroy_process_group()
+        except BaseException:
+            pass
+        finally:
+            self._owns_process_group = False
+            self._setup_complete = False
+            self._closed = True
 
     def _require_collectives_ready(self) -> None:
         self._require_open()
+        if self._process_group_fatal:
+            raise _ProcessGroupFatalError(
+                "distributed process group is unusable after a fatal failure"
+            )
         if not self._setup_complete or not dist.is_initialized():
             raise RuntimeError("DDP strategy must be set up before collectives")
+
+    def _mark_process_group_fatal(self) -> None:
+        self._process_group_fatal = True
 
     def _validate_module_device(self, module: torch.nn.Module) -> None:
         tensors = (*module.parameters(), *module.buffers())
@@ -1088,6 +1207,7 @@ class DDPStrategy(SingleProcessStrategy):
         try:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         except BaseException as exc:
+            self._mark_process_group_fatal()
             raise _ProcessGroupFatalError(
                 f"distributed {operation} failed"
             ) from exc
@@ -1098,6 +1218,7 @@ class DDPStrategy(SingleProcessStrategy):
         try:
             dist.all_gather_object(gathered, value)
         except BaseException as exc:
+            self._mark_process_group_fatal()
             raise _ProcessGroupFatalError(
                 f"distributed {operation} failed"
             ) from exc

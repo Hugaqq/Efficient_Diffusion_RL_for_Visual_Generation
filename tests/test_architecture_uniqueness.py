@@ -1,4 +1,4 @@
-"""Static guardrails for the W02/W03 single component cutover."""
+"""Static guardrails for the single W02-W05 architecture cutover."""
 
 from __future__ import annotations
 
@@ -128,3 +128,104 @@ def test_legacy_adapter_and_rollout_contract_symbols_are_absent():
                     if node.name in banned_definitions:
                         violations.append((path, node.lineno, node.name))
     assert violations == []
+
+
+def test_runner_contract_types_and_commit_coordinator_have_one_owner():
+    expected = PACKAGE / "runner.py"
+    owners = {
+        name: []
+        for name in (
+            "StepMetrics",
+            "StepArtifacts",
+            "StepResult",
+            "CommitCoordinator",
+            "ExperimentRunner",
+        )
+    }
+    for path in _modules():
+        for node in ast.walk(_tree(path)):
+            if isinstance(node, ast.ClassDef) and node.name in owners:
+                owners[node.name].append(path)
+
+    assert owners == {name: [expected] for name in owners}
+    assert all(
+        node.name != "StepInput"
+        for path in _modules()
+        for node in ast.walk(_tree(path))
+        if isinstance(node, ast.ClassDef)
+    )
+
+
+def test_experiment_runner_has_exactly_one_execute_step_definition_and_call():
+    path = PACKAGE / "runner.py"
+    tree = _tree(path)
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ExperimentRunner"
+    )
+    definitions = [
+        node
+        for node in runner.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_execute_step"
+    ]
+    calls = [
+        node
+        for node in ast.walk(runner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr == "_execute_step"
+    ]
+
+    assert len(definitions) == 1
+    assert len(calls) == 1
+    assert all(
+        not (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name
+            in {
+                "_execute_single_step",
+                "_execute_distributed_step",
+                "_run_distributed",
+            }
+        )
+        for node in ast.walk(runner)
+    )
+
+
+def test_optimizer_plugin_step_is_called_only_inside_execute_step():
+    path = PACKAGE / "runner.py"
+    tree = _tree(path)
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ExperimentRunner"
+    )
+    methods = {
+        node.name: node
+        for node in runner.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    call_owners = []
+    for method_name, method in methods.items():
+        for node in ast.walk(method):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "step"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "optimizer_plugin"
+            ):
+                call_owners.append(method_name)
+
+    assert call_owners == ["_execute_step"]
+
+
+def test_retired_runner_tests_and_compatibility_files_are_absent():
+    assert not (ROOT / "tests" / "test_visual_rl.py").exists()
+    assert not (ROOT / "tests" / "test_c10_runner_artifacts.py").exists()
+    assert not (PACKAGE / "callbacks.py").exists()
+    assert not (PACKAGE / "evaluation").exists()
