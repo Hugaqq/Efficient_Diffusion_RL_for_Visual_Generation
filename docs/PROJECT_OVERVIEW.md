@@ -62,8 +62,9 @@ PromptDataset
 | World-R1 | Wan2.1 + strict reward service | 已接入统一主线 | `not_run` |
 | Tiny | CPU single/Gloo contract | 本地测试使用 | 不代表真实模型 |
 
-真实 C20/Q100、Flow native CUDA parity、MG1/NCCL、远端执行、上传和最终 wheel
-安装尚未运行。源码准备、synthetic fixture 或 Gloo 测试不能替代这些结论。
+本地全仓自动化、Tiny single/Gloo API smoke 和基础 wheel 隔离安装已经通过。
+真实 C20/Q100、Flow native CUDA parity、MG1/NCCL、远端执行和上传尚未运行。
+源码准备、synthetic fixture、Gloo 或基础 wheel 测试不能替代这些真实结论。
 
 完整范围与明确排除项见 [V0_7_SCOPE.md](V0_7_SCOPE.md)。
 
