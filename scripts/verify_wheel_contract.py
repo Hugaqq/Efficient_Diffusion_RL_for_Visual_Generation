@@ -153,13 +153,22 @@ def _metadata_errors(metadata_bytes: bytes, pyproject_path: Path) -> tuple[str, 
     expected = {
         "Name": project["name"],
         "Version": project["version"],
-        "Requires-Python": project["requires-python"],
     }
     for field, value in expected.items():
         if metadata.get(field) != value:
             errors.append(
                 f"METADATA {field} is {metadata.get(field)!r}, expected {value!r}"
             )
+    actual_python = metadata.get("Requires-Python")
+    if (
+        not isinstance(actual_python, str)
+        or _normalize_specifier_list(actual_python)
+        != _normalize_specifier_list(project["requires-python"])
+    ):
+        errors.append(
+            "METADATA Requires-Python mismatch: "
+            f"got={actual_python!r}, expected={project['requires-python']!r}"
+        )
     extras = set(metadata.get_all("Provides-Extra", []))
     if extras != expected_extras:
         errors.append(
@@ -289,7 +298,10 @@ def _normalize_requirement(value: str) -> str:
     if match is None:
         raise ValueError(f"invalid Requires-Dist value: {value!r}")
     name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
-    normalized = name + re.sub(r"\s+", "", match.group(2))
+    constraints = re.sub(r"\s+", "", match.group(2))
+    if constraints.startswith("(") and constraints.endswith(")"):
+        constraints = constraints[1:-1]
+    normalized = name + _normalize_specifier_list(constraints)
     if not separator:
         return normalized
     marker_match = re.fullmatch(
@@ -299,6 +311,22 @@ def _normalize_requirement(value: str) -> str:
     if marker_match is None:
         raise ValueError(f"unsupported Requires-Dist marker: {value!r}")
     return f"{normalized};extra=={marker_match.group(2)}"
+
+
+def _normalize_specifier_list(value: str) -> str:
+    if value == "":
+        return ""
+    raw_parts = value.split(",")
+    if any(not part.strip() for part in raw_parts):
+        raise ValueError(f"invalid empty version specifier in {value!r}")
+    parts: list[str] = []
+    for raw_part in raw_parts:
+        part = raw_part.strip()
+        if re.fullmatch(r"(?:===|==|~=|!=|<=|>=|<|>)[^,;\s]+", part) is None:
+            raise ValueError(f"invalid version specifier: {part!r}")
+        parts.append(part)
+    parts.sort()
+    return ",".join(parts)
 
 
 def _record_errors(

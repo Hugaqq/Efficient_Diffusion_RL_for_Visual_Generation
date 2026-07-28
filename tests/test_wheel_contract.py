@@ -62,6 +62,9 @@ def _build_wheel(
     omit_dependency: bool = False,
     duplicate_dependency: bool = False,
     wrong_extra_marker: bool = False,
+    normalized_metadata_order: bool = False,
+    invalid_python_specifier: bool = False,
+    invalid_dependency_specifier: bool = False,
 ) -> Path:
     dist_info = "visual_rl-0.7.0.dist-info"
     package_paths = sorted(
@@ -89,11 +92,22 @@ def _build_wheel(
         requirements[len(CORE_REQUIRES)] = requirements[
             len(CORE_REQUIRES)
         ].replace('extra == "train"', 'extra == "dev"')
+    if normalized_metadata_order:
+        requirements[0] = "numpy<2.3,>=1.26"
+    if invalid_dependency_specifier:
+        requirements[0] = "numpy>=1.26,,<2.3"
+    requires_python = (
+        "<3.12,>=3.10"
+        if normalized_metadata_order
+        else ">=3.10,<3.12"
+    )
+    if invalid_python_specifier:
+        requires_python = ">=3.10,,<3.12"
     metadata_lines = [
         "Metadata-Version: 2.3",
         "Name: visual-rl",
         "Version: 0.7.0",
-        "Requires-Python: >=3.10,<3.12",
+        f"Requires-Python: {requires_python}",
         "Provides-Extra: dev",
         "Provides-Extra: train",
         *(f"Requires-Dist: {requirement}" for requirement in requirements),
@@ -125,6 +139,26 @@ def _build_wheel(
 def test_valid_synthetic_wheel_matches_source_and_metadata(tmp_path: Path) -> None:
     _build_wheel(tmp_path)
     assert verify_wheel_contract(ROOT, tmp_path) == ()
+
+
+def test_checker_accepts_equivalent_normalized_specifier_order(
+    tmp_path: Path,
+) -> None:
+    _build_wheel(tmp_path, normalized_metadata_order=True)
+    assert verify_wheel_contract(ROOT, tmp_path) == ()
+
+
+def test_checker_rejects_empty_or_malformed_specifier_items(
+    tmp_path: Path,
+) -> None:
+    wheel = _build_wheel(tmp_path, invalid_python_specifier=True)
+    errors = verify_wheel_contract(ROOT, tmp_path)
+    assert any("cannot validate METADATA dependency contract" in error for error in errors)
+    wheel.unlink()
+
+    _build_wheel(tmp_path, invalid_dependency_specifier=True)
+    errors = verify_wheel_contract(ROOT, tmp_path)
+    assert any("cannot validate METADATA dependency contract" in error for error in errors)
 
 
 def test_checker_requires_exactly_one_wheel(tmp_path: Path) -> None:
