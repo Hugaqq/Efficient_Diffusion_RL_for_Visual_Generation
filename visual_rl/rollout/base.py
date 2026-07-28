@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
 from typing import Any
 
-from visual_rl.core.types import RolloutBatch, StepContext
+from visual_rl.core.types import FrozenMapping, RolloutBatch, StepContext
 from visual_rl.model_adapters.base import ModelAdapter
 
 
 class RolloutEngine(ABC):
+    """Base contract for rollout engines.
+
+    v0.7 direction (frozen by the master plan, stage 2.1; wired up by the
+    atomic cutover): the only entry becomes keyword-only
+    ``sample(*, adapter, prompts, metadata, context) -> RolloutBatch`` with
+    all four keywords mandatory (``prompts``/``metadata`` already tuples of
+    equal length, ``context`` never ``None``). The engine only performs
+    deterministic prompt expansion, per-row identity and timestep/branch
+    planning, constructs the single ``RolloutRequest`` and calls
+    ``adapter.sample(request)`` exactly once. The legacy optional-context
+    signature, ``resolve_context()`` coercion and runtime-config bridging are
+    removed by the cutover.
+    """
+
     def __init__(self, config: dict[str, Any]):
         self.config = config
 
@@ -104,6 +119,55 @@ class RolloutEngine(ABC):
         )
         finalized.validate_lightweight(strict=True)
         return finalized
+
+    # ------------------------------------------------------------------
+    # Unified component factory protocol (plan stage 2.2); see
+    # ``ModelAdapter`` for the shared contract. Non-abstract defaults keep
+    # existing subclasses instantiable until the cutover.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def resolve_params(
+        cls,
+        raw: Mapping[str, Any],
+        context: Any,
+    ) -> Mapping[str, Any]:
+        """Whitelist/default/validate/canonicalize component params."""
+
+        if not isinstance(raw, Mapping):
+            raise TypeError(
+                f"{cls.__name__}.resolve_params() requires a mapping, "
+                f"got {type(raw).__name__}"
+            )
+        return FrozenMapping(raw)
+
+    @classmethod
+    def check_environment(
+        cls,
+        resolved: Mapping[str, Any],
+        context: Any,
+    ) -> tuple:
+        """Bounded, read-only environment checks; default is no checks."""
+
+        return ()
+
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, Any],
+        context: Any,
+    ):
+        """Construct the runtime component from resolved params."""
+
+        raise NotImplementedError(
+            f"{cls.__name__} does not implement from_config() yet"
+        )
+
+    @classmethod
+    def required_capabilities(cls, resolved_params: Mapping[str, Any]) -> frozenset:
+        """Conditional capabilities implied by the component's own params."""
+
+        return frozenset()
 
 
 def _as_list(value: Any, expected: int) -> list[Any]:

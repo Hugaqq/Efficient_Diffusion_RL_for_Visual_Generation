@@ -3,15 +3,59 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
+import math
 import operator
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
+
+#: Canonical seed range shared by Python/NumPy/Torch generators (plan 2.1).
+UINT32_MAX = 0xFFFF_FFFF
+
+
+def validate_step_seed_budget(seed: int, max_steps: int, world_size: int) -> None:
+    """Reject seed budgets whose per-step seed formula can overflow uint32.
+
+    The unique per-step seed formula is ``seed + step * world_size + rank``
+    with ``step < max_steps`` and ``rank < world_size``; the largest value
+    ``seed + (max_steps - 1) * world_size + (world_size - 1)`` must fit the
+    canonical uint32 range. Checked before any dataset/rollout work; no
+    modulo-based second seed semantics exist.
+    """
+
+    for name, value in (
+        ("seed", seed),
+        ("max_steps", max_steps),
+        ("world_size", world_size),
+    ):
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an integer, not bool")
+    if not 0 <= seed <= UINT32_MAX:
+        raise ValueError("seed must fit the canonical uint32 range")
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    final_seed = seed + (max_steps - 1) * world_size + (world_size - 1)
+    if final_seed > UINT32_MAX:
+        raise ValueError(
+            "seed + (max_steps - 1) * world_size + (world_size - 1) exceeds "
+            f"the canonical uint32 range: {final_seed} > {UINT32_MAX}"
+        )
 
 
 @dataclass(frozen=True)
 class StepContext:
-    """Immutable runtime identity for one rollout/update step."""
+    """Immutable runtime identity for one rollout/update step.
+
+    ``step``/``seed``/``rank``/``world_size`` are the canonical v0.7 identity
+    fields and are validated eagerly: non-bool ints, ``step >= 0``,
+    ``0 <= seed <= 0xFFFFFFFF``, ``world_size >= 1`` and
+    ``0 <= rank < world_size``. ``epoch_tag``/``policy_version`` are legacy
+    fields kept for current call sites; the atomic cutover removes them and
+    ``step`` remains the single logical policy version.
+    """
 
     step: int
     seed: int
@@ -19,6 +63,19 @@ class StepContext:
     rank: int = 0
     world_size: int = 1
     policy_version: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("step", "seed", "rank", "world_size"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"{name} must be an integer, not bool")
+        if self.step < 0:
+            raise ValueError("step must be non-negative")
+        if not 0 <= self.seed <= UINT32_MAX:
+            raise ValueError("seed must fit the canonical uint32 range")
+        if self.world_size < 1:
+            raise ValueError("world_size must be positive")
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError("rank must satisfy 0 <= rank < world_size")
 
 
 @dataclass(init=False)
@@ -42,6 +99,17 @@ class RolloutBatch:
     context: StepContext | None
     model_metadata: dict[str, Any]
     model_tensors: dict[str, Any]
+    # v0.7 typed contract fields (plan stage 2.1). They are optional during
+    # the incremental phase and only meaningful for the matching rollout or
+    # algorithm kind; the atomic cutover makes the full set mandatory.
+    selected_timestep_index: Any
+    flash_coefficient: Any
+    branch_step_index: Any
+    trajectory_step_index: Any
+    transition_std_dev: Any
+    camera_trajectory: Any
+    recompute_payload: dict[str, Any]
+    artifact_metadata: dict[str, Any]
 
     def __init__(
         self,
@@ -66,6 +134,14 @@ class RolloutBatch:
         branch_ids: Any = None,
         seed: int | None = None,
         epoch_tag: int | None = None,
+        selected_timestep_index: Any = None,
+        flash_coefficient: Any = None,
+        branch_step_index: Any = None,
+        trajectory_step_index: Any = None,
+        transition_std_dev: Any = None,
+        camera_trajectory: Any = None,
+        recompute_payload: dict[str, Any] | None = None,
+        artifact_metadata: dict[str, Any] | None = None,
     ) -> None:
         if branch_id is not None and branch_ids is not None:
             raise ValueError("Provide branch_id, not both branch_id and branch_ids")
@@ -120,6 +196,14 @@ class RolloutBatch:
         self.context = context
         self.model_metadata = dict(model_metadata or {})
         self.model_tensors = dict(model_tensors or {})
+        self.selected_timestep_index = selected_timestep_index
+        self.flash_coefficient = flash_coefficient
+        self.branch_step_index = branch_step_index
+        self.trajectory_step_index = trajectory_step_index
+        self.transition_std_dev = transition_std_dev
+        self.camera_trajectory = camera_trajectory
+        self.recompute_payload = dict(recompute_payload or {})
+        self.artifact_metadata = dict(artifact_metadata or {})
 
     @property
     def branch_ids(self) -> Any:
@@ -173,6 +257,13 @@ class RolloutBatch:
                 "branch_id",
                 "transition_mask",
                 "model_tensors",
+                "selected_timestep_index",
+                "flash_coefficient",
+                "branch_step_index",
+                "trajectory_step_index",
+                "transition_std_dev",
+                "camera_trajectory",
+                "recompute_payload",
             )
         }
         return self._copy_with(**updates)
@@ -190,6 +281,13 @@ class RolloutBatch:
                 "branch_id",
                 "transition_mask",
                 "model_tensors",
+                "selected_timestep_index",
+                "flash_coefficient",
+                "branch_step_index",
+                "trajectory_step_index",
+                "transition_std_dev",
+                "camera_trajectory",
+                "recompute_payload",
             )
         }
         return self._copy_with(**updates)
@@ -203,7 +301,12 @@ class RolloutBatch:
         return self._copy_with(**updates)
 
     def slice(self, indices: Any) -> RolloutBatch:
-        """Select a non-empty ordered subset along the sample axis."""
+        """Select a non-empty ordered subset along the sample axis.
+
+        ``trajectory_step_index`` and ``artifact_metadata`` are batch-shared
+        values and are carried through unchanged (never sliced, even when a
+        coincidental ``T == B`` would make them look batch-indexed).
+        """
 
         resolved = _validate_sample_indices(indices, self.batch_size)
         updates = {
@@ -224,6 +327,12 @@ class RolloutBatch:
                 "transition_mask",
                 "model_metadata",
                 "model_tensors",
+                "selected_timestep_index",
+                "flash_coefficient",
+                "branch_step_index",
+                "transition_std_dev",
+                "camera_trajectory",
+                "recompute_payload",
             )
         }
         selected = self._copy_with(**updates)
@@ -918,3 +1027,493 @@ def _as_cpu_bool_tensor(name: str, value: Any) -> Any:
 
 def _stable_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# v0.7 cross-component contract types (master plan stage 2, incremental).
+#
+# These frozen types are added ahead of the atomic cutover that rewires the
+# concrete producers/consumers. They do not change existing behavior; no
+# current call site is required to use them yet.
+# ---------------------------------------------------------------------------
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, FrozenMapping):
+        return value
+    if isinstance(value, Mapping):
+        return FrozenMapping(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool, type(None), Path)):
+        return value
+    raise TypeError(
+        "FrozenMapping values must be JSON-safe scalars/containers or Path, "
+        f"got {type(value).__name__}"
+    )
+
+
+class FrozenMapping(Mapping):
+    """Internal, pickle-safe read-only mapping shared by every contract.
+
+    Construction recursively defensive-copies: nested mappings become
+    ``FrozenMapping`` instances stored as fixed tuple pairs, lists become
+    tuples; mutating the caller's original containers afterwards cannot
+    affect the constructed object. ``MappingProxyType`` is deliberately not
+    used because it cannot be pickled; two-rank ``gather_object()`` and
+    ``pickle.dumps(StepResult)`` must round-trip. Use ``to_plain_dict()`` at
+    the YAML/JSON boundary to recover plain containers.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, source: Any = ()) -> None:
+        raw_items = source.items() if isinstance(source, Mapping) else source
+        items = []
+        for key, value in raw_items:
+            if not isinstance(key, str):
+                raise TypeError("FrozenMapping keys must be strings")
+            items.append((key, _freeze_value(value)))
+        object.__setattr__(self, "_items", tuple(items))
+
+    def __getitem__(self, key: str) -> Any:
+        for item_key, value in self._items:
+            if item_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self):
+        return (key for key, _value in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, FrozenMapping):
+            return self._items == other._items
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._items)
+
+    def __repr__(self) -> str:
+        return f"FrozenMapping({dict(self._items)!r})"
+
+
+def _reject_non_plain(value: Any) -> None:
+    if isinstance(value, (set, frozenset)):
+        raise TypeError("to_plain_dict does not accept set/frozenset values")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError("to_plain_dict does not accept binary values")
+    if callable(value):
+        raise TypeError("to_plain_dict does not accept callables")
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            raise TypeError("to_plain_dict does not accept torch.Tensor")
+    except ImportError:
+        pass
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            raise TypeError("to_plain_dict does not accept numpy.ndarray")
+    except ImportError:
+        pass
+
+
+def to_plain_dict(value: Any) -> Any:
+    """The single strict artifact/config projector (plan stage 2).
+
+    Accepts validated frozen dataclasses, ``FrozenMapping``/``Mapping``,
+    tuple/list, ``Path`` and finite JSON scalars, and returns plain
+    dict/list/scalar containers. ``Tensor``/``ndarray``/callables/sets/
+    arbitrary objects and non-finite floats are rejected before anything is
+    written; nothing is silently stringified or listified.
+    """
+
+    if is_dataclass(value) and not isinstance(value, type):
+        parameters = getattr(value, "__dataclass_params__", None)
+        if parameters is None or not parameters.frozen:
+            raise TypeError("to_plain_dict only accepts frozen dataclass instances")
+        return {
+            item.name: to_plain_dict(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        projected = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("to_plain_dict mapping keys must be strings")
+            projected[key] = to_plain_dict(item)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [to_plain_dict(item) for item in value]
+    if isinstance(value, (str, bool, int)) or value is None:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("to_plain_dict does not accept non-finite floats")
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    _reject_non_plain(value)
+    raise TypeError(f"to_plain_dict does not accept {type(value).__name__}")
+
+
+@dataclass(frozen=True)
+class RolloutRequest:
+    """The single rollout request constructed once per step by RolloutEngine.
+
+    ``prompts``/``metadata`` are already expanded to ``B`` rows; identity
+    tuples are per-row ``[B]``; ``branch_id`` entries are JSON scalars
+    (``str | int | None``). The Adapter echoes every field verbatim and must
+    not re-expand, drop or reorder rows.
+    """
+
+    prompts: tuple[str, ...]
+    metadata: tuple[Mapping[str, Any], ...]
+    sample_id: tuple[str, ...]
+    prompt_id: tuple[str, ...]
+    group_id: tuple[str, ...]
+    branch_id: tuple[Any, ...] | None
+    context: StepContext
+    kind: Literal["full_trajectory", "single_step", "branching"]
+    num_steps: int
+    group_size: int
+    selected_timestep_index: tuple[int, ...] | None = None
+    branch_step_index: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
+class PolicyRecomputeStats:
+    """Microbatch-local policy recompute output (never persisted).
+
+    ``new_log_probs`` is differentiable and matches
+    ``batch.old_log_probs.shape``; values are only required to be finite at
+    ``batch.transition_mask=True`` positions. With
+    ``require_reference=False`` the three reference fields must be ``None``
+    and no reference forward may have run.
+    """
+
+    new_log_probs: Any
+    current_transition_mean: Any | None = None
+    transition_std: Any | None = None
+    reference_transition_mean: Any | None = None
+
+    def validate_against(
+        self,
+        batch: RolloutBatch,
+        *,
+        require_reference: bool,
+    ) -> None:
+        """Enforce the frozen recompute contract before the objective runs."""
+
+        import torch
+
+        old_shape = _shape_tuple(batch.old_log_probs)
+        new_shape = _shape_tuple(self.new_log_probs)
+        if old_shape is None or new_shape is None or old_shape != new_shape:
+            raise ValueError(
+                "new_log_probs must have the same shape as old_log_probs: "
+                f"{new_shape} != {old_shape}"
+            )
+        reference_fields = (
+            self.current_transition_mean,
+            self.transition_std,
+            self.reference_transition_mean,
+        )
+        if not require_reference:
+            if any(item is not None for item in reference_fields):
+                raise ValueError(
+                    "reference statistics require require_reference=True"
+                )
+        elif any(item is None for item in reference_fields):
+            raise ValueError(
+                "require_reference=True requires current_transition_mean, "
+                "transition_std and reference_transition_mean"
+            )
+
+        new_log_probs = self.new_log_probs
+        if not isinstance(new_log_probs, torch.Tensor):
+            raise TypeError("new_log_probs must be a torch.Tensor")
+        mask = batch.transition_mask
+        if mask is not None:
+            mask = torch.as_tensor(
+                mask, device=new_log_probs.device, dtype=torch.bool
+            )
+            if tuple(mask.shape) != tuple(new_log_probs.shape):
+                raise ValueError(
+                    "transition_mask must have the same shape as new_log_probs: "
+                    f"{tuple(mask.shape)} != {tuple(new_log_probs.shape)}"
+                )
+            active = new_log_probs.masked_select(mask)
+        else:
+            active = new_log_probs
+        if not bool(torch.isfinite(active).all()):
+            raise ValueError(
+                "new_log_probs must be finite at active transition positions"
+            )
+
+        if not require_reference:
+            return
+        if not new_log_probs.requires_grad:
+            raise ValueError("new_log_probs must require gradients")
+        current_mean = self.current_transition_mean
+        reference_mean = self.reference_transition_mean
+        transition_std = self.transition_std
+        if not current_mean.requires_grad:
+            raise ValueError("current_transition_mean must require gradients")
+        if reference_mean.requires_grad or reference_mean.grad_fn is not None:
+            raise ValueError(
+                "reference_transition_mean must be detached without grad_fn"
+            )
+        if transition_std.requires_grad or transition_std.grad_fn is not None:
+            raise ValueError("transition_std must be detached without grad_fn")
+        if _shape_tuple(current_mean) != _shape_tuple(reference_mean):
+            raise ValueError(
+                "current_transition_mean and reference_transition_mean must "
+                "have the same shape"
+            )
+        mean_shape = _shape_tuple(current_mean)
+        if mean_shape is None or tuple(mean_shape[:2]) != tuple(new_shape):
+            raise ValueError(
+                "transition mean shapes must start with the [B, T] log-prob "
+                f"prefix, got {mean_shape} for {new_shape}"
+            )
+        std_shape = _shape_tuple(transition_std)
+        broadcast_std = tuple(new_shape) + (1,) * (len(mean_shape) - 2)
+        if std_shape not in {tuple(mean_shape), tuple(new_shape), broadcast_std}:
+            raise ValueError(
+                "transition_std must have the full mean shape, [B, T], or "
+                f"[B, T, 1, ..., 1]; got {std_shape}"
+            )
+        if not bool(torch.isfinite(transition_std).all()):
+            raise ValueError("transition_std must be finite")
+        if not bool((transition_std > 0).all()):
+            raise ValueError("transition_std must be strictly positive")
+
+
+@dataclass(frozen=True)
+class RewardVector:
+    """One RewardClient's shard-local frozen result (provider-internal)."""
+
+    sample_id: tuple[str, ...]
+    values: Any  # finite reward vector [B]
+    shared_metadata: Mapping[str, Any]  # JSON-safe protocol/revision metadata
+    sample_metadata: tuple[Mapping[str, Any], ...]  # per-sample evidence [B]
+
+
+@dataclass(frozen=True)
+class MetricContribution:
+    """One reducible metric: detached finite scalar sum plus a denominator.
+
+    ``denominator=None`` uniquely means cross-rank SUM; a positive integer
+    means ``sum(numerator) / sum(denominator)``.
+    """
+
+    numerator: Any
+    denominator: int | None
+
+    def __post_init__(self) -> None:
+        if self.denominator is not None:
+            if type(self.denominator) is not int:
+                raise TypeError("denominator must be an integer, not bool")
+            if self.denominator <= 0:
+                raise ValueError("denominator must be a positive int or None (SUM)")
+
+
+@dataclass(frozen=True)
+class AdvantageResult:
+    """AdvantageComputer output: the only detached policy signal source."""
+
+    base_advantage: Any  # detached [B]
+    diagnostics: Mapping[str, MetricContribution] = field(
+        default_factory=FrozenMapping
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.diagnostics, FrozenMapping):
+            object.__setattr__(self, "diagnostics", FrozenMapping(self.diagnostics))
+
+
+@dataclass(frozen=True)
+class PolicyLossInputs:
+    """Per-transition objective inputs declared by the PolicyAlgorithm."""
+
+    base_advantage: Any  # [B, T]
+    algorithm_weight: Any  # [B, T]
+    active_mask: Any  # bool [B, T]
+    clip_range: float
+    reference_kl_weight: float
+
+
+@dataclass(frozen=True)
+class ObjectiveOutput:
+    """PolicyObjective scalar output; ``loss`` is what backward consumes."""
+
+    loss: Any
+    policy_loss: Any
+    reference_kl: Any
+    approx_kl: Any
+    clipfrac: Any
+    active_transition_count: int
+
+
+@dataclass(frozen=True)
+class UpdateResult:
+    """UpdateEngine's only return contract: globally reduced JSON-safe scalars.
+
+    ``reference_kl`` is a scalar zero (not ``None``) when the reference
+    regularizer is disabled. ``diagnostics`` uses ``advantage/`` or
+    ``algorithm/`` namespaced keys and never overrides the six core fields.
+    """
+
+    loss: float
+    policy_loss: float
+    reference_kl: float
+    approx_kl: float
+    clipfrac: float
+    active_transition_count: int
+    diagnostics: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.diagnostics, FrozenMapping):
+            object.__setattr__(self, "diagnostics", FrozenMapping(self.diagnostics))
+
+
+@dataclass(frozen=True)
+class ValidationCheck:
+    """One structured validation/preflight check item."""
+
+    level: Literal["error", "warning"]
+    code: str
+    path: str
+    message: str
+    volatile: bool = False
+
+
+@dataclass(frozen=True)
+class ResolutionContext:
+    """The only context ``resolve_params()`` may use to normalize paths."""
+
+    config_path: Path  # absolute normalized YAML path
+    config_dir: Path  # config_path.parent
+
+
+@dataclass(frozen=True)
+class ValidationContext:
+    """Bounded, read-only environment check context (no model/GPU init)."""
+
+    phase: Literal["validate", "run"]
+    config_dir: Path
+    distributed_mode: Literal["single", "ddp"]
+    world_size: Literal[1, 2]  # uniquely derived from distributed_mode
+    backend: str | None  # uniquely derived from mode + device
+    device: str
+    timeout_s: float
+
+
+@dataclass(frozen=True)
+class ValidatedRuntimeEnv:
+    """Launch topology parsed once by the CPU-only environment validator."""
+
+    mode: Literal["single", "ddp"]
+    rank: int
+    local_rank: int
+    world_size: int
+    local_world_size: int
+    group_rank: int | None
+    group_world_size: int | None
+    master_addr: str | None
+    master_port: int | None
+    visible_gpu_count: int
+    raw_launch_env: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw_launch_env, FrozenMapping):
+            object.__setattr__(
+                self, "raw_launch_env", FrozenMapping(self.raw_launch_env)
+            )
+
+
+@dataclass(frozen=True)
+class RuntimeBuildContext:
+    """Rank-local build parameters passed to every factory ``from_config()``.
+
+    ``device`` is a ``torch.device`` at runtime (kept ``Any`` here so this
+    module stays import-level torch-free); factories must use the passed
+    device/backend/precision and never re-derive them from the environment.
+    """
+
+    rank: int
+    local_rank: int
+    world_size: int
+    backend: str | None
+    device: Any
+    precision: Literal["fp32", "fp16", "bf16"]
+
+
+@dataclass(frozen=True)
+class StepMetrics:
+    """Post-reduction scalar metrics of one step; counts are Python ints."""
+
+    values: Mapping[str, Any]
+    sample_count: int
+    active_transition_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, FrozenMapping):
+            object.__setattr__(self, "values", FrozenMapping(self.values))
+
+
+@dataclass(frozen=True)
+class SampleRecord:
+    """One JSON-safe manifest record per sample (manifest schema v3)."""
+
+    run_id: str
+    sample_id: str
+    sample_index: int
+    step: int
+    rank: int
+    prompt: str
+    media_type: str
+    prompt_metadata: Mapping[str, Any]
+    seed: int
+    rollout_type: str
+    timestep_summary: Mapping[str, Any]
+    reward_values: Mapping[str, Any]
+    media_path: str | None
+    rollout_cache_path: str | None
+    checkpoint_path: str | None
+    model_metadata: Mapping[str, Any]
+    prompt_id: str
+    group_id: str
+    branch_id: str | int | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prompt_metadata",
+            "timestep_summary",
+            "reward_values",
+            "model_metadata",
+        ):
+            if not isinstance(getattr(self, name), FrozenMapping):
+                object.__setattr__(self, name, FrozenMapping(getattr(self, name)))
+
+
+@dataclass(frozen=True)
+class StepArtifacts:
+    """Commit material of one step; holds no tensors or autograd graph."""
+
+    local_records: tuple[SampleRecord, ...]
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """The single ``_execute_step()`` return: identity, scalars, materials."""
+
+    context: StepContext
+    metrics: StepMetrics
+    artifacts: StepArtifacts

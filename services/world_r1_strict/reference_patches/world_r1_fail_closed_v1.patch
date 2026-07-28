@@ -1,0 +1,1238 @@
+diff --git a/reward_server/general_reward.py b/reward_server/general_reward.py
+index d5f46d9..d4afd2c 100644
+--- a/reward_server/general_reward.py
++++ b/reward_server/general_reward.py
+@@ -1,139 +1,364 @@
+-"""Multi-GPU backend for the general reward."""
++"""Multi-GPU backend for the general reward (fail-closed strict manager).
++
++world_r1_fail_closed_v1: every decode/scorer/worker failure raises from
++``compute_batch_scores`` instead of being swallowed into a finite 0.5 default
++score.  Workers are explicit ``spawn`` processes so any poisoned manager can
++be terminated with zero residuals.
++"""
+ 
+-from concurrent.futures import ThreadPoolExecutor, as_completed
+ from io import BytesIO
++import math
++import multiprocessing
++import os
++import queue as queue_module
+ import threading
++import time
+ 
+ import hpsv2
+ import torch
+ from PIL import Image
+ 
++STRICT_MANAGER_PROTOCOL = "world_r1_fail_closed_v1"
++STRICT_REWARD_KIND = "reward_general"
++STRICT_MANAGER_TIMEOUT_S = 1800.0
++STRICT_CLEANUP_TIMEOUT_S = 10.0
++STRICT_FATAL_EXIT_CODE = 70
++_RESULT_POLL_S = 0.05
++
++
++class StrictManagerError(RuntimeError):
++    """Base class for fail-closed strict manager failures."""
++
++
++class StrictManagerNotReadyError(StrictManagerError):
++    """compute_batch_scores was called on a non-ready manager."""
++
++
++class StrictManagerInitError(StrictManagerError):
++    """Worker initialization failed, timed out or lost a worker."""
++
++
++class StrictRewardDecodeError(StrictManagerError):
++    """One request row could not be decoded into an RGB image."""
++
++
++class StrictRewardComputeError(StrictManagerError):
++    """A worker reported ROW_ERROR or an invalid result envelope."""
++
++
++class StrictRewardTimeoutError(StrictManagerError):
++    """The single strict deadline was exhausted."""
++
++
++class StrictWorkerDeathError(StrictManagerError):
++    """A spawn worker process died while a batch was in flight."""
++
++
++def _terminate_and_reap(workers, *, timeout_s=STRICT_CLEANUP_TIMEOUT_S):
++    """Bounded two-phase reaping: terminate(5s) then kill(5s), else exit(70)."""
++
++    live = [worker for worker in workers if worker.is_alive()]
++    for worker in live:
++        worker.terminate()
++    deadline = time.monotonic() + timeout_s / 2
++    for worker in live:
++        worker.join(timeout=max(deadline - time.monotonic(), 0.0))
++    survivors = [worker for worker in live if worker.is_alive()]
++    if survivors:
++        for worker in survivors:
++            worker.kill()
++        deadline = time.monotonic() + timeout_s / 2
++        for worker in survivors:
++            worker.join(timeout=max(deadline - time.monotonic(), 0.0))
++    stubborn = [worker for worker in survivors if worker.is_alive()]
++    if stubborn:
++        # Cleanup itself failed: the only WSGI worker must die so the
++        # deployment supervisor rebuilds the whole process.
++        os._exit(STRICT_FATAL_EXIT_CODE)
++
++
++def _close_queue(task_queue):
++    try:
++        task_queue.cancel_join_thread()
++    except Exception:
++        pass
++    try:
++        task_queue.close()
++    except Exception:
++        pass
++
+ 
+ class GeneralRewardInstance:
+-    """Single general-reward worker pinned to one GPU."""
++    """Single general-reward worker pinned to one logical GPU index."""
+ 
+     def __init__(self, gpu_id: int):
+         self.gpu_id = gpu_id
+-        self._busy = False
+-        self._lock = threading.Lock()
+ 
+     def load_model(self):
+         print(f"General reward worker {self.gpu_id} initialized")
+ 
+-    def set_busy(self, busy_state: bool):
+-        with self._lock:
+-            self._busy = busy_state
+-
+     @torch.no_grad()
+     def compute_score(self, images, prompts):
++        # Any HPS scorer exception propagates: the strict worker converts it
++        # into a ROW_ERROR envelope instead of a 0.5 default score.
++        if torch.cuda.is_available():
++            torch.cuda.set_device(self.gpu_id)
++
++        prompt_to_images = {}
++        for index, prompt in enumerate(prompts):
++            prompt_to_images.setdefault(prompt, []).append((index, images[index]))
++
++        scores = [0.0] * len(images)
++        for prompt, image_group in prompt_to_images.items():
++            pil_images = [image for _, image in image_group]
++            hps_scores = hpsv2.score(pil_images, prompt, hps_version="v2.1")
++            for group_index, (origin_index, _) in enumerate(image_group):
++                scores[origin_index] = float(hps_scores[group_index])
++            torch.cuda.empty_cache()
++
++        return scores
++
++
++def _general_worker_main(
++    logical_index,
++    task_queue,
++    result_queue,
++    init_queue,
++    *,
++    instance_factory=None,
++):
++    """Spawn worker: one tagged terminal envelope per received row."""
++
++    try:
++        # The spawn child inherits the parent's CUDA_VISIBLE_DEVICES unchanged;
++        # logical_index is a PyTorch logical device index.
++        if torch.cuda.is_available():
++            torch.cuda.set_device(logical_index)
++        factory = GeneralRewardInstance if instance_factory is None else instance_factory
++        instance = factory(logical_index)
++        instance.load_model()
++    except Exception:
++        init_queue.put(("INIT_ERROR", logical_index, "WORKER_INIT_FAILED"))
++        return
++
++    init_queue.put(("READY", logical_index))
++    while True:
++        task = task_queue.get()
++        if task is None:
++            return
++        row_index, image, prompt = task
+         try:
+-            self.set_busy(True)
+-            if torch.cuda.is_available():
+-                torch.cuda.set_device(self.gpu_id)
+-
+-            prompt_to_images = {}
+-            for index, prompt in enumerate(prompts):
+-                prompt_to_images.setdefault(prompt, []).append((index, images[index]))
+-
+-            scores = [0.0] * len(images)
+-            for prompt, image_group in prompt_to_images.items():
+-                if len(image_group) > 1:
+-                    pil_images = [image for _, image in image_group]
+-                    try:
+-                        hps_scores = hpsv2.score(pil_images, prompt, hps_version="v2.1")
+-                        for group_index, (origin_index, _) in enumerate(image_group):
+-                            scores[origin_index] = float(hps_scores[group_index])
+-                        torch.cuda.empty_cache()
+-                    except Exception:
+-                        for origin_index, _ in image_group:
+-                            scores[origin_index] = 0.5
+-                else:
+-                    origin_index, pil_image = image_group[0]
+-                    try:
+-                        hps_scores = hpsv2.score([pil_image], prompt, hps_version="v2.1")
+-                        scores[origin_index] = float(hps_scores[0])
+-                    except Exception:
+-                        scores[origin_index] = 0.5
+-
+-            return scores
+-        finally:
+-            self.set_busy(False)
++            score = float(instance.compute_score([image], [prompt])[0])
++        except Exception:
++            result_queue.put(("ROW_ERROR", row_index, "SCORER_EXCEPTION"))
++            continue
++        result_queue.put(("ROW_OK", row_index, score))
+ 
+ 
+ class MultiGPUGeneralRewardManager:
+-    """Multi-GPU manager for general reward evaluation."""
++    """Fail-closed multi-GPU manager for general reward evaluation."""
++
++    STRICT_MANAGER_PROTOCOL = STRICT_MANAGER_PROTOCOL
++    STRICT_REWARD_KIND = STRICT_REWARD_KIND
+ 
+     def __init__(self):
+-        self.instances = []
++        self._ready = False
++        self._closed = False
++        self._request_lock = threading.Lock()
++        self._mp_context = multiprocessing.get_context("spawn")
++        self._workers = []
++        self._task_queues = []
++        self._result_queue = None
++        # Controlled-dependency seam used only by the deployment
++        # fault-injection gate; production keeps the patch constant.
++        self._score_timeout_s = STRICT_MANAGER_TIMEOUT_S
+         self.num_gpus = 0
+-        self.executor = None
++
++    def is_ready(self) -> bool:
++        return self._ready and not self._closed
++
++    def _start_worker(
++        self,
++        logical_index,
++        task_queue,
++        result_queue,
++        init_queue,
++        *,
++        instance_factory=None,
++    ):
++        process = self._mp_context.Process(
++            target=_general_worker_main,
++            args=(logical_index, task_queue, result_queue, init_queue),
++            kwargs={"instance_factory": instance_factory},
++            daemon=True,
++        )
++        process.start()
++        return process
+ 
+     def initialize(self):
++        if self._closed:
++            raise StrictManagerInitError("manager is closed")
++        if self._ready or self._workers:
++            raise StrictManagerInitError("initialize() must be called exactly once")
+         if not torch.cuda.is_available():
+-            instance = GeneralRewardInstance(0)
+-            instance.load_model()
+-            self.instances = [instance]
+-            self.num_gpus = 1
+-            return
+-
++            raise StrictManagerInitError(
++                "CUDA is required for the strict general reward manager"
++            )
++        deadline = time.monotonic() + self._score_timeout_s
+         self.num_gpus = torch.cuda.device_count()
+-        for gpu_id in range(self.num_gpus):
+-            instance = GeneralRewardInstance(gpu_id)
+-            instance.load_model()
+-            self.instances.append(instance)
+-
+-        self.executor = ThreadPoolExecutor(max_workers=self.num_gpus)
++        self._result_queue = self._mp_context.Queue()
++        init_queue = self._mp_context.Queue()
++        try:
++            for gpu_id in range(self.num_gpus):
++                task_queue = self._mp_context.Queue()
++                self._task_queues.append(task_queue)
++                self._workers.append(
++                    self._start_worker(
++                        gpu_id, task_queue, self._result_queue, init_queue
++                    )
++                )
++            ready_count = 0
++            while ready_count < self.num_gpus:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise StrictManagerInitError("worker initialization timed out")
++                for worker in self._workers:
++                    if not worker.is_alive():
++                        raise StrictManagerInitError(
++                            "a worker process exited during initialization"
++                        )
++                try:
++                    envelope = init_queue.get(timeout=min(remaining, _RESULT_POLL_S))
++                except queue_module.Empty:
++                    continue
++                tag, gpu_id = envelope[0], envelope[1]
++                if tag == "READY":
++                    print(f"Worker for logical GPU {gpu_id} is ready")
++                    ready_count += 1
++                elif tag == "INIT_ERROR":
++                    raise StrictManagerInitError(
++                        f"worker for logical GPU {gpu_id} failed to initialize: "
++                        f"{envelope[2]}"
++                    )
++                else:
++                    raise StrictManagerInitError(
++                        f"unexpected initialization envelope {tag!r}"
++                    )
++        except BaseException:
++            self._poison_and_shutdown()
++            _close_queue(init_queue)
++            raise
++        _close_queue(init_queue)
++        self._ready = True
++        print(
++            f"Strict general reward manager initialized with "
++            f"{self.num_gpus} spawn worker processes"
++        )
+ 
+     def compute_batch_scores(self, batch_images, batch_prompts):
+-        if not self.instances:
+-            return [0.5] * len(batch_images)
+-        if self.num_gpus == 1:
+-            return self._compute_sequential(batch_images, batch_prompts)
+-        return self._compute_parallel(batch_images, batch_prompts)
+-
+-    def _compute_sequential(self, batch_images, batch_prompts):
+-        results = []
+-        instance = self.instances[0]
+-        for batch_index, image_bytes in enumerate(batch_images):
++        # The single deadline is defined BEFORE attempting lock acquisition;
++        # lock wait, decode, enqueue, scoring and collection all consume the
++        # same remaining budget.
++        deadline = time.monotonic() + self._score_timeout_s
++        acquired = self._request_lock.acquire(
++            timeout=max(deadline - time.monotonic(), 0.0)
++        )
++        if not acquired:
++            raise StrictRewardTimeoutError(
++                "timed out waiting for the strict manager request lock"
++            )
++        try:
++            if not self.is_ready():
++                raise StrictManagerNotReadyError(
++                    "strict general reward manager is not ready"
++                )
+             try:
+-                image = Image.open(BytesIO(image_bytes))
+-                if image.mode != "RGB":
+-                    image = image.convert("RGB")
+-                results.append(instance.compute_score([image], [batch_prompts[batch_index]])[0])
+-            except Exception:
+-                results.append(0.5)
+-        return results
++                return self._compute_locked(batch_images, batch_prompts, deadline)
++            except BaseException:
++                self._poison_and_shutdown()
++                raise
++        finally:
++            self._request_lock.release()
+ 
+-    def _compute_parallel(self, batch_images, batch_prompts):
+-        tasks = []
+-        for batch_index, image_bytes in enumerate(batch_images):
++    def _compute_locked(self, batch_images, batch_prompts, deadline):
++        if len(batch_images) != len(batch_prompts):
++            raise StrictRewardComputeError(
++                "batch_images and batch_prompts must have the same length"
++            )
++        decoded = []
++        for row_index, (image_bytes, prompt) in enumerate(
++            zip(batch_images, batch_prompts)
++        ):
+             try:
+                 image = Image.open(BytesIO(image_bytes))
+                 if image.mode != "RGB":
+                     image = image.convert("RGB")
+-                tasks.append((batch_index, image, batch_prompts[batch_index]))
+-            except Exception:
+-                tasks.append((batch_index, None, None))
+-
+-        future_to_batch = {}
+-        results = [0.5] * len(batch_images)
+-        for worker_index, (batch_index, image, prompt) in enumerate(tasks):
+-            if image is None:
+-                continue
+-            instance = self.instances[worker_index % self.num_gpus]
+-            future = self.executor.submit(instance.compute_score, [image], [prompt])
+-            future_to_batch[future] = batch_index
++                image.load()
++            except Exception as exc:
++                raise StrictRewardDecodeError(
++                    f"request row {row_index} is not a decodable image"
++                ) from exc
++            decoded.append((row_index, image, prompt))
+ 
+-        for future in as_completed(future_to_batch):
+-            batch_index = future_to_batch[future]
+-            try:
+-                batch_scores = future.result(timeout=60)
+-                results[batch_index] = batch_scores[0] if batch_scores else 0.5
+-            except Exception:
+-                results[batch_index] = 0.5
++        for row_index, image, prompt in decoded:
++            worker_slot = row_index % self.num_gpus
++            self._task_queues[worker_slot].put((row_index, image, prompt))
+ 
++        results = [None] * len(decoded)
++        received = 0
++        while received < len(decoded):
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise StrictRewardTimeoutError(
++                    "timed out collecting strict worker results"
++                )
++            for worker in self._workers:
++                if not worker.is_alive():
++                    raise StrictWorkerDeathError(
++                        "a strict reward worker process died mid-batch"
++                    )
++            try:
++                envelope = self._result_queue.get(
++                    timeout=min(remaining, _RESULT_POLL_S)
++                )
++            except queue_module.Empty:
++                continue
++            tag, row_index, payload = envelope
++            if tag == "ROW_ERROR":
++                raise StrictRewardComputeError(
++                    f"request row {row_index} failed in the worker: {payload}"
++                )
++            if tag != "ROW_OK":
++                raise StrictRewardComputeError(
++                    f"unexpected worker result envelope {tag!r}"
++                )
++            value = float(payload)
++            if not math.isfinite(value):
++                raise StrictRewardComputeError(
++                    f"request row {row_index} returned a non-finite score"
++                )
++            results[row_index] = value
++            received += 1
+         return results
+ 
++    def _poison_and_shutdown(self):
++        """Idempotent fail-closed cleanup shared by every failure path."""
++
++        if self._closed:
++            return
++        self._closed = True
++        self._ready = False
++        workers = list(self._workers)
++        self._workers = []
++        task_queues = list(self._task_queues)
++        self._task_queues = []
++        result_queue = self._result_queue
++        self._result_queue = None
++        for task_queue in task_queues:
++            _close_queue(task_queue)
++        if result_queue is not None:
++            _close_queue(result_queue)
++        _terminate_and_reap(workers)
++
+     def shutdown(self):
+-        if self.executor:
+-            self.executor.shutdown(wait=True)
++        self._poison_and_shutdown()
+diff --git a/reward_server/reward_3d.py b/reward_server/reward_3d.py
+index 3389d13..a508be3 100644
+--- a/reward_server/reward_3d.py
++++ b/reward_server/reward_3d.py
+@@ -1,19 +1,98 @@
+ #!/usr/bin/env python3
+-"""Multi-GPU backend for the 3D reward."""
++"""Multi-GPU backend for the 3D reward (fail-closed strict manager).
++
++world_r1_fail_closed_v1: every decode/scorer/worker failure raises from
++``compute_batch_scores`` instead of being swallowed into a finite 0.0 default
++score.  All Queue/Process objects come from an explicit ``spawn`` context and
++every row yields exactly one tagged terminal envelope.
++"""
+ 
+ import torch
+ import numpy as np
+ from PIL import Image
+ from io import BytesIO
+-from multiprocessing import Process, Queue
++import math
++import multiprocessing
+ import os
++import queue as queue_module
+ import json
++import threading
++import time
+ import datetime
+ 
+ from reward_server.reward_3d_backend import DEFAULT_RECONSTRUCTION_MODEL, Reward3DBackend
+ 
++STRICT_MANAGER_PROTOCOL = "world_r1_fail_closed_v1"
++STRICT_REWARD_KIND = "reward_3d"
++STRICT_MANAGER_TIMEOUT_S = 1800.0
++STRICT_CLEANUP_TIMEOUT_S = 10.0
++STRICT_FATAL_EXIT_CODE = 70
++_RESULT_POLL_S = 0.05
++
++
++class StrictManagerError(RuntimeError):
++    """Base class for fail-closed strict manager failures."""
++
++
++class StrictManagerNotReadyError(StrictManagerError):
++    """compute_batch_scores was called on a non-ready manager."""
++
++
++class StrictManagerInitError(StrictManagerError):
++    """Worker initialization failed, timed out or lost a worker."""
++
++
++class StrictRewardDecodeError(StrictManagerError):
++    """One request row could not be decoded into RGB frames."""
++
++
++class StrictRewardComputeError(StrictManagerError):
++    """A worker reported ROW_ERROR or an invalid result envelope."""
++
++
++class StrictRewardTimeoutError(StrictManagerError):
++    """The single strict deadline was exhausted."""
++
++
++class StrictWorkerDeathError(StrictManagerError):
++    """A spawn worker process died while a batch was in flight."""
++
++
++def _terminate_and_reap(workers, *, timeout_s=STRICT_CLEANUP_TIMEOUT_S):
++    """Bounded two-phase reaping: terminate(5s) then kill(5s), else exit(70)."""
++
++    live = [worker for worker in workers if worker.is_alive()]
++    for worker in live:
++        worker.terminate()
++    deadline = time.monotonic() + timeout_s / 2
++    for worker in live:
++        worker.join(timeout=max(deadline - time.monotonic(), 0.0))
++    survivors = [worker for worker in live if worker.is_alive()]
++    if survivors:
++        for worker in survivors:
++            worker.kill()
++        deadline = time.monotonic() + timeout_s / 2
++        for worker in survivors:
++            worker.join(timeout=max(deadline - time.monotonic(), 0.0))
++    stubborn = [worker for worker in survivors if worker.is_alive()]
++    if stubborn:
++        # Cleanup itself failed: the only WSGI worker must die so the
++        # deployment supervisor rebuilds the whole process.
++        os._exit(STRICT_FATAL_EXIT_CODE)
++
+ 
+-def reward_3d_worker_process(gpu_id, model_name, scorer_type, task_queue, result_queue):
++def _close_queue(task_queue):
++    try:
++        task_queue.cancel_join_thread()
++    except Exception:
++        pass
++    try:
++        task_queue.close()
++    except Exception:
++        pass
++
++
++def reward_3d_worker_process(gpu_id, model_name, scorer_type, task_queue, result_queue, init_queue):
+     """
+     Worker process that runs the 3D reward stack on a specific GPU.
+ 
+@@ -25,12 +104,11 @@ def reward_3d_worker_process(gpu_id, model_name, scorer_type, task_queue, result
+         result_queue: Queue to send results including per-video artifact paths
+     """
+     try:
+-        # CRITICAL: Set CUDA device BEFORE any CUDA operations
+-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+-
+-        # Re-import torch after setting CUDA_VISIBLE_DEVICES
++        # The spawn child inherits the parent's CUDA_VISIBLE_DEVICES unchanged;
++        # gpu_id is a PyTorch logical device index resolved by CUDA/PyTorch.
+         import torch as torch_local
+-        device = torch_local.device("cuda:0")  # Maps to the physical GPU
++        torch_local.cuda.set_device(gpu_id)
++        device = torch_local.device(f"cuda:{gpu_id}")
+ 
+         print(f"[Process {os.getpid()}] Initializing 3D reward backend on physical GPU {gpu_id}")
+         reward_3d_backend = Reward3DBackend(device=device, model_name=model_name)
+@@ -272,8 +350,8 @@ Output only a single digit (0-9):'''
+                         print(f"[Process {os.getpid()}] Error scoring video: {e}")
+                         import traceback
+                         traceback.print_exc()
+-                        all_rewards.append(0.0)
+                         torch_local.cuda.empty_cache()
++                        raise
+ 
+                 return all_rewards
+ 
+@@ -359,8 +437,9 @@ Format your final answer as: <Score>X</Score>
+                             score = raw_score / 10.0
+                             print(f"[Process {os.getpid()}] Extracted score: {raw_score}/10 = {score}")
+                         else:
+-                            print(f"[Process {os.getpid()}] Warning: No score found in OpenAI response, returning 0.0")
+-                            score = 0.0
++                            raise RuntimeError(
++                                "OpenAI response did not contain a <Score> tag"
++                            )
+ 
+                         all_rewards.append(score)
+ 
+@@ -372,7 +451,7 @@ Format your final answer as: <Score>X</Score>
+                         print(f"[Process {os.getpid()}] Error scoring with OpenAI: {e}")
+                         import traceback
+                         traceback.print_exc()
+-                        all_rewards.append(0.0)
++                        raise
+ 
+                 return all_rewards
+ 
+@@ -397,19 +476,18 @@ Format your final answer as: <Score>X</Score>
+                 try:
+                     import lpips as lpips_lib
+                 except Exception as e:
+-                    print(f"[Process {os.getpid()}] Failed to import lpips: {e}")
+-                    return 0.0
++                    raise RuntimeError(f"Failed to import lpips: {e}") from e
+                 lpips_model = lpips_lib.LPIPS(net="alex").to(device)
+                 lpips_model.eval()
+ 
+             if gs_video_tensor.dim() != 4 or input_video_tensor.dim() != 4:
+-                print(f"[Process {os.getpid()}] Invalid LPIPS tensor shapes: gs={gs_video_tensor.shape}, input={input_video_tensor.shape}")
+-                return 0.0
++                raise RuntimeError(
++                    f"Invalid LPIPS tensor shapes: gs={gs_video_tensor.shape}, input={input_video_tensor.shape}"
++                )
+ 
+             num_frames = min(gs_video_tensor.shape[0], input_video_tensor.shape[0])
+             if num_frames <= 0:
+-                print(f"[Process {os.getpid()}] Empty video for LPIPS scoring")
+-                return 0.0
++                raise RuntimeError("Empty video for LPIPS scoring")
+ 
+             gs_clip = gs_video_tensor[:num_frames].float()
+             input_clip = input_video_tensor[:num_frames].float()
+@@ -434,7 +512,7 @@ Format your final answer as: <Score>X</Score>
+             return gs_score
+ 
+         # Signal that initialization is complete
+-        result_queue.put(("READY", gpu_id))
++        init_queue.put(("READY", gpu_id))
+ 
+         # Process tasks from queue
+         while True:
+@@ -477,37 +555,39 @@ Format your final answer as: <Score>X</Score>
+                     camera_trajectory=camera_trajectory,
+                 )
+ 
+-                # Save gs_video and meta_view
+-                print(f"[Process {os.getpid()}] Saving GS video and meta view for batch {batch_idx}")
++                # Debug artifact writes are best-effort only: they never feed
++                # back into gs/meta/camera/final scores, so failures warn and
++                # continue instead of poisoning the row.
+                 import cv2 as cv2_local
+ 
+-                # Save GS video
+-                gs_video_path = os.path.join(save_dir, f"batch_{batch_idx}_gs_video.mp4")
+-                gs_frames_np = (gs_video.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
+-                height, width = gs_frames_np.shape[1:3]
+-                fourcc = cv2_local.VideoWriter_fourcc(*'mp4v')
+-                gs_writer = cv2_local.VideoWriter(gs_video_path, fourcc, 24, (width, height))
+-                for frame in gs_frames_np:
+-                    # Convert RGB to BGR for OpenCV
+-                    frame_bgr = cv2_local.cvtColor(frame, cv2_local.COLOR_RGB2BGR)
+-                    gs_writer.write(frame_bgr)
+-                gs_writer.release()
+-                print(f"[Process {os.getpid()}] Saved GS video to {gs_video_path}")
+-
+-                # Save meta view (single image, not video)
+-                meta_view_path = os.path.join(save_dir, f"batch_{batch_idx}_meta_view.png")
+-                meta_view_np = (meta_view.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+-                # Convert RGB to BGR for OpenCV
+-                meta_view_bgr = cv2_local.cvtColor(meta_view_np, cv2_local.COLOR_RGB2BGR)
+-                cv2_local.imwrite(meta_view_path, meta_view_bgr)
+-                print(f"[Process {os.getpid()}] Saved meta view to {meta_view_path}")
+-
++                gs_video_path = ""
++                meta_view_path = ""
+                 trajectory_comparison_path = ""
+-                if trajectory_comparison_image is not None:
+-                    trajectory_comparison_path = os.path.join(save_dir, f"batch_{batch_idx}_trajectory_comparison.png")
+-                    trajectory_comparison_bgr = cv2_local.cvtColor(trajectory_comparison_image, cv2_local.COLOR_RGB2BGR)
+-                    cv2_local.imwrite(trajectory_comparison_path, trajectory_comparison_bgr)
+-                    print(f"[Process {os.getpid()}] Saved trajectory comparison to {trajectory_comparison_path}")
++                try:
++                    # Save GS video
++                    gs_video_path = os.path.join(save_dir, f"batch_{batch_idx}_gs_video.mp4")
++                    gs_frames_np = (gs_video.permute(0, 2, 3, 1).cpu().numpy() * 255).astype(np.uint8)
++                    height, width = gs_frames_np.shape[1:3]
++                    fourcc = cv2_local.VideoWriter_fourcc(*'mp4v')
++                    gs_writer = cv2_local.VideoWriter(gs_video_path, fourcc, 24, (width, height))
++                    for frame in gs_frames_np:
++                        # Convert RGB to BGR for OpenCV
++                        frame_bgr = cv2_local.cvtColor(frame, cv2_local.COLOR_RGB2BGR)
++                        gs_writer.write(frame_bgr)
++                    gs_writer.release()
++
++                    # Save meta view (single image, not video)
++                    meta_view_path = os.path.join(save_dir, f"batch_{batch_idx}_meta_view.png")
++                    meta_view_np = (meta_view.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
++                    meta_view_bgr = cv2_local.cvtColor(meta_view_np, cv2_local.COLOR_RGB2BGR)
++                    cv2_local.imwrite(meta_view_path, meta_view_bgr)
++
++                    if trajectory_comparison_image is not None:
++                        trajectory_comparison_path = os.path.join(save_dir, f"batch_{batch_idx}_trajectory_comparison.png")
++                        trajectory_comparison_bgr = cv2_local.cvtColor(trajectory_comparison_image, cv2_local.COLOR_RGB2BGR)
++                        cv2_local.imwrite(trajectory_comparison_path, trajectory_comparison_bgr)
++                except Exception as debug_exc:
++                    print(f"[Process {os.getpid()}] Warning: debug artifact write failed: {debug_exc}")
+ 
+                 # Debug: Check tensor properties
+                 print(f"[Process {os.getpid()}] gs_video shape: {gs_video.shape}, dtype: {gs_video.dtype}, range: [{gs_video.min():.3f}, {gs_video.max():.3f}]")
+@@ -519,14 +599,18 @@ Format your final answer as: <Score>X</Score>
+                     gs_score = compute_lpips_gs_score(gs_video, video_tensor)
+                 else:
+                     gs_scores = gs_scorer([prompt], [gs_video])
+-                    gs_score = gs_scores[0] if gs_scores else 0.0
++                    if not gs_scores:
++                        raise RuntimeError("Qwen scorer returned an empty result for the GS video")
++                    gs_score = gs_scores[0]
+ 
+                 # Score meta_view with meta_scorer (single image - Qwen or OpenAI)
+                 # Need to add batch dimension for image: (3, H, W) -> (1, 3, H, W)
+                 print(f"[Process {os.getpid()}] Scoring meta view for batch {batch_idx}")
+                 meta_view_batch = meta_view.unsqueeze(0)  # (1, 3, H, W)
+                 meta_scores = meta_scorer([prompt], [meta_view_batch])
+-                meta_score = meta_scores[0] if meta_scores else 0.0
++                if not meta_scores:
++                    raise RuntimeError("Qwen scorer returned an empty result for the meta view")
++                meta_score = meta_scores[0]
+ 
+                 # Paper setting: R_3D = S_meta + S_recon + S_traj, each bounded in [0, 1].
+                 gs_score = float(np.clip(gs_score, 0.0, 1.0))
+@@ -538,14 +622,17 @@ Format your final answer as: <Score>X</Score>
+                 print(f"  GS score: {gs_score:.3f}, Meta score: {meta_score:.3f}, Camera motion: {camera_motion_score:.3f}, Final: {final_score:.3f}")
+ 
+                 result_queue.put((
++                    "ROW_OK",
+                     batch_idx,
+-                    gs_score,
+-                    meta_score,
+-                    camera_motion_score,
+-                    final_score,
+-                    gs_video_path,
+-                    meta_view_path,
+-                    trajectory_comparison_path,
++                    (
++                        gs_score,
++                        meta_score,
++                        camera_motion_score,
++                        final_score,
++                        gs_video_path,
++                        meta_view_path,
++                        trajectory_comparison_path,
++                    ),
+                 ))
+ 
+             except Exception as e:
+@@ -560,93 +647,170 @@ Format your final answer as: <Score>X</Score>
+                 except:
+                     pass
+ 
+-                result_queue.put((batch_idx, 0.0, 0.0, 0.0, 0.0, "", "", ""))
++                result_queue.put(("ROW_ERROR", batch_idx, "ROW_COMPUTE_FAILED"))
+ 
+     except Exception as e:
+         print(f"[Process {os.getpid()}] Fatal error in worker process: {e}")
+         import traceback
+         traceback.print_exc()
+-        result_queue.put(("ERROR", gpu_id))
++        init_queue.put(("INIT_ERROR", gpu_id, "WORKER_INIT_FAILED"))
+ 
+ 
+ class MultiGPUReward3DManager:
+-    """Manager for multi-GPU 3D reward evaluation."""
++    """Fail-closed manager for multi-GPU 3D reward evaluation."""
++
++    STRICT_MANAGER_PROTOCOL = STRICT_MANAGER_PROTOCOL
++    STRICT_REWARD_KIND = STRICT_REWARD_KIND
+ 
+     def __init__(self, model_name=DEFAULT_RECONSTRUCTION_MODEL, scorer_type="qwen", use_lpips=False):
+         self.model_name = model_name
+         self.scorer_type = scorer_type
+         self.use_lpips = use_lpips
++        self._ready = False
++        self._closed = False
++        self._request_lock = threading.Lock()
++        self._mp_context = multiprocessing.get_context("spawn")
++        self._workers = []
++        self._task_queues = []
++        self._result_queue = None
++        # Controlled-dependency seam used only by the deployment
++        # fault-injection gate; production keeps the patch constant.
++        self._score_timeout_s = STRICT_MANAGER_TIMEOUT_S
+         self.num_gpus = 0
+-        self.processes = []
+-        self.task_queues = []
+-        self.result_queue = None
+         self.current_gpu_index = 0  # For round-robin assignment
+         self.call_counter = 0  # Track number of calls for logging
+         self.last_results = None
+ 
++    def is_ready(self) -> bool:
++        return self._ready and not self._closed
++
++    def _start_worker(self, logical_index, task_queue, result_queue, init_queue):
++        process = self._mp_context.Process(
++            target=reward_3d_worker_process,
++            args=(
++                logical_index,
++                self.model_name,
++                self.scorer_type,
++                task_queue,
++                result_queue,
++                init_queue,
++            ),
++            daemon=True,
++        )
++        process.start()
++        return process
++
+     def initialize(self):
++        if self._closed:
++            raise StrictManagerInitError("manager is closed")
++        if self._ready or self._workers:
++            raise StrictManagerInitError("initialize() must be called exactly once")
+         if not torch.cuda.is_available():
+-            print("CUDA not available. Cannot run the 3D reward backend.")
+-            return
++            raise StrictManagerInitError(
++                "CUDA is required for the strict 3D reward manager"
++            )
+ 
++        deadline = time.monotonic() + self._score_timeout_s
+         self.num_gpus = torch.cuda.device_count()
+-        print(f"Initializing the 3D reward backend on {self.num_gpus} GPUs")
+-
+-        # Create shared result queue
+-        self.result_queue = Queue()
+-
+-        # Create a task queue and worker process for each GPU
+-        for gpu_id in range(self.num_gpus):
+-            task_queue = Queue()
+-            self.task_queues.append(task_queue)
+-
+-            # Start worker process
+-            process = Process(
+-                target=reward_3d_worker_process,
+-                args=(gpu_id, self.model_name, self.scorer_type, task_queue, self.result_queue)
+-            )
+-            process.start()
+-            self.processes.append(process)
+-            print(f"Started worker process for GPU {gpu_id} (PID: {process.pid})")
+-
+-        # Wait for all workers to finish initialization
+-        ready_count = 0
+-        while ready_count < self.num_gpus:
+-            msg_type, gpu_id = self.result_queue.get()
+-            if msg_type == "READY":
+-                print(f"Worker for GPU {gpu_id} is ready")
+-                ready_count += 1
+-            elif msg_type == "ERROR":
+-                print(f"Worker for GPU {gpu_id} failed to initialize")
+-
+-        print(f"Multi-GPU 3D reward backend initialized with {self.num_gpus} worker processes")
++        print(f"Initializing the strict 3D reward backend on {self.num_gpus} GPUs")
++        self._result_queue = self._mp_context.Queue()
++        init_queue = self._mp_context.Queue()
++        try:
++            for gpu_id in range(self.num_gpus):
++                task_queue = self._mp_context.Queue()
++                self._task_queues.append(task_queue)
++                self._workers.append(
++                    self._start_worker(gpu_id, task_queue, self._result_queue, init_queue)
++                )
++                print(f"Started spawn worker for logical GPU {gpu_id}")
++
++            ready_count = 0
++            while ready_count < self.num_gpus:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise StrictManagerInitError("worker initialization timed out")
++                for worker in self._workers:
++                    if not worker.is_alive():
++                        raise StrictManagerInitError(
++                            "a worker process exited during initialization"
++                        )
++                try:
++                    envelope = init_queue.get(timeout=min(remaining, _RESULT_POLL_S))
++                except queue_module.Empty:
++                    continue
++                tag, gpu_id = envelope[0], envelope[1]
++                if tag == "READY":
++                    print(f"Worker for logical GPU {gpu_id} is ready")
++                    ready_count += 1
++                elif tag == "INIT_ERROR":
++                    raise StrictManagerInitError(
++                        f"worker for logical GPU {gpu_id} failed to initialize: "
++                        f"{envelope[2]}"
++                    )
++                else:
++                    raise StrictManagerInitError(
++                        f"unexpected initialization envelope {tag!r}"
++                    )
++        except BaseException:
++            self._poison_and_shutdown()
++            _close_queue(init_queue)
++            raise
++        _close_queue(init_queue)
++        self._ready = True
++        print(f"Strict 3D reward manager initialized with {self.num_gpus} spawn worker processes")
+ 
+     def compute_batch_scores(self, batch_videos, batch_prompts, camera_trajectories=None, use_lpips=None):
+         """
+-        Compute scores for a batch with load balancing across GPUs
++        Compute scores for a batch with load balancing across GPUs.
+ 
+-        Args:
+-            batch_videos: List of videos, each video is a list of frame bytes (JPEG)
+-            batch_prompts: List of text prompts (length = batch_size)
+-            camera_trajectories: Optional list of camera trajectories (length = batch_size)
+-            use_lpips: Use LPIPS to score GS video instead of Qwen3-VL
+-
+-        Returns:
+-            List of final scores (length = batch_size)
++        Any decode/scorer/worker/timeout failure poisons the manager and
++        raises; no finite 0.0 default score is ever returned.
+         """
++        # The single deadline is defined BEFORE attempting lock acquisition;
++        # lock wait, decode, enqueue, scoring and collection all consume the
++        # same remaining budget.
++        deadline = time.monotonic() + self._score_timeout_s
++        acquired = self._request_lock.acquire(
++            timeout=max(deadline - time.monotonic(), 0.0)
++        )
++        if not acquired:
++            raise StrictRewardTimeoutError(
++                "timed out waiting for the strict manager request lock"
++            )
++        try:
++            if not self.is_ready():
++                raise StrictManagerNotReadyError(
++                    "strict 3D reward manager is not ready"
++                )
++            try:
++                return self._compute_locked(
++                    batch_videos,
++                    batch_prompts,
++                    camera_trajectories=camera_trajectories,
++                    use_lpips=use_lpips,
++                    deadline=deadline,
++                )
++            except BaseException:
++                self._poison_and_shutdown()
++                raise
++        finally:
++            self._request_lock.release()
++
++    def _compute_locked(self, batch_videos, batch_prompts, *, camera_trajectories, use_lpips, deadline):
+         if use_lpips is None:
+             use_lpips = self.use_lpips
+-        if not self.processes:
+-            print("Error: 3D reward worker processes not initialized")
+-            return [0.0] * len(batch_videos)
+-
+         batch_size = len(batch_videos)
+-        results = {
+-            'final_scores': [0.0] * batch_size,
+-            'gs_scores': [0.0] * batch_size,
+-            'meta_scores': [0.0] * batch_size,
+-            'camera_motion_scores': [0.0] * batch_size,
+-        }
++        if len(batch_prompts) != batch_size:
++            raise StrictRewardComputeError(
++                "batch_videos and batch_prompts must have the same length"
++            )
++
++        if camera_trajectories is None:
++            camera_trajectories = [None] * batch_size
++        elif len(camera_trajectories) != batch_size:
++            raise StrictRewardComputeError(
++                "camera_trajectories must align with batch_videos one-to-one"
++            )
+ 
+         # Create output directory for logging
+         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+@@ -654,53 +818,81 @@ class MultiGPUReward3DManager:
+         os.makedirs(batch_dir, exist_ok=True)
+         self.call_counter += 1
+ 
+-        if camera_trajectories is None:
+-            camera_trajectories = [None] * batch_size
+-        elif not isinstance(camera_trajectories, list):
+-            camera_trajectories = [camera_trajectories] * batch_size
+-        elif len(camera_trajectories) != batch_size:
+-            if len(camera_trajectories) < batch_size:
+-                camera_trajectories = camera_trajectories + [None] * (batch_size - len(camera_trajectories))
+-            else:
+-                camera_trajectories = camera_trajectories[:batch_size]
+-
+-        # Prepare tasks
++        # Decode every row in the parent before enqueueing anything; a bad
++        # frame JPEG is a structured decode failure, never a default score.
+         tasks = []
+         for batch_idx, (video_frames, prompt, camera_trajectory) in enumerate(
+             zip(batch_videos, batch_prompts, camera_trajectories)
+         ):
++            if not video_frames:
++                raise StrictRewardDecodeError(f"request row {batch_idx} has no frames")
+             try:
+-                # Convert frame bytes to PIL Images
+                 frames = [Image.open(BytesIO(frame_bytes)).convert('RGB') for frame_bytes in video_frames]
+-                print(f"Preparing batch {batch_idx}: {len(frames)} frames")
+-                tasks.append((batch_idx, frames, prompt, use_lpips, camera_trajectory))
+-            except Exception as e:
+-                print(f"Error preparing batch {batch_idx}: {e}")
+-                # Will use default score 0.0
++                for frame in frames:
++                    frame.load()
++            except Exception as exc:
++                raise StrictRewardDecodeError(
++                    f"request row {batch_idx} contains an undecodable frame"
++                ) from exc
++            tasks.append((batch_idx, frames, prompt, batch_dir, use_lpips, camera_trajectory))
+ 
+         # Distribute tasks to workers using round-robin
+-        for batch_idx, frames, prompt, task_use_lpips, camera_trajectory in tasks:
++        for batch_idx, frames, prompt, task_batch_dir, task_use_lpips, camera_trajectory in tasks:
+             gpu_idx = self.current_gpu_index % self.num_gpus
+-            print(f"Assigning batch {batch_idx} to GPU {gpu_idx}")
+-            # Pass batch_dir so worker can save videos
+-            self.task_queues[gpu_idx].put(
+-                (batch_idx, frames, prompt, batch_dir, task_use_lpips, camera_trajectory)
+-            )
++            self.task_queues_put(gpu_idx, (batch_idx, frames, prompt, task_batch_dir, task_use_lpips, camera_trajectory))
+             self.current_gpu_index += 1
+ 
+-        # Collect results
+-        completed = 0
++        # Collect exactly one tagged terminal envelope per received row.
++        results = {
++            'final_scores': [None] * batch_size,
++            'gs_scores': [None] * batch_size,
++            'meta_scores': [None] * batch_size,
++            'camera_motion_scores': [None] * batch_size,
++        }
+         per_video_results = []
+-
+-        while completed < len(tasks):
+-            batch_idx, gs_score, meta_score, camera_motion_score, final_score, gs_video_path, meta_view_path, trajectory_comparison_path = self.result_queue.get()
++        received = 0
++        while received < len(tasks):
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise StrictRewardTimeoutError(
++                    "timed out collecting strict worker results"
++                )
++            for worker in self._workers:
++                if not worker.is_alive():
++                    raise StrictWorkerDeathError(
++                        "a strict reward worker process died mid-batch"
++                    )
++            try:
++                envelope = self._result_queue.get(timeout=min(remaining, _RESULT_POLL_S))
++            except queue_module.Empty:
++                continue
++            tag, batch_idx, payload = envelope
++            if tag == "ROW_ERROR":
++                raise StrictRewardComputeError(
++                    f"request row {batch_idx} failed in the worker: {payload}"
++                )
++            if tag != "ROW_OK":
++                raise StrictRewardComputeError(
++                    f"unexpected worker result envelope {tag!r}"
++                )
++            (gs_score, meta_score, camera_motion_score, final_score,
++             gs_video_path, meta_view_path, trajectory_comparison_path) = payload
++            for name, value in (
++                ("gs_score", gs_score),
++                ("meta_score", meta_score),
++                ("camera_motion_score", camera_motion_score),
++                ("final_score", final_score),
++            ):
++                if not math.isfinite(float(value)):
++                    raise StrictRewardComputeError(
++                        f"request row {batch_idx} returned a non-finite {name}"
++                    )
+             results['gs_scores'][batch_idx] = gs_score
+             results['meta_scores'][batch_idx] = meta_score
+             results['camera_motion_scores'][batch_idx] = camera_motion_score
+             results['final_scores'][batch_idx] = final_score
+-            completed += 1
++            received += 1
+ 
+-            # Store result for logging
+             per_video_results.append({
+                 "video_id": batch_idx,
+                 "prompt": batch_prompts[batch_idx],
+@@ -714,19 +906,13 @@ class MultiGPUReward3DManager:
+                 "trajectory_comparison_path": trajectory_comparison_path,
+             })
+ 
+-            print(f"Received result for batch {batch_idx}: GS={gs_score:.3f}, Meta={meta_score:.3f}, Motion={camera_motion_score:.3f}, Final={final_score:.3f}")
+-            if gs_video_path:
+-                print(f"  GS video: {gs_video_path}")
+-            if meta_view_path:
+-                print(f"  Meta view: {meta_view_path}")
+-            if trajectory_comparison_path:
+-                print(f"  Trajectory compare: {trajectory_comparison_path}")
+-
+-        # Save results to JSON file
+-        results_path = os.path.join(batch_dir, "reward_3d_scores.json")
+-        with open(results_path, "w", encoding="utf-8") as f:
+-            json.dump(per_video_results, f, ensure_ascii=False, indent=2)
+-        print(f"Saved 3D reward scores to {results_path}")
++        # Score logging is a debug side effect and must never fail the batch.
++        try:
++            results_path = os.path.join(batch_dir, "reward_3d_scores.json")
++            with open(results_path, "w", encoding="utf-8") as f:
++                json.dump(per_video_results, f, ensure_ascii=False, indent=2)
++        except Exception as log_exc:
++            print(f"Warning: failed to write 3D reward score log: {log_exc}")
+ 
+         self.last_results = {
+             "batch_dir": batch_dir,
+@@ -739,20 +925,28 @@ class MultiGPUReward3DManager:
+ 
+         return results['final_scores']
+ 
++    def task_queues_put(self, gpu_idx, task):
++        self._task_queues[gpu_idx].put(task)
++
++    def _poison_and_shutdown(self):
++        """Idempotent fail-closed cleanup shared by every failure path."""
++
++        if self._closed:
++            return
++        self._closed = True
++        self._ready = False
++        workers = list(self._workers)
++        self._workers = []
++        task_queues = list(self._task_queues)
++        self._task_queues = []
++        result_queue = self._result_queue
++        self._result_queue = None
++        for task_queue in task_queues:
++            _close_queue(task_queue)
++        if result_queue is not None:
++            _close_queue(result_queue)
++        _terminate_and_reap(workers)
++
+     def shutdown(self):
+-        """Shutdown all worker processes"""
+-        print("Shutting down 3D reward worker processes...")
+-
+-        # Send shutdown signal to all workers
+-        for task_queue in self.task_queues:
+-            task_queue.put(None)
+-
+-        # Wait for all processes to finish
+-        for process in self.processes:
+-            process.join(timeout=10)
+-            if process.is_alive():
+-                print(f"Force terminating process {process.pid}")
+-                process.terminate()
+-                process.join()
+-
+-        print("All 3D reward worker processes shut down")
++        """Shutdown all worker processes (same idempotent primitive)."""
++        self._poison_and_shutdown()
+diff --git a/reward_server/reward_3d_backend.py b/reward_server/reward_3d_backend.py
+index b2470af..0c82e83 100644
+--- a/reward_server/reward_3d_backend.py
++++ b/reward_server/reward_3d_backend.py
+@@ -30,6 +30,10 @@ from reward_server.depth_anything_3.utils.visualize import vis_depth_map_tensor
+ 
+ DEFAULT_RECONSTRUCTION_MODEL = "depth-anything/" + "DA3-GIANT"
+ 
++
++class Reward3DBackendError(RuntimeError):
++    """A reward-affecting 3D backend step failed (fail-closed, no 0.0 default)."""
++
+ class Reward3DBackend:
+     """Generate 3D reward artifacts from a video rollout."""
+ 
+@@ -538,15 +542,18 @@ class Reward3DBackend:
+ 
+         pred_extrinsics = as_homogeneous(np.asarray(prediction.extrinsics, dtype=np.float32))
+         if pred_extrinsics.shape[0] < 2:
+-            return 0.0, None, None
++            raise Reward3DBackendError(
++                "reconstruction produced fewer than two predicted poses"
++            )
+ 
+         target_poses = self._extract_target_camera_poses(
+             camera_trajectory,
+             target_len=pred_extrinsics.shape[0],
+         )
+         if target_poses is None:
+-            print("Camera trajectory missing or invalid; motion score set to 0.0")
+-            return 0.0, None, None
++            raise Reward3DBackendError(
++                "camera trajectory is missing or invalid for motion scoring"
++            )
+ 
+         target_extrinsics = np.stack(
+             [np.linalg.inv(pose) for pose in target_poses],
+@@ -555,7 +562,9 @@ class Reward3DBackend:
+ 
+         common_len = min(pred_extrinsics.shape[0], target_extrinsics.shape[0])
+         if common_len < 2:
+-            return 0.0, None, None
++            raise Reward3DBackendError(
++                "predicted and target trajectories share fewer than two poses"
++            )
+ 
+         pred_extrinsics = self._resample_pose_sequence(pred_extrinsics, common_len)
+         target_extrinsics = self._resample_pose_sequence(target_extrinsics, common_len)
+@@ -573,7 +582,9 @@ class Reward3DBackend:
+                     ransac=common_len >= 6,
+                 )
+             except Exception as exc:
+-                print(f"Pose alignment failed, falling back to first-frame normalization: {exc}")
++                raise Reward3DBackendError(
++                    f"pose alignment failed: {exc}"
++                ) from exc
+ 
+         pred_pose_rel = self._align_pose_sequence_to_first(affine_inverse_np(pred_extrinsics_aligned))
+         score = self._compute_motion_profile_scores(pred_pose_rel, target_pose_rel)

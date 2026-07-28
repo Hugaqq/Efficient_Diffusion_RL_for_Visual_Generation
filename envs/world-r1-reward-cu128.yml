@@ -1,0 +1,8 @@
+name: world-r1-reward
+channels:
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - cuda-nvcc=12.8

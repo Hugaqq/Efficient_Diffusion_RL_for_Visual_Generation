@@ -1,0 +1,9 @@
+a red cube on a white table, camera push in
+a green sphere on a gray floor, camera pull out
+a blue cylinder in a dark room, camera move left
+a yellow cone on a wooden desk, camera move right
+a small robot on a metal platform, camera orbit left
+a ceramic vase on a stone pedestal, camera orbit right
+a toy train on a circular track, camera pan left
+a glass bottle on a wooden shelf, camera pan right
+a matte gray sphere on a white background
