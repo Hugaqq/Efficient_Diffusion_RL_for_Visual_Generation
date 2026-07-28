@@ -1096,10 +1096,8 @@ def _core_metric_row(step: int, metrics: StepMetricsLike) -> dict[str, Any]:
     for name, value in values.items():
         if not isinstance(name, str) or not name:
             raise ValueError("metric names must be non-empty strings")
-        if isinstance(value, bool):
-            continue
-        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-            raise ValueError("metric values must be finite Python scalars")
+        if type(value) is not float or not math.isfinite(value):
+            raise ValueError("metric values must be finite Python floats")
     _positive_int("sample_count", sample_count)
     _positive_int("active_transition_count", active_count)
     return {
@@ -1130,10 +1128,8 @@ def _validate_metric_row(row: Any, *, expected_step: int) -> None:
             continue
         if not isinstance(name, str) or not name:
             raise ArtifactError("metric names must be non-empty strings")
-        if isinstance(value, bool):
-            continue
-        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-            raise ArtifactError("metric values must be finite Python scalars")
+        if type(value) is not float or not math.isfinite(value):
+            raise ArtifactError("metric values must be finite Python floats")
 
 
 def _validated_run_root(
