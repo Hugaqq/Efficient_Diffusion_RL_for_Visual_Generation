@@ -1,5 +1,7 @@
 # VisualRL 实验结果总结与后续修复方向（历史快照）
 
+> Historical v0.6 evidence; not a v0.7 usage/config contract.
+
 > 状态：本文件冻结合并阶段当时的结果与判断，其中部分“下一步”已经完成。当前 Goal、状态和执行顺序只以 `docs/PROJECT_OVERVIEW.md` 与 `experiments/EXPERIMENT_PLAN.md` 为准。
 
 更新时间：2026-07-15

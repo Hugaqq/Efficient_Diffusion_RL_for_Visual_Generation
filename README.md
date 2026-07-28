@@ -1,178 +1,200 @@
-# VisualRL v0.6 Simplified Core
+# VisualRL v0.7
 
-VisualRL 是一套面向 image/video generation 的轻量 Diffusion RL infra。项目不再维护多套训练框架，而是把三类研究能力放进同一条可复现主线：
+VisualRL 是面向图像与视频 diffusion reinforcement learning 的研究基础设施。
+v0.7 只保留一条公开训练路径：
 
-- TempFlow-GRPO：timestep-aware optimizer 与共享前缀 branching rollout。
-- Flash-GRPO：selected-timestep / single-step rollout 与策略更新。
-- World-R1：Wan video adapter、3D/world feedback client 与 reward server 边界。
-- GenRL：仅作为参考代码来源，不是 runtime 依赖。
+```text
+一份完整 YAML
+→ visual_rl.load()
+→ resolve()
+→ validate()
+→ run()
+→ inspect_run() / audit_run()
+```
 
-## 唯一主线
+模型、rollout、reward、算法、训练步数、分布式模式、artifact 和恢复来源都由
+这份 YAML 决定。包不提供训练 CLI、preset 合并、外部插件注册或第二个
+Runner。
+
+## 当前证据状态
+
+源码、固定实验配置和离线验证工具已经准备完成。真实 Flow-GRPO、
+TempFlow-GRPO、Flash-GRPO、World-R1 的 C20/Q100，Flow native parity，
+MG1/NCCL、远端执行、上传和最终 wheel 安装当前均为 `not_run`。`not_run`
+不是通过、跳过即成功或质量提升声明。
+
+当前文档：
+
+- [v0.7 用户指南](docs/V0_7_USER_GUIDE.md)
+- [v0.7 验收矩阵](docs/V0_7_ACCEPTANCE.md)
+- [项目边界](docs/V0_7_SCOPE.md)
+- [项目概览](docs/PROJECT_OVERVIEW.md)
+- [固定实验计划](experiments/EXPERIMENT_PLAN.md)
+- [W06 固定实验套件](experiments/v0_7/README.md)
+- [更新记录](CHANGELOG.md)
+
+## 完整 Tiny YAML
+
+下面是一份可独立解析的完整单进程 CPU 配置。仓库中的权威测试副本是
+[tests/fixtures/configs/tiny_grpo.yaml](tests/fixtures/configs/tiny_grpo.yaml)。
+
+```yaml
+schema_version: 1
+
+run:
+  seed: 42
+
+model:
+  name: tiny_diffusion
+  adapter_checkpoint: null
+  params:
+    image_size: 16
+
+dataset:
+  path: null
+  prompts: ["a red cube", "a blue cube"]
+  split: train
+  repeat_per_prompt: 1
+  require_unique: true
+  sampling_strategy: sequential
+  sampling_seed: 42
+  empty_prompt_policy: error
+
+rollout:
+  name: full_trajectory
+  params:
+    samples_per_prompt: 2
+    num_steps: 2
+
+reward:
+  components:
+    - name: mock
+      weight: 1.0
+      params:
+        mode: prompt_media
+  execution:
+    microbatch_size: null
+    max_retries: 0
+  cache_dir: null
+
+algorithm:
+  name: grpo
+  params:
+    clip_range: 0.001
+    adv_clip_max: 5.0
+    beta: 0.0
+  advantage:
+    epsilon: 1.0e-6
+
+optimizer:
+  learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  max_grad_norm: null
+  max_initial_logprob_delta: null
+  require_initial_clipfrac_zero: false
+  require_finite_gradients: true
+  require_nonzero_gradients: false
+
+runtime:
+  max_steps: 1
+  batch_size: 2
+  precision: fp32
+  update_microbatch_size: 2
+  deterministic: true
+  progress: false
+  rollout_cache:
+    enabled: false
+  distributed:
+    mode: single
+    device: cpu
+    timeout_s: 30.0
+    max_snapshot_tensor_bytes: null
+
+artifacts:
+  output_dir: runs/tiny-grpo
+  checkpoint_every: 1
+  checkpoint_keep_last: 2
+
+resume:
+  from: null
+```
+
+真实 SD3/Wan 的完整基线位于 [configs](configs/)；固定 C20/Q100/MG1 配置位于
+[experiments/v0_7/configs](experiments/v0_7/configs/)。
+
+## 唯一 Python 入口
+
+用户创建自己的 `run_experiment.py`。脚本固定一个完整 YAML 路径，不接收命令行
+覆盖，也不在 Python 中重新拼装训练语义：
+
+```python
+from pathlib import Path
+
+import visual_rl as vr
+
+config_path = Path("/absolute/path/to/complete-config.yaml")
+experiment = vr.load(config_path)
+experiment.resolve()
+report = experiment.validate()
+if not report.ok:
+    raise RuntimeError(report)
+
+result = experiment.run()
+status = vr.inspect_run(result.output_dir)
+audit = vr.audit_run(result.output_dir)
+if not status.ok or not audit.ok:
+    raise RuntimeError("authoritative artifact validation failed")
+```
+
+单进程启动：
+
+```bash
+python run_experiment.py
+```
+
+双 rank DDP 使用同一个脚本和一份将
+`runtime.distributed.mode/device` 配置为 `ddp/cpu` 或 `ddp/cuda` 的完整
+YAML：
+
+```bash
+torchrun --standalone --nproc-per-node=2 run_experiment.py
+```
+
+恢复训练不增加第二入口：创建另一份完整 YAML，使 `resume.from` 与
+`artifacts.output_dir` 指向同一个已有 run directory，再运行同一用户脚本。
+
+## 代码主线
 
 ```text
 VisualRLConfig
--> PromptDataset
--> ModelAdapter
--> RolloutEngine
--> RolloutBatch
--> FeedbackProvider
--> RewardExecutor
--> RewardBatch
--> AdvantageFunction / PolicyObjective / UpdateEngine
--> OptimizerPlugin escape hatch
--> DistributedStrategy
--> ArtifactManager
+→ PromptDataset
+→ ModelAdapter
+→ RolloutEngine / RolloutBatch
+→ RewardExecutor / RewardBatch
+→ AdvantageResult / PolicyLossInputs
+→ PolicyObjective / UpdateEngine
+→ ExperimentRunner._execute_step()
+→ CommitCoordinator / authoritative commit marker
 ```
 
-`ExperimentRunner` 是唯一训练协调器。算法差异不通过新增 Trainer 表达，而是放在 `OptimizerPlugin`、`RolloutEngine` 和 `FeedbackProvider` 中。
+单卡与 DDP 共用这条 step lifecycle。算法只准备 typed loss inputs；GRPO、
+Flash-GRPO 和 TempFlow-GRPO 的 ratio、clip、policy loss、approximate KL 与
+clip fraction 只在一个公共 objective 内计算。
 
-## 目录职责
+## 本地源码验证
 
-```text
-visual_rl/
-  runner.py          唯一训练循环
-  core/              Batch、StepContext、注册表和确定性运行身份
-  configs/           schema、Resolver、preset、recipe 和 profile
-  datasets/          prompt 数据准备
-  model_adapters/    模型加载、采样和 logprob 重算
-  rollout/           full / single-step / branching rollout
-  feedback/          provider、client、cache 和同步/异步 RewardExecutor
-  optimizers/        advantage、objective、UpdateEngine 和完整 plugin
-  artifacts/         事务 commit、manifest、metrics、checkpoint 和 report
-  evaluation/        held-out evaluator
-  distributed.py     单进程与原生 PyTorch DDP strategy
-  third_party/       SD3/Wan 仍需要的参考仓库路径隔离
-scripts/             probe、remote smoke 和旧诊断工具
-train.py             最小 config-driven 入口
-```
-
-## 扩展方式
-
-- 新模型：实现 `ModelAdapter`，声明 `media_type`，调用 `register_model_adapter()`。
-- 新 rollout：实现 `RolloutEngine`，输出统一的 `RolloutBatch`，调用 `register_rollout_engine()`。
-- 新 reward：Python API 使用外部函数/对象 descriptor，YAML 使用可信
-  `module:attribute` target；复杂场景再实现 `FeedbackProvider`。
-- 新算法：优先组合 `AdvantageFunction`、`PolicyObjective` 与 `UpdateEngine`；
-  不能自然拆分的算法使用完整 `OptimizerPlugin` escape hatch。
-- 不需要修改：数据准备、主训练循环、manifest、metric、checkpoint 和 report 保存。
-
-自定义 feedback 的构造参数放在 `rewards.provider_params`。自定义 optimizer 必须支持 `state_dict/load_state_dict`，ModelAdapter 必须实现 `save_pretrained/load_checkpoint`，这些契约都会在训练前或 checkpoint 时检查。
-
-## 启动方式
-
-最小 Python API 与 CLI 使用同一条 preflight、恢复和 Runner 主线：
-
-```python
-import visual_rl as vr
-
-experiment = vr.Experiment(
-    model=vr.models.MockWan(),
-    rollout=vr.rollouts.FullTrajectory(batch_size=1),
-    reward=vr.rewards.Mock(),
-    advantage=vr.advantages.GroupNormalize(),
-    objective=vr.objectives.GRPO(),
-    train=vr.Train(steps=2, lr=1e-3),
-)
-experiment.validate()  # 纯静态；可信组件核验使用 trusted_components=True
-result = experiment.run(["a red cube on a white table"])
-# experiment.run([...], resume_from=result.latest_checkpoint)
-```
-
-远端 World-R1 实验应显式声明冻结的 scorer 身份，例如
-`vr.rewards.WorldR1(..., protocol_mode="strict_v2",
-general_server_revision="hps-v2.1:<sha256>")`。未声明 `server_revision` 仍可运行，
-但持久 reward cache 会关闭，避免同一 URL 更换 scorer 后误命中旧结果。异步 reward
-使用 `vr.RewardExecution(mode="async")` 时默认把完整提交 batch 交给 provider；只有显式
-设置 `microbatch_size=N` 才分片，并把该分片策略纳入 checkpoint 恢复语义。
-
-真实 Diffusers 模型可通过
-`vr.models.Wan(..., gradient_checkpointing=True)` 或
-`vr.models.SD3(..., gradient_checkpointing=True)` 显式启用 gradient checkpointing；
-也可显式传入 `False`。省略该参数保持原有配置与 fingerprint 不变。显式请求会在
-PEFT attach 后核验实际状态，并将 `requested/effective` 写入 rollout 与 checkpoint
-provenance；新 checkpoint 的声明与恢复时状态不一致会拒绝恢复，旧 checkpoint 缺少
-这两个字段时仍按原兼容规则加载。
+本地验证只证明对应测试合同，不替代真实 GPU、NCCL 或质量实验：
 
 ```bash
-visual-rl presets
-visual-rl validate preset:flash_tiny_single_step
-visual-rl inspect preset:tempflow_tiny_branching
-visual-rl run visual_rl/configs/presets/world_r1_wan_v02_mock.yaml
-visual-rl status runs/example
-visual-rl audit runs/example
+conda run -n visual-rl python -m pytest -q tests/test_experiment_api.py
+conda run -n visual-rl python -m pytest -q tests/test_documentation_contract.py
+conda run -n visual-rl python -m ruff check visual_rl tests
 ```
 
-`preset:NAME` 明确引用安装包自带的 preset，因此可以从任意工作目录使用；不带
-`preset:` 的 `CONFIG` 始终按文件路径处理，不会把同名本地文件与 packaged preset
-混淆。`visual-rl presets` 列出当前安装版本提供的全部名称，以上命令也都支持
-`--json`。
-
-`validate` 和 `inspect` 默认只执行静态 preflight；加
-`--trusted-components` 才显式加载并核对本地 built-ins。`run` 固定执行
-Resolver -> static preflight -> trusted component load -> `ExperimentRunner`。
-三个命令均支持按顺序应用的 `--set KEY=VALUE` 和单一 JSON envelope 输出；
-resume 使用 `visual-rl run CONFIG --resume PATH`。
-
-`status RUN_DIR` 通过 marker-aware lifecycle API 判断 run 是否已完成并可用于聚合；
-`audit RUN_DIR` 通过 authoritative commit marker 审计 checkpoint 与派生记录。两者
-都支持 `--json`，不会使用宽松 JSON 解析，也不会在终端转述底层未脱敏异常。
-
-CLI 稳定退出码为：`0` 成功，`2` usage/YAML/Resolver/static，`3` trusted
-组件，`4` resume/checkpoint，`5` execution，`6` run status/artifact audit
-未通过，`1` internal。`status` 仅在完成态及 authoritative marker 有效时返回 0；
-运行中、failed、stale、missing、篡改或 audit invalid 均返回 6。诊断与训练进度写入
-stderr。仓库内 `python train.py --config CONFIG` 仅保留兼容转发，并会输出
-deprecation warning。
-
-运行时同时保留同步单进程 reference path 与原生 PyTorch DDP path。DDP 由
-`torchrun` 提供 `RANK/LOCAL_RANK/WORLD_SIZE`，不建设自定义 launcher；一个完整
-prompt group 固定在同一 rank，rank 0 管理全局事务产物，各 rank 使用本地
-rollout/reward cache。当前自动验证覆盖单机 CPU/gloo 与相同 world-size resume；
-GPU/NCCL、多机和弹性 world-size 不在当前正确性声明内。
-
-DDP 对可捕获且所有 rank 仍能参与 collective 的 optimizer-step 异常执行参数、
-optimizer 和 GradScaler 回滚；单进程路径不创建这些快照。进程硬退出、进程组中断、
-collective 超时或通信后端失效无法由存活 rank 在内存中协调回滚，只能重启并从最后一个
-已持久化 commit marker 恢复，不能把这一边界描述为任意故障下的原子更新。
-
-每次 run 自动维护：
-
-```text
-config.resolved.json
-trigger_decision.json
-prompt_set.json
-sample_manifest.json
-reward_table.json
-metrics.jsonl
-visual_report.md
-commits/
-checkpoint_*/training_state.pt
-latest.json
-```
-
-checkpoint 还保存 optimizer/plugin/RNG 状态、实现身份和可训练参数签名。`commits/commit_*.json`
-是 authoritative commit log；`latest.json`、manifest/metric/report projection、retention audit
-和 runtime sidecar 都是 marker 持久化后的可恢复派生产物，失败不会把已提交 step 改写为失败。
-
-## 本地验证
-
-```bash
-conda run -n visual-rl python -m pytest -q -m "not distributed"
-conda run -n visual-rl python -m pytest -q -m distributed
-conda run -n visual-rl ruff check visual_rl scripts tests train.py
-```
-
-本地测试只运行 Tiny/Fake runtime，不下载模型、不连接远程 reward server、不启动 Wan/World-R1 heavy training。当前代码支持 bounded contract 验证；真实 SD3/Wan 训练结论必须以独立 GPU 实验为准。
-
-第一条命令运行默认离线 suite；第二条单独运行需要本机 loopback socket 的 CPU/gloo
-多进程测试。测试由 `tests/test_visual_rl.py` 的三条轻量主线与聚焦 contract 测试共同组成，
-覆盖 Resolver/CLI、reward executor、artifact transaction、checkpoint/resume、
-Wan LoRA、分布式归约和两进程 CPU/gloo。它不声明覆盖真实大模型、远程 reward
-server、GPU/NCCL 的数值与效果验证。
-
-项目 Goal、当前状态、三条工作线、下一步顺序和能力边界见
-[docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md)；真实实验的当前状态、冻结 recipe
-和晋级门槛见 [experiments/EXPERIMENT_PLAN.md](experiments/EXPERIMENT_PLAN.md)。合并阶段的历史
-结果快照保留在
-[experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md](experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md)，
-但不再作为当前状态来源。
+确定性边界见
+[docs/DETERMINISTIC_RUNTIME.md](docs/DETERMINISTIC_RUNTIME.md)。World-R1
+companion service 的独立部署见
+[services/world_r1_strict/README.md](services/world_r1_strict/README.md)。

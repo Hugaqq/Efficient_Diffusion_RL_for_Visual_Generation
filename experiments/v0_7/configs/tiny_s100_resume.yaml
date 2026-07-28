@@ -1,0 +1,81 @@
+schema_version: 1
+
+run:
+  seed: 42
+
+model:
+  name: tiny_diffusion
+  adapter_checkpoint: null
+  params:
+    image_size: 16
+
+dataset:
+  path: ../prompts/tiny_s100_v1.txt
+  prompts: null
+  split: train
+  repeat_per_prompt: 1
+  require_unique: true
+  sampling_strategy: sequential
+  sampling_seed: 42
+  empty_prompt_policy: error
+
+rollout:
+  name: full_trajectory
+  params:
+    samples_per_prompt: 2
+    num_steps: 2
+
+reward:
+  components:
+    - name: mock
+      weight: 1.0
+      params:
+        mode: prompt_media
+  execution:
+    microbatch_size: null
+    max_retries: 0
+  cache_dir: null
+
+algorithm:
+  name: grpo
+  params:
+    clip_range: 0.001
+    adv_clip_max: 5.0
+    beta: 0.0
+  advantage:
+    epsilon: 1.0e-6
+
+optimizer:
+  learning_rate: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  max_grad_norm: null
+  max_initial_logprob_delta: null
+  require_initial_clipfrac_zero: false
+  require_finite_gradients: true
+  require_nonzero_gradients: false
+
+runtime:
+  max_steps: 100
+  batch_size: 1
+  precision: fp32
+  update_microbatch_size: 2
+  deterministic: true
+  progress: false
+  rollout_cache:
+    enabled: false
+  distributed:
+    mode: single
+    device: cpu
+    timeout_s: 30.0
+    max_snapshot_tensor_bytes: null
+
+artifacts:
+  output_dir: ../runs/tiny_s100_interrupted
+  checkpoint_every: 50
+  checkpoint_keep_last: 2
+
+resume:
+  from: ../runs/tiny_s100_interrupted

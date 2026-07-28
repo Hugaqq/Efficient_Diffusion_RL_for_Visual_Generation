@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {"algorithm": "flow_grpo_sd3", "seed": 17, "run_dir": "runs/flow_grpo_sd3_q100_seed17"},
+    {"algorithm": "flow_grpo_sd3", "seed": 29, "run_dir": "runs/flow_grpo_sd3_q100_seed29"},
+    {"algorithm": "flow_grpo_sd3", "seed": 43, "run_dir": "runs/flow_grpo_sd3_q100_seed43"},
+    {"algorithm": "tempflow_sd3", "seed": 17, "run_dir": "runs/tempflow_sd3_q100_seed17"},
+    {"algorithm": "tempflow_sd3", "seed": 29, "run_dir": "runs/tempflow_sd3_q100_seed29"},
+    {"algorithm": "tempflow_sd3", "seed": 43, "run_dir": "runs/tempflow_sd3_q100_seed43"},
+    {"algorithm": "flash_wan", "seed": 17, "run_dir": "runs/flash_wan_q100_seed17"},
+    {"algorithm": "flash_wan", "seed": 29, "run_dir": "runs/flash_wan_q100_seed29"},
+    {"algorithm": "flash_wan", "seed": 43, "run_dir": "runs/flash_wan_q100_seed43"},
+    {"algorithm": "world_r1_wan", "seed": 17, "run_dir": "runs/world_r1_wan_q100_seed17"},
+    {"algorithm": "world_r1_wan", "seed": 29, "run_dir": "runs/world_r1_wan_q100_seed29"},
+    {"algorithm": "world_r1_wan", "seed": 43, "run_dir": "runs/world_r1_wan_q100_seed43"}
+  ]
+}
