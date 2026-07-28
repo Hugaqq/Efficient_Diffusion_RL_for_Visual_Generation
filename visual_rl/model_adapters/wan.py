@@ -1288,6 +1288,9 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
                 "Wan PEFT checkpoint reported unexpected active adapter keys: "
                 + ", ".join(str(key) for key in active_unexpected)
             )
+        restored_state = self._get_active_peft_state(get_peft_model_state_dict)
+        self._validate_peft_checkpoint_state(adapter_state, restored_state)
+        self._validate_peft_checkpoint_values(adapter_state, restored_state)
 
     def _get_active_peft_state(self, get_peft_model_state_dict) -> Mapping[str, Any]:
         parameters = inspect.signature(get_peft_model_state_dict).parameters
@@ -1349,6 +1352,24 @@ class WorldR1WanLegacyAdapter(ModelAdapter):
                 )
             shapes[key] = tuple(int(dimension) for dimension in shape)
         return shapes
+
+    @staticmethod
+    def _validate_peft_checkpoint_values(
+        checkpoint_state: Mapping[str, Any],
+        restored_state: Mapping[str, Any],
+    ) -> None:
+        import torch
+
+        for key, expected in checkpoint_state.items():
+            actual = restored_state[key]
+            expected_tensor = torch.as_tensor(expected).detach().cpu()
+            actual_tensor = (
+                torch.as_tensor(actual).detach().cpu().to(dtype=expected_tensor.dtype)
+            )
+            if not torch.equal(actual_tensor, expected_tensor):
+                raise RuntimeError(
+                    f"Wan PEFT checkpoint value was not restored exactly: {key}"
+                )
 
     def _active_adapter_result_keys(
         self,

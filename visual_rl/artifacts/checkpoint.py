@@ -311,6 +311,9 @@ def _legacy_config_payload(
     train = payload.get("train", {})
     for key in ("max_steps", "save_every"):
         train.pop(key, None)
+    rewards = payload.get("rewards")
+    if isinstance(rewards, dict) and rewards.get("schedule") == []:
+        rewards.pop("schedule")
     payload.pop("runner", None)
     if implementation is not None:
         payload["implementation"] = to_jsonable(implementation)
@@ -405,6 +408,8 @@ def _normalize_world_r1_reward_defaults(payload: dict[str, Any]) -> None:
     rewards = payload.get("rewards")
     if not isinstance(rewards, dict):
         return
+    if rewards.get("schedule") == []:
+        rewards.pop("schedule")
     clients = rewards.get("clients")
     if not isinstance(clients, dict):
         return

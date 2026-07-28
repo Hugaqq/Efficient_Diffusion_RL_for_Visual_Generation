@@ -187,7 +187,10 @@ class SD3:
     lora_rank: int = 32
     lora_alpha: int = 64
     max_sequence_length: int = 128
-    reference_mode: bool = True
+    # Policy-identity mode is the effectiveness-training default.  Native
+    # reference parity remains an explicit opt-in because it intentionally
+    # recomputes log probabilities with the transformer in training mode.
+    reference_mode: bool = False
     gradient_checkpointing: bool | None = None
 
     def __post_init__(self) -> None:
@@ -627,25 +630,58 @@ class TempFlow:
     temporal_scale: float = 2.25
     beta: float = 0.0
     adv_clip_max: float = 5.0
-    weighting_mode: str = "std_dev_t"
-    objective_version: str = "legacy"
+    weighting_mode: str | None = None
+    objective_version: str = "policy_identity_v1"
+    advantage_epsilon: float | None = None
+    advantage_dtype: str | None = None
+    preserve_advantage_dtype: bool | None = None
 
     def to_config(self) -> dict[str, Any]:
-        return {
-            "algorithm": {
-                "name": "tempflow_grpo",
-                "objective_version": self.objective_version,
-                "clip_range": self.clip_range,
-                "beta": self.beta,
-                "adv_clip_max": self.adv_clip_max,
-                "credit_assignment": "branch_timestep",
-                "noise_weighting": {
-                    "enabled": True,
-                    "mode": self.weighting_mode,
-                    "scale": self.temporal_scale,
+        strict = self.objective_version != "legacy"
+        weighting_mode = self.weighting_mode or (
+            "reference_std_dev_t" if strict else "std_dev_t"
+        )
+        algorithm: dict[str, Any] = {
+            "name": "tempflow_grpo",
+            "objective_version": self.objective_version,
+            "clip_range": self.clip_range,
+            "beta": self.beta,
+            "adv_clip_max": self.adv_clip_max,
+            "credit_assignment": "branch_timestep",
+            "noise_weighting": {
+                "enabled": True,
+                "mode": weighting_mode,
+                "scale": self.temporal_scale,
+            },
+        }
+        if strict or self.advantage_epsilon is not None:
+            algorithm["advantage_epsilon"] = (
+                1e-4 if self.advantage_epsilon is None else self.advantage_epsilon
+            )
+        if strict or self.advantage_dtype is not None:
+            algorithm["advantage_dtype"] = (
+                "float64" if self.advantage_dtype is None else self.advantage_dtype
+            )
+        if strict or self.preserve_advantage_dtype is not None:
+            algorithm["params"] = {
+                "preserve_advantage_dtype": (
+                    True
+                    if self.preserve_advantage_dtype is None
+                    else self.preserve_advantage_dtype
+                )
+            }
+        result: dict[str, Any] = {"algorithm": algorithm}
+        if strict:
+            result["optimizer"] = {
+                "name": "algorithm",
+                "params": {
+                    "max_initial_logprob_delta": 1e-5,
+                    "require_initial_clipfrac_zero": True,
+                    "require_finite_gradients": True,
+                    "require_nonzero_gradients": True,
                 },
             }
-        }
+        return result
 
 
 @dataclass(frozen=True)

@@ -104,6 +104,10 @@ class TempFlowGRPOAlgorithm:
             new_log_probs,
         )
         if self.objective_version != "legacy":
+            active_mask = active_mask & self._transition_mask(
+                batch,
+                new_log_probs,
+            )
             self._validate_strict_advantage_dtype(
                 advantages,
                 name="expanded advantages",
@@ -124,7 +128,17 @@ class TempFlowGRPOAlgorithm:
                 f"{tuple(old_log_probs.shape)} != {tuple(new_log_probs.shape)}"
             )
 
-        ratio = torch.exp(new_log_probs - old_log_probs)
+        logprob_delta = new_log_probs - old_log_probs
+        safe_logprob_delta = (
+            logprob_delta
+            if self.objective_version == "legacy"
+            else torch.where(
+                active_mask,
+                logprob_delta,
+                torch.zeros_like(logprob_delta),
+            )
+        )
+        ratio = torch.exp(safe_logprob_delta)
         unclipped = -advantages * ratio
         clipped = -advantages * ratio.clamp(
             1.0 - self.clip_range, 1.0 + self.clip_range
@@ -135,7 +149,7 @@ class TempFlowGRPOAlgorithm:
             name="PPO policy loss",
         )
         approx_kl = 0.5 * self._objective_mean(
-            (new_log_probs - old_log_probs) ** 2,
+            safe_logprob_delta.square(),
             active_mask,
             name="approx_kl",
         )
@@ -217,6 +231,7 @@ class TempFlowGRPOAlgorithm:
             advantages,
             old_log_probs,
         )
+        active_mask = active_mask & self._transition_mask(batch, old_log_probs)
         return int(active_mask.sum().item())
 
     def metric_reduction_weight(
@@ -306,6 +321,25 @@ class TempFlowGRPOAlgorithm:
                 assigned[row, index:] = rewards[row]
                 active_mask[row, index:] = True
         return assigned, active_mask
+
+    @staticmethod
+    def _transition_mask(batch: RolloutBatch, new_log_probs):
+        import torch
+
+        if batch.transition_mask is None:
+            return torch.ones_like(new_log_probs, dtype=torch.bool)
+        mask = torch.as_tensor(
+            batch.transition_mask,
+            device=new_log_probs.device,
+            dtype=torch.bool,
+        )
+        if tuple(mask.shape) != tuple(new_log_probs.shape):
+            raise ValueError(
+                "TempFlow transition_mask must have the same shape as log "
+                f"probabilities: {tuple(mask.shape)} != "
+                f"{tuple(new_log_probs.shape)}"
+            )
+        return mask
 
     @staticmethod
     def _branch_timestep_indices(batch: RolloutBatch, new_log_probs) -> list[int]:
@@ -451,7 +485,7 @@ class TempFlowGRPOAlgorithm:
                 raise ValueError(
                     f"TempFlow {self.objective_version} batch is missing required provenance "
                     f"{key!r}"
-                )
+            )
             actual = metadata[key]
             matches = actual is expected if isinstance(expected, bool) else actual == expected
             if not matches:

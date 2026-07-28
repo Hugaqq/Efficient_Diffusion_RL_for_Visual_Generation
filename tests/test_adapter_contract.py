@@ -68,7 +68,9 @@ def test_train_eval_and_compatibility_aliases_delegate_to_train_module(
 )
 def test_state_dict_round_trip(adapter, parameter_name, _checkpoint_name):
     parameter = getattr(adapter, parameter_name)
-    state = {name: value.detach().clone() for name, value in adapter.state_dict().items()}
+    state = {
+        name: value.detach().clone() for name, value in adapter.state_dict().items()
+    }
 
     with torch.no_grad():
         parameter.add_(3.0)
@@ -148,6 +150,41 @@ def test_sd3_full_checkpoint_load_uses_weights_only(tmp_path, monkeypatch):
     adapter.load_checkpoint(tmp_path)
 
     assert observed == [True]
+
+
+def test_sd3_peft_resume_rejects_incomplete_or_inexact_adapter_state():
+    expected = {
+        "transformer.block.lora_A.weight": torch.zeros(2, 3),
+        "transformer.block.lora_B.weight": torch.ones(3, 2),
+    }
+
+    SD3TempFlowAdapter._validate_peft_checkpoint_state(expected, expected)
+    with pytest.raises(RuntimeError, match="missing adapter keys"):
+        SD3TempFlowAdapter._validate_peft_checkpoint_state(
+            expected,
+            {"transformer.block.lora_A.weight": torch.zeros(2, 3)},
+        )
+    with pytest.raises(RuntimeError, match="extra adapter keys"):
+        SD3TempFlowAdapter._validate_peft_checkpoint_state(
+            expected,
+            {**expected, "unexpected.lora.weight": torch.zeros(1)},
+        )
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        SD3TempFlowAdapter._validate_peft_checkpoint_state(
+            expected,
+            {
+                **expected,
+                "transformer.block.lora_A.weight": torch.zeros(3, 2),
+            },
+        )
+    with pytest.raises(RuntimeError, match="not restored exactly"):
+        SD3TempFlowAdapter._validate_peft_checkpoint_values(
+            expected,
+            {
+                **expected,
+                "transformer.block.lora_B.weight": torch.zeros(3, 2),
+            },
+        )
 
 
 def test_adapter_rollout_leaves_context_for_engine_finalization():
@@ -237,9 +274,7 @@ def test_heavy_adapters_expose_transformer_with_stable_filtered_names(adapter):
     adapter.transformer = transformer
 
     assert adapter.train_module is transformer
-    assert [name for name, _ in adapter.named_parameters()] == [
-        "transformer.policy"
-    ]
+    assert [name for name, _ in adapter.named_parameters()] == ["transformer.policy"]
     assert list(adapter.parameters()) == [transformer.policy]
 
 
@@ -259,9 +294,7 @@ def test_sd3_reference_recompute_keeps_transformer_train_contract():
 
 
 def test_sd3_non_reference_training_alias_preserves_sampling_mode():
-    adapter = SD3TempFlowAdapter(
-        {"device": "cpu", "extra": {"defer_load": True}}
-    )
+    adapter = SD3TempFlowAdapter({"device": "cpu", "extra": {"defer_load": True}})
     adapter.transformer = torch.nn.Linear(1, 1)
     adapter.prepare_for_sampling()
 

@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from visual_rl.configs.schema import normalize_reward_schedule
 from visual_rl.core.registry import REWARD_CLIENTS
 from visual_rl.core.types import RewardBatch
 import visual_rl.feedback.world_r1_rewards  # noqa: F401 - registers World-R1 reward clients
@@ -26,16 +27,21 @@ _MISSING_CACHE_FINGERPRINT = object()
 
 class RewardRouter:
     def __init__(self, config: dict[str, Any], cache_dir: str | Path | None = None):
-        self.config = config
         if not isinstance(config, dict):
             from dataclasses import asdict
 
             config = asdict(config)
+        self.config = dict(config)
         if "normalize" in config:
             raise ValueError(
                 "Reward normalization belongs to AdvantageComputer; remove rewards.normalize"
             )
         self.weights = dict(config.get("weights", {}))
+        self.schedule = normalize_reward_schedule(
+            config.get("schedule", []),
+            weights=self.weights,
+            clients=config.get("clients", {}),
+        )
         self.fail_policy = config.get("fail_policy", "invalid")
         self.cache = RewardCache(cache_dir)
         self.clients = {}
@@ -80,9 +86,12 @@ class RewardRouter:
         prompts: list[str],
         metadata: list[dict[str, Any]],
         sample_id: Any = None,
+        *,
+        step: int | None = None,
     ) -> RewardBatch:
         import torch
 
+        schedule_phase, effective_weights = self._effective_weights(step)
         resolved_sample_id = self._coerce_sample_id(sample_id, expected=len(prompts))
         raw_numpy: dict[str, np.ndarray] = {}
         weighted_numpy: dict[str, np.ndarray] = {}
@@ -94,7 +103,7 @@ class RewardRouter:
         reward_latencies: list[float] = []
         cache_status: dict[str, bool] = {}
 
-        for reward_name, weight in self.weights.items():
+        for reward_name, weight in effective_weights.items():
             reward_started = time.perf_counter()
             if reward_name not in self.clients:
                 raise KeyError(f"No reward client configured for {reward_name!r}")
@@ -209,6 +218,14 @@ class RewardRouter:
             "client_latencies_s": client_latencies,
             "reward_latencies_s": reward_latencies,
         }
+        if schedule_phase is not None:
+            merged_metadata["_schedule"] = {
+                "name": schedule_phase["name"],
+                "step": step,
+                "start_step": schedule_phase["start_step"],
+                "end_step": schedule_phase["end_step"],
+                "effective_weights": dict(effective_weights),
+            }
 
         if weighted_numpy:
             total_np = sum(weighted_numpy.values())
@@ -223,6 +240,22 @@ class RewardRouter:
             valid_mask=torch.as_tensor(valid, dtype=torch.bool),
             metadata=merged_metadata,
             sample_id=resolved_sample_id,
+        )
+
+    def _effective_weights(
+        self, step: int | None
+    ) -> tuple[dict[str, Any] | None, dict[str, float]]:
+        if not self.schedule:
+            return None, dict(self.weights)
+        if isinstance(step, bool) or not isinstance(step, int):
+            raise TypeError(
+                "RewardRouter requires an integer step when rewards.schedule is set"
+            )
+        for phase in self.schedule:
+            if phase["start_step"] <= step < phase["end_step"]:
+                return phase, dict(phase["weights"])
+        raise ValueError(
+            f"Reward step {step} is outside the configured rewards.schedule"
         )
 
     @staticmethod

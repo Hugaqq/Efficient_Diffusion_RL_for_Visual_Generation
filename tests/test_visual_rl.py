@@ -200,6 +200,52 @@ def test_resume_matches_an_uninterrupted_training_run(tmp_path):
         assert resumed_metrics[0][name] == continuous_metrics[1][name]
 
 
+def test_active_and_zero_lr_sentinel_share_step0_but_only_active_updates(
+    tmp_path,
+):
+    """A sentinel executes the full step without changing policy parameters."""
+
+    import torch
+
+    from visual_rl.rollout.cache import RolloutCache
+
+    preset = "visual_rl/configs/presets/flash_tiny_single_step.yaml"
+    active_config = _config(preset, tmp_path / "active", steps=1)
+    sentinel_config = _config(preset, tmp_path / "sentinel", steps=1)
+    sentinel_config.train.learning_rate = 0.0
+
+    active = ExperimentRunner(active_config)
+    sentinel = ExperimentRunner(sentinel_config)
+    active_initial = active.adapter.color_bias.detach().cpu().clone()
+    sentinel_initial = sentinel.adapter.color_bias.detach().cpu().clone()
+    assert torch.equal(active_initial, sentinel_initial)
+
+    active_metrics = active.run()
+    sentinel_metrics = sentinel.run()
+
+    assert not torch.equal(active.adapter.color_bias.detach().cpu(), active_initial)
+    assert torch.equal(
+        sentinel.adapter.color_bias.detach().cpu(),
+        sentinel_initial,
+    )
+    assert active_metrics[0]["grad_norm"] > 0.0
+    assert sentinel_metrics[0]["grad_norm"] > 0.0
+
+    active_rollout = RolloutCache(tmp_path / "active" / "rollouts").load(0)
+    sentinel_rollout = RolloutCache(tmp_path / "sentinel" / "rollouts").load(0)
+    assert active_rollout.prompts == sentinel_rollout.prompts
+    assert active_rollout.sample_id == sentinel_rollout.sample_id
+    assert torch.equal(active_rollout.media, sentinel_rollout.media)
+    assert torch.equal(active_rollout.timesteps, sentinel_rollout.timesteps)
+    assert torch.equal(active_rollout.old_log_probs, sentinel_rollout.old_log_probs)
+
+    active_rewards = _json(tmp_path / "active" / "reward_table.json")["records"]
+    sentinel_rewards = _json(tmp_path / "sentinel" / "reward_table.json")["records"]
+    assert [row["reward_values"] for row in active_rewards] == [
+        row["reward_values"] for row in sentinel_rewards
+    ]
+
+
 def test_checkpoint_v2_allows_same_data_content_at_new_paths(tmp_path):
     """V2 records source paths but compares verified content identity."""
 
@@ -1090,7 +1136,6 @@ def test_prompt_dataset_empty_rows_require_an_explicit_policy(tmp_path):
 
 def test_rollout_cache_validates_triplet_and_rejects_corrupt_media(tmp_path):
     import torch
-
     from visual_rl.rollout.cache import RolloutCache
 
     cache = RolloutCache(tmp_path)
@@ -1208,50 +1253,60 @@ def test_legacy_numeric_helpers_accept_categorical_branch_id_lists():
 
 def test_world_r1_reward_3d_client_matches_reference_wire_format(monkeypatch):
     import io
-    import pickle
 
     import torch
+
     pil_image = pytest.importorskip("PIL.Image")
 
     from visual_rl.feedback.world_r1_rewards import WorldR1Reward3DClient
 
-    captured = {}
-
-    def post_bytes(url, payload, *, timeout):
-        captured.update(
-            {
-                "url": url,
-                "payload": pickle.loads(payload),
-                "timeout": timeout,
-            }
-        )
-        return pickle.dumps(
-            {
-                "outputs": [0.6, 1.5],
-                "details": [
-                    {
-                        "gs_score": 0.1,
-                        "meta_score": 0.2,
-                        "camera_motion_score": 0.3,
-                        "final_score": 0.6,
-                        "gs_video_path": "first.mp4",
-                        "meta_view_path": "first.png",
-                        "trajectory_comparison_path": "first.png",
-                    },
-                    {
-                        "gs_score": 0.4,
-                        "meta_score": 0.5,
-                        "camera_motion_score": 0.6,
-                        "final_score": 1.5,
-                        "gs_video_path": "second.mp4",
-                        "meta_view_path": "second.png",
-                        "trajectory_comparison_path": "second.png",
-                    },
-                ],
-            }
-        )
-
-    monkeypatch.setattr("visual_rl.feedback.clients._post_bytes", post_bytes)
+    captured = []
+    responses = [
+        {
+            "outputs": [0.6, 1.5],
+            "details": [
+                {
+                    "gs_score": 0.1,
+                    "meta_score": 0.2,
+                    "camera_motion_score": 0.3,
+                    "final_score": 0.6,
+                    "gs_video_path": "first.mp4",
+                    "meta_view_path": "first.png",
+                    "trajectory_comparison_path": "first.png",
+                },
+                {
+                    "gs_score": 0.4,
+                    "meta_score": 0.5,
+                    "camera_motion_score": 0.6,
+                    "final_score": 1.5,
+                    "gs_video_path": "second.mp4",
+                    "meta_view_path": "second.png",
+                    "trajectory_comparison_path": "second.png",
+                },
+            ],
+        },
+        {
+            "outputs": [0.0, 0.0],
+            "details": [
+                {
+                    "gs_score": 0.0,
+                    "meta_score": 0.0,
+                    "camera_motion_score": 0.0,
+                    "final_score": 0.0,
+                    "gs_video_path": "",
+                    "meta_view_path": "",
+                },
+                {
+                    "gs_score": 0.0,
+                    "meta_score": 0.0,
+                    "camera_motion_score": 0.0,
+                    "final_score": 0.0,
+                    "gs_video_path": "",
+                    "meta_view_path": "",
+                },
+            ],
+        },
+    ]
     media = torch.zeros(2, 3, 3, 4, 4)
     media[0, :, 0] = 1.0
     media[1, :, 2] = 1.0
@@ -1259,19 +1314,29 @@ def test_world_r1_reward_3d_client_matches_reference_wire_format(monkeypatch):
         url="http://127.0.0.1:18089",
         timeout=7.0,
         retries=0,
+        transport=SimpleNamespace(post=lambda *args, **kwargs: None),
     )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload: captured.append(payload) or responses.pop(0),
+    )
+    identity = "\n".join(
+        ("[1 0 0 0]", "[0 1 0 0]", "[0 0 1 0]", "[0 0 0 1]")
+    )
+    trajectory = {f"frame{index}": identity for index in range(3)}
     values, metadata = client.score(
         media,
         ["red", "blue"],
-        [{"camera_trajectory": [1, 2]}, {}],
+        [{"camera_trajectory": trajectory}, {}],
     )
 
     assert values.tolist() == pytest.approx([0.6, 1.5])
-    assert captured["payload"]["prompts"] == ["red", "blue"]
-    assert captured["payload"]["camera_trajectories"] == [[1, 2], None]
-    assert len(captured["payload"]["videos"]) == 2
-    assert all(len(video) == 3 for video in captured["payload"]["videos"])
-    decoded = pil_image.open(io.BytesIO(captured["payload"]["videos"][0][0]))
+    assert captured[0]["prompts"] == ["red", "blue"]
+    assert captured[0]["camera_trajectories"] == [trajectory, None]
+    assert len(captured[0]["videos"]) == 2
+    assert all(len(video) == 3 for video in captured[0]["videos"])
+    decoded = pil_image.open(io.BytesIO(captured[0]["videos"][0][0]))
     assert decoded.size == (4, 4)
     assert metadata["score_reconstruction"] == pytest.approx([0.1, 0.4])
     assert metadata["score_meta_view"] == pytest.approx([0.2, 0.5])
@@ -1279,53 +1344,19 @@ def test_world_r1_reward_3d_client_matches_reference_wire_format(monkeypatch):
         [0.3, 0.6]
     )
 
-    monkeypatch.setattr(
-        "visual_rl.feedback.clients._post_bytes",
-        lambda *_args, **_kwargs: pickle.dumps(
-            {
-                "outputs": [0.0, 0.0],
-                "details": [
-                    {
-                        "gs_score": 0.0,
-                        "meta_score": 0.0,
-                        "camera_motion_score": 0.0,
-                        "final_score": 0.0,
-                        "gs_video_path": "",
-                        "meta_view_path": "",
-                    },
-                    {
-                        "gs_score": 0.0,
-                        "meta_score": 0.0,
-                        "camera_motion_score": 0.0,
-                        "final_score": 0.0,
-                        "gs_video_path": "",
-                        "meta_view_path": "",
-                    },
-                ],
-            }
-        ),
-    )
-    with pytest.raises(RuntimeError, match="empty reconstruction artifacts"):
+    with pytest.raises(ValueError, match="empty reconstruction artifact"):
         client.score(media, ["red", "blue"], [{}, {}])
 
 
 def test_world_r1_general_client_samples_and_encodes_one_frame(monkeypatch):
     import io
-    import pickle
 
     import torch
     pil_image = pytest.importorskip("PIL.Image")
 
     from visual_rl.feedback.world_r1_rewards import WorldR1RewardGeneralClient
 
-    captured = {}
-
-    def post_bytes(_url, payload, *, timeout):
-        captured["payload"] = pickle.loads(payload)
-        captured["timeout"] = timeout
-        return pickle.dumps({"outputs": [0.25, 0.75]})
-
-    monkeypatch.setattr("visual_rl.feedback.clients._post_bytes", post_bytes)
+    captured = []
     media = torch.zeros(2, 3, 3, 4, 4)
     media[0, 1, 0] = 1.0
     media[1, 1, 2] = 1.0
@@ -1334,16 +1365,22 @@ def test_world_r1_general_client_samples_and_encodes_one_frame(monkeypatch):
         frame_index=1,
         timeout=5.0,
         retries=0,
+        transport=SimpleNamespace(post=lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda payload: captured.append(payload) or {"outputs": [0.25, 0.75]},
     )
     values, metadata = client.score(media, ["red", "blue"], [{}, {}])
 
     assert values.tolist() == pytest.approx([0.25, 0.75])
-    assert captured["payload"]["prompts"] == ["red", "blue"]
-    assert len(captured["payload"]["images"]) == 2
-    decoded = pil_image.open(io.BytesIO(captured["payload"]["images"][0]))
+    assert captured[0]["prompts"] == ["red", "blue"]
+    assert len(captured[0]["images"]) == 2
+    decoded = pil_image.open(io.BytesIO(captured[0]["images"][0]))
     assert decoded.size == (4, 4)
     assert metadata["payload_kind"] == "images"
-    assert metadata["frame_sampling"]["selected_frame_index"] == 1
+    assert metadata["encoding"]["selected_frame_index"] == 1
 
 
 def test_remote_reward_client_rejects_malformed_response(monkeypatch):

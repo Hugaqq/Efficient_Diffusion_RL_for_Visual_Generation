@@ -19,6 +19,13 @@ class FlashGRPOAlgorithm:
     beta: float = 0.0
     rectification: dict[str, Any] | None = None
 
+    def __post_init__(self) -> None:
+        if self.beta != 0.0:
+            raise ValueError(
+                "Flash-GRPO requires beta=0 until differentiable "
+                "current/reference KL is recomputed during the update"
+            )
+
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "FlashGRPOAlgorithm":
         if not isinstance(config, dict):
@@ -33,8 +40,6 @@ class FlashGRPOAlgorithm:
                 "Flash-GRPO objective_version must be legacy_v0 or reference_v1"
             )
         beta = float(config.get("beta", 0.0))
-        if objective_version == "reference_v1" and beta != 0.0:
-            raise ValueError("Flash-GRPO reference_v1 requires beta=0")
         return cls(
             objective_version=objective_version,
             clip_range=float(config.get("clip_range", 0.001)),
@@ -46,10 +51,14 @@ class FlashGRPOAlgorithm:
     def compute_loss(self, batch: RolloutBatch, rewards, new_log_probs):
         import torch
 
-        if self.objective_version == "reference_v1" and self.beta != 0.0:
+        if self.beta != 0.0:
             raise ValueError(
-                "Flash-GRPO reference_v1 requires beta=0 until a reference-model "
-                "forward KL contract is available"
+                "Flash-GRPO requires beta=0 until differentiable "
+                "current/reference KL is recomputed during the update"
+            )
+        if new_log_probs.ndim != 2:
+            raise ValueError(
+                "Flash-GRPO log probabilities must have shape [batch, transitions]"
             )
         advantages = self._expand_advantages(rewards, new_log_probs)
         advantages = advantages.clamp(-self.adv_clip_max, self.adv_clip_max)
@@ -67,28 +76,56 @@ class FlashGRPOAlgorithm:
                     batch, new_log_probs
                 ).to(new_log_probs.device)
         advantages = advantages * rectification_weights
-        old_log_probs = batch.old_log_probs.to(new_log_probs.device, dtype=new_log_probs.dtype)
+        old_log_probs = torch.as_tensor(
+            batch.old_log_probs,
+            device=new_log_probs.device,
+            dtype=new_log_probs.dtype,
+        )
+        if tuple(old_log_probs.shape) != tuple(new_log_probs.shape):
+            raise ValueError(
+                "Flash-GRPO old/new log probabilities must have identical "
+                f"shapes: {tuple(old_log_probs.shape)} != "
+                f"{tuple(new_log_probs.shape)}"
+            )
+        transition_mask = self._transition_mask(batch, new_log_probs)
 
-        ratio = torch.exp(new_log_probs - old_log_probs)
+        logprob_delta = new_log_probs - old_log_probs
+        safe_logprob_delta = torch.where(
+            transition_mask,
+            logprob_delta,
+            torch.zeros_like(logprob_delta),
+        )
+        ratio = torch.exp(safe_logprob_delta)
         unclipped = -advantages * ratio
-        clipped = -advantages * ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
-        policy_loss = torch.maximum(unclipped, clipped).mean()
-        approx_kl = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean()
-        clipfrac = ((ratio - 1.0).abs() > self.clip_range).float().mean()
-        if (
-            self.objective_version == "legacy_v0"
-            and batch.kl is not None
-            and self.beta > 0
-        ):
-            policy_loss = policy_loss + self.beta * batch.kl.to(new_log_probs.device, dtype=new_log_probs.dtype).mean()
+        clipped = -advantages * ratio.clamp(
+            1.0 - self.clip_range, 1.0 + self.clip_range
+        )
+        policy_loss = (
+            torch.maximum(unclipped, clipped).masked_select(transition_mask).mean()
+        )
+        approx_kl = (
+            0.5 * safe_logprob_delta.square().masked_select(transition_mask).mean()
+        )
+        clipfrac = (
+            ((ratio - 1.0).abs() > self.clip_range)
+            .to(new_log_probs.dtype)
+            .masked_select(transition_mask)
+            .mean()
+        )
+        active_weights = rectification_weights.masked_select(transition_mask)
+        active_advantages = advantages.masked_select(transition_mask)
 
         return policy_loss, {
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "policy_loss": policy_loss.detach(),
-            "flash_rectification_weight_mean": rectification_weights.mean().detach(),
-            "flash_selected_timestep_mean": self._selected_timestep_mean(batch, new_log_probs),
-            "flash_active_timestep_frac": (advantages != 0).float().mean().detach(),
+            "flash_rectification_weight_mean": active_weights.mean().detach(),
+            "flash_selected_timestep_mean": self._selected_timestep_mean(
+                batch, new_log_probs
+            ),
+            "flash_active_timestep_frac": (
+                (active_advantages != 0).to(new_log_probs.dtype).mean().detach()
+            ),
         }
 
     def prepare_batch(self, batch: RolloutBatch, advantages) -> RolloutBatch:
@@ -177,10 +214,46 @@ class FlashGRPOAlgorithm:
         del advantages
         old_log_probs = torch.as_tensor(batch.old_log_probs)
         if old_log_probs.ndim == 0 or old_log_probs.shape[0] != batch.batch_size:
+            raise ValueError("Flash-GRPO old_log_probs must have a batch dimension")
+        if batch.transition_mask is None:
+            return old_log_probs.numel()
+        mask = torch.as_tensor(batch.transition_mask, dtype=torch.bool)
+        if tuple(mask.shape) != tuple(old_log_probs.shape):
             raise ValueError(
-                "Flash-GRPO old_log_probs must have a batch dimension"
+                "transition_mask must have the same shape as old_log_probs"
             )
-        return old_log_probs.numel()
+        return int(mask.sum().item())
+
+    def metric_reduction_weight(
+        self,
+        batch: RolloutBatch,
+        advantages,
+        metric_name: str,
+    ) -> int:
+        if metric_name == "flash_selected_timestep_mean":
+            return batch.batch_size
+        return self.reduction_weight(batch, advantages)
+
+    @staticmethod
+    def _transition_mask(batch: RolloutBatch, new_log_probs):
+        import torch
+
+        if batch.transition_mask is None:
+            return torch.ones_like(new_log_probs, dtype=torch.bool)
+        mask = torch.as_tensor(
+            batch.transition_mask,
+            device=new_log_probs.device,
+            dtype=torch.bool,
+        )
+        if tuple(mask.shape) != tuple(new_log_probs.shape):
+            raise ValueError(
+                "Flash-GRPO transition_mask must have the same shape as log "
+                f"probabilities: {tuple(mask.shape)} != "
+                f"{tuple(new_log_probs.shape)}"
+            )
+        if not bool(mask.any()):
+            raise ValueError("Flash-GRPO requires at least one active transition")
+        return mask
 
     def _prepared_rectification_weights(self, batch, new_log_probs):
         import torch

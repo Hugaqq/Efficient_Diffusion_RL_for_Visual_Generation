@@ -165,6 +165,7 @@ def fake_runtime(monkeypatch):
         load_result_shape="object",
         loaded_target_modules=set(DEFAULT_WAN_LORA_TARGETS),
         missing=(),
+        skip_weight_write=False,
         replace_parameter=False,
         unexpected=(),
     )
@@ -209,7 +210,9 @@ def fake_runtime(monkeypatch):
 
     def set_peft_model_state_dict(model, values, adapter_name):
         assert adapter_name == model.active_adapter
-        if state.replace_parameter:
+        if state.skip_weight_write:
+            pass
+        elif state.replace_parameter:
             model.lora_weight = torch.nn.Parameter(torch.tensor(9.0))
         else:
             with torch.no_grad():
@@ -822,6 +825,16 @@ def test_peft_checkpoint_accepts_clean_real_api_result_shapes(
     adapter.load_checkpoint(tmp_path)
 
     assert adapter.transformer.lora_weight.item() == 3.0
+
+
+def test_peft_checkpoint_rejects_clean_noop_loader(tmp_path, fake_runtime):
+    adapter = WorldR1WanLegacyAdapter(_config())
+    adapter.load()
+    adapter.save_pretrained(tmp_path)
+    fake_runtime.skip_weight_write = True
+
+    with pytest.raises(RuntimeError, match="value was not restored exactly"):
+        adapter.load_checkpoint(tmp_path)
 
 
 def test_peft_checkpoint_rejects_unknown_load_result_shape(tmp_path, fake_runtime):

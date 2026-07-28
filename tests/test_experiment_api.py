@@ -256,12 +256,73 @@ def test_default_wan_descriptor_preserves_legacy_v2_fingerprint(tmp_path):
 
 
 def test_flash_grpo_descriptor_exposes_compatible_objective_versions():
-    assert vr.objectives.FlashGRPO().to_config()["algorithm"][
-        "objective_version"
-    ] == "legacy"
-    assert vr.objectives.FlashGRPO(objective_version="reference_v1").to_config()[
-        "algorithm"
-    ]["objective_version"] == "reference_v1"
+    assert (
+        vr.objectives.FlashGRPO().to_config()["algorithm"]["objective_version"]
+        == "legacy"
+    )
+    assert (
+        vr.objectives.FlashGRPO(objective_version="reference_v1").to_config()[
+            "algorithm"
+        ]["objective_version"]
+        == "reference_v1"
+    )
+
+
+def test_default_sd3_tempflow_python_api_resolves_to_policy_identity(tmp_path):
+    experiment = vr.Experiment(
+        model=vr.models.SD3(
+            checkpoint="/models/sd35-medium",
+            repo_root="/repos/tempflow-grpo",
+            resolution=384,
+        ),
+        rollout=vr.rollouts.Branching(num_steps=10, branch_count=6),
+        reward=vr.rewards.PromptColor(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=vr.objectives.TempFlow(),
+        train=vr.Train(steps=20, lr=3e-4, precision="bf16"),
+        output_dir=tmp_path / "sd3-policy-identity",
+    )
+
+    report = experiment.validate()
+    config = experiment.resolve()
+
+    assert report.trusted is False
+    assert config.model.extra["tempflow_reference_mode"] is False
+    assert config.sample.name == "branching"
+    assert config.sample.num_steps == 10
+    assert config.rollout["branch_count"] == 6
+    assert config.algorithm.objective_version == "policy_identity_v1"
+    assert config.algorithm.advantage_epsilon == pytest.approx(1e-4)
+    assert config.algorithm.advantage_dtype == "float64"
+    assert config.algorithm.params["preserve_advantage_dtype"] is True
+    assert config.algorithm.noise_weighting == {
+        "enabled": True,
+        "mode": "reference_std_dev_t",
+        "scale": 2.25,
+    }
+    assert config.optimizer.params["max_initial_logprob_delta"] == pytest.approx(1e-5)
+    assert config.optimizer.params["require_initial_clipfrac_zero"] is True
+    assert config.optimizer.params["require_nonzero_gradients"] is True
+
+
+def test_explicit_legacy_tempflow_keeps_tiny_compatibility(tmp_path):
+    experiment = vr.Experiment(
+        model=vr.models.TinyDiffusion(),
+        rollout=vr.rollouts.Branching(),
+        reward=vr.rewards.PromptColor(),
+        advantage=vr.advantages.GroupNormalize(),
+        objective=vr.objectives.TempFlow(objective_version="legacy"),
+        train=vr.Train(),
+        output_dir=tmp_path / "tiny-legacy",
+    )
+
+    experiment.validate()
+    config = experiment.resolve()
+
+    assert config.algorithm.objective_version == "legacy"
+    assert config.algorithm.advantage_dtype == "float32"
+    assert config.algorithm.params == {}
+    assert config.algorithm.noise_weighting["mode"] == "std_dev_t"
 
 
 @pytest.mark.parametrize(
@@ -272,7 +333,8 @@ def test_flash_grpo_descriptor_exposes_compatible_objective_versions():
             0.0,
             "Flash-GRPO objective_version must be one of",
         ),
-        ("reference_v1", 0.1, "Flash-GRPO reference_v1 requires beta=0"),
+        ("legacy", 0.1, "Flash-GRPO requires beta=0"),
+        ("reference_v1", 0.1, "Flash-GRPO requires beta=0"),
         (
             "reference_v1",
             0.0,

@@ -227,6 +227,52 @@ def test_credit_assignment_preserves_float64_advantages(
     assert active_mask.tolist() == expected_mask
 
 
+def test_strict_objective_masks_padding_before_logratio_exponentiation() -> None:
+    algorithm = TempFlowGRPOAlgorithm(
+        objective_version="reference_v1",
+        clip_range=0.2,
+        credit_assignment="all_after_branch",
+        noise_weighting={
+            "enabled": True,
+            "mode": "reference_std_dev_t",
+            "scale": 2.25,
+        },
+        preserve_advantage_dtype=True,
+        advantage_dtype="float64",
+    )
+    old_log_probs = torch.zeros(2, 4, dtype=torch.float64)
+    transition_mask = torch.tensor(
+        [[True, True, False, False], [True, True, True, False]]
+    )
+    batch = _batch(
+        old_log_probs,
+        branch_indices=[1, 1],
+        model_metadata=_reference_metadata(
+            trajectory_step_indices=[0, 1, 2, 3],
+            transition_std_dev_t=[0.2, 0.4, 0.6, 0.8],
+        ),
+    ).replace(transition_mask=transition_mask)
+    new_log_probs = old_log_probs.clone()
+    new_log_probs[~transition_mask] = 2_000.0
+    new_log_probs.requires_grad_(True)
+
+    loss, metrics = algorithm.compute_loss(
+        batch,
+        torch.tensor([1.0, -1.0], dtype=torch.float64),
+        new_log_probs,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["approx_kl"])
+    assert torch.isfinite(metrics["clipfrac"])
+    assert torch.isfinite(new_log_probs.grad).all()
+    assert (
+        torch.count_nonzero(new_log_probs.grad.masked_select(~transition_mask)).item()
+        == 0
+    )
+
+
 def test_legacy_branch_timestep_matches_literal_full_mean_and_gradient() -> None:
     algorithm = TempFlowGRPOAlgorithm(
         objective_version="legacy",
@@ -525,9 +571,7 @@ def test_remote_tempflow_smoke_defaults_strict_and_bounds_reference_opt_in() -> 
     assert "--allow-initial-clipping" not in default_args
 
     with pytest.raises(ValueError, match="only valid"):
-        _bounded_trainer_cli_args(
-            RemoteSd3CliSmokeConfig(allow_initial_clipping=True)
-        )
+        _bounded_trainer_cli_args(RemoteSd3CliSmokeConfig(allow_initial_clipping=True))
     reference_args = _bounded_trainer_cli_args(
         RemoteSd3CliSmokeConfig(
             tempflow_execution_mode="reference-compatible",

@@ -353,9 +353,7 @@ def _algorithm_batch(case: str) -> RolloutBatch:
         model_metadata.update(
             {
                 "tempflow_reference_mode": True,
-                "trajectory_contract_version": (
-                    TEMPFLOW_REFERENCE_TRAJECTORY_CONTRACT
-                ),
+                "trajectory_contract_version": (TEMPFLOW_REFERENCE_TRAJECTORY_CONTRACT),
                 "recompute_transformer_training": True,
                 "trajectory_step_indices": [0, 1, 2],
                 "transition_std_dev_t": torch.tensor(
@@ -384,9 +382,7 @@ def _algorithm_batch(case: str) -> RolloutBatch:
     branch_indices = [0, 2, 1, 2]
     return RolloutBatch(
         prompts=[f"algorithm-{index}" for index in range(batch_size)],
-        metadata=[
-            {"branch_step_index": index} for index in branch_indices
-        ],
+        metadata=[{"branch_step_index": index} for index in branch_indices],
         media=torch.zeros(batch_size, 1),
         latents=torch.zeros(batch_size, transitions, 1),
         next_latents=torch.ones(batch_size, transitions, 1),
@@ -467,6 +463,176 @@ def _run_algorithm_update(case: str, microbatch_size: int | None):
         update_microbatch_size=microbatch_size,
     ).step(adapter, batch, rewards, optimizer, batch.context)
     return adapter.parameter.detach(), metrics
+
+
+def test_grpo_masks_loss_metrics_gradients_and_reduction_weight() -> None:
+    batch = _algorithm_batch("grpo")
+    mask = batch.transition_mask
+    advantages = torch.tensor([1.2, -0.7, 0.4, -1.1], dtype=torch.float64)
+    new_log_probs = torch.tensor(
+        [
+            [0.02, -0.03, 0.04],
+            [0.05, 1.7, -1.4],
+            [-0.06, 0.07, 1.2],
+            [0.08, -0.09, 0.10],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    literal_new_log_probs = new_log_probs.detach().clone().requires_grad_(True)
+    algorithm = GRPOAlgorithm(clip_range=0.15)
+
+    loss, metrics = algorithm.compute_loss(batch, advantages, new_log_probs)
+
+    old_log_probs = batch.old_log_probs.to(dtype=torch.float64)
+    expanded_advantages = advantages[:, None].expand_as(literal_new_log_probs)
+    ratio = torch.exp(literal_new_log_probs - old_log_probs)
+    expected_loss = (
+        torch.maximum(
+            -expanded_advantages * ratio,
+            -expanded_advantages * ratio.clamp(0.85, 1.15),
+        )
+        .masked_select(mask)
+        .mean()
+    )
+    expected_kl = (
+        0.5
+        * (literal_new_log_probs - old_log_probs).square().masked_select(mask).mean()
+    )
+    expected_clipfrac = (
+        ((ratio - 1.0).abs() > 0.15).to(new_log_probs.dtype).masked_select(mask).mean()
+    )
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(metrics["approx_kl"], expected_kl)
+    torch.testing.assert_close(metrics["clipfrac"], expected_clipfrac)
+    assert algorithm.reduction_weight(batch, advantages) == int(mask.sum()) == 9
+
+    loss.backward()
+    expected_loss.backward()
+    torch.testing.assert_close(new_log_probs.grad, literal_new_log_probs.grad)
+    assert torch.count_nonzero(new_log_probs.grad.masked_select(~mask)).item() == 0
+
+
+def test_logprob_metrics_ignore_masked_padding_values() -> None:
+    batch = _algorithm_batch("grpo")
+    mask = batch.transition_mask
+    old_log_probs = torch.zeros_like(batch.old_log_probs)
+    old_log_probs[~mask] = -50.0
+    rollout_kl = torch.full_like(old_log_probs, 0.25)
+    rollout_kl[~mask] = 100.0
+    batch = batch.replace(old_log_probs=old_log_probs, kl=rollout_kl)
+    new_log_probs = torch.full_like(old_log_probs, 0.1)
+    new_log_probs[~mask] = 50.0
+
+    metrics = UpdateEngine._logprob_metrics(batch, new_log_probs)
+
+    assert metrics["old_logprob_mean"] == pytest.approx(0.0)
+    assert metrics["new_logprob_mean"] == pytest.approx(0.1)
+    assert metrics["logprob_delta_mean"] == pytest.approx(0.1)
+    assert metrics["logprob_delta_abs_max"] == pytest.approx(0.1)
+    assert metrics["rollout_kl_mean"] == pytest.approx(0.25)
+    assert metrics["rollout_kl_abs_max"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("beta", [-0.1, 0.1])
+def test_grpo_nonzero_beta_fails_closed(beta: float) -> None:
+    with pytest.raises(ValueError, match="requires beta=0"):
+        GRPOAlgorithm(beta=beta)
+
+
+@pytest.mark.parametrize("objective_version", ["legacy_v0", "reference_v1"])
+@pytest.mark.parametrize("beta", [-0.1, 0.1])
+def test_flash_nonzero_beta_fails_closed(
+    objective_version: str,
+    beta: float,
+) -> None:
+    with pytest.raises(ValueError, match="requires beta=0"):
+        FlashGRPOAlgorithm(
+            objective_version=objective_version,
+            beta=beta,
+        )
+
+
+def test_flash_masks_loss_metrics_gradients_and_reduction_weight() -> None:
+    batch = _algorithm_batch("flash_reference")
+    mask = batch.transition_mask
+    advantages = torch.tensor([1.2, -0.7, 0.4, -1.1], dtype=torch.float64)
+    new_log_probs = torch.tensor(
+        [
+            [0.02, -0.03, 0.04],
+            [0.05, 1.7, -1.4],
+            [-0.06, 0.07, 1.2],
+            [0.08, -0.09, 0.10],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    literal_new_log_probs = new_log_probs.detach().clone().requires_grad_(True)
+    algorithm = FlashGRPOAlgorithm(
+        objective_version="reference_v1",
+        clip_range=0.15,
+    )
+
+    loss, metrics = algorithm.compute_loss(batch, advantages, new_log_probs)
+
+    old_log_probs = batch.old_log_probs.to(dtype=torch.float64)
+    coefficient = batch.model_tensors["coefficient"].to(dtype=torch.float64)
+    weights = coefficient / coefficient.mean()
+    expanded_advantages = advantages[:, None].expand_as(literal_new_log_probs)
+    weighted_advantages = expanded_advantages * weights
+    ratio = torch.exp(literal_new_log_probs - old_log_probs)
+    expected_loss = (
+        torch.maximum(
+            -weighted_advantages * ratio,
+            -weighted_advantages * ratio.clamp(0.85, 1.15),
+        )
+        .masked_select(mask)
+        .mean()
+    )
+    expected_kl = (
+        0.5
+        * (literal_new_log_probs - old_log_probs).square().masked_select(mask).mean()
+    )
+    expected_clipfrac = (
+        ((ratio - 1.0).abs() > 0.15).to(new_log_probs.dtype).masked_select(mask).mean()
+    )
+
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(metrics["approx_kl"], expected_kl)
+    torch.testing.assert_close(metrics["clipfrac"], expected_clipfrac)
+    assert algorithm.reduction_weight(batch, advantages) == int(mask.sum()) == 9
+
+    loss.backward()
+    expected_loss.backward()
+    torch.testing.assert_close(new_log_probs.grad, literal_new_log_probs.grad)
+    assert torch.count_nonzero(new_log_probs.grad.masked_select(~mask)).item() == 0
+
+
+@pytest.mark.parametrize("case", ["grpo", "flash_reference"])
+def test_masked_extreme_logratio_cannot_poison_gradients(case: str) -> None:
+    batch = _algorithm_batch(case)
+    mask = batch.transition_mask
+    new_log_probs = torch.zeros_like(
+        batch.old_log_probs,
+        dtype=torch.float64,
+    )
+    new_log_probs[~mask] = 2_000.0
+    new_log_probs.requires_grad_(True)
+    advantages = torch.tensor([1.2, -0.7, 0.4, -1.1], dtype=torch.float64)
+
+    loss, metrics = _algorithm_for_case(case).compute_loss(
+        batch,
+        advantages,
+        new_log_probs,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["approx_kl"])
+    assert torch.isfinite(metrics["clipfrac"])
+    assert torch.isfinite(new_log_probs.grad).all()
+    assert torch.count_nonzero(new_log_probs.grad.masked_select(~mask)).item() == 0
 
 
 @pytest.mark.parametrize(
@@ -590,4 +756,4 @@ def test_flash_global_coefficient_mean_is_prepared_once_before_microbatching() -
     torch.testing.assert_close(local_mean, torch.tensor(4.75, dtype=torch.float64))
     assert count == batch.batch_size
     assert synchronizations == [None, None]
-    assert metrics["flash_rectification_weight_mean"] == pytest.approx(4.75 / 8.0)
+    assert metrics["flash_rectification_weight_mean"] == pytest.approx(0.5)

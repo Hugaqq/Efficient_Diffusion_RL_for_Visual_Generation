@@ -9,11 +9,14 @@ class RewardRouterFeedbackProvider(FeedbackProvider):
         self.reward_router = RewardRouter(reward_config, cache_dir=cache_dir)
 
     def score(self, batch: RolloutBatch) -> RewardBatch:
+        score_kwargs = {"sample_id": batch.sample_id}
+        if getattr(self.reward_router, "schedule", None):
+            score_kwargs["step"] = None if batch.context is None else batch.context.step
         rewards = self.reward_router.score(
             batch.media,
             batch.prompts,
             batch.metadata,
-            sample_id=batch.sample_id,
+            **score_kwargs,
         )
         if rewards.sample_id is None:
             raise ValueError(
