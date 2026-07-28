@@ -6,9 +6,10 @@ training Runner.
 
 ## Install and import
 
-The release candidate supports Python `>=3.10,<3.12`. A final wheel build and
-clean-environment install belong to the W07 release gate; they have not been
-run as part of W06 source preparation.
+The release candidate supports Python `>=3.10,<3.12`. The W07 local release
+gate verifies one explicit candidate wheel, a fresh base-environment install,
+`pip check`, and an outside-repository isolated import. This base-wheel result
+does not claim that the optional training stack or real GPU experiments ran.
 
 ```python
 import visual_rl as vr

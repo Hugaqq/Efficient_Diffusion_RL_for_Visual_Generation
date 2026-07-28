@@ -18,10 +18,11 @@ Runner。
 
 ## 当前证据状态
 
-源码、固定实验配置和离线验证工具已经准备完成。真实 Flow-GRPO、
+源码、固定实验配置、离线验证工具、全仓自动化、Tiny single/Gloo API smoke
+和基础 wheel 构建/隔离安装已经在本地验证。真实 Flow-GRPO、
 TempFlow-GRPO、Flash-GRPO、World-R1 的 C20/Q100，Flow native parity，
-MG1/NCCL、远端执行、上传和最终 wheel 安装当前均为 `not_run`。`not_run`
-不是通过、跳过即成功或质量提升声明。
+MG1/NCCL、远端执行和上传当前均为 `not_run`。`not_run` 不是通过、跳过即
+成功或质量提升声明。
 
 当前文档：
 

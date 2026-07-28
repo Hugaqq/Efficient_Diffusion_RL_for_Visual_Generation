@@ -21,7 +21,7 @@ is not a pass, a skip interpreted as success, or a quality claim.
 | Q100 reward improvement | preregistered pooled/seed/Theil-Sen gates after evidence completeness | `not_run` |
 | MG1 internal NCCL | three fixed two-rank NCCL failure/correctness tests | `not_run` |
 | MG1 Tiny C20 | two-GPU continuous, interrupted, fresh resume | `not_run` |
-| Candidate wheel build/install | unique wheel, checker pass, clean install, import/public API smoke | `not_run` (W07 owner) |
+| Candidate wheel build/install | unique wheel, checker pass, clean install, outside-repository import; Tiny single/resume/Gloo public API smoke | `verified locally` |
 | Remote execution/upload | authorized clean-commit execution and curated evidence transfer | `not_run` |
 
 ## Frozen correctness order
@@ -98,3 +98,22 @@ git diff --check
 The real evidence gate
 `python experiments/v0_7/verify_evidence.py` is intentionally not executed
 during source preparation because the required files do not yet exist.
+
+## Commands run for W07 local release readiness
+
+The final candidate is accepted locally only when this whole sequence passes on
+one clean commit:
+
+```text
+compileall + Ruff + git diff --check
+full pytest excluding the dedicated API smoke
+dedicated Tiny single/resume/Gloo API smoke
+python -m build
+explicit wheel content/metadata/RECORD check
+fresh base venv install + pip check
+outside-repository python -I import
+```
+
+This verifies local orchestration and base-package installation only. It does
+not change any real GPU/NCCL, C20/Q100, reward-improvement, remote-execution, or
+upload row above from `not_run`.

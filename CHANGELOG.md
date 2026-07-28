@@ -16,6 +16,7 @@
 - Added a standard-library wheel content/metadata/RECORD checker with exact
   core/extra dependency and forbidden-payload enforcement.
 
-Real C20, Q100, Flow native, MG1/NCCL, remote execution, upload, and final
-candidate wheel installation remain `not_run`; see
+The full local automation, Tiny public-API smoke, and base candidate-wheel
+build/install gate pass. Real C20, Q100, Flow native, MG1/NCCL, remote
+execution, and upload remain `not_run`; see
 [`docs/V0_7_ACCEPTANCE.md`](docs/V0_7_ACCEPTANCE.md).

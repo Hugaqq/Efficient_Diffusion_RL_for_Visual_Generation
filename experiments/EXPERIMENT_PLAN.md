@@ -159,7 +159,7 @@ curated machine-readable evidence，不上传 checkpoint、credential、个人�
 | World-R1 C20 | `not_run` |
 | 四算法 Q100 | `not_run` |
 | MG1/NCCL | `not_run` |
-| final wheel install | `not_run` |
+| final wheel build/base install/outside import | `verified locally` |
 | remote execution/upload | `not_run` |
 
 当前状态不得引用 v0.6 历史报告晋级。机器可读最终验证由
