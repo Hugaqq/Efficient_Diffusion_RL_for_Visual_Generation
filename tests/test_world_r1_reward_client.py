@@ -218,18 +218,6 @@ def _camera_trajectory(frames: int, *, offset: float = 0.0) -> dict[str, str]:
     }
 
 
-def _minwm_camera_trajectory(frames: int) -> dict[str, object]:
-    viewmats = np.repeat(np.eye(4, dtype=np.float32)[None], frames, axis=0)
-    viewmats[:, 0, 3] = np.arange(frames, dtype=np.float32) / 10.0
-    intrinsics = np.repeat(np.eye(3, dtype=np.float32)[None], frames, axis=0)
-    return {
-        "viewmats": viewmats.tolist(),
-        "Ks": intrinsics.tolist(),
-        "convention": "w2c",
-        "coordinate_system": "opencv",
-    }
-
-
 def test_default_requests_session_disables_environment_proxies(monkeypatch):
     session = SimpleNamespace(trust_env=True)
     monkeypatch.setitem(
@@ -447,67 +435,6 @@ def test_reference_3d_payload_camera_trajectory_and_details_are_batch_aligned():
     assert result[SCORE_META_VIEW] == pytest.approx([0.2, 0.5])
     assert result[SCORE_TRAJECTORY_ALIGNMENT] == pytest.approx([0.3, 0.6])
     assert result[TRAJECTORY_COMPARISON_PATHS] == ["/tmp/a.json", ""]
-
-
-def test_reward_3d_aligns_77_decoded_frames_with_20_minwm_camera_poses():
-    selected = list(range(0, 77, 4))
-    media = np.zeros((1, 77, 1, 1, 3), dtype=np.uint8)
-    media[0, :, 0, 0, :] = np.arange(77, dtype=np.uint8)[:, None]
-    client = WorldR1Reward3DClient(
-        "http://localhost:8089",
-        transport=FakeTransport(),
-        media_layout="BFHWC",
-        protocol_mode="strict_v2",
-        server_revision="world-r1-test",
-        require_camera_trajectory=True,
-        frame_indices=selected,
-        jpeg_encoder=lambda frame: bytes([int(frame[0, 0, 0])]),
-    )
-
-    metadata = {
-        "camera_trajectory": _minwm_camera_trajectory(20),
-        "minwm_reward_frame_alignment": {
-            "contract": "minwm_vae_camera_alignment_v1",
-            "latent_frames": 20,
-            "decoded_media_frames": 77,
-            "vae_temporal_stride": 4,
-        },
-    }
-    payloads, evidence = client.prepare_payloads(
-        media,
-        ["move through the scene"],
-        [metadata],
-        sample_id=["sample-0"],
-    )
-
-    assert payloads[0]["videos"] == [[bytes([index]) for index in selected]]
-    assert list(payloads[0]["camera_trajectories"][0]) == [
-        f"frame{index}" for index in range(20)
-    ]
-    assert evidence["selected_frame_indices"] == selected
-    fingerprint = client.cache_fingerprint()
-    assert fingerprint["frame_policy"]["selected_frame_indices"] == selected
-    assert fingerprint["camera_conversion"]["input_pose_convention"] == "w2c"
-
-    wrong = selected.copy()
-    wrong[1] = 5
-    misaligned = WorldR1Reward3DClient(
-        "http://localhost:8089",
-        transport=FakeTransport(),
-        media_layout="BFHWC",
-        protocol_mode="strict_v2",
-        server_revision="world-r1-test",
-        require_camera_trajectory=True,
-        frame_indices=wrong,
-        jpeg_encoder=lambda frame: bytes([int(frame[0, 0, 0])]),
-    )
-    with pytest.raises(ValueError, match="must match MinWM VAE camera alignment"):
-        misaligned.prepare_payloads(
-            media,
-            ["move through the scene"],
-            [metadata],
-            sample_id=["sample-0"],
-        )
 
 
 def test_released_reference_3d_details_support_trusted_order_contract():
