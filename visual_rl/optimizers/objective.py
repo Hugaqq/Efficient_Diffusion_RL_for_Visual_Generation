@@ -1,198 +1,325 @@
-"""Policy-objective adapters for the unified optimizer update path."""
+"""The single policy objective for every built-in policy algorithm."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+import math
+import operator
+from typing import TYPE_CHECKING, Any
+
+from visual_rl.core.types import PolicyRecomputeStats, RolloutBatch
+from visual_rl.errors import RunError
+from visual_rl.optimizers.clipped_surrogate import clipped_surrogate, masked_mean
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
-@dataclass
-class ObjectiveOutput:
-    """Loss and observable metrics emitted by one policy objective."""
-
-    loss: Any
-    policy_loss: Any
-    approx_kl: Any
-    clipfrac: Any
-    metrics: dict[str, Any]
+def _require_detached(name: str, value: Tensor) -> None:
+    if value.requires_grad or value.grad_fn is not None:
+        raise ValueError(f"{name} must be detached without grad_fn")
 
 
-class PolicyObjective:
-    """Map a rollout batch, advantages, and new log-probs to an objective."""
+def _finite_scalar(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a real scalar")
+    resolved = float(value)
+    if not math.isfinite(resolved):
+        raise ValueError(f"{name} must be finite")
+    return resolved
 
-    def prepare_batch(self, batch: Any, advantages: Any) -> Any:
-        """Prepare full-batch constants before update microbatch slicing."""
 
-        del advantages
-        return batch
+@dataclass(frozen=True)
+class PolicyLossInputs:
+    """Algorithm-prepared tensors consumed by the shared objective."""
 
-    def requires_global_batch_reduction(self) -> bool:
-        """Whether distributed preparation needs one global weighted mean."""
+    base_advantage: Tensor
+    algorithm_weight: Tensor
+    active_mask: Tensor
+    clip_range: float
+    reference_kl_weight: float = 0.0
 
-        return False
+    def __post_init__(self) -> None:
+        import torch
 
-    def global_batch_reduction(
-        self,
-        batch: Any,
-        advantages: Any,
-    ) -> tuple[Any, int]:
-        """Return the local mean and count for full-batch normalization."""
+        for name in ("base_advantage", "algorithm_weight", "active_mask"):
+            value = getattr(self, name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            _require_detached(name, value)
 
-        del batch, advantages
-        raise RuntimeError("This objective does not use a global batch reduction")
+        shape = tuple(self.base_advantage.shape)
+        if len(shape) != 2:
+            raise ValueError("base_advantage must have shape [B, T]")
+        if tuple(self.algorithm_weight.shape) != shape:
+            raise ValueError(
+                "algorithm_weight must have the same shape as base_advantage"
+            )
+        if tuple(self.active_mask.shape) != shape:
+            raise ValueError("active_mask must have the same shape as base_advantage")
+        if not self.base_advantage.is_floating_point():
+            raise TypeError("base_advantage must be floating point")
+        if not self.algorithm_weight.is_floating_point():
+            raise TypeError("algorithm_weight must be floating point")
+        if self.active_mask.dtype != torch.bool:
+            raise TypeError("active_mask must have bool dtype")
+        if self.base_advantage.device != self.algorithm_weight.device:
+            raise ValueError(
+                "base_advantage and algorithm_weight must be on the same device"
+            )
+        if self.base_advantage.device != self.active_mask.device:
+            raise ValueError("active_mask must be on the base_advantage device")
+        if self.base_advantage.dtype != self.algorithm_weight.dtype:
+            raise TypeError(
+                "base_advantage and algorithm_weight must have the same dtype"
+            )
 
-    def apply_global_batch_reduction(
-        self,
-        batch: Any,
-        advantages: Any,
-        global_mean: Any,
-    ) -> Any:
-        """Apply a globally reduced mean before microbatch slicing."""
+        safe_base = torch.where(self.active_mask, self.base_advantage, 0.0)
+        safe_weight = torch.where(self.active_mask, self.algorithm_weight, 1.0)
+        if not bool(torch.isfinite(safe_base).all()):
+            raise ValueError("base_advantage must be finite at active transitions")
+        if not bool(torch.isfinite(safe_weight).all()):
+            raise ValueError("algorithm_weight must be finite at active transitions")
+        if not bool((safe_weight > 0).all()):
+            raise ValueError(
+                "algorithm_weight must be strictly positive at active transitions"
+            )
 
-        del advantages, global_mean
-        return batch
+        clip_range = _finite_scalar("clip_range", self.clip_range)
+        if not 0.0 < clip_range < 1.0:
+            raise ValueError("clip_range must satisfy 0 < clip_range < 1")
+        reference_kl_weight = _finite_scalar(
+            "reference_kl_weight",
+            self.reference_kl_weight,
+        )
+        if reference_kl_weight < 0.0:
+            raise ValueError("reference_kl_weight must be non-negative")
+        object.__setattr__(self, "clip_range", clip_range)
+        object.__setattr__(self, "reference_kl_weight", reference_kl_weight)
 
-    def reduction_weight(self, batch: Any, advantages: Any) -> int:
-        """Return the number of elements reduced by this objective."""
+    def slice(self, indices: Any) -> PolicyLossInputs:
+        """Select a non-empty, duplicate-free set of samples along ``B``."""
 
         import torch
 
-        del advantages
-        values = torch.as_tensor(batch.old_log_probs)
-        if values.ndim == 0 or values.shape[0] != batch.batch_size:
-            raise ValueError("old_log_probs must have a batch dimension")
-        if batch.transition_mask is None:
-            return values.numel()
-        mask = torch.as_tensor(batch.transition_mask, dtype=torch.bool)
-        if tuple(mask.shape) != tuple(values.shape):
-            raise ValueError(
-                "transition_mask must have the same shape as old_log_probs"
-            )
-        return int(mask.sum().item())
-
-    def metric_reduction_weight(
-        self,
-        batch: Any,
-        advantages: Any,
-        metric_name: str,
-    ) -> int:
-        """Return the reduction weight for one objective metric."""
-
-        del metric_name
-        return self.reduction_weight(batch, advantages)
-
-    def __call__(
-        self,
-        batch: Any,
-        advantages: Any,
-        new_log_probs: Any,
-    ) -> ObjectiveOutput:
-        raise NotImplementedError
-
-
-class AlgorithmPolicyObjective(PolicyObjective):
-    """Adapt an existing algorithm loss kernel without changing its math."""
-
-    _REQUIRED_METRICS = ("policy_loss", "approx_kl", "clipfrac")
-
-    def __init__(self, algorithm: Any):
-        if not callable(getattr(algorithm, "compute_loss", None)):
-            raise TypeError("algorithm must define compute_loss(batch, advantages, new_log_probs)")
-        self.algorithm = algorithm
-
-    def prepare_batch(self, batch: Any, advantages: Any) -> Any:
-        prepare = getattr(self.algorithm, "prepare_batch", None)
-        if prepare is None:
-            return super().prepare_batch(batch, advantages)
-        return prepare(batch, advantages)
-
-    def requires_global_batch_reduction(self) -> bool:
-        required = getattr(
-            self.algorithm,
-            "requires_global_batch_reduction",
-            None,
-        )
-        if required is None:
-            return False
-        value = required()
-        if not isinstance(value, bool):
+        if isinstance(indices, (str, bytes)):
+            raise TypeError("indices must be a non-empty sequence of integers")
+        try:
+            resolved = list(indices)
+        except TypeError as exc:
             raise TypeError(
-                "algorithm.requires_global_batch_reduction must return bool"
-            )
-        return value
-
-    def global_batch_reduction(
-        self,
-        batch: Any,
-        advantages: Any,
-    ) -> tuple[Any, int]:
-        reduction = getattr(self.algorithm, "global_batch_reduction", None)
-        if reduction is None:
-            return super().global_batch_reduction(batch, advantages)
-        return reduction(batch, advantages)
-
-    def apply_global_batch_reduction(
-        self,
-        batch: Any,
-        advantages: Any,
-        global_mean: Any,
-    ) -> Any:
-        apply_reduction = getattr(
-            self.algorithm,
-            "apply_global_batch_reduction",
-            None,
+                "indices must be a non-empty sequence of integers"
+            ) from exc
+        if not resolved:
+            raise ValueError("indices must not be empty")
+        batch_size = int(self.base_advantage.shape[0])
+        normalized: list[int] = []
+        for position, index in enumerate(resolved):
+            if isinstance(index, bool):
+                raise TypeError(
+                    f"sample index at position {position} must be an integer"
+                )
+            try:
+                item = operator.index(index)
+            except TypeError as exc:
+                raise TypeError(
+                    f"sample index at position {position} must be an integer"
+                ) from exc
+            if item < 0 or item >= batch_size:
+                raise IndexError(
+                    f"sample index {item} is out of bounds for batch size {batch_size}"
+                )
+            normalized.append(item)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("indices must not contain duplicates")
+        tensor_index = torch.tensor(
+            normalized,
+            dtype=torch.long,
+            device=self.base_advantage.device,
         )
-        if apply_reduction is None:
-            return super().apply_global_batch_reduction(
-                batch,
-                advantages,
-                global_mean,
-            )
-        return apply_reduction(batch, advantages, global_mean)
-
-    def reduction_weight(self, batch: Any, advantages: Any) -> int:
-        reduction_weight = getattr(self.algorithm, "reduction_weight", None)
-        if reduction_weight is None:
-            return super().reduction_weight(batch, advantages)
-        return reduction_weight(batch, advantages)
-
-    def metric_reduction_weight(
-        self,
-        batch: Any,
-        advantages: Any,
-        metric_name: str,
-    ) -> int:
-        metric_reduction_weight = getattr(
-            self.algorithm,
-            "metric_reduction_weight",
-            None,
+        return replace(
+            self,
+            base_advantage=self.base_advantage.index_select(0, tensor_index),
+            algorithm_weight=self.algorithm_weight.index_select(0, tensor_index),
+            active_mask=self.active_mask.index_select(0, tensor_index),
         )
-        if metric_reduction_weight is None:
-            return self.reduction_weight(batch, advantages)
-        return metric_reduction_weight(batch, advantages, metric_name)
+
+    def validate_against(self, batch: RolloutBatch) -> None:
+        """Require the algorithm tensors to match the canonical transition grid."""
+
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("batch must be a RolloutBatch")
+        old_log_probs = batch.old_log_probs
+        if tuple(old_log_probs.shape) != tuple(self.base_advantage.shape):
+            raise ValueError(
+                "PolicyLossInputs tensors must match batch.old_log_probs shape"
+            )
+
+
+@dataclass(frozen=True)
+class ObjectiveOutput:
+    """The five core scalars and their one shared reduction weight."""
+
+    loss: Tensor
+    policy_loss: Tensor
+    reference_kl: Tensor
+    approx_kl: Tensor
+    clipfrac: Tensor
+    active_transition_count: int
+
+
+def reference_regularizer(
+    *,
+    current_mean: Tensor,
+    reference_mean: Tensor,
+    transition_std: Tensor,
+    active_mask: Tensor,
+) -> Tensor:
+    """Compute the same-variance Gaussian transition KL over active entries."""
+
+    import torch
+
+    for name, value in (
+        ("current_mean", current_mean),
+        ("reference_mean", reference_mean),
+        ("transition_std", transition_std),
+        ("active_mask", active_mask),
+    ):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+    if not current_mean.is_floating_point():
+        raise TypeError("current_mean must be floating point")
+    if not reference_mean.is_floating_point():
+        raise TypeError("reference_mean must be floating point")
+    if not transition_std.is_floating_point():
+        raise TypeError("transition_std must be floating point")
+    if active_mask.dtype != torch.bool:
+        raise TypeError("active_mask must have bool dtype")
+    if not current_mean.requires_grad:
+        raise RunError("current_mean must require gradients")
+    if reference_mean.requires_grad or reference_mean.grad_fn is not None:
+        raise RunError("reference_mean must be detached without grad_fn")
+    if transition_std.requires_grad or transition_std.grad_fn is not None:
+        raise RunError("transition_std must be detached without grad_fn")
+    if any(
+        value.device != current_mean.device
+        for value in (reference_mean, transition_std, active_mask)
+    ):
+        raise RunError("reference regularizer tensors must share one device")
+    if (
+        current_mean.dtype != reference_mean.dtype
+        or current_mean.dtype != transition_std.dtype
+    ):
+        raise RunError("reference regularizer floating tensors must share one dtype")
+
+    try:
+        current, reference = torch.broadcast_tensors(
+            current_mean,
+            reference_mean,
+        )
+    except RuntimeError as exc:
+        raise RunError("current and reference transition means cannot broadcast") from exc
+    if current.ndim < 3:
+        raise RunError("transition means must have shape [B, T, ...X]")
+    if tuple(current.shape[:2]) != tuple(active_mask.shape):
+        raise RunError("active_mask must match the [B, T] transition dimensions")
+
+    expanded_mask = active_mask.reshape(
+        *active_mask.shape,
+        *((1,) * (current.ndim - 2)),
+    )
+    expanded_mask = torch.broadcast_to(expanded_mask, current.shape)
+    if tuple(transition_std.shape) == tuple(active_mask.shape):
+        std_base = transition_std.reshape(
+            *active_mask.shape,
+            *((1,) * (current.ndim - 2)),
+        )
+    elif tuple(transition_std.shape) == tuple(current.shape):
+        std_base = transition_std
+    elif (
+        transition_std.ndim == current.ndim
+        and tuple(transition_std.shape[:2]) == tuple(active_mask.shape)
+        and all(size == 1 for size in transition_std.shape[2:])
+    ):
+        std_base = transition_std
+    else:
+        raise RunError("unsupported transition_std shape")
+    try:
+        std = torch.broadcast_to(std_base, current.shape)
+    except RuntimeError as exc:
+        raise RunError("transition_std cannot broadcast to transition means") from exc
+
+    active_current = torch.where(expanded_mask, current, 0.0)
+    active_reference = torch.where(expanded_mask, reference, 0.0)
+    active_std = torch.where(expanded_mask, std, 1.0)
+    if not bool(torch.isfinite(active_current).all()):
+        raise RunError("current_mean must be finite at active transitions")
+    if not bool(torch.isfinite(active_reference).all()):
+        raise RunError("reference_mean must be finite at active transitions")
+    if not bool(torch.isfinite(active_std).all()):
+        raise RunError("transition_std must be finite at active transitions")
+    if not bool((active_std > 0).all()):
+        raise RunError("transition_std must be positive at active transitions")
+
+    safe_delta = active_current - active_reference
+    feature_axes = tuple(range(2, current.ndim))
+    per_transition_reference_kl = (
+        safe_delta.square() / (2.0 * active_std.square())
+    ).mean(dim=feature_axes)
+    reference_kl = masked_mean(per_transition_reference_kl, active_mask)
+    if not bool(torch.isfinite(reference_kl)):
+        raise RunError("reference_kl must be finite")
+    return reference_kl
+
+
+class PolicyObjective:
+    """Combine the shared surrogate with the optional reference regularizer."""
 
     def __call__(
         self,
-        batch: Any,
-        advantages: Any,
-        new_log_probs: Any,
+        batch: RolloutBatch,
+        loss_inputs: PolicyLossInputs,
+        stats: PolicyRecomputeStats,
     ) -> ObjectiveOutput:
-        result = self.algorithm.compute_loss(batch, advantages, new_log_probs)
-        if not isinstance(result, tuple) or len(result) != 2:
-            raise TypeError("algorithm.compute_loss must return (loss, metrics)")
-        loss, metrics = result
-        if not isinstance(metrics, dict):
-            raise TypeError("algorithm.compute_loss metrics must be a dict")
-        missing = [name for name in self._REQUIRED_METRICS if name not in metrics]
-        if missing:
-            raise ValueError(
-                "algorithm.compute_loss metrics missing required fields: "
-                f"{', '.join(missing)}"
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("batch must be a RolloutBatch")
+        if not isinstance(loss_inputs, PolicyLossInputs):
+            raise TypeError("loss_inputs must be a PolicyLossInputs")
+        if not isinstance(stats, PolicyRecomputeStats):
+            raise TypeError("stats must be a PolicyRecomputeStats")
+        loss_inputs.validate_against(batch)
+
+        surrogate = clipped_surrogate(
+            old_log_probs=batch.old_log_probs,
+            new_log_probs=stats.new_log_probs,
+            inputs=loss_inputs,
+        )
+        if loss_inputs.reference_kl_weight > 0.0:
+            if (
+                stats.current_transition_mean is None
+                or stats.reference_transition_mean is None
+                or stats.transition_std is None
+            ):
+                raise RunError(
+                    "reference KL requires current/reference means and transition std"
+                )
+            reference_kl = reference_regularizer(
+                current_mean=stats.current_transition_mean,
+                reference_mean=stats.reference_transition_mean,
+                transition_std=stats.transition_std,
+                active_mask=loss_inputs.active_mask,
             )
+        else:
+            reference_kl = surrogate.policy_loss.new_zeros(())
+        loss = (
+            surrogate.policy_loss
+            + loss_inputs.reference_kl_weight * reference_kl
+        )
         return ObjectiveOutput(
             loss=loss,
-            policy_loss=metrics["policy_loss"],
-            approx_kl=metrics["approx_kl"],
-            clipfrac=metrics["clipfrac"],
-            metrics=dict(metrics),
+            policy_loss=surrogate.policy_loss,
+            reference_kl=reference_kl,
+            approx_kl=surrogate.approx_kl,
+            clipfrac=surrogate.clipfrac,
+            active_transition_count=surrogate.active_transition_count,
         )

@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-rl"
-version = "0.6.0"
+version = "0.7.0"
 description = "Unified Diffusion RL infrastructure for visual generation."
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
-  "numpy>=1.26,<2.0",
+  "numpy>=1.26,<2.3",
   "pyyaml>=6.0",
   "tqdm>=4.66",
 ]
@@ -27,20 +27,15 @@ train = [
   "requests>=2.32",
   "pillow>=10",
   "imageio>=2.34",
+  "imageio-ffmpeg>=0.6",
 ]
 dev = [
   "pytest>=8.2",
   "ruff>=0.8",
 ]
 
-[project.scripts]
-visual-rl = "visual_rl.cli:main"
-
 [tool.setuptools.packages.find]
 include = ["visual_rl*"]
-
-[tool.setuptools.package-data]
-"visual_rl.configs.presets" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

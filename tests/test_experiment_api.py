@@ -1,533 +1,298 @@
-"""CPU/offline contracts for the small composable Experiment API."""
+"""CPU-only contracts for VisualRL's sole high-level Python API."""
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
-import json
+import inspect
 from pathlib import Path
 import subprocess
 import sys
 
 import pytest
-import yaml
 
 import visual_rl as vr
-from visual_rl.artifacts.checkpoint import config_fingerprint
-from visual_rl.configs.schema import config_to_dict, load_config
+from visual_rl.api import audit_run, inspect_run, load
+from visual_rl.api_types import AuditReport, RunResult, RunStatus, ValidationReport
+from visual_rl.core.types import FrozenMapping, ValidatedRuntimeEnv, ValidationCheck
+from visual_rl.errors import RunError, ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
+PUBLIC = (
+    "__version__",
+    "load",
+    "inspect_run",
+    "audit_run",
+    "ValidationReport",
+    "RunResult",
+    "RunStatus",
+    "AuditReport",
+    "ConfigError",
+    "ComponentError",
+    "ValidationError",
+    "RunError",
+    "ResumeError",
+    "ArtifactError",
+)
 
 
-def _mock_experiment(output_dir: Path, **kwargs) -> vr.Experiment:
-    return vr.Experiment(
-        model=vr.models.MockWan(),
-        rollout=vr.rollouts.FullTrajectory(batch_size=1),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.GRPO(),
-        train=vr.Train(steps=kwargs.pop("steps", 1), lr=1e-3),
-        output_dir=output_dir,
-        show_progress=False,
-        strict_rollout_validation=True,
-        **kwargs,
+def _runtime_env() -> ValidatedRuntimeEnv:
+    return ValidatedRuntimeEnv(
+        mode="single",
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        group_rank=None,
+        group_world_size=None,
+        master_addr=None,
+        master_port=None,
+        visible_gpu_count=0,
+        raw_launch_env=FrozenMapping({}),
     )
 
 
-def _deep_merge(target: dict, incoming: dict) -> None:
-    for key, value in incoming.items():
-        if isinstance(target.get(key), dict) and isinstance(value, dict):
-            _deep_merge(target[key], value)
-        else:
-            target[key] = value
+def _materialize_result_paths(root: Path) -> dict[str, Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    checkpoint = root / "checkpoint_000001"
+    checkpoint.mkdir(exist_ok=True)
+    commits = root / "commits"
+    commits.mkdir(exist_ok=True)
+    paths = {
+        "authoritative_checkpoint": checkpoint,
+        "resolved_config_path": root / "config.resolved.json",
+        "manifest_path": root / "sample_manifest.jsonl",
+        "metrics_path": root / "metrics.jsonl",
+        "marker_path": commits / "commit_000001.json",
+    }
+    for name, path in paths.items():
+        if name != "authoritative_checkpoint":
+            path.touch()
+    return paths
 
 
-def test_lazy_exports_keep_config_access_runtime_pure():
-    script = """
+def test_top_level_public_allowlist_is_exact():
+    assert tuple(vr.__all__) == PUBLIC
+    assert vr.load is load
+    assert vr.inspect_run is inspect_run
+    assert vr.audit_run is audit_run
+    for retired in (
+        "Experiment",
+        "ExperimentRunner",
+        "VisualRLConfig",
+        "Train",
+        "load_config",
+        "validate_config",
+        "register_builtin_plugins",
+    ):
+        assert not hasattr(vr, retired)
+
+
+def test_handle_has_zero_override_signatures_and_cannot_be_publicly_constructed():
+    experiment = load(TINY)
+
+    assert str(inspect.signature(experiment.resolve)) == "() -> 'VisualRLConfig'"
+    assert str(inspect.signature(experiment.validate)) == "() -> 'ValidationReport'"
+    assert str(inspect.signature(experiment.run)) == "() -> 'RunResult'"
+    assert type(experiment).__name__ == "_Experiment"
+    assert not hasattr(vr, "Experiment")
+
+
+def test_load_freezes_yaml_bytes_and_resolve_reuses_same_object(tmp_path):
+    path = tmp_path / "config.yaml"
+    original = TINY.read_text(encoding="utf-8")
+    path.write_text(original, encoding="utf-8")
+    experiment = load(path)
+    path.write_text(original.replace("seed: 42", "seed: 99"), encoding="utf-8")
+
+    first = experiment.resolve()
+    second = experiment.resolve()
+
+    assert first is second
+    assert first.run.seed == 42
+
+
+def test_import_load_and_resolve_do_not_import_training_frameworks():
+    script = f"""
 import sys
 import visual_rl as vr
-assert 'visual_rl.experiment' not in sys.modules
-assert 'visual_rl.runner' not in sys.modules
-_ = vr.VisualRLConfig
-assert 'visual_rl.experiment' not in sys.modules
-assert 'visual_rl.runner' not in sys.modules
-_ = vr.Experiment
-assert 'visual_rl.experiment' in sys.modules
-assert 'visual_rl.runner' not in sys.modules
+assert 'torch' not in sys.modules
+experiment = vr.load({str(TINY)!r})
+assert 'torch' not in sys.modules
+experiment.resolve()
 assert 'torch' not in sys.modules
 assert 'diffusers' not in sys.modules
+assert 'transformers' not in sys.modules
+assert 'peft' not in sys.modules
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],
         cwd=ROOT,
-        check=False,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr
 
 
-def test_descriptors_are_frozen_and_construction_validate_have_no_output_side_effect(
-    tmp_path, monkeypatch
-):
-    output_dir = tmp_path / "not-created"
-    descriptor = vr.models.TinyDiffusion(image_size=8)
-    with pytest.raises(FrozenInstanceError):
-        descriptor.image_size = 16
+def test_validate_caches_report_and_runtime_snapshot(monkeypatch):
+    calls = []
+    check = ValidationCheck("warning", "test.warning", "runtime", "warning")
+    report = ValidationReport((check,), 0, 1)
+    env = _runtime_env()
 
-    experiment = _mock_experiment(output_dir)
-    assert not output_dir.exists()
-    import visual_rl.builtins as builtins_module
+    def fake_preflight(config, **kwargs):
+        calls.append((config, kwargs))
+        return report, env
+
+    import visual_rl.preflight as preflight
+
+    monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
+    experiment = load(TINY)
+
+    assert experiment.validate() is report
+    assert experiment.validate() is report
+    assert len(calls) == 1
+    assert calls[0][1]["phase"] == "validate"
+
+
+def test_run_claim_is_consumed_by_validation_failure(monkeypatch):
+    error = ValidationCheck("error", "test.error", "runtime", "broken", True)
+
+    def fake_preflight(config, **kwargs):
+        del config, kwargs
+        return ValidationReport((error,), None, None), None
+
+    import visual_rl.preflight as preflight
+
+    monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
+    experiment = load(TINY)
+
+    with pytest.raises(ValidationError, match="run-phase validation"):
+        experiment.run()
+    with pytest.raises(RunError, match="already attempted"):
+        experiment.run()
+
+
+def test_run_passes_same_config_and_fresh_env_to_only_runner(
+    monkeypatch, tmp_path
+):
+    env = _runtime_env()
+    reports = []
+
+    def fake_preflight(config, **kwargs):
+        reports.append((config, kwargs))
+        return ValidationReport((), 0, 1), env
+
+    output_dir = tmp_path.resolve()
+    paths = _materialize_result_paths(output_dir)
+    result = RunResult(
+        run_id="run-1",
+        output_dir=output_dir,
+        committed_steps=1,
+        **paths,
+        last_metrics={
+            "step": 0,
+            "sample_count": 4,
+            "active_transition_count": 8,
+            "reward_mean": 1.0,
+        },
+    )
+    runner_calls = []
+
+    class FakeRunner:
+        def __init__(self, config, validated_env):
+            runner_calls.append((config, validated_env))
+
+        def run(self):
+            return result
+
+    import visual_rl.preflight as preflight
+    import visual_rl.runner as runner
+
+    monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
+    monkeypatch.setattr(runner, "ExperimentRunner", FakeRunner)
+    experiment = load(TINY)
+
+    assert experiment.run() is result
+    assert len(reports) == 2
+    assert reports[0][1]["phase"] == "validate"
+    assert reports[1][1]["phase"] == "run"
+    assert isinstance(reports[1][1]["cached_report"], ValidationReport)
+    assert reports[1][1]["cached_report"].ok
+    assert reports[1][1]["cached_env"] is env
+    assert runner_calls == [(experiment.resolve(), env)]
+
+
+def test_report_properties_are_derived_and_result_metrics_are_frozen(tmp_path):
+    error = ValidationCheck("error", "e", "x", "bad")
+    warning = ValidationCheck("warning", "w", "x", "careful")
+    report = ValidationReport((warning, error), None, None)
+    assert not report.ok
+    assert report.errors == (error,)
+    assert report.warnings == (warning,)
+
+    metrics = {
+        "step": 0,
+        "sample_count": 2,
+        "active_transition_count": 2,
+        "reward_mean": 1.0,
+    }
+    root = tmp_path.resolve()
+    paths = _materialize_result_paths(root)
+    result = RunResult(
+        run_id="r",
+        output_dir=root,
+        committed_steps=1,
+        **paths,
+        last_metrics=metrics,
+    )
+    metrics["reward_mean"] = 9.0
+    assert result.last_metrics["reward_mean"] == 1.0
+    with pytest.raises(TypeError):
+        result.last_metrics["reward_mean"] = 2.0
+
+
+def test_inspect_and_audit_build_public_types_from_internal_projections(
+    monkeypatch, tmp_path
+):
+    root = tmp_path.resolve()
+
+    import visual_rl.artifacts.audit as audit_module
+    import visual_rl.artifacts.status as status_module
 
     monkeypatch.setattr(
-        builtins_module,
-        "register_builtin_plugins",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("static validation loaded runtime plugins")
-        ),
+        status_module,
+        "inspect_run_status",
+        lambda path: {
+            "run_id": "r",
+            "committed_steps": 2,
+            "authoritative_checkpoint": "checkpoint_000002",
+            "resumable": True,
+            "pending_transaction_count": 0,
+            "checks": (),
+        },
     )
-    report = experiment.validate()
-    assert not report.trusted
-    assert not output_dir.exists()
-
-
-def test_validate_can_explicitly_run_the_formal_trusted_preflight(tmp_path):
-    output_dir = tmp_path / "trusted-not-created"
-
-    report = _mock_experiment(output_dir).validate(trusted_components=True)
-
-    assert report.trusted is True
-    assert report.components
-    assert not output_dir.exists()
-
-
-def test_relative_paths_use_experiment_construction_cwd(tmp_path, monkeypatch):
-    construction_dir = tmp_path / "construction"
-    later_dir = tmp_path / "later"
-    construction_dir.mkdir()
-    later_dir.mkdir()
-    monkeypatch.chdir(construction_dir)
-    experiment = vr.Experiment(
-        model=vr.models.Wan(
-            checkpoint="models/wan",
-            world_r1_root="repos/world-r1",
-        ),
-        rollout=vr.rollouts.FullTrajectory(),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.GRPO(),
-        train=vr.Train(),
-        output_dir="runs/api",
+    monkeypatch.setattr(
+        audit_module,
+        "audit_run_artifacts",
+        lambda path: {
+            "run_id": "r",
+            "committed_steps": 2,
+            "checked_commit_count": 2,
+            "checked_artifact_paths": [
+                "commits/commit_000001.json",
+                "checkpoint_000002/checkpoint.json",
+            ],
+            "checks": (),
+        },
     )
 
-    monkeypatch.chdir(later_dir)
-    config = experiment.resolve()
+    status = inspect_run(root)
+    audit = audit_run(root)
 
-    assert config.model.model_path == str(construction_dir / "models/wan")
-    assert config.model.extra["world_r1_root"] == str(
-        construction_dir / "repos/world-r1"
-    )
-    assert "wan_backend" not in config.model.extra
-    assert "flash_grpo_root" not in config.model.extra
-    assert config.paths.output_dir == str(construction_dir / "runs/api")
-
-
-def test_wan_python_descriptor_selects_exact_backend_root_and_keeps_positionals(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    legacy = vr.models.Wan(
-        "models/wan",
-        "repos/world-r1",
-        "cpu",
-        "float32",
-        False,
-        False,
-    ).to_config()["model"]["extra"]
-    flash = vr.models.Wan(
-        "models/wan",
-        backend="flash",
-        flash_grpo_root="repos/flash-grpo",
-    )
-    experiment = vr.Experiment(
-        model=flash,
-        rollout=vr.rollouts.Flash(),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.FlashGRPO(),
-        train=vr.Train(),
-    )
-    resolved = experiment.resolve().model.extra
-
-    assert "wan_backend" not in legacy
-    assert legacy["world_r1_root"] == "repos/world-r1"
-    assert "flash_grpo_root" not in legacy
-    assert legacy["device"] == "cpu"
-    assert legacy["dtype"] == "float32"
-    assert legacy["local_files_only"] is False
-    assert legacy["low_cpu_mem_usage"] is False
-    assert resolved["wan_backend"] == "flash"
-    assert resolved["flash_grpo_root"] == str(tmp_path / "repos/flash-grpo")
-    assert "world_r1_root" not in resolved
-    assert experiment.validate().trusted is False
-    assert experiment.resolve().algorithm.objective_version == "legacy"
-    with pytest.raises(ValueError, match="backend must be one of"):
-        vr.models.Wan("models/wan", backend="other")
-
-
-@pytest.mark.parametrize(
-    ("model", "rollout", "objective", "message"),
-    [
-        (
-            vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
-            vr.rollouts.Flash(),
-            vr.objectives.FlashGRPO(),
-            "Wan wan_backend=world_r1 only supports full_trajectory rollout",
-        ),
-        (
-            vr.models.Wan(
-                "/models/wan",
-                backend="flash",
-                flash_grpo_root="/repos/flash-grpo",
-            ),
-            vr.rollouts.FullTrajectory(),
-            vr.objectives.GRPO(),
-            "Wan wan_backend=flash only supports single_step or flash_single_step rollout",
-        ),
-        (
-            vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
-            vr.rollouts.Branching(),
-            vr.objectives.TempFlow(),
-            "Wan wan_backend=world_r1 only supports full_trajectory rollout",
-        ),
-        (
-            vr.models.Wan(
-                "/models/wan",
-                backend="flash",
-                flash_grpo_root="/repos/flash-grpo",
-            ),
-            vr.rollouts.Branching(),
-            vr.objectives.TempFlow(),
-            "Wan wan_backend=flash only supports single_step or flash_single_step rollout",
-        ),
-    ],
-)
-def test_wan_python_api_rejects_rollout_backend_mismatch(
-    tmp_path, model, rollout, objective, message
-):
-    experiment = vr.Experiment(
-        model=model,
-        rollout=rollout,
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=objective,
-        train=vr.Train(),
-        output_dir=tmp_path / "invalid",
-    )
-
-    with pytest.raises(ValueError, match=message):
-        experiment.validate()
-    assert not (tmp_path / "invalid").exists()
-
-
-def test_default_wan_descriptor_preserves_legacy_v2_fingerprint(tmp_path):
-    experiment = vr.Experiment(
-        model=vr.models.Wan("/models/wan", world_r1_root="/repos/world-r1"),
-        rollout=vr.rollouts.FullTrajectory(),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.GRPO(),
-        train=vr.Train(),
-        output_dir=tmp_path / "run",
-    )
-    current = experiment.to_config()
-    legacy = json.loads(json.dumps(current))
-    legacy["model"]["extra"].pop("wan_backend", None)
-    explicit_world_r1 = json.loads(json.dumps(current))
-    explicit_world_r1["model"]["extra"]["wan_backend"] = "world_r1"
-
-    assert "wan_backend" not in current["model"]["extra"]
-    assert config_fingerprint(current, {}, version=2) == config_fingerprint(
-        legacy, {}, version=2
-    )
-    assert config_fingerprint(current, {}, version=2) != config_fingerprint(
-        explicit_world_r1, {}, version=2
-    )
-
-
-def test_flash_grpo_descriptor_exposes_compatible_objective_versions():
-    assert vr.objectives.FlashGRPO().to_config()["algorithm"][
-        "objective_version"
-    ] == "legacy"
-    assert vr.objectives.FlashGRPO(objective_version="reference_v1").to_config()[
-        "algorithm"
-    ]["objective_version"] == "reference_v1"
-
-
-@pytest.mark.parametrize(
-    ("objective_version", "beta", "message"),
-    [
-        (
-            "not-a-flash-objective",
-            0.0,
-            "Flash-GRPO objective_version must be one of",
-        ),
-        ("reference_v1", 0.1, "Flash-GRPO reference_v1 requires beta=0"),
-        (
-            "reference_v1",
-            0.0,
-            "Flash-GRPO reference_v1 requires model capability",
-        ),
-    ],
-)
-def test_flash_grpo_static_contract_is_model_independent(
-    tmp_path, objective_version, beta, message
-):
-    experiment = vr.Experiment(
-        model=vr.models.TinyDiffusion(),
-        rollout=vr.rollouts.Flash(),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.FlashGRPO(
-            objective_version=objective_version,
-            beta=beta,
-        ),
-        train=vr.Train(),
-        output_dir=tmp_path / "invalid",
-    )
-
-    with pytest.raises(ValueError, match=message):
-        experiment.validate()
-    assert not (tmp_path / "invalid").exists()
-
-
-def test_python_and_yaml_resolve_to_identical_config_and_fingerprint(tmp_path):
-    experiment = vr.Experiment(
-        model=vr.models.TinyDiffusion(image_size=12),
-        rollout=vr.rollouts.Flash(selected_steps=3),
-        reward=vr.rewards.PromptColor(default_color="blue"),
-        advantage=vr.advantages.GroupNormalize(epsilon=1e-4),
-        objective=vr.objectives.FlashGRPO(clip_range=0.02),
-        train=vr.Train(steps=2, lr=0.05),
-        run_name="equivalent",
-        seed=9,
-        output_dir=tmp_path / "run",
-    )
-
-    values = {
-        "run_name": "equivalent",
-        "seed": 9,
-        "use_lora": True,
-        "paths": {"output_dir": str(tmp_path / "run")},
-    }
-    for descriptor in (
-        experiment.model,
-        experiment.rollout,
-        experiment.reward,
-        experiment.advantage,
-        experiment.objective,
-        experiment.train,
-    ):
-        _deep_merge(values, descriptor.to_config())
-    yaml_path = tmp_path / "equivalent.yaml"
-    yaml_path.write_text(yaml.safe_dump(values, sort_keys=False), encoding="utf-8")
-
-    python_values = experiment.to_config()
-    yaml_values = config_to_dict(load_config(yaml_path))
-    assert python_values == yaml_values
-    assert config_fingerprint(python_values, {}, version=1) == config_fingerprint(
-        yaml_values, {}, version=1
-    )
-
-
-def test_reward_and_objective_are_single_fragment_replacements(tmp_path):
-    base = _mock_experiment(tmp_path / "base").to_config()
-    changed_reward = vr.Experiment(
-        model=vr.models.MockWan(),
-        rollout=vr.rollouts.FullTrajectory(batch_size=1),
-        reward=vr.rewards.PromptColor(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.GRPO(),
-        train=vr.Train(steps=1, lr=1e-3),
-        output_dir=tmp_path / "base",
-        show_progress=False,
-        strict_rollout_validation=True,
-    ).to_config()
-    changed_objective = vr.Experiment(
-        model=vr.models.MockWan(),
-        rollout=vr.rollouts.Flash(),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.FlashGRPO(),
-        train=vr.Train(steps=1, lr=1e-3),
-        output_dir=tmp_path / "base",
-        show_progress=False,
-        strict_rollout_validation=True,
-    ).to_config()
-
-    assert {key for key in base if base[key] != changed_reward[key]} == {"rewards"}
-    assert changed_objective["algorithm"]["name"] == "flash_grpo"
-    assert changed_objective["sample"]["name"] == "single_step"
-
-
-def test_existing_compatibility_validation_rejects_flash_tempflow(tmp_path):
-    experiment = vr.Experiment(
-        model=vr.models.TinyDiffusion(),
-        rollout=vr.rollouts.Flash(),
-        reward=vr.rewards.PromptColor(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.TempFlow(),
-        train=vr.Train(),
-        output_dir=tmp_path / "invalid",
-    )
-    with pytest.raises(ValueError, match="Incompatible config"):
-        experiment.validate()
-    assert not (tmp_path / "invalid").exists()
-
-
-def test_python_api_exposes_precision_microbatch_and_reward_execution(tmp_path):
-    experiment = vr.Experiment(
-        model=vr.models.MockWan(),
-        rollout=vr.rollouts.FullTrajectory(batch_size=1),
-        reward=vr.rewards.Mock(),
-        advantage=vr.advantages.GroupNormalize(),
-        objective=vr.objectives.GRPO(),
-        train=vr.Train(
-            steps=2,
-            precision="bf16",
-            update_microbatch_size=1,
-        ),
-        reward_execution=vr.RewardExecution(
-            mode="async",
-            max_workers=2,
-            microbatch_size=1,
-            timeout_s=2.0,
-            max_in_flight=2,
-            require_hard_timeout=True,
-        ),
-        output_dir=tmp_path / "runtime-api",
-    )
-
-    config = experiment.resolve()
-
-    assert config.train.precision == "bf16"
-    assert config.train.update_microbatch_size == 1
-    assert config.runner.reward_executor.mode == "async"
-    assert config.runner.reward_executor.max_workers == 2
-    assert config.runner.reward_executor.microbatch_size == 1
-    assert config.runner.reward_executor.max_in_flight == 2
-    assert config.runner.reward_executor.require_hard_timeout is True
-    assert not (tmp_path / "runtime-api").exists()
-
-
-def test_reward_execution_defaults_to_full_submitted_batch_sentinel():
-    config = vr.RewardExecution().to_config()["runner"]["reward_executor"]
-
-    assert config["microbatch_size"] is None
-
-
-def test_mock_run_uses_one_runner_and_returns_lightweight_result(tmp_path, monkeypatch):
-    import visual_rl.runner as runner_module
-
-    real_runner = runner_module.ExperimentRunner
-    constructions = 0
-
-    class CountingRunner(real_runner):
-        def __init__(self, config):
-            nonlocal constructions
-            constructions += 1
-            super().__init__(config)
-
-    monkeypatch.setattr(runner_module, "ExperimentRunner", CountingRunner)
-    result = _mock_experiment(tmp_path / "run", run_name="api-mock").run(
-        ["orbit around a small vase"]
-    )
-
-    assert constructions == 1
-    assert isinstance(result, vr.RunResult)
-    assert result.run_id == "api-mock"
-    assert result.completed_steps == 1
-    assert result.latest_checkpoint == result.output_dir / "checkpoint_000001"
-    assert result.latest_checkpoint.is_dir()
-    assert [row["step"] for row in result.iter_metrics()] == [0]
-    assert result.load_manifest().records
-    resolved = json.loads(
-        (result.output_dir / "config.resolved.json").read_text(encoding="utf-8")
-    )
-    assert resolved["dataset"]["prompts"] == ["orbit around a small vase"]
-    with pytest.raises(FrozenInstanceError):
-        result.completed_steps = 2
-
-
-def test_python_api_resume_matches_continuous_run_and_keeps_experiment_immutable(
-    tmp_path,
-):
-    import torch
-
-    prompts = ["orbit around a small vase"]
-    continuous = _mock_experiment(tmp_path / "continuous", steps=2).run(prompts)
-
-    split_dir = tmp_path / "split"
-    first = _mock_experiment(split_dir, steps=1).run(prompts)
-    resume_experiment = _mock_experiment(split_dir, steps=2)
-    before = config_to_dict(resume_experiment.resolve())
-    resumed = resume_experiment.run(
-        prompts,
-        resume_from=first.output_dir / "latest.json",
-    )
-
-    assert config_to_dict(resume_experiment.resolve()) == before
-    assert resume_experiment.resolve().paths.resume_from is None
-    continuous_rows = list(continuous.iter_metrics())
-    resumed_rows = list(resumed.iter_metrics())
-    assert [row["step"] for row in continuous_rows] == [0, 1]
-    assert [row["step"] for row in resumed_rows] == [0, 1]
-    for name in ("loss", "reward_mean", "approx_kl", "clipfrac"):
-        assert resumed_rows[1][name] == continuous_rows[1][name]
-    continuous_state = torch.load(
-        continuous.latest_checkpoint / "mock_adapter.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    resumed_state = torch.load(
-        resumed.latest_checkpoint / "mock_adapter.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    assert torch.equal(resumed_state["policy_bias"], continuous_state["policy_bias"])
-
-
-def test_python_api_rejects_tampered_resume_before_model_or_output_side_effects(
-    tmp_path, monkeypatch
-):
-    prompts = ["orbit around a small vase"]
-    source = _mock_experiment(tmp_path / "source").run(prompts)
-    adapter_state = source.latest_checkpoint / "mock_adapter.pt"
-    adapter_state.write_bytes(adapter_state.read_bytes() + b"tampered")
-
-    from visual_rl.model_adapters.mock import MockWanAdapter
-
-    model_calls = 0
-
-    def fail_model_init(self, config):
-        del self, config
-        nonlocal model_calls
-        model_calls += 1
-        raise AssertionError("resume validation instantiated a model")
-
-    monkeypatch.setattr(MockWanAdapter, "__init__", fail_model_init)
-    output_dir = tmp_path / "must-not-exist"
-    experiment = _mock_experiment(output_dir, steps=2)
-    from visual_rl.preflight import ResumePreflightError
-    from visual_rl.runner import ResumeError
-
-    with pytest.raises(ResumeError, match="recover resume-source"):
-        experiment.run(prompts, resume_from=tmp_path / "missing" / "latest.json")
-    with pytest.raises(
-        (ResumeError, ResumePreflightError),
-        match="SHA256 mismatch|recover resume-source",
-    ):
-        experiment.run(prompts, resume_from=source.output_dir / "latest.json")
-
-    assert model_calls == 0
-    assert not output_dir.exists()
+    assert isinstance(status, RunStatus) and status.ok and status.resumable
+    assert status.authoritative_checkpoint == root / "checkpoint_000002"
+    assert isinstance(audit, AuditReport) and audit.ok
+    assert audit.checked_commit_count == 2
+    assert audit.checked_artifact_paths[0] == root / "commits/commit_000001.json"

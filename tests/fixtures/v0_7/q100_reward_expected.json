@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "expectations": {
+    "algorithm_count": 4,
+    "row_count": 3600,
+    "rows_per_algorithm": 900,
+    "rows_per_seed": 300,
+    "step_count": 100,
+    "theil_sen_pair_count": 4950,
+    "all_evidence_complete": true,
+    "all_reward_pass": true,
+    "positive_seed_count": 3,
+    "pooled_delta": 0.128,
+    "theil_sen_slope": 0.002
+  }
+}

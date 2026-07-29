@@ -39,6 +39,17 @@ experiments/**/remote_results/
 experiments/**/*.lock
 experiments/**/*.pid
 
+# v0.7 fixed-suite generated outputs and real evidence. Keep the curated
+# evidence README and q100_inputs.json tracked.
+experiments/v0_7/runs/
+experiments/v0_7/reward_cache/
+experiments/v0_7/evidence/environment.jsonl
+experiments/v0_7/evidence/flow_native.json
+experiments/v0_7/evidence/mg1_internal.json
+experiments/v0_7/evidence/q100_reward_rows.jsonl
+experiments/v0_7/evidence/q100_source_status.json
+experiments/v0_7/evidence/role_results.json
+
 # Locally generated research prompt splits. Regenerate them with the dataset
 # preparation script after checking upstream redistribution terms.
 data/prompts/tempflow_real_rgb_v*/

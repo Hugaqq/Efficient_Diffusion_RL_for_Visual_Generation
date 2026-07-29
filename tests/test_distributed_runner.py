@@ -1,313 +1,226 @@
-"""CPU/gloo integration coverage for the native distributed ExperimentRunner."""
+"""Two-rank CPU/Gloo integration for the one shared Runner lifecycle."""
 
 from __future__ import annotations
 
-import copy
 import json
+import multiprocessing
 import os
-import queue
-import socket
-import time
-import traceback
-from multiprocessing.context import SpawnContext
 from pathlib import Path
+import queue
+import shutil
+import socket
+import tempfile
+import time
 from typing import Any
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+import yaml
 
-from visual_rl.artifacts import ArtifactManager
-from visual_rl.configs.schema import VisualRLConfig
-from visual_rl.distributed import DistributedFailureError
-import visual_rl.runner as runner_module
-from visual_rl.runner import ExperimentRunner, ResumeError
+
+ROOT = Path(__file__).resolve().parents[1]
+TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _config(
-    output_dir: str | Path,
+    tmp_path: Path,
     *,
-    steps: int,
-    resume_from: str | Path | None = None,
-    deterministic_run_dir: bool = True,
-) -> VisualRLConfig:
-    config = VisualRLConfig(run_name="distributed-runner")
-    config.paths.output_dir = str(output_dir)
-    config.paths.resume_from = None if resume_from is None else str(resume_from)
-    config.dataset.prompts = [f"prompt-{index}" for index in range(8)]
-    config.model.latent_shape = [1, 1, 1, 1]
-    config.model.media_shape = [1, 3, 2, 2]
-    config.sample.batch_size = 1
-    config.sample.samples_per_prompt = 2
-    config.sample.num_steps = 1
-    config.train.max_steps = steps
-    config.train.save_every = 1
-    config.train.learning_rate = 1e-2
-    config.runner.show_progress = False
-    config.runner.strict_rollout_validation = True
-    config.runner.deterministic_run_dir = deterministic_run_dir
-    config.runner.distributed.backend = "gloo"
-    config.runner.distributed.device = "cpu"
-    config.runner.distributed.timeout_s = 5.0
-    return config
+    name: str,
+    max_steps: int,
+    resume: bool,
+    preview_samples_per_event: int = 0,
+) -> Path:
+    payload = yaml.safe_load(TINY.read_text(encoding="utf-8"))
+    output_dir = (tmp_path / name).resolve()
+    payload["runtime"]["max_steps"] = max_steps
+    payload["runtime"]["distributed"]["mode"] = "ddp"
+    payload["runtime"]["distributed"]["device"] = "cpu"
+    payload["runtime"]["distributed"]["timeout_s"] = 30.0
+    payload["runtime"]["distributed"]["max_snapshot_tensor_bytes"] = 1 << 20
+    payload["artifacts"]["output_dir"] = str(output_dir)
+    payload["artifacts"]["checkpoint_every"] = 1
+    payload["artifacts"]["preview_samples_per_event"] = (
+        preview_samples_per_event
+    )
+    payload["resume"]["from"] = str(output_dir) if resume else None
+    path = tmp_path / f"{name}-{max_steps}-{int(resume)}.yaml"
+    path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
 
 
-def _free_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def _state_equal(left: Any, right: Any) -> bool:
-    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
-        return torch.equal(left, right)
-    if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(
-            _state_equal(left[key], right[key]) for key in left
-        )
-    if isinstance(left, (list, tuple)) and isinstance(right, type(left)):
-        return len(left) == len(right) and all(
-            _state_equal(a, b) for a, b in zip(left, right, strict=True)
-        )
-    return left == right
-
-
-def _runner_worker(
+def _worker(
     rank: int,
-    ports: tuple[int, int, int],
-    output_base: str,
-    failure_output: str,
-    results: Any,
+    config_path: str,
+    port: int,
+    output: Any,
+    failure_rank: int | None,
+    preview_failure_rank: int | None,
 ) -> None:
-    commit_calls = 0
-    trigger_decision_writes = 0
-    original_commit = ArtifactManager.commit
-    original_save_json = runner_module.save_json
-
-    def counted_commit(self, *args, **kwargs):
-        nonlocal commit_calls
-        commit_calls += 1
-        return original_commit(self, *args, **kwargs)
-
-    ArtifactManager.commit = counted_commit
-
-    def counted_save_json(path, data):
-        nonlocal trigger_decision_writes
-        if Path(path).name == "trigger_decision.json":
-            trigger_decision_writes += 1
-        return original_save_json(path, data)
-
-    runner_module.save_json = counted_save_json
     try:
-        os.environ.update(
-            RANK=str(rank),
-            LOCAL_RANK=str(rank),
-            WORLD_SIZE="2",
-            MASTER_ADDR="127.0.0.1",
-            MASTER_PORT=str(ports[0]),
+        import visual_rl as vr
+        from visual_rl.core.types import FrozenMapping, ValidatedRuntimeEnv
+        from visual_rl.runner import ExperimentRunner
+
+        config = vr.load(config_path).resolve()
+        if rank == preview_failure_rank:
+            from visual_rl.artifacts.preview import PreviewWriter
+
+            def fail_preview(_value, _destination):
+                raise RuntimeError("injected rank-zero preview failure")
+
+            PreviewWriter._write_image = staticmethod(fail_preview)
+        if rank == failure_rank:
+            import visual_rl.runtime_factory as runtime_factory
+
+            original_build = runtime_factory.build_runtime_components
+
+            def build_with_reward_failure(config, context):
+                components = original_build(config, context)
+
+                def fail_reward(_batch, _step_context):
+                    raise RuntimeError("injected rank-one reward failure")
+
+                components.reward_executor.score = fail_reward
+                return components
+
+            runtime_factory.build_runtime_components = build_with_reward_failure
+        environment = ValidatedRuntimeEnv(
+            mode="ddp",
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+            local_world_size=2,
+            group_rank=0,
+            group_world_size=1,
+            master_addr="127.0.0.1",
+            master_port=port,
+            visible_gpu_count=0,
+            raw_launch_env=FrozenMapping({}),
         )
-
-        first = ExperimentRunner(
-            _config(output_base, steps=1, deterministic_run_dir=False)
-        )
-        first_groups: list[str] = []
-        original_sample = first.rollout.sample
-
-        def record_first(*args, **kwargs):
-            batch = original_sample(*args, **kwargs)
-            first_groups.extend(batch.group_id)
-            return batch
-
-        first.rollout.sample = record_first
-        first_metrics = first.run()
-        first_parameter = float(first.adapter.policy_bias.detach().cpu())
-        actual_output = str(first.output_dir)
-
-        first_manifest_count = None
-        first_manifest_ranks = None
-        checkpoint_ranks = None
-        if rank == 0:
-            first_manifest = json.loads(
-                (first.output_dir / "sample_manifest.json").read_text(encoding="utf-8")
-            )["records"]
-            first_manifest_count = len(first_manifest)
-            first_manifest_ranks = [
-                int(record["sample_id"].split("-rank-")[1][:4])
-                for record in first_manifest
-            ]
-            checkpoint = torch.load(
-                first.output_dir / "checkpoint_000001" / "training_state.pt",
-                map_location="cpu",
-                weights_only=True,
-            )
-            checkpoint_ranks = [
-                entry["rank"] for entry in checkpoint["distributed_state"]["entries"]
-            ]
-
-        os.environ["MASTER_PORT"] = str(ports[1])
-        resumed = ExperimentRunner(
-            _config(
-                actual_output,
-                steps=2,
-                resume_from=Path(actual_output) / "latest.json",
-            )
-        )
-        resumed_groups: list[str] = []
-        resumed_sample = resumed.rollout.sample
-
-        def record_resumed(*args, **kwargs):
-            batch = resumed_sample(*args, **kwargs)
-            resumed_groups.extend(batch.group_id)
-            return batch
-
-        resumed.rollout.sample = record_resumed
-        resumed_metrics = resumed.run()
-        resumed_parameter = float(resumed.adapter.policy_bias.detach().cpu())
-
-        final_manifest_count = None
-        latest_step = None
-        if rank == 0:
-            final_manifest_count = len(
-                json.loads(
-                    (resumed.output_dir / "sample_manifest.json").read_text(
-                        encoding="utf-8"
-                    )
-                )["records"]
-            )
-            latest_step = json.loads(
-                (resumed.output_dir / "latest.json").read_text(encoding="utf-8")
-            )["step"]
-
-        os.environ["MASTER_PORT"] = str(ports[2])
-        failing = ExperimentRunner(_config(failure_output, steps=1))
-        parameters = [
-            parameter.detach().clone() for parameter in failing.adapter.parameters()
-        ]
-        optimizer_state = copy.deepcopy(failing.optimizer.state_dict())
-        rollback_probe = {"value": 0}
-        original_plugin_state_dict = failing.optimizer_plugin.state_dict
-        original_plugin_load_state_dict = failing.optimizer_plugin.load_state_dict
-
-        def plugin_state_dict():
-            return {
-                **original_plugin_state_dict(),
-                "rollback_probe": rollback_probe["value"],
+        runner = ExperimentRunner(config, environment)
+        result = runner.run()
+        output.put(
+            {
+                "rank": rank,
+                "ok": True,
+                "run_id": result.run_id,
+                "committed_steps": result.committed_steps,
+                "checkpoint": result.authoritative_checkpoint.name,
+                "last_metrics": dict(result.last_metrics),
+                "owned_artifact_manager": runner.artifact_manager is not None,
             }
-
-        def plugin_load_state_dict(state):
-            restored = dict(state)
-            rollback_probe["value"] = int(restored.pop("rollback_probe"))
-            original_plugin_load_state_dict(restored)
-
-        def bypass_atomic_callback(
-            *,
-            adapter,
-            optimizer,
-            **_kwargs,
-        ):
-            rollback_probe["value"] += 1
-            for parameter in adapter.parameters():
-                parameter.grad = torch.ones_like(parameter)
-            result = optimizer.step()
-            return {
-                f"rank_{rank}_only_metric": float(result or 0.0),
-                "loss": 0.0,
+        )
+    except BaseException as exc:
+        output.put(
+            {
+                "rank": rank,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
             }
+        )
 
-        failing.optimizer_plugin.state_dict = plugin_state_dict
-        failing.optimizer_plugin.load_state_dict = plugin_load_state_dict
-        failing.optimizer_plugin.step = bypass_atomic_callback
+
+def _exception_chain(exc: BaseException) -> tuple[str, ...]:
+    values = []
+    current: BaseException | None = exc
+    while current is not None:
+        values.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__
+    return tuple(values)
+
+
+def _public_post_marker_worker(
+    rank: int,
+    config_path: str,
+    port: int,
+    output: Any,
+    method_name: str,
+    phase: str,
+) -> None:
+    os.environ.update(
+        {
+            "RANK": str(rank),
+            "LOCAL_RANK": str(rank),
+            "WORLD_SIZE": "2",
+            "LOCAL_WORLD_SIZE": "2",
+            "GROUP_RANK": "0",
+            "GROUP_WORLD_SIZE": "1",
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+        }
+    )
+    try:
+        import visual_rl as vr
+        from visual_rl.artifacts.manager import ArtifactManager
+        from visual_rl.errors import ArtifactError
+
+        original = getattr(ArtifactManager, method_name)
+
+        def fail_after_marker(
+            manager: ArtifactManager,
+            *args,
+            **kwargs,
+        ) -> None:
+            if method_name == "rebuild_projections" and manager.head is None:
+                original(manager, *args, **kwargs)
+                return
+            raise ArtifactError(
+                f"injected distributed post-marker {phase} failure"
+            )
+
+        setattr(ArtifactManager, method_name, fail_after_marker)
         try:
-            failing.run()
-        except DistributedFailureError as exc:
-            failure_error = str(exc)
-        else:
-            raise AssertionError("rank-divergent result contract was not rejected")
-        parameters_restored = all(
-            torch.equal(parameter.detach(), before)
-            for parameter, before in zip(
-                failing.adapter.parameters(),
-                parameters,
-                strict=True,
-            )
+            vr.load(config_path).run()
+        finally:
+            setattr(ArtifactManager, method_name, original)
+        output.put(
+            {
+                "rank": rank,
+                "ok": False,
+                "error": "public DDP run unexpectedly succeeded",
+            }
         )
-        optimizer_restored = _state_equal(
-            failing.optimizer.state_dict(),
-            optimizer_state,
-        )
-        plugin_state_restored = rollback_probe["value"] == 0
-        failure_commit_exists = rank == 0 and any(
-            (failing.output_dir / "commits").glob("commit_*.json")
+    except BaseException as exc:
+        output.put(
+            {
+                "rank": rank,
+                "ok": True,
+                "error_type": type(exc).__name__,
+                "chain": _exception_chain(exc),
+            }
         )
 
-        results.put(
-            (
-                "ok",
-                {
-                    "rank": rank,
-                    "actual_output": actual_output,
-                    "first_groups": sorted(set(first_groups)),
-                    "resumed_groups": sorted(set(resumed_groups)),
-                    "first_metrics": first_metrics,
-                    "resumed_metrics": resumed_metrics,
-                    "first_parameter": first_parameter,
-                    "resumed_parameter": resumed_parameter,
-                    "first_manifest_count": first_manifest_count,
-                    "first_manifest_ranks": first_manifest_ranks,
-                    "final_manifest_count": final_manifest_count,
-                    "checkpoint_ranks": checkpoint_ranks,
-                    "latest_step": latest_step,
-                    "global_step": resumed.global_step,
-                    "commit_calls": commit_calls,
-                    "trigger_decision_writes": trigger_decision_writes,
-                    "failure_error": failure_error,
-                    "failure_commit_exists": failure_commit_exists,
-                    "failure_parameters_restored": parameters_restored,
-                    "failure_optimizer_restored": optimizer_restored,
-                    "failure_plugin_state_restored": plugin_state_restored,
-                    "reward_cache": str(
-                        Path(actual_output) / "reward_cache" / f"rank_{rank:04d}"
-                    ),
-                    "rollout_cache": str(
-                        Path(actual_output) / "rollouts" / f"rank_{rank:04d}"
-                    ),
-                },
-            )
-        )
-    except BaseException:
-        results.put(("error", traceback.format_exc()))
-    finally:
-        ArtifactManager.commit = original_commit
-        runner_module.save_json = original_save_json
 
-
-@pytest.mark.skipif(
-    not dist.is_available() or not dist.is_gloo_available(),
-    reason="PyTorch gloo distributed backend is unavailable",
-)
-@pytest.mark.distributed
-def test_two_rank_runner_resume_artifacts_metrics_and_failure(tmp_path) -> None:
-    started = time.monotonic()
-    deadline = started + 12.0
-    context: SpawnContext = mp.get_context("spawn")
-    results = context.Queue()
-    ports: list[int] = []
-    while len(ports) < 3:
-        candidate = _free_loopback_port()
-        if candidate not in ports:
-            ports.append(candidate)
-    output_base = tmp_path / "nondeterministic"
-    failure_output = tmp_path / "failure"
+def _run_two_ranks(
+    config: Path,
+    port: int,
+    *,
+    failure_rank: int | None = None,
+    preview_failure_rank: int | None = None,
+    expect_failure: bool = False,
+) -> list[dict[str, Any]]:
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
     processes = [
         context.Process(
-            target=_runner_worker,
+            target=_worker,
             args=(
                 rank,
-                tuple(ports),
-                str(output_base),
-                str(failure_output),
-                results,
+                str(config),
+                port,
+                output,
+                failure_rank,
+                preview_failure_rank,
             ),
         )
         for rank in range(2)
@@ -315,95 +228,464 @@ def test_two_rank_runner_resume_artifacts_metrics_and_failure(tmp_path) -> None:
     for process in processes:
         process.start()
     for process in processes:
-        process.join(timeout=max(0.0, deadline - time.monotonic()))
-    for process in processes:
+        process.join(timeout=45)
         if process.is_alive():
             process.terminate()
-            process.join(timeout=1)
-            pytest.fail("2-rank distributed runner integration timed out")
+            process.join(timeout=5)
+            pytest.fail("two-rank Runner worker timed out")
         assert process.exitcode == 0
 
-    received = []
+    rows = []
     for _ in range(2):
         try:
-            status, payload = results.get(timeout=1)
+            rows.append(output.get(timeout=5))
         except queue.Empty:
-            pytest.fail("distributed runner worker returned no result")
-        assert status == "ok", payload
-        received.append(payload)
-    by_rank = {payload["rank"]: payload for payload in received}
+            pytest.fail("two-rank Runner worker returned no result")
+    rows.sort(key=lambda row: row["rank"])
+    assert [row["rank"] for row in rows] == [0, 1]
+    assert all(row["ok"] is not expect_failure for row in rows), rows
+    return rows
 
-    assert set(by_rank) == {0, 1}
-    assert by_rank[0]["actual_output"] == by_rank[1]["actual_output"]
-    assert by_rank[0]["first_groups"] != by_rank[1]["first_groups"]
-    assert all(len(payload["first_groups"]) == 1 for payload in by_rank.values())
-    assert by_rank[0]["first_parameter"] == pytest.approx(by_rank[1]["first_parameter"])
-    assert by_rank[0]["resumed_parameter"] == pytest.approx(
-        by_rank[1]["resumed_parameter"]
+
+def _run_public_post_marker_failure(
+    config: Path,
+    port: int,
+    *,
+    method_name: str,
+    phase: str,
+) -> list[dict[str, Any]]:
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    processes = [
+        context.Process(
+            target=_public_post_marker_worker,
+            args=(
+                rank,
+                str(config),
+                port,
+                output,
+                method_name,
+                phase,
+            ),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=45)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("public post-marker DDP worker timed out")
+        assert process.exitcode == 0
+
+    rows = []
+    for _ in processes:
+        try:
+            rows.append(output.get(timeout=5))
+        except queue.Empty:
+            pytest.fail("public post-marker DDP worker returned no result")
+    rows.sort(key=lambda row: row["rank"])
+    assert [row["rank"] for row in rows] == [0, 1]
+    return rows
+
+
+def _normalized_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["run_id"] = "<run>"
+    for record in payload["records"]:
+        record["run_id"] = "<run>"
+    return payload
+
+
+def _metric_rows(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def _nccl_torchrun_rank() -> int:
+    required = (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
     )
-    assert by_rank[0]["first_metrics"] == by_rank[1]["first_metrics"]
-    assert by_rank[0]["resumed_metrics"] == by_rank[1]["resumed_metrics"]
-    assert by_rank[0]["first_metrics"][0]["sample_count"] == 4
-    assert by_rank[0]["first_metrics"][0]["reward_executor_attempts"] == 2
-    assert by_rank[0]["first_metrics"][0]["reward_executor_shards"] == 2
-    assert by_rank[0]["first_metrics"][0]["peak_rollback_snapshot_tensor_bytes"] > 0
-    assert by_rank[0]["first_metrics"][0]["rollback_snapshot_capture_time_s"] >= 0
-    assert by_rank[0]["first_manifest_count"] == 4
-    assert by_rank[0]["first_manifest_ranks"] == [0, 0, 1, 1]
-    assert by_rank[0]["final_manifest_count"] == 8
-    assert by_rank[0]["checkpoint_ranks"] == [0, 1]
-    assert by_rank[0]["latest_step"] == 2
-    assert all(payload["global_step"] == 2 for payload in by_rank.values())
-    assert by_rank[0]["commit_calls"] == 2
-    assert by_rank[1]["commit_calls"] == 0
-    assert by_rank[0]["trigger_decision_writes"] == 3
-    assert by_rank[1]["trigger_decision_writes"] == 0
-    assert all(Path(payload["reward_cache"]).is_dir() for payload in by_rank.values())
-    assert all(Path(payload["rollout_cache"]).is_dir() for payload in by_rank.values())
-    assert all(
-        "result contracts must match on every rank" in payload["failure_error"]
-        for payload in by_rank.values()
-    )
-    assert all(payload["failure_parameters_restored"] for payload in by_rank.values())
-    assert all(payload["failure_optimizer_restored"] for payload in by_rank.values())
-    assert all(payload["failure_plugin_state_restored"] for payload in by_rank.values())
-    assert by_rank[0]["failure_commit_exists"] is False
-
-    single_resume = _config(
-        by_rank[0]["actual_output"],
-        steps=3,
-        resume_from=Path(by_rank[0]["actual_output"]) / "latest.json",
-    )
-    with pytest.raises(ResumeError, match="world size changed"):
-        ExperimentRunner(single_resume)
-    assert time.monotonic() - started < 12.0
+    if any(name not in os.environ for name in required):
+        pytest.skip("requires a complete two-rank torchrun environment")
+    if not dist.is_available() or not dist.is_nccl_available():
+        pytest.skip("requires a PyTorch build with NCCL")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible CUDA devices")
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    except ValueError as exc:
+        pytest.skip(f"requires integer torchrun topology values: {exc}")
+    if (
+        world_size != 2
+        or local_world_size != 2
+        or rank not in (0, 1)
+        or local_rank not in (0, 1)
+        or local_rank >= torch.cuda.device_count()
+    ):
+        pytest.skip(
+            "requires one single-node two-rank torchrun process per visible GPU"
+        )
+    return rank
 
 
-@pytest.mark.parametrize("field", ["split_roles", "fsdp2"])
-def test_invalid_conditional_scaling_closes_before_model_or_output(
-    tmp_path,
-    monkeypatch,
-    field,
+def _wait_for_path(path: Path, *, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {path.name}")
+        time.sleep(0.05)
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_two_rank_gloo_shares_lifecycle_rank_zero_writes_and_resume(
+    tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path / "must-not-exist", steps=1)
-    setattr(config.runner.conditional_scaling, field, True)
-    calls = {"distributed_context": 0, "model": 0}
-
-    def record_distributed_context(*_args, **_kwargs):
-        calls["distributed_context"] += 1
-        raise AssertionError("distributed setup must not run")
-
-    def record_model(*_args, **_kwargs):
-        calls["model"] += 1
-        raise AssertionError("model lookup must not run")
-
-    monkeypatch.setattr(
-        runner_module.DistributedContext, "from_env", record_distributed_context
+    first = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="split",
+            max_steps=1,
+            resume=False,
+        ),
+        _free_port(),
     )
-    monkeypatch.setattr(runner_module.MODEL_ADAPTERS, "get", record_model)
+    resumed = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="split",
+            max_steps=2,
+            resume=True,
+        ),
+        _free_port(),
+    )
+    continuous = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="continuous",
+            max_steps=2,
+            resume=False,
+        ),
+        _free_port(),
+    )
 
-    with pytest.raises(ValueError, match=field):
-        ExperimentRunner(config)
+    assert {row["run_id"] for row in first} == {
+        row["run_id"] for row in resumed
+    }
+    assert [row["owned_artifact_manager"] for row in first] == [True, False]
+    assert [row["owned_artifact_manager"] for row in resumed] == [True, False]
+    assert all(row["committed_steps"] == 1 for row in first)
+    assert all(row["committed_steps"] == 2 for row in resumed)
+    assert all(row["checkpoint"] == "checkpoint_000002" for row in resumed)
+    assert first[0]["last_metrics"] == first[1]["last_metrics"]
+    assert resumed[0]["last_metrics"] == resumed[1]["last_metrics"]
+    assert continuous[0]["last_metrics"] == continuous[1]["last_metrics"]
+    assert resumed[0]["last_metrics"] == continuous[0]["last_metrics"]
+    assert resumed[0]["last_metrics"]["sample_count"] == 8
 
-    assert calls == {"distributed_context": 0, "model": 0}
-    assert not Path(config.paths.output_dir).exists()
+    split_dir = tmp_path / "split"
+    continuous_dir = tmp_path / "continuous"
+    commits = sorted((split_dir / "commits").glob("commit_*.json"))
+    assert [path.name for path in commits] == [
+        "commit_000001.json",
+        "commit_000002.json",
+    ]
+    assert (split_dir / "checkpoint_000002").is_dir()
+    manifest = json.loads(
+        (split_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    )
+    assert len(manifest["records"]) == 16
+    assert {record["rank"] for record in manifest["records"]} == {0, 1}
+    assert len({record["sample_id"] for record in manifest["records"]}) == 16
+    from visual_rl.artifacts.checkpoint import checkpoint_tree_sha256
+
+    assert checkpoint_tree_sha256(
+        split_dir / "checkpoint_000002"
+    ) == checkpoint_tree_sha256(
+        continuous_dir / "checkpoint_000002"
+    )
+    assert _normalized_manifest(
+        split_dir / "sample_manifest.json"
+    ) == _normalized_manifest(
+        continuous_dir / "sample_manifest.json"
+    )
+    assert _metric_rows(split_dir / "metrics.jsonl") == _metric_rows(
+        continuous_dir / "metrics.jsonl"
+    )
+
+    import visual_rl as vr
+
+    status = vr.inspect_run(split_dir)
+    audit = vr.audit_run(split_dir)
+    assert status.ok and status.committed_steps == 2
+    assert audit.ok and audit.checked_commit_count == 2
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_two_rank_preview_phase_writes_only_rank_zero_bounded_media(
+    tmp_path: Path,
+) -> None:
+    _run_two_ranks(
+        _config(
+            tmp_path,
+            name="preview",
+            max_steps=1,
+            resume=False,
+            preview_samples_per_event=2,
+        ),
+        _free_port(),
+    )
+
+    output_dir = tmp_path / "preview"
+    preview_files = tuple(sorted((output_dir / "previews").rglob("*.jpg")))
+    assert [path.relative_to(output_dir).as_posix() for path in preview_files] == [
+        "previews/step_000000/rank_0/sample_000000.jpg",
+        "previews/step_000000/rank_0/sample_000001.jpg",
+    ]
+    manifest = json.loads(
+        (output_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    )
+    with_media = [
+        record for record in manifest["records"] if record["media_path"] is not None
+    ]
+    assert len(with_media) == 2
+    assert {record["rank"] for record in with_media} == {0}
+    assert all(record["rollout_cache_path"] is None for record in manifest["records"])
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_rank_zero_preview_failure_does_not_desynchronize_commit(
+    tmp_path: Path,
+) -> None:
+    rows = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="preview-failure",
+            max_steps=1,
+            resume=False,
+            preview_samples_per_event=2,
+        ),
+        _free_port(),
+        preview_failure_rank=0,
+    )
+
+    assert all(row["committed_steps"] == 1 for row in rows)
+    output_dir = tmp_path / "preview-failure"
+    assert not tuple(output_dir.rglob("*.jpg"))
+    manifest = json.loads(
+        (output_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    )
+    assert all(record["media_path"] is None for record in manifest["records"])
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_rank_one_pre_update_failure_aborts_both_ranks_without_commit(
+    tmp_path: Path,
+) -> None:
+    rows = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="failure",
+            max_steps=1,
+            resume=False,
+        ),
+        _free_port(),
+        failure_rank=1,
+        expect_failure=True,
+    )
+
+    assert all("injected rank-one reward failure" in row["error"] for row in rows)
+    output_dir = tmp_path / "failure"
+    assert not list((output_dir / "commits").glob("commit_*.json"))
+    assert not list(output_dir.glob("checkpoint_*"))
+    assert list((output_dir / ".staging").iterdir()) == []
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+@pytest.mark.parametrize(
+    ("method_name", "phase"),
+    (
+        ("rebuild_projections", "projection"),
+        ("cleanup_published_staging", "cleanup"),
+        ("apply_checkpoint_retention", "retention"),
+    ),
+)
+def test_two_rank_public_post_marker_failure_is_run_error_with_head_preserved(
+    tmp_path: Path,
+    method_name: str,
+    phase: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        name=f"post-marker-ddp-{phase}",
+        max_steps=1,
+        resume=False,
+    )
+    rows = _run_public_post_marker_failure(
+        config,
+        _free_port(),
+        method_name=method_name,
+        phase=phase,
+    )
+
+    assert all(row["ok"] for row in rows), rows
+    assert [row["error_type"] for row in rows] == ["RunError", "RunError"]
+    assert all(
+        any(
+            f"injected distributed post-marker {phase} failure" in item
+            for item in row["chain"]
+        )
+        for row in rows
+    )
+    output_dir = tmp_path / f"post-marker-ddp-{phase}"
+    assert (output_dir / "commits" / "commit_000001.json").is_file()
+    assert (output_dir / "checkpoint_000001").is_dir()
+
+    import visual_rl as vr
+
+    status = vr.inspect_run(output_dir)
+    assert status.committed_steps == 1
+    assert status.authoritative_checkpoint == output_dir / "checkpoint_000001"
+
+
+@pytest.mark.distributed
+def test_nccl_root_commit_failure_synchronizes() -> None:
+    """Run one real torchrun/NCCL root-only pre-marker commit failure."""
+
+    rank = _nccl_torchrun_rank()
+    master_port = int(os.environ["MASTER_PORT"])
+    root = (
+        Path(tempfile.gettempdir()).resolve()
+        / f"visualrl-nccl-root-commit-{os.getuid()}-{master_port}"
+    )
+    ready = root / "ready"
+    if rank == 0:
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(mode=0o700, parents=True)
+        ready.write_text("ready\n", encoding="utf-8")
+    else:
+        _wait_for_path(ready, timeout_s=30.0)
+
+    payload = yaml.safe_load(TINY.read_text(encoding="utf-8"))
+    output_dir = root / "run"
+    payload["runtime"]["max_steps"] = 1
+    payload["runtime"]["distributed"]["mode"] = "ddp"
+    payload["runtime"]["distributed"]["device"] = "cuda"
+    payload["runtime"]["distributed"]["timeout_s"] = 30.0
+    payload["runtime"]["distributed"]["max_snapshot_tensor_bytes"] = 1 << 20
+    payload["artifacts"]["output_dir"] = str(output_dir)
+    payload["artifacts"]["checkpoint_every"] = 1
+    payload["resume"]["from"] = None
+    config = root / f"config-rank-{rank}.yaml"
+    config.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    import visual_rl as vr
+    from visual_rl.artifacts.manager import ArtifactManager
+    from visual_rl.errors import ArtifactError, RunError
+
+    original = ArtifactManager.commit
+
+    def fail_before_marker(self, transaction, *, checkpoint_path):
+        del self, transaction, checkpoint_path
+        raise ArtifactError("injected rank-zero pre-marker commit failure")
+
+    ArtifactManager.commit = fail_before_marker
+    caught: BaseException | None = None
+    try:
+        vr.load(config).run()
+    except BaseException as exc:
+        caught = exc
+    finally:
+        ArtifactManager.commit = original
+
+    assert isinstance(caught, RunError)
+    chain = _exception_chain(caught)
+    assert any(
+        "injected rank-zero pre-marker commit failure" in item
+        for item in chain
+    )
+    result_path = root / f"result-rank-{rank}.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "rank": rank,
+                "error_type": type(caught).__name__,
+                "injected_failure_observed": any(
+                    "injected rank-zero pre-marker commit failure" in item
+                    for item in chain
+                ),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    if rank == 0:
+        rank_paths = tuple(root / f"result-rank-{item}.json" for item in range(2))
+        for path in rank_paths:
+            _wait_for_path(path, timeout_s=30.0)
+        results = tuple(
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in rank_paths
+        )
+        assert [item["rank"] for item in results] == [0, 1]
+        assert all(item["error_type"] == "RunError" for item in results)
+        assert all(item["injected_failure_observed"] for item in results)
+        assert not list((output_dir / "commits").glob("commit_*.json"))
+        assert not list(output_dir.glob("checkpoint_*"))
+        assert list((output_dir / ".staging").iterdir()) == []
+        status = vr.inspect_run(output_dir)
+        assert status.committed_steps == 0
+        sentinel = {
+            "nodeid": (
+                "tests/test_distributed_runner.py::"
+                "test_nccl_root_commit_failure_synchronizes"
+            ),
+            "world_size": 2,
+            "ranks_entered": [0, 1],
+            "ranks_exited": [0, 1],
+            "marker_advanced": False,
+            "passed": True,
+        }
+        print(
+            "VISUALRL_NCCL_RESULT="
+            + json.dumps(sentinel, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
