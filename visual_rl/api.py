@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from pathlib import Path
 import threading
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import yaml
 
 from visual_rl.api_types import AuditReport, RunResult, RunStatus, ValidationReport
+from visual_rl.callbacks import Callback, _normalize_callbacks
 from visual_rl.configs.resolver import resolve_config
 from visual_rl.configs.schema import VisualRLConfig
 from visual_rl.core.types import (
@@ -97,7 +98,9 @@ class _Experiment:
         _factory_token: object,
     ) -> None:
         if _factory_token is not _EXPERIMENT_TOKEN:
-            raise TypeError("Experiment handles can only be created by visual_rl.load()")
+            raise TypeError(
+                "Experiment handles can only be created by visual_rl.load()"
+            )
         self._raw_snapshot = raw_snapshot
         self._context = context
         self._config: VisualRLConfig | None = None
@@ -137,9 +140,7 @@ class _Experiment:
         )
         if not isinstance(report, ValidationReport):
             raise TypeError("run_preflight() must return a ValidationReport")
-        if runtime_env is not None and not isinstance(
-            runtime_env, ValidatedRuntimeEnv
-        ):
+        if runtime_env is not None and not isinstance(runtime_env, ValidatedRuntimeEnv):
             raise TypeError(
                 "run_preflight() runtime snapshot must be ValidatedRuntimeEnv or None"
             )
@@ -147,13 +148,18 @@ class _Experiment:
         self._runtime_env = runtime_env
         return report
 
-    def run(self) -> RunResult:
+    def run(
+        self,
+        *,
+        callbacks: Sequence[Callback] = (),
+    ) -> RunResult:
         # The claim is deliberately the first state-changing operation. Every
         # first run attempt, including validation failure, consumes the handle.
         with self._run_lock:
             if self._run_claimed:
                 raise RunError("This experiment handle has already attempted run()")
             self._run_claimed = True
+        callbacks_tuple = _normalize_callbacks(callbacks)
 
         report = self.validate()
         if self._config is None:
@@ -186,10 +192,14 @@ class _Experiment:
         from visual_rl.runner import ExperimentRunner
 
         try:
-            result = ExperimentRunner(config, runtime_env).run()
+            result = ExperimentRunner(
+                config,
+                runtime_env,
+                callbacks=callbacks_tuple,
+            ).run()
         except VisualRLError:
             raise
-        except BaseException as exc:
+        except Exception as exc:
             raise RunError("Experiment execution failed") from exc
         if not isinstance(result, RunResult):
             raise RunError("ExperimentRunner.run() must return RunResult directly")
@@ -308,9 +318,7 @@ def audit_run(path: str | Path) -> AuditReport:
                 value.get("checked_commit_count", value.get("commit_markers", 0)),
                 field="checked_commit_count",
             ),
-            checked_artifact_paths=tuple(
-                _child_path(root, item) for item in raw_paths
-            ),
+            checked_artifact_paths=tuple(_child_path(root, item) for item in raw_paths),
             checks=_checks_from_projection(value, prefix="audit"),
         )
     except ArtifactError:
@@ -340,9 +348,7 @@ def _resolution_check(
 ) -> ValidationCheck:
     if isinstance(exc, ComponentError):
         code = "component.selection"
-        path = ".".join(
-            part for part in (exc.kind, exc.name) if isinstance(part, str)
-        )
+        path = ".".join(part for part in (exc.kind, exc.name) if isinstance(part, str))
     else:
         code = "config.resolve"
         path = exc.key or str(config_path)

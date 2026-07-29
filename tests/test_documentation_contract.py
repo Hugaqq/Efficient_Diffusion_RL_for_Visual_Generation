@@ -31,9 +31,7 @@ ARCHIVE_SOURCES = (
     "experiments/EXPERIMENT_RESULTS_SUMMARY_2026-07-15.md",
     "experiments/INFRA_VALIDATION_WORKLOG.md",
 )
-ARCHIVE_BANNER = (
-    "> Historical v0.6 evidence; not a v0.7 usage/config contract."
-)
+ARCHIVE_BANNER = "> Historical v0.6 evidence; not a v0.7 usage/config contract."
 
 FENCE_RE = re.compile(
     r"^```(?P<language>[^\n]*)\n(?P<body>.*?)^```\s*$",
@@ -144,8 +142,22 @@ def test_readme_exposes_one_complete_yaml_and_fixed_launch_script() -> None:
     }
     assert top_level == REQUIRED_YAML_TOP_LEVEL
     assert "python run_experiment.py" in readme
-    assert (
-        "torchrun --standalone --nproc-per-node=2 run_experiment.py" in readme
+    assert "torchrun --standalone --nproc-per-node=2 run_experiment.py" in readme
+
+
+def test_formal_docs_expose_only_python_read_only_callbacks() -> None:
+    readme = _read("README.md")
+    guide = _read("docs/V0_7_USER_GUIDE.md")
+    changelog = _read("CHANGELOG.md")
+
+    assert "read-only Callback" in readme
+    assert "class RewardPrinter(vr.Callback):" in guide
+    assert "callbacks=[RewardPrinter()]" in guide
+    assert "read-only Callback" in changelog
+    assert "callbacks:" not in "\n".join(
+        body
+        for language, body in _fences(f"{readme}\n{guide}")
+        if language in {"yaml", "yml"}
     )
 
 
@@ -174,9 +186,7 @@ def test_historical_evidence_has_an_exact_archive_allowlist_and_banner() -> None
     assert all(not (ROOT / path).exists() for path in ARCHIVE_SOURCES)
 
     archive_root = ROOT / "experiments/archive/v0_6"
-    actual = {
-        path.relative_to(ROOT).as_posix() for path in archive_root.rglob("*.md")
-    }
+    actual = {path.relative_to(ROOT).as_posix() for path in archive_root.rglob("*.md")}
     assert actual == set(ARCHIVE_PATHS)
 
     for relative_path in ARCHIVE_PATHS:

@@ -6,8 +6,8 @@ import base64
 import csv
 import hashlib
 import io
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 from scripts.verify_wheel_contract import (
     verify_wheel_contract,
@@ -47,9 +47,11 @@ def _record(payloads: dict[str, bytes], record_name: str) -> bytes:
             writer.writerow((name, "", ""))
         else:
             payload = payloads[name]
-            digest = base64.urlsafe_b64encode(
-                hashlib.sha256(payload).digest()
-            ).rstrip(b"=").decode("ascii")
+            digest = (
+                base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+                .rstrip(b"=")
+                .decode("ascii")
+            )
             writer.writerow((name, f"sha256={digest}", str(len(payload))))
     return stream.getvalue().encode("utf-8")
 
@@ -76,8 +78,7 @@ def _build_wheel(
     if omit_source:
         package_paths.pop()
     payloads = {
-        path.relative_to(ROOT).as_posix(): path.read_bytes()
-        for path in package_paths
+        path.relative_to(ROOT).as_posix(): path.read_bytes() for path in package_paths
     }
     requirements = list(CORE_REQUIRES)
     requirements.extend(
@@ -90,18 +91,14 @@ def _build_wheel(
     if duplicate_dependency:
         requirements.append(requirements[0])
     if wrong_extra_marker:
-        requirements[len(CORE_REQUIRES)] = requirements[
-            len(CORE_REQUIRES)
-        ].replace('extra == "train"', 'extra == "dev"')
+        requirements[len(CORE_REQUIRES)] = requirements[len(CORE_REQUIRES)].replace(
+            'extra == "train"', 'extra == "dev"'
+        )
     if normalized_metadata_order:
         requirements[0] = "numpy<2.3,>=1.26"
     if invalid_dependency_specifier:
         requirements[0] = "numpy>=1.26,,<2.3"
-    requires_python = (
-        "<3.12,>=3.10"
-        if normalized_metadata_order
-        else ">=3.10,<3.12"
-    )
+    requires_python = "<3.12,>=3.10" if normalized_metadata_order else ">=3.10,<3.12"
     if invalid_python_specifier:
         requires_python = ">=3.10,,<3.12"
     metadata_lines = [
@@ -138,8 +135,10 @@ def _build_wheel(
 
 
 def test_valid_synthetic_wheel_matches_source_and_metadata(tmp_path: Path) -> None:
-    _build_wheel(tmp_path)
+    wheel = _build_wheel(tmp_path)
     assert verify_wheel_contract(ROOT, tmp_path) == ()
+    with zipfile.ZipFile(wheel) as archive:
+        assert "visual_rl/callbacks.py" in archive.namelist()
 
 
 def test_checker_accepts_equivalent_normalized_specifier_order(
@@ -154,12 +153,16 @@ def test_checker_rejects_empty_or_malformed_specifier_items(
 ) -> None:
     wheel = _build_wheel(tmp_path, invalid_python_specifier=True)
     errors = verify_wheel_contract(ROOT, tmp_path)
-    assert any("cannot validate METADATA dependency contract" in error for error in errors)
+    assert any(
+        "cannot validate METADATA dependency contract" in error for error in errors
+    )
     wheel.unlink()
 
     _build_wheel(tmp_path, invalid_dependency_specifier=True)
     errors = verify_wheel_contract(ROOT, tmp_path)
-    assert any("cannot validate METADATA dependency contract" in error for error in errors)
+    assert any(
+        "cannot validate METADATA dependency contract" in error for error in errors
+    )
 
 
 def test_checker_requires_exactly_one_wheel(tmp_path: Path) -> None:

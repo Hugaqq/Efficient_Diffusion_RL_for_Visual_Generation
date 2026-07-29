@@ -149,6 +149,11 @@ if not status.ok or not audit.ok:
     raise RuntimeError("authoritative artifact validation failed")
 ```
 
+`run(callbacks=[...])` additionally accepts constructed, read-only Callback
+observers for lifecycle metrics and authoritative commit paths. They do not
+enter YAML, checkpoint identity, or the training data path; see the
+[v0.7 user guide](docs/V0_7_USER_GUIDE.md#read-only-callbacks).
+
 单进程启动：
 
 ```bash

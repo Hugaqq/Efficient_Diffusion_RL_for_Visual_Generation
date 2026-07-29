@@ -27,7 +27,10 @@ def test_no_registry_import_or_registration_side_effect_remains():
     for path in _modules():
         tree = _tree(path)
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "visual_rl.core.registry":
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "visual_rl.core.registry"
+            ):
                 violations.append((path, node.lineno, "registry import"))
             if isinstance(node, ast.Call):
                 function = node.func
@@ -255,5 +258,88 @@ def test_optimizer_plugin_step_is_called_only_inside_execute_step():
 def test_retired_runner_tests_and_compatibility_files_are_absent():
     assert not (ROOT / "tests" / "test_visual_rl.py").exists()
     assert not (ROOT / "tests" / "test_c10_runner_artifacts.py").exists()
-    assert not (PACKAGE / "callbacks.py").exists()
     assert not (PACKAGE / "evaluation").exists()
+
+
+def test_callback_dispatch_has_one_runner_owner_and_no_training_layer_imports():
+    runner_path = PACKAGE / "runner.py"
+    runner = next(
+        node
+        for node in _tree(runner_path).body
+        if isinstance(node, ast.ClassDef) and node.name == "ExperimentRunner"
+    )
+    methods = {
+        node.name: node
+        for node in runner.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    dispatch_owners = [
+        method_name
+        for method_name, method in methods.items()
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_dispatch_callbacks"
+    ]
+    emit_call_owners = [
+        method_name
+        for method_name, method in methods.items()
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr == "_emit_callbacks"
+    ]
+
+    assert dispatch_owners == ["_emit_callbacks"]
+    assert set(emit_call_owners) == {"run"}
+    emit_calls = {
+        node.func.attr
+        for node in ast.walk(methods["_emit_callbacks"])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert emit_calls.isdisjoint(
+        {
+            "all_gather",
+            "all_gather_object",
+            "broadcast",
+            "broadcast_object",
+            "gather",
+            "gather_object",
+        }
+    )
+
+    forbidden_roots = (
+        PACKAGE / "algorithms",
+        PACKAGE / "artifacts",
+        PACKAGE / "feedback",
+        PACKAGE / "model_adapters",
+        PACKAGE / "optimizers",
+        PACKAGE / "rollout",
+    )
+    imports = []
+    for root in forbidden_roots:
+        for path in root.rglob("*.py"):
+            for node in ast.walk(_tree(path)):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "visual_rl.callbacks"
+                ):
+                    imports.append((path, node.lineno))
+    assert imports == []
+
+
+def test_minimal_callback_contract_has_no_second_framework_types():
+    tree = _tree(PACKAGE / "callbacks.py")
+    class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+
+    assert class_names == {"Callback", "CallbackEvent"}
+    assert class_names.isdisjoint(
+        {
+            "CallbackList",
+            "CallbackControl",
+            "CallbackRegistry",
+            "RunCallback",
+        }
+    )

@@ -13,7 +13,6 @@ from visual_rl.configs.schema import VisualRLConfig
 from visual_rl.core.types import FrozenMapping, to_plain_dict
 from visual_rl.errors import ComponentError, ConfigError
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
 
@@ -46,9 +45,7 @@ def test_tiny_fixture_resolves_to_one_frozen_canonical_config():
     }
     assert config.artifacts.preview_samples_per_event == 0
     assert not hasattr(config.runtime, "rollout_cache")
-    assert config.artifacts.output_dir == (
-        TINY.parent / "runs" / "tiny-grpo"
-    ).resolve()
+    assert config.artifacts.output_dir == (TINY.parent / "runs" / "tiny-grpo").resolve()
     assert isinstance(config.model.params, FrozenMapping)
     with pytest.raises(FrozenInstanceError):
         config.run.seed = 7
@@ -118,6 +115,7 @@ def test_removed_runtime_rollout_cache_is_rejected_as_unknown_config(
         (None, "runner"),
         (None, "paths"),
         (None, "plugins"),
+        (None, "callbacks"),
         ("run", "name"),
         ("dataset", "split_name"),
         ("optimizer", "name"),
@@ -125,9 +123,7 @@ def test_removed_runtime_rollout_cache_is_rejected_as_unknown_config(
         ("runtime", "world_size"),
     ],
 )
-def test_unknown_legacy_or_duplicate_owner_fields_fail_fast(
-    tmp_path, section, key
-):
+def test_unknown_legacy_or_duplicate_owner_fields_fail_fast(tmp_path, section, key):
     values = _tiny_mapping()
     target = values if section is None else values[section]
     target[key] = "legacy"
@@ -183,19 +179,19 @@ def test_relative_global_and_component_paths_share_yaml_directory(tmp_path):
 
     config = load(path).resolve()
 
-    assert config.model.adapter_checkpoint == (
-        tmp_path / "adapters" / "warm-start"
-    ).resolve()
+    assert (
+        config.model.adapter_checkpoint
+        == (tmp_path / "adapters" / "warm-start").resolve()
+    )
     assert config.model.params["checkpoint"] == (tmp_path / "models" / "sd3").resolve()
-    assert config.model.params["reference_repo"] == (
-        tmp_path / "references" / "tempflow"
-    ).resolve()
+    assert (
+        config.model.params["reference_repo"]
+        == (tmp_path / "references" / "tempflow").resolve()
+    )
 
 
 @pytest.mark.parametrize("relationship", ["same", "inside", "contains"])
-def test_reward_cache_and_output_directory_must_not_overlap(
-    tmp_path, relationship
-):
+def test_reward_cache_and_output_directory_must_not_overlap(tmp_path, relationship):
     values = _tiny_mapping()
     output = tmp_path / "run"
     cache = {

@@ -5,19 +5,18 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
-from pathlib import Path
 import queue
 import shutil
 import socket
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 import torch.distributed as dist
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
@@ -46,9 +45,7 @@ def _config(
     payload["runtime"]["distributed"]["max_snapshot_tensor_bytes"] = 1 << 20
     payload["artifacts"]["output_dir"] = str(output_dir)
     payload["artifacts"]["checkpoint_every"] = 1
-    payload["artifacts"]["preview_samples_per_event"] = (
-        preview_samples_per_event
-    )
+    payload["artifacts"]["preview_samples_per_event"] = preview_samples_per_event
     payload["resume"]["from"] = str(output_dir) if resume else None
     path = tmp_path / f"{name}-{max_steps}-{int(resume)}.yaml"
     path.write_text(
@@ -65,12 +62,40 @@ def _worker(
     output: Any,
     failure_rank: int | None,
     preview_failure_rank: int | None,
+    callback_mode: str | None,
 ) -> None:
     try:
         import visual_rl as vr
         from visual_rl.core.types import FrozenMapping, ValidatedRuntimeEnv
         from visual_rl.runner import ExperimentRunner
 
+        callback_events: list[str] = []
+        callback_phases: list[str] = []
+        callbacks = ()
+        if callback_mode is not None:
+            from visual_rl.distributed import DDPStrategy
+
+            original_run_phase = DDPStrategy.run_phase
+
+            def record_run_phase(self, name, operation):
+                if name.startswith("callback."):
+                    callback_phases.append(name)
+                return original_run_phase(self, name, operation)
+
+            DDPStrategy.run_phase = record_run_phase
+
+            class WorkerCallback(vr.Callback):
+                def _observe(self, event: vr.CallbackEvent) -> None:
+                    callback_events.append(event.kind)
+                    if callback_mode == "fail" and event.kind == "step_end":
+                        raise RuntimeError("injected rank-zero callback failure")
+
+                on_run_start = _observe
+                on_step_end = _observe
+                on_commit = _observe
+                on_run_end = _observe
+
+            callbacks = (WorkerCallback(),)
         config = vr.load(config_path).resolve()
         if rank == preview_failure_rank:
             from visual_rl.artifacts.preview import PreviewWriter
@@ -107,7 +132,11 @@ def _worker(
             visible_gpu_count=0,
             raw_launch_env=FrozenMapping({}),
         )
-        runner = ExperimentRunner(config, environment)
+        runner = ExperimentRunner(
+            config,
+            environment,
+            callbacks=callbacks,
+        )
         result = runner.run()
         output.put(
             {
@@ -118,6 +147,8 @@ def _worker(
                 "checkpoint": result.authoritative_checkpoint.name,
                 "last_metrics": dict(result.last_metrics),
                 "owned_artifact_manager": runner.artifact_manager is not None,
+                "callback_events": callback_events,
+                "callback_phases": callback_phases,
             }
         )
     except BaseException as exc:
@@ -174,9 +205,7 @@ def _public_post_marker_worker(
             if method_name == "rebuild_projections" and manager.head is None:
                 original(manager, *args, **kwargs)
                 return
-            raise ArtifactError(
-                f"injected distributed post-marker {phase} failure"
-            )
+            raise ArtifactError(f"injected distributed post-marker {phase} failure")
 
         setattr(ArtifactManager, method_name, fail_after_marker)
         try:
@@ -207,6 +236,7 @@ def _run_two_ranks(
     *,
     failure_rank: int | None = None,
     preview_failure_rank: int | None = None,
+    callback_mode: str | None = None,
     expect_failure: bool = False,
 ) -> list[dict[str, Any]]:
     context = multiprocessing.get_context("spawn")
@@ -221,6 +251,7 @@ def _run_two_ranks(
                 output,
                 failure_rank,
                 preview_failure_rank,
+                callback_mode,
             ),
         )
         for rank in range(2)
@@ -386,9 +417,7 @@ def test_two_rank_gloo_shares_lifecycle_rank_zero_writes_and_resume(
         _free_port(),
     )
 
-    assert {row["run_id"] for row in first} == {
-        row["run_id"] for row in resumed
-    }
+    assert {row["run_id"] for row in first} == {row["run_id"] for row in resumed}
     assert [row["owned_artifact_manager"] for row in first] == [True, False]
     assert [row["owned_artifact_manager"] for row in resumed] == [True, False]
     assert all(row["committed_steps"] == 1 for row in first)
@@ -418,14 +447,10 @@ def test_two_rank_gloo_shares_lifecycle_rank_zero_writes_and_resume(
 
     assert checkpoint_tree_sha256(
         split_dir / "checkpoint_000002"
-    ) == checkpoint_tree_sha256(
-        continuous_dir / "checkpoint_000002"
-    )
+    ) == checkpoint_tree_sha256(continuous_dir / "checkpoint_000002")
     assert _normalized_manifest(
         split_dir / "sample_manifest.json"
-    ) == _normalized_manifest(
-        continuous_dir / "sample_manifest.json"
-    )
+    ) == _normalized_manifest(continuous_dir / "sample_manifest.json")
     assert _metric_rows(split_dir / "metrics.jsonl") == _metric_rows(
         continuous_dir / "metrics.jsonl"
     )
@@ -436,6 +461,49 @@ def test_two_rank_gloo_shares_lifecycle_rank_zero_writes_and_resume(
     audit = vr.audit_run(split_dir)
     assert status.ok and status.committed_steps == 2
     assert audit.ok and audit.checked_commit_count == 2
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+@pytest.mark.parametrize("callback_mode", ("record", "fail"))
+def test_two_rank_callbacks_share_phases_and_execute_only_on_rank_zero(
+    tmp_path: Path,
+    callback_mode: str,
+) -> None:
+    rows = _run_two_ranks(
+        _config(
+            tmp_path,
+            name=f"callbacks-{callback_mode}",
+            max_steps=2,
+            resume=False,
+        ),
+        _free_port(),
+        callback_mode=callback_mode,
+    )
+
+    expected_phases = [
+        "callback.on_run_start",
+        "callback.on_step_end",
+        "callback.on_commit",
+        "callback.on_step_end",
+        "callback.on_commit",
+        "callback.on_run_end",
+    ]
+    assert rows[0]["callback_phases"] == expected_phases
+    assert rows[1]["callback_phases"] == expected_phases
+    assert rows[0]["callback_events"] == [
+        "run_start",
+        "step_end",
+        "commit",
+        "step_end",
+        "commit",
+        "run_end",
+    ]
+    assert rows[1]["callback_events"] == []
+    assert all(row["committed_steps"] == 2 for row in rows)
 
 
 @pytest.mark.distributed
@@ -637,10 +705,7 @@ def test_nccl_root_commit_failure_synchronizes() -> None:
 
     assert isinstance(caught, RunError)
     chain = _exception_chain(caught)
-    assert any(
-        "injected rank-zero pre-marker commit failure" in item
-        for item in chain
-    )
+    assert any("injected rank-zero pre-marker commit failure" in item for item in chain)
     result_path = root / f"result-rank-{rank}.json"
     result_path.write_text(
         json.dumps(
@@ -662,8 +727,7 @@ def test_nccl_root_commit_failure_synchronizes() -> None:
         for path in rank_paths:
             _wait_for_path(path, timeout_s=30.0)
         results = tuple(
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in rank_paths
+            json.loads(path.read_text(encoding="utf-8")) for path in rank_paths
         )
         assert [item["rank"] for item in results] == [0, 1]
         assert all(item["error_type"] == "RunError" for item in results)

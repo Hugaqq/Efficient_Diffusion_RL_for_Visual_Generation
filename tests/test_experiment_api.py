@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +15,6 @@ from visual_rl.api_types import AuditReport, RunResult, RunStatus, ValidationRep
 from visual_rl.core.types import FrozenMapping, ValidatedRuntimeEnv, ValidationCheck
 from visual_rl.errors import RunError, ValidationError
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
 PUBLIC = (
@@ -23,6 +22,8 @@ PUBLIC = (
     "load",
     "inspect_run",
     "audit_run",
+    "Callback",
+    "CallbackEvent",
     "ValidationReport",
     "RunResult",
     "RunStatus",
@@ -88,12 +89,14 @@ def test_top_level_public_allowlist_is_exact():
         assert not hasattr(vr, retired)
 
 
-def test_handle_has_zero_override_signatures_and_cannot_be_publicly_constructed():
+def test_handle_has_only_callback_run_extension_and_cannot_be_publicly_constructed():
     experiment = load(TINY)
 
     assert str(inspect.signature(experiment.resolve)) == "() -> 'VisualRLConfig'"
     assert str(inspect.signature(experiment.validate)) == "() -> 'ValidationReport'"
-    assert str(inspect.signature(experiment.run)) == "() -> 'RunResult'"
+    assert str(inspect.signature(experiment.run)) == (
+        "(*, callbacks: 'Sequence[Callback]' = ()) -> 'RunResult'"
+    )
     assert type(experiment).__name__ == "_Experiment"
     assert not hasattr(vr, "Experiment")
 
@@ -174,9 +177,7 @@ def test_run_claim_is_consumed_by_validation_failure(monkeypatch):
         experiment.run()
 
 
-def test_run_passes_same_config_and_fresh_env_to_only_runner(
-    monkeypatch, tmp_path
-):
+def test_run_passes_same_config_and_fresh_env_to_only_runner(monkeypatch, tmp_path):
     env = _runtime_env()
     reports = []
 
@@ -199,29 +200,103 @@ def test_run_passes_same_config_and_fresh_env_to_only_runner(
         },
     )
     runner_calls = []
+    first_callback = vr.Callback()
+    late_callback = vr.Callback()
+    callbacks = [first_callback]
 
     class FakeRunner:
-        def __init__(self, config, validated_env):
-            runner_calls.append((config, validated_env))
+        def __init__(self, config, validated_env, *, callbacks):
+            runner_calls.append((config, validated_env, callbacks))
 
         def run(self):
             return result
 
-    import visual_rl.preflight as preflight
-    import visual_rl.runner as runner
+    from visual_rl import preflight, runner
 
     monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
     monkeypatch.setattr(runner, "ExperimentRunner", FakeRunner)
     experiment = load(TINY)
+    callbacks.append(late_callback)
+    callbacks.pop()
 
-    assert experiment.run() is result
+    assert experiment.run(callbacks=callbacks) is result
     assert len(reports) == 2
     assert reports[0][1]["phase"] == "validate"
     assert reports[1][1]["phase"] == "run"
     assert isinstance(reports[1][1]["cached_report"], ValidationReport)
     assert reports[1][1]["cached_report"].ok
     assert reports[1][1]["cached_env"] is env
-    assert runner_calls == [(experiment.resolve(), env)]
+    assert runner_calls == [(experiment.resolve(), env, (first_callback,))]
+
+
+@pytest.mark.parametrize(
+    "callbacks",
+    [
+        "visual_rl.callbacks:Callback",
+        b"callback",
+        vr.Callback,
+        lambda _event: None,
+        [vr.Callback],
+        [lambda _event: None],
+        [object()],
+        {"callback": vr.Callback()},
+        iter((vr.Callback(),)),
+    ],
+)
+def test_run_rejects_non_instance_callback_inputs_and_consumes_handle(
+    callbacks,
+) -> None:
+    experiment = load(TINY)
+
+    with pytest.raises(TypeError, match="callbacks"):
+        experiment.run(callbacks=callbacks)
+    with pytest.raises(RunError, match="already attempted"):
+        experiment.run()
+
+
+def test_run_freezes_callback_sequence_before_validation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    env = _runtime_env()
+    output_dir = tmp_path.resolve()
+    result = RunResult(
+        run_id="run-freeze",
+        output_dir=output_dir,
+        committed_steps=1,
+        **_materialize_result_paths(output_dir),
+        last_metrics={
+            "step": 0,
+            "sample_count": 4,
+            "active_transition_count": 8,
+            "reward_mean": 1.0,
+        },
+    )
+    first = vr.Callback()
+    late = vr.Callback()
+    callbacks = [first]
+    captured = []
+
+    def fake_preflight(config, **kwargs):
+        del config, kwargs
+        callbacks.append(late)
+        return ValidationReport((), 0, 1), env
+
+    class FakeRunner:
+        def __init__(self, config, validated_env, *, callbacks):
+            del config, validated_env
+            captured.append(callbacks)
+
+        def run(self):
+            return result
+
+    from visual_rl import preflight, runner
+
+    monkeypatch.setattr(preflight, "run_preflight", fake_preflight)
+    monkeypatch.setattr(runner, "ExperimentRunner", FakeRunner)
+
+    assert load(TINY).run(callbacks=callbacks) is result
+    assert captured == [(first,)]
 
 
 def test_report_properties_are_derived_and_result_metrics_are_frozen(tmp_path):
