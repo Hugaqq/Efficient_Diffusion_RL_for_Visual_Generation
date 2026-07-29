@@ -5,6 +5,9 @@
 - Replaced legacy command-line/config construction paths with one high-level
   Python API: complete YAML `load -> resolve -> validate -> run`, followed by
   public `inspect_run` and `audit_run`.
+- Added minimal read-only Callback observers for run start, completed policy
+  steps, authoritative commits, and successful run end without exposing
+  mutable training objects or adding a second execution path.
 - Unified GRPO, Flash-GRPO, and TempFlow-GRPO policy updates behind one
   clipped-surrogate objective and one Runner/update path.
 - Added fixed source preparation for 30 Tiny/SD3/Wan/MG1 roles, with

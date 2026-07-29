@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import random
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -219,6 +219,22 @@ def test_v5_producer_writes_exact_tree_keys_and_stable_bytes(
         "algorithm": "grpo",
         "version": 1,
     }
+    training_state = torch.load(
+        first / "training_state.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(training_state) == {
+        "format_version",
+        "global_step",
+        "world_size",
+        "training_contract",
+        "optimizer_topology",
+        "optimizer",
+        "grad_scaler",
+        "rank_states",
+    }
+    assert all("callback" not in key for key in training_state)
     assert _tree_bytes(first) == _tree_bytes(second)
     assert first_metadata.tree_sha256 == second_metadata.tree_sha256
     assert first_metadata.tree_sha256 == checkpoint_tree_sha256(first)
@@ -300,9 +316,7 @@ def test_reader_uses_weights_only_and_rejects_unknown_fields_before_mutation(
     )
     assert validated.global_step == 3
     training_calls = [
-        kwargs
-        for path, kwargs in calls
-        if path.name == "training_state.pt"
+        kwargs for path, kwargs in calls if path.name == "training_state.pt"
     ]
     assert training_calls == [{"map_location": "cpu", "weights_only": True}]
     assert torch.equal(adapter.train_module.weight, original_weights)
@@ -430,9 +444,7 @@ def test_digest_changes_for_adapter_moment_rng_or_step(tmp_path: Path) -> None:
     random.seed(41)
     np.random.seed(41)
     torch.manual_seed(41)
-    baseline, _adapter, _optimizer_value, _rng = _save_fixture(
-        tmp_path / "baseline"
-    )
+    baseline, _adapter, _optimizer_value, _rng = _save_fixture(tmp_path / "baseline")
     baseline_digest = checkpoint_tree_sha256(baseline)
 
     variants: list[str] = []

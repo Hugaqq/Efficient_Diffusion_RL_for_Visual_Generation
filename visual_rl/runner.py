@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import math
-from pathlib import Path
 import pickle
 import random
-from typing import Any
 import uuid
 import warnings
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
 
 from visual_rl.api_types import RunResult
 from visual_rl.artifacts.manifest import SampleRecord
+from visual_rl.callbacks import Callback, CallbackEvent, _dispatch_callbacks
 from visual_rl.configs.schema import VisualRLConfig
 from visual_rl.core.types import (
     FrozenMapping,
@@ -23,7 +25,6 @@ from visual_rl.core.types import (
     to_plain_dict,
 )
 from visual_rl.errors import ResumeError, RunError, attach_cleanup_notes
-
 
 _CORE_UPDATE_METRICS = (
     "loss",
@@ -62,9 +63,7 @@ class StepMetrics:
             if not isinstance(name, str) or not name:
                 raise ValueError("metric names must be non-empty strings")
             if type(value) is not float or not math.isfinite(value):
-                raise ValueError(
-                    "StepMetrics.values must contain finite Python floats"
-                )
+                raise ValueError("StepMetrics.values must contain finite Python floats")
 
 
 @dataclass(frozen=True)
@@ -76,10 +75,7 @@ class StepArtifacts:
     def __post_init__(self) -> None:
         if type(self.local_records) is not tuple or not self.local_records:
             raise ValueError("local_records must be a non-empty tuple")
-        if any(
-            not isinstance(record, SampleRecord)
-            for record in self.local_records
-        ):
+        if any(not isinstance(record, SampleRecord) for record in self.local_records):
             raise TypeError("local_records must contain only SampleRecord values")
 
 
@@ -144,12 +140,9 @@ class CommitCoordinator:
         if not isinstance(output_dir, Path) or not output_dir.is_absolute():
             raise TypeError("output_dir must be an absolute pathlib.Path")
         if checkpoint_keep_last is not None and (
-            type(checkpoint_keep_last) is not int
-            or checkpoint_keep_last <= 0
+            type(checkpoint_keep_last) is not int or checkpoint_keep_last <= 0
         ):
-            raise ValueError(
-                "checkpoint_keep_last must be a positive integer or None"
-            )
+            raise ValueError("checkpoint_keep_last must be a positive integer or None")
         if not isinstance(training_contract, TrainingContract):
             raise TypeError("training_contract must be a TrainingContract")
         if not isinstance(strategy, (SingleProcessStrategy, DDPStrategy)):
@@ -168,8 +161,7 @@ class CommitCoordinator:
                 "load_state_dict",
             )
             if any(
-                not callable(getattr(scaler, name, None))
-                for name in scaler_methods
+                not callable(getattr(scaler, name, None)) for name in scaler_methods
             ):
                 raise TypeError("scaler must implement the GradScaler contract")
         if strategy.is_main_process:
@@ -184,25 +176,18 @@ class CommitCoordinator:
         if type(trainable_named_parameters) is not tuple or not (
             trainable_named_parameters
         ):
-            raise ValueError(
-                "trainable_named_parameters must be a non-empty tuple"
-            )
+            raise ValueError("trainable_named_parameters must be a non-empty tuple")
         names = tuple(name for name, _parameter in trainable_named_parameters)
-        parameters = tuple(
-            parameter for _name, parameter in trainable_named_parameters
-        )
+        parameters = tuple(parameter for _name, parameter in trainable_named_parameters)
         if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("trainable parameter names must be non-empty")
         if len(names) != len(set(names)):
             raise ValueError("trainable parameter names must be unique")
         if any(
-            not isinstance(parameter, torch.nn.Parameter)
-            or not parameter.requires_grad
+            not isinstance(parameter, torch.nn.Parameter) or not parameter.requires_grad
             for parameter in parameters
         ):
-            raise TypeError(
-                "trainable parameters must be trainable torch.nn.Parameter"
-            )
+            raise TypeError("trainable parameters must be trainable torch.nn.Parameter")
         adapter_named = adapter.named_parameters()
         if tuple(name for name, _parameter in adapter_named) != names or tuple(
             id(parameter) for _name, parameter in adapter_named
@@ -340,8 +325,7 @@ class CommitCoordinator:
                 raise RuntimeError("rank zero has no transaction to commit")
             completed_steps = step_result.context.step + 1
             checkpoint_path = (
-                self.transaction.staging_dir
-                / f"checkpoint_{completed_steps:06d}"
+                self.transaction.staging_dir / f"checkpoint_{completed_steps:06d}"
             )
             committed_transaction = self.transaction
             self.artifact_manager.commit(
@@ -367,9 +351,7 @@ class CommitCoordinator:
                 if self.strategy.is_main_process:
                     assert self.artifact_manager is not None
                     if committed_transaction is None:
-                        raise RuntimeError(
-                            "committed transaction handle was lost"
-                        )
+                        raise RuntimeError("committed transaction handle was lost")
                     self.artifact_manager.cleanup_published_staging(
                         committed_transaction
                     )
@@ -454,9 +436,7 @@ class CommitCoordinator:
         ):
             raise ValueError("StepResult topology does not match Strategy")
         expected_seed = (
-            self.base_seed
-            + context.step * context.world_size
-            + context.rank
+            self.base_seed + context.step * context.world_size + context.rank
         )
         if context.seed != expected_seed:
             raise ValueError("StepResult seed does not match the canonical formula")
@@ -527,9 +507,7 @@ class CommitCoordinator:
         if context.world_size != self.strategy.world_size:
             raise ValueError("gathered result world_size is invalid")
         expected_seed = (
-            self.base_seed
-            + context.step * context.world_size
-            + context.rank
+            self.base_seed + context.step * context.world_size + context.rank
         )
         if context.seed != expected_seed:
             raise ValueError("gathered result seed is invalid")
@@ -572,8 +550,7 @@ class CommitCoordinator:
         if self.transaction is None:
             raise RuntimeError("checkpoint stage requires an open transaction")
         checkpoint_path = (
-            self.transaction.staging_dir
-            / f"checkpoint_{completed_steps:06d}"
+            self.transaction.staging_dir / f"checkpoint_{completed_steps:06d}"
         )
         save_training_state(
             checkpoint_path,
@@ -615,13 +592,22 @@ class ExperimentRunner:
         self,
         config: VisualRLConfig,
         validated_env: ValidatedRuntimeEnv,
+        *,
+        callbacks: tuple[Callback, ...] = (),
     ) -> None:
         if not isinstance(config, VisualRLConfig):
             raise TypeError("config must be a VisualRLConfig")
         if not isinstance(validated_env, ValidatedRuntimeEnv):
             raise TypeError("validated_env must be a ValidatedRuntimeEnv")
+        if type(callbacks) is not tuple or any(
+            not isinstance(callback, Callback) for callback in callbacks
+        ):
+            raise TypeError(
+                "callbacks must be a tuple of constructed Callback instances"
+            )
         self.config = config
         self.validated_env = validated_env
+        self._callbacks = callbacks
         self.strategy: Any | None = None
         self.artifact_manager: Any | None = None
         self.components: Any | None = None
@@ -647,19 +633,33 @@ class ExperimentRunner:
 
         self._reset_run_state()
         primary_error: BaseException | None = None
+        cleanup_consensus_complete = False
         try:
             preparation = self._prepare_run()
+            target_steps = int(self.config.runtime.max_steps)
             if preparation.noop_result is not None:
+                noop_result = preparation.noop_result
+                self._emit_callbacks(
+                    "on_run_start",
+                    lambda: self._build_run_start_event(
+                        preparation,
+                        target_steps=target_steps,
+                    ),
+                )
+                self._complete_successful_cleanup()
+                cleanup_consensus_complete = True
+                self._emit_callbacks(
+                    "on_run_end",
+                    lambda: _run_end_event(
+                        noop_result,
+                        target_steps=target_steps,
+                    ),
+                )
                 return preparation.noop_result
             assert self.strategy is not None
 
-            target_steps = int(self.config.runtime.max_steps)
-
             def build_progress() -> None:
-                if (
-                    self.strategy.is_main_process
-                    and self.config.runtime.progress
-                ):
+                if self.strategy.is_main_process and self.config.runtime.progress:
                     self.progress = TrainProgressPrinter()
                     self.progress.start(
                         target_steps,
@@ -689,23 +689,20 @@ class ExperimentRunner:
             training_contract = TrainingContract(
                 algorithm=self.config.algorithm.name,
                 version=(
-                    self.components.optimizer_plugin.algorithm
-                    .TRAINING_CONTRACT_VERSION
+                    self.components.optimizer_plugin.algorithm.TRAINING_CONTRACT_VERSION
                 ),
             )
 
             def preflight_training_state() -> None:
                 if preparation.authoritative_checkpoint is not None:
-                    self.validated_training_state = (
-                        read_and_validate_training_state(
-                            preparation.authoritative_checkpoint,
-                            adapter=self.components.model,
-                            optimizer=self.optimizer,
-                            scaler=self.scaler,
-                            expected_global_step=preparation.start_step,
-                            expected_world_size=self.strategy.world_size,
-                            expected_training_contract=training_contract,
-                        )
+                    self.validated_training_state = read_and_validate_training_state(
+                        preparation.authoritative_checkpoint,
+                        adapter=self.components.model,
+                        optimizer=self.optimizer,
+                        scaler=self.scaler,
+                        expected_global_step=preparation.start_step,
+                        expected_world_size=self.strategy.world_size,
+                        expected_training_contract=training_contract,
                     )
                 elif self.config.model.adapter_checkpoint is not None:
                     self.components.model.validate_checkpoint(
@@ -753,9 +750,7 @@ class ExperimentRunner:
                     start_step=preparation.start_step,
                     base_seed=self.config.run.seed,
                     output_dir=self.config.artifacts.output_dir,
-                    checkpoint_keep_last=(
-                        self.config.artifacts.checkpoint_keep_last
-                    ),
+                    checkpoint_keep_last=(self.config.artifacts.checkpoint_keep_last),
                     training_contract=training_contract,
                     strategy=self.strategy,
                     artifact_manager=self.artifact_manager,
@@ -769,14 +764,18 @@ class ExperimentRunner:
 
             self.strategy.run_phase("commit_setup", build_coordinator)
             assert self.coordinator is not None
-            checkpoint_every = int(
-                self.config.artifacts.checkpoint_every
+            self._emit_callbacks(
+                "on_run_start",
+                lambda: self._build_run_start_event(
+                    preparation,
+                    target_steps=target_steps,
+                ),
             )
+            checkpoint_every = int(self.config.artifacts.checkpoint_every)
             for step in range(preparation.start_step, target_steps):
                 should_checkpoint = (
-                    (step + 1) % checkpoint_every == 0
-                    or step + 1 == target_steps
-                )
+                    step + 1
+                ) % checkpoint_every == 0 or step + 1 == target_steps
                 should_preview = (
                     self.config.artifacts.preview_samples_per_event > 0
                     and (step == 0 or should_checkpoint)
@@ -790,6 +789,32 @@ class ExperimentRunner:
                     step_result,
                     should_checkpoint=should_checkpoint,
                 )
+                callback_metrics = _step_callback_metrics(step_result)
+                self._emit_callbacks(
+                    "on_step_end",
+                    lambda current_step=step, current_metrics=callback_metrics: (
+                        self._build_step_event(
+                            "step_end",
+                            preparation,
+                            step=current_step,
+                            target_steps=target_steps,
+                            metrics=current_metrics,
+                        )
+                    ),
+                )
+                if should_checkpoint:
+                    self._emit_callbacks(
+                        "on_commit",
+                        lambda current_step=step, current_metrics=callback_metrics: (
+                            self._build_step_event(
+                                "commit",
+                                preparation,
+                                step=current_step,
+                                target_steps=target_steps,
+                                metrics=current_metrics,
+                            )
+                        ),
+                    )
                 if self.progress is not None:
                     self.progress.update(step + 1, step_result.metrics)
 
@@ -804,24 +829,36 @@ class ExperimentRunner:
             result = self.strategy.broadcast_object(local_result)
             if not isinstance(result, RunResult):
                 raise RuntimeError("training did not produce a RunResult")
+            self._complete_successful_cleanup()
+            cleanup_consensus_complete = True
+            self._emit_callbacks(
+                "on_run_end",
+                lambda: _run_end_event(
+                    result,
+                    target_steps=target_steps,
+                ),
+            )
             return result
         except BaseException as exc:
             primary_error = exc
             raise
         finally:
-            cleanup_errors = self._close_local_run_resources()
+            cleanup_errors = (
+                () if cleanup_consensus_complete else self._close_local_run_resources()
+            )
             try:
-                if primary_error is None and self.strategy is not None:
+                if (
+                    primary_error is None
+                    and self.strategy is not None
+                    and not cleanup_consensus_complete
+                ):
                     try:
                         self.strategy.failure_gate(
                             "cleanup",
                             cleanup_errors[0] if cleanup_errors else None,
                         )
                     except BaseException as consensus_error:
-                        if (
-                            type(consensus_error).__name__
-                            == "_ProcessGroupFatalError"
-                        ):
+                        if type(consensus_error).__name__ == "_ProcessGroupFatalError":
                             raise
                         raise RunError("run cleanup failed") from consensus_error
                 elif primary_error is not None and cleanup_errors:
@@ -829,6 +866,103 @@ class ExperimentRunner:
             finally:
                 if self.strategy is not None:
                     self.strategy.close()
+
+    def _complete_successful_cleanup(self) -> None:
+        """Synchronize resource cleanup before reporting a successful run end."""
+
+        if self.strategy is None:
+            raise RuntimeError("successful cleanup requires an initialized Strategy")
+        cleanup_errors = self._close_local_run_resources()
+        try:
+            self.strategy.failure_gate(
+                "cleanup",
+                cleanup_errors[0] if cleanup_errors else None,
+            )
+        except BaseException as consensus_error:
+            if type(consensus_error).__name__ == "_ProcessGroupFatalError":
+                raise
+            raise RunError("run cleanup failed") from consensus_error
+
+    def _emit_callbacks(
+        self,
+        hook: str,
+        build_event: Callable[[], CallbackEvent],
+    ) -> None:
+        """Enter one all-rank phase and invoke user callbacks only on rank zero."""
+
+        if self.strategy is None:
+            raise RuntimeError("callback dispatch requires an initialized Strategy")
+        if not callable(build_event):
+            raise TypeError("callback event factory must be callable")
+
+        def operation() -> None:
+            if not self.strategy.is_main_process:
+                return
+            event = build_event()
+            if not isinstance(event, CallbackEvent):
+                raise TypeError("callback event factory must return CallbackEvent")
+            _dispatch_callbacks(self._callbacks, hook, event)
+
+        self.strategy.run_phase(f"callback.{hook}", operation)
+
+    def _build_run_start_event(
+        self,
+        preparation: _RunPreparation,
+        *,
+        target_steps: int,
+    ) -> CallbackEvent:
+        committed_steps, artifacts = self._authoritative_callback_state()
+        if committed_steps != preparation.start_step:
+            raise RuntimeError(
+                "callback run_start does not match the authoritative start step"
+            )
+        return CallbackEvent(
+            kind="run_start",
+            run_id=preparation.run_id,
+            output_dir=self.config.artifacts.output_dir,
+            step=None,
+            target_steps=target_steps,
+            committed_steps=committed_steps,
+            metrics=FrozenMapping(),
+            artifacts=artifacts,
+        )
+
+    def _build_step_event(
+        self,
+        kind: str,
+        preparation: _RunPreparation,
+        *,
+        step: int,
+        target_steps: int,
+        metrics: FrozenMapping,
+    ) -> CallbackEvent:
+        if kind not in {"step_end", "commit"}:
+            raise ValueError("step callback kind must be step_end or commit")
+        committed_steps, artifacts = self._authoritative_callback_state()
+        return CallbackEvent(
+            kind=kind,
+            run_id=preparation.run_id,
+            output_dir=self.config.artifacts.output_dir,
+            step=step,
+            target_steps=target_steps,
+            committed_steps=committed_steps,
+            metrics=metrics,
+            artifacts=(artifacts if kind == "commit" else FrozenMapping()),
+        )
+
+    def _authoritative_callback_state(
+        self,
+    ) -> tuple[int, FrozenMapping]:
+        if self.strategy is None or not self.strategy.is_main_process:
+            raise RuntimeError(
+                "authoritative callback state is available only on rank zero"
+            )
+        if self.artifact_manager is None:
+            raise RuntimeError("rank zero has no ArtifactManager")
+        if self.artifact_manager.head is None:
+            return 0, FrozenMapping()
+        result = _build_run_result(self.artifact_manager)
+        return result.committed_steps, _result_callback_artifacts(result)
 
     def _prepare_run(self) -> _RunPreparation:
         from visual_rl.artifacts.manager import ArtifactManager
@@ -863,10 +997,7 @@ class ExperimentRunner:
             if (
                 gathered_configs is None
                 or len(gathered_configs) != strategy.world_size
-                or any(
-                    item != gathered_configs[0]
-                    for item in gathered_configs[1:]
-                )
+                or any(item != gathered_configs[0] for item in gathered_configs[1:])
             ):
                 raise ValueError(
                     "canonical configuration differs across distributed ranks"
@@ -909,10 +1040,7 @@ class ExperimentRunner:
             or len(artifact_payload) != 3
             or not isinstance(artifact_payload[0], str)
             or type(artifact_payload[1]) is not int
-            or not (
-                artifact_payload[2] is None
-                or isinstance(artifact_payload[2], str)
-            )
+            or not (artifact_payload[2] is None or isinstance(artifact_payload[2], str))
         ):
             raise RuntimeError("artifact preparation returned an invalid payload")
         run_id, start_step, checkpoint_text = artifact_payload
@@ -933,9 +1061,7 @@ class ExperimentRunner:
             device=strategy.device,
             precision=self.config.runtime.precision,
         )
-        checkpoint_path = (
-            None if checkpoint_text is None else Path(checkpoint_text)
-        )
+        checkpoint_path = None if checkpoint_text is None else Path(checkpoint_text)
         if self.config.runtime.max_steps == start_step:
             local_result: RunResult | None = None
 
@@ -997,11 +1123,14 @@ class ExperimentRunner:
         components = self.components
         prompt_batch_size = int(self.config.runtime.batch_size)
 
-        setup: tuple[
-            tuple[str, ...],
-            tuple[Any, ...],
-            StepContext,
-        ] | None = None
+        setup: (
+            tuple[
+                tuple[str, ...],
+                tuple[Any, ...],
+                StepContext,
+            ]
+            | None
+        ) = None
 
         def step_setup() -> None:
             nonlocal setup
@@ -1022,9 +1151,7 @@ class ExperimentRunner:
             context = StepContext(
                 step=step,
                 seed=(
-                    self.config.run.seed
-                    + step * strategy.world_size
-                    + strategy.rank
+                    self.config.run.seed + step * strategy.world_size + strategy.rank
                 ),
                 rank=strategy.rank,
                 world_size=strategy.world_size,
@@ -1044,9 +1171,7 @@ class ExperimentRunner:
                 context=context,
             )
             if sampled.context is not context:
-                raise ValueError(
-                    "rollout returned a different StepContext object"
-                )
+                raise ValueError("rollout returned a different StepContext object")
             return sampled
 
         batch = strategy.run_phase("rollout", sample_and_validate)
@@ -1081,9 +1206,7 @@ class ExperimentRunner:
                 assert self.coordinator is not None
                 return self.coordinator.stage_previews(
                     batch,
-                    max_samples=(
-                        self.config.artifacts.preview_samples_per_event
-                    ),
+                    max_samples=(self.config.artifacts.preview_samples_per_event),
                 )
 
             media_paths = strategy.run_phase("preview", stage_previews)
@@ -1128,9 +1251,7 @@ class ExperimentRunner:
             metrics = StepMetrics(
                 values=FrozenMapping(values),
                 sample_count=batch.batch_size * strategy.world_size,
-                active_transition_count=(
-                    update_result.active_transition_count
-                ),
+                active_transition_count=(update_result.active_transition_count),
             )
             step_result = StepResult(
                 context=context,
@@ -1228,15 +1349,9 @@ def _build_run_result(manager: Any) -> RunResult:
     completed_steps = int(head["completed_steps"])
     last_row = head["steps"][-1]["core_metric_row"]
     last_metrics = {
-        name: value
-        for name, value in last_row.items()
-        if name != "schema_version"
+        name: value for name, value in last_row.items() if name != "schema_version"
     }
-    marker_path = (
-        manager.output_dir
-        / "commits"
-        / f"commit_{completed_steps:06d}.json"
-    )
+    marker_path = manager.output_dir / "commits" / f"commit_{completed_steps:06d}.json"
     return RunResult(
         run_id=manager.run_id,
         output_dir=manager.output_dir,
@@ -1247,4 +1362,43 @@ def _build_run_result(manager: Any) -> RunResult:
         metrics_path=manager.metrics_path,
         marker_path=marker_path,
         last_metrics=last_metrics,
+    )
+
+
+def _step_callback_metrics(step_result: StepResult) -> FrozenMapping:
+    values: dict[str, int | float] = {
+        "step": step_result.context.step,
+        "sample_count": step_result.metrics.sample_count,
+        "active_transition_count": (step_result.metrics.active_transition_count),
+    }
+    values.update(step_result.metrics.values)
+    return FrozenMapping(values)
+
+
+def _result_callback_artifacts(result: RunResult) -> FrozenMapping:
+    return FrozenMapping(
+        {
+            "authoritative_checkpoint": result.authoritative_checkpoint,
+            "resolved_config_path": result.resolved_config_path,
+            "manifest_path": result.manifest_path,
+            "metrics_path": result.metrics_path,
+            "marker_path": result.marker_path,
+        }
+    )
+
+
+def _run_end_event(
+    result: RunResult,
+    *,
+    target_steps: int,
+) -> CallbackEvent:
+    return CallbackEvent(
+        kind="run_end",
+        run_id=result.run_id,
+        output_dir=result.output_dir,
+        step=result.committed_steps - 1,
+        target_steps=target_steps,
+        committed_steps=result.committed_steps,
+        metrics=FrozenMapping(result.last_metrics),
+        artifacts=_result_callback_artifacts(result),
     )

@@ -53,6 +53,32 @@ preflight and returns structured checks. An Experiment handle can attempt
 `run()` only once. Resume is expressed in another complete YAML whose
 `resume.from` is the same run directory as `artifacts.output_dir`.
 
+## Read-only callbacks
+
+Callbacks are constructed in Python and passed only to `run()`. They receive
+immutable, tensor-free events and cannot stop training or modify the model,
+optimizer, reward, loss, or checkpoint state.
+
+```python
+import visual_rl as vr
+
+
+class RewardPrinter(vr.Callback):
+    def on_step_end(self, event: vr.CallbackEvent) -> None:
+        print(event.step, event.metrics["reward_mean"])
+
+
+result = vr.load("/absolute/path/to/complete-config.yaml").run(
+    callbacks=[RewardPrinter()]
+)
+```
+
+The minimal lifecycle is `on_run_start`, `on_step_end`, `on_commit`, and
+`on_run_end`. Use `on_commit` when an observer needs paths guaranteed to have
+passed the authoritative marker and artifact-maintenance boundary. Callback
+instances and state are not stored in YAML, manifests, or checkpoints, and
+resume does not replay historical events.
+
 ## Fixed source-prepared suites
 
 The 30 complete experiment configurations live in
