@@ -15,6 +15,7 @@ from visual_rl.core.types import (
     StepContext,
 )
 from visual_rl.errors import RunError
+from visual_rl.model_adapters import sd3 as sd3_module
 from visual_rl.model_adapters.sd3 import SD3TempFlowAdapter
 
 
@@ -73,14 +74,14 @@ class _NoDisableTransformer(torch.nn.Module):
         return (torch.zeros_like(hidden_states) + self.base + self.delta,)
 
 
-def _runtime_context() -> RuntimeBuildContext:
+def _runtime_context(precision: str = "fp32") -> RuntimeBuildContext:
     return RuntimeBuildContext(
         rank=0,
         local_rank=0,
         world_size=1,
         backend=None,
         device=torch.device("cpu"),
-        precision="fp32",
+        precision=precision,
     )
 
 
@@ -179,6 +180,100 @@ def test_sd3_beta_zero_path_performs_no_disabled_adapter_forward():
     assert stats.current_transition_mean is None
     assert stats.transition_std is None
     assert stats.reference_transition_mean is None
+
+
+def test_sd3_prompt_payload_matches_policy_precision_before_latent_creation():
+    adapter = SD3TempFlowAdapter(
+        checkpoint=Path("/checkpoint"),
+        reference_repo=Path("/reference"),
+        lora_rank=4,
+        lora_alpha=8,
+        lora_target_modules=("to_q",),
+        gradient_checkpointing=False,
+        guidance_scale=1.0,
+        resolution=4,
+        max_sequence_length=8,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+        context=_runtime_context("bf16"),
+    )
+    adapter.pipeline = SimpleNamespace(
+        text_encoder=object(),
+        text_encoder_2=object(),
+        text_encoder_3=object(),
+        tokenizer=object(),
+        tokenizer_2=object(),
+        tokenizer_3=object(),
+    )
+
+    def encode(_encoders, _tokenizers, prompts, _max_sequence_length):
+        batch_size = len(prompts)
+        return (
+            torch.zeros(batch_size, 2, 4, dtype=torch.float32),
+            torch.zeros(batch_size, 4, dtype=torch.float32),
+        )
+
+    adapter._encode_prompt = encode
+
+    values = adapter._prompt_payload(("red", "blue"))
+
+    assert len(values) == 4
+    assert all(value.dtype == torch.bfloat16 for value in values)
+    assert all(value.device.type == "cpu" for value in values)
+
+
+def test_sd3_scheduler_timesteps_preserve_fractional_values_for_recompute():
+    scheduler = SimpleNamespace(
+        timesteps=torch.tensor([999.0, 833.3333, 0.25], dtype=torch.float32)
+    )
+
+    values = sd3_module._scheduler_timesteps(
+        scheduler,
+        batch_size=2,
+        expected=3,
+        device=torch.device("cpu"),
+    )
+
+    assert values.dtype == torch.float32
+    assert tuple(values.shape) == (2, 3)
+    assert torch.equal(values[0], scheduler.timesteps)
+    assert torch.equal(values[1], scheduler.timesteps)
+
+
+def test_sd3_policy_dtype_guard_normalizes_reference_pipeline_latents():
+    adapter = SD3TempFlowAdapter(
+        checkpoint=Path("/checkpoint"),
+        reference_repo=Path("/reference"),
+        lora_rank=4,
+        lora_alpha=8,
+        lora_target_modules=("to_q",),
+        gradient_checkpointing=False,
+        guidance_scale=1.0,
+        resolution=4,
+        max_sequence_length=8,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+        context=_runtime_context("bf16"),
+    )
+
+    class Transformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_dtype = None
+
+        def forward(self, *, hidden_states):
+            self.observed_dtype = hidden_states.dtype
+            return hidden_states
+
+    transformer = Transformer()
+    adapter._install_policy_dtype_guard(transformer)
+
+    result = transformer(hidden_states=torch.ones(1, dtype=torch.float32))
+
+    assert transformer.observed_dtype == torch.bfloat16
+    assert result.dtype == torch.bfloat16
+    adapter.close()
+    assert not transformer._forward_pre_hooks
 
 
 def test_sd3_reference_stats_use_current_lora_and_frozen_disabled_adapter():

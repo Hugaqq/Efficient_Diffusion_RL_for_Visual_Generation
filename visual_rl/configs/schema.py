@@ -29,7 +29,6 @@ __all__ = (
     "RewardComponentConfig",
     "RewardConfig",
     "RewardExecutionConfig",
-    "RolloutCacheConfig",
     "RunConfig",
     "RuntimeConfig",
     "VisualRLConfig",
@@ -120,11 +119,6 @@ class OptimizerConfig:
 
 
 @dataclass(frozen=True)
-class RolloutCacheConfig:
-    enabled: bool
-
-
-@dataclass(frozen=True)
 class DistributedConfig:
     mode: DistributedMode
     device: DistributedDevice
@@ -140,7 +134,6 @@ class RuntimeConfig:
     update_microbatch_size: int
     deterministic: bool
     progress: bool
-    rollout_cache: RolloutCacheConfig
     distributed: DistributedConfig
 
 
@@ -149,6 +142,7 @@ class ArtifactsConfig:
     output_dir: Path
     checkpoint_every: int
     checkpoint_keep_last: int | None
+    preview_samples_per_event: int
 
 
 @dataclass(frozen=True)
@@ -431,14 +425,9 @@ def config_from_mapping(
             "update_microbatch_size",
             "deterministic",
             "progress",
-            "rollout_cache",
             "distributed",
         },
     )
-    rollout_cache_raw = _mapping(
-        runtime_raw["rollout_cache"], path="runtime.rollout_cache"
-    )
-    _exact_keys(rollout_cache_raw, {"enabled"}, path="runtime.rollout_cache")
     distributed_raw = _mapping(
         runtime_raw["distributed"], path="runtime.distributed"
     )
@@ -487,12 +476,6 @@ def config_from_mapping(
             runtime_raw["deterministic"], path="runtime.deterministic"
         ),
         progress=_boolean(runtime_raw["progress"], path="runtime.progress"),
-        rollout_cache=RolloutCacheConfig(
-            enabled=_boolean(
-                rollout_cache_raw["enabled"],
-                path="runtime.rollout_cache.enabled",
-            )
-        ),
         distributed=DistributedConfig(
             mode=mode,
             device=device,
@@ -507,11 +490,25 @@ def config_from_mapping(
     artifacts_raw = _section(
         root,
         "artifacts",
-        {"output_dir", "checkpoint_every", "checkpoint_keep_last"},
+        {
+            "output_dir",
+            "checkpoint_every",
+            "checkpoint_keep_last",
+            "preview_samples_per_event",
+        },
     )
     output_dir = _required_path(
         artifacts_raw["output_dir"], base=config_dir, path="artifacts.output_dir"
     )
+    preview_samples_per_event = _integer(
+        artifacts_raw["preview_samples_per_event"],
+        path="artifacts.preview_samples_per_event",
+    )
+    if not 0 <= preview_samples_per_event <= 2:
+        _fail(
+            "expected an integer between 0 and 2",
+            path="artifacts.preview_samples_per_event",
+        )
     artifacts = ArtifactsConfig(
         output_dir=output_dir,
         checkpoint_every=_positive_int(
@@ -522,6 +519,7 @@ def config_from_mapping(
             artifacts_raw["checkpoint_keep_last"],
             path="artifacts.checkpoint_keep_last",
         ),
+        preview_samples_per_event=preview_samples_per_event,
     )
 
     resume_raw = _section(root, "resume", {"from"})

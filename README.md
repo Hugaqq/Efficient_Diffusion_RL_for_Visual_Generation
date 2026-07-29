@@ -106,8 +106,6 @@ runtime:
   update_microbatch_size: 2
   deterministic: true
   progress: false
-  rollout_cache:
-    enabled: false
   distributed:
     mode: single
     device: cpu
@@ -118,6 +116,7 @@ artifacts:
   output_dir: runs/tiny-grpo
   checkpoint_every: 1
   checkpoint_keep_last: 2
+  preview_samples_per_event: 0
 
 resume:
   from: null

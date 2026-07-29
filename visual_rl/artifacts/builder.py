@@ -45,8 +45,7 @@ class ManifestBuilder:
         batch: RolloutBatch,
         rewards: RewardBatch,
         *,
-        media_path: str | Path | None,
-        rollout_cache_path: str | Path | None,
+        media_paths: tuple[str | Path | None, ...],
     ) -> tuple[SampleRecord, ...]:
         """Project a validated batch without accepting duplicate identity inputs."""
 
@@ -55,15 +54,12 @@ class ManifestBuilder:
         if not isinstance(rewards, RewardBatch):
             raise TypeError("rewards must be a RewardBatch")
         rewards.validate_against(batch)
-        media_path_value = self._relative_path("media_path", media_path)
-        cache_path_value = self._relative_path(
-            "rollout_cache_path",
-            rollout_cache_path,
+        if type(media_paths) is not tuple or len(media_paths) != batch.batch_size:
+            raise ValueError("media_paths must be a tuple with shape [B]")
+        normalized_media_paths = tuple(
+            self._relative_path(f"media_paths[{index}]", value)
+            for index, value in enumerate(media_paths)
         )
-        if (media_path_value is None) != (cache_path_value is None):
-            raise ValueError(
-                "media_path and rollout_cache_path must both be present or both None"
-            )
 
         records = []
         for index in range(batch.batch_size):
@@ -88,8 +84,8 @@ class ManifestBuilder:
                     reward_values=FrozenMapping(
                         self._reward_values(rewards, index)
                     ),
-                    media_path=media_path_value,
-                    rollout_cache_path=cache_path_value,
+                    media_path=normalized_media_paths[index],
+                    rollout_cache_path=None,
                     checkpoint_path=None,
                     model_metadata=FrozenMapping(batch.artifact_metadata),
                     prompt_id=batch.prompt_id[index],

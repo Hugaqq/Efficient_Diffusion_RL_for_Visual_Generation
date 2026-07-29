@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,12 +88,21 @@ def _write_config(
     *,
     max_steps: int,
     checkpoint_every: int,
+    output_name: str = "run",
+    preview_samples_per_event: int = 0,
+    checkpoint_keep_last: int = 2,
 ) -> Path:
     payload = yaml.safe_load(TINY.read_text(encoding="utf-8"))
     payload["runtime"]["max_steps"] = max_steps
-    payload["artifacts"]["output_dir"] = str((tmp_path / "run").resolve())
+    payload["artifacts"]["output_dir"] = str(
+        (tmp_path / output_name).resolve()
+    )
     payload["artifacts"]["checkpoint_every"] = checkpoint_every
-    destination = tmp_path / "config.yaml"
+    payload["artifacts"]["preview_samples_per_event"] = (
+        preview_samples_per_event
+    )
+    payload["artifacts"]["checkpoint_keep_last"] = checkpoint_keep_last
+    destination = tmp_path / f"{output_name}.yaml"
     destination.write_text(
         yaml.safe_dump(payload, sort_keys=False),
         encoding="utf-8",
@@ -154,11 +163,20 @@ def test_step_metrics_fail_closed_on_noncanonical_values(values, message) -> Non
 
 def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
     config = vr.load(TINY).resolve()
+    config = replace(
+        config,
+        artifacts=replace(
+            config.artifacts,
+            preview_samples_per_event=2,
+        ),
+    )
     observed: dict[str, StepContext] = {}
+    phases: list[str] = []
 
     class Strategy:
         rank = 0
         world_size = 1
+        is_main_process = True
 
         @staticmethod
         def dataset_start(step: int, batch_size: int) -> int:
@@ -166,7 +184,8 @@ def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
             return 0
 
         @staticmethod
-        def run_phase(_name, operation):
+        def run_phase(name, operation):
+            phases.append(name)
             return operation()
 
         @staticmethod
@@ -241,11 +260,15 @@ def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
                 diagnostics={},
             )
 
-    class Cache:
+    class Coordinator:
         @staticmethod
-        def save(batch):
-            observed["cache"] = batch.context
-            return None, None
+        def stage_previews(batch, *, max_samples):
+            assert max_samples == 2
+            observed["preview"] = batch.context
+            return (
+                "previews/step_000000/rank_0/sample_000000.jpg",
+                None,
+            )
 
     runner = ExperimentRunner(config, _single_env())
     runner.strategy = Strategy()
@@ -258,20 +281,35 @@ def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
     )
     runner.optimizer = object()
     runner.scaler = None
-    runner.rollout_cache = Cache()
     runner.manifest_builder = ManifestBuilder(
         run_id="run-contract",
         media_type="image",
         rollout_type="full_trajectory",
     )
+    runner.coordinator = Coordinator()
 
-    result = runner._execute_step(0)
+    result = runner._execute_step(0, should_preview=True)
 
     assert result.context is observed["rollout"]
     assert all(value is result.context for value in observed.values())
+    assert phases == [
+        "step_setup",
+        "rollout",
+        "reward",
+        "reduce",
+        "update",
+        "preview",
+        "record",
+    ]
     assert result.metrics.sample_count == 2
     assert result.metrics.active_transition_count == 2
     assert len(result.artifacts.local_records) == 2
+    assert result.artifacts.local_records[0].media_path is not None
+    assert result.artifacts.local_records[1].media_path is None
+    assert all(
+        record.rollout_cache_path is None
+        for record in result.artifacts.local_records
+    )
 
 
 def test_runner_uses_one_commit_coordinator_schedule(
@@ -306,6 +344,84 @@ def test_runner_uses_one_commit_coordinator_schedule(
     assert schedule == [(0, False), (1, True), (2, True)]
     assert result.committed_steps == 3
     assert result.authoritative_checkpoint.name == "checkpoint_000003"
+
+
+def test_preview_success_failure_and_disabled_preserve_training_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from visual_rl.artifacts.checkpoint import checkpoint_tree_sha256
+    from visual_rl.artifacts.preview import PreviewWriter
+
+    def run_variant(name: str, preview_count: int):
+        return ExperimentRunner(
+            vr.load(
+                _write_config(
+                    tmp_path,
+                    max_steps=2,
+                    checkpoint_every=2,
+                    output_name=name,
+                    preview_samples_per_event=preview_count,
+                )
+            ).resolve(),
+            _single_env(),
+        ).run()
+
+    disabled = run_variant("disabled", 0)
+    enabled = run_variant("enabled", 2)
+
+    def fail_image(_value, _destination):
+        raise RuntimeError("injected encoder failure")
+
+    monkeypatch.setattr(PreviewWriter, "_write_image", staticmethod(fail_image))
+    with pytest.warns(RuntimeWarning, match="injected encoder failure"):
+        failed = run_variant("failed", 2)
+
+    digests = {
+        checkpoint_tree_sha256(result.authoritative_checkpoint)
+        for result in (disabled, enabled, failed)
+    }
+    assert len(digests) == 1
+    assert disabled.last_metrics == enabled.last_metrics == failed.last_metrics
+    assert not (tmp_path / "disabled" / "previews").exists()
+    assert len(tuple((tmp_path / "enabled" / "previews").rglob("*.jpg"))) == 4
+    assert not tuple((tmp_path / "failed").rglob("*.jpg"))
+    for name in ("disabled", "enabled", "failed"):
+        manifest = (
+            tmp_path / name / "sample_manifest.json"
+        ).read_text(encoding="utf-8")
+        assert '"rollout_cache_path":null' in manifest.replace(" ", "")
+
+
+def test_public_api_tiny_100_step_storage_smoke(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        max_steps=100,
+        checkpoint_every=10,
+        output_name="tiny-s100",
+        preview_samples_per_event=0,
+        checkpoint_keep_last=1,
+    )
+
+    result = vr.load(config_path).run()
+
+    output_dir = tmp_path / "tiny-s100"
+    assert result.committed_steps == 100
+    assert result.authoritative_checkpoint == output_dir / "checkpoint_000100"
+    assert [path.name for path in output_dir.glob("checkpoint_*")] == [
+        "checkpoint_000100"
+    ]
+    assert len(tuple((output_dir / "commits").glob("commit_*.json"))) == 10
+    assert list((output_dir / ".staging").iterdir()) == []
+    assert not (output_dir / "cache").exists()
+    assert not (output_dir / "previews").exists()
+    manifest = (output_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    assert manifest.count('"rollout_cache_path":null') == 400
+    assert manifest.count('"media_path":null') == 400
+    total_bytes = sum(
+        path.stat().st_size for path in output_dir.rglob("*") if path.is_file()
+    )
+    assert total_bytes < 50 * 1024 * 1024
 
 
 def test_cleanup_failure_does_not_replace_primary_run_error(

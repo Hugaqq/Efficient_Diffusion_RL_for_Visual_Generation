@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from visual_rl.api_types import ValidationReport
 from visual_rl.core.types import (
     FrozenMapping,
@@ -14,6 +16,7 @@ from visual_rl.core.types import (
 )
 from visual_rl.preflight import (
     _validate_capabilities,
+    _validate_preview_dependencies,
     _validate_runtime_environment,
     backend_for,
 )
@@ -36,6 +39,59 @@ def test_backend_mapping_has_one_explicit_v07_matrix() -> None:
     assert backend_for("single", "cuda") is None
     assert backend_for("ddp", "cpu") == "gloo"
     assert backend_for("ddp", "cuda") == "nccl"
+
+
+@pytest.mark.parametrize(
+    ("capability", "dependency"),
+    [
+        ("media.image", "PIL"),
+        ("media.video", "imageio_ffmpeg"),
+    ],
+)
+def test_preview_preflight_requires_the_selected_media_encoder(
+    monkeypatch,
+    capability: str,
+    dependency: str,
+) -> None:
+    selected = (
+        (
+            "model",
+            "fixture",
+            {},
+            SimpleNamespace(provides=frozenset({capability})),
+        ),
+    )
+    config = SimpleNamespace(
+        artifacts=SimpleNamespace(preview_samples_per_event=2)
+    )
+    observed: list[str] = []
+
+    def missing(name: str):
+        observed.append(name)
+        return None
+
+    monkeypatch.setattr("visual_rl.preflight.importlib.util.find_spec", missing)
+
+    checks = _validate_preview_dependencies(selected, config)
+
+    assert observed == [dependency]
+    assert [item.code for item in checks] == [
+        "artifacts.preview_dependency_missing"
+    ]
+    assert checks[0].volatile is True
+
+
+def test_preview_preflight_skips_dependencies_when_disabled(monkeypatch) -> None:
+    config = SimpleNamespace(
+        artifacts=SimpleNamespace(preview_samples_per_event=0)
+    )
+
+    def unexpected(_name: str):
+        raise AssertionError("dependency lookup must not run")
+
+    monkeypatch.setattr("visual_rl.preflight.importlib.util.find_spec", unexpected)
+
+    assert _validate_preview_dependencies((), config) == ()
 
 
 def test_single_environment_snapshot_is_complete_and_frozen() -> None:
@@ -284,6 +340,7 @@ def test_run_phase_replaces_volatile_checks_and_rejects_snapshot_drift(
         raw_launch_env=FrozenMapping({"RANK": None}),
     )
     config = SimpleNamespace(
+        artifacts=SimpleNamespace(preview_samples_per_event=0),
         runtime=SimpleNamespace(
             distributed=SimpleNamespace(
                 mode="single",

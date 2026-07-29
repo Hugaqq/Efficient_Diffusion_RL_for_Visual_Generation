@@ -35,6 +35,7 @@ def _config(
     name: str,
     max_steps: int,
     resume: bool,
+    preview_samples_per_event: int = 0,
 ) -> Path:
     payload = yaml.safe_load(TINY.read_text(encoding="utf-8"))
     output_dir = (tmp_path / name).resolve()
@@ -45,6 +46,9 @@ def _config(
     payload["runtime"]["distributed"]["max_snapshot_tensor_bytes"] = 1 << 20
     payload["artifacts"]["output_dir"] = str(output_dir)
     payload["artifacts"]["checkpoint_every"] = 1
+    payload["artifacts"]["preview_samples_per_event"] = (
+        preview_samples_per_event
+    )
     payload["resume"]["from"] = str(output_dir) if resume else None
     path = tmp_path / f"{name}-{max_steps}-{int(resume)}.yaml"
     path.write_text(
@@ -60,6 +64,7 @@ def _worker(
     port: int,
     output: Any,
     failure_rank: int | None,
+    preview_failure_rank: int | None,
 ) -> None:
     try:
         import visual_rl as vr
@@ -67,6 +72,13 @@ def _worker(
         from visual_rl.runner import ExperimentRunner
 
         config = vr.load(config_path).resolve()
+        if rank == preview_failure_rank:
+            from visual_rl.artifacts.preview import PreviewWriter
+
+            def fail_preview(_value, _destination):
+                raise RuntimeError("injected rank-zero preview failure")
+
+            PreviewWriter._write_image = staticmethod(fail_preview)
         if rank == failure_rank:
             import visual_rl.runtime_factory as runtime_factory
 
@@ -194,6 +206,7 @@ def _run_two_ranks(
     port: int,
     *,
     failure_rank: int | None = None,
+    preview_failure_rank: int | None = None,
     expect_failure: bool = False,
 ) -> list[dict[str, Any]]:
     context = multiprocessing.get_context("spawn")
@@ -201,7 +214,14 @@ def _run_two_ranks(
     processes = [
         context.Process(
             target=_worker,
-            args=(rank, str(config), port, output, failure_rank),
+            args=(
+                rank,
+                str(config),
+                port,
+                output,
+                failure_rank,
+                preview_failure_rank,
+            ),
         )
         for rank in range(2)
     ]
@@ -416,6 +436,71 @@ def test_two_rank_gloo_shares_lifecycle_rank_zero_writes_and_resume(
     audit = vr.audit_run(split_dir)
     assert status.ok and status.committed_steps == 2
     assert audit.ok and audit.checked_commit_count == 2
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_two_rank_preview_phase_writes_only_rank_zero_bounded_media(
+    tmp_path: Path,
+) -> None:
+    _run_two_ranks(
+        _config(
+            tmp_path,
+            name="preview",
+            max_steps=1,
+            resume=False,
+            preview_samples_per_event=2,
+        ),
+        _free_port(),
+    )
+
+    output_dir = tmp_path / "preview"
+    preview_files = tuple(sorted((output_dir / "previews").rglob("*.jpg")))
+    assert [path.relative_to(output_dir).as_posix() for path in preview_files] == [
+        "previews/step_000000/rank_0/sample_000000.jpg",
+        "previews/step_000000/rank_0/sample_000001.jpg",
+    ]
+    manifest = json.loads(
+        (output_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    )
+    with_media = [
+        record for record in manifest["records"] if record["media_path"] is not None
+    ]
+    assert len(with_media) == 2
+    assert {record["rank"] for record in with_media} == {0}
+    assert all(record["rollout_cache_path"] is None for record in manifest["records"])
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo is unavailable",
+)
+def test_rank_zero_preview_failure_does_not_desynchronize_commit(
+    tmp_path: Path,
+) -> None:
+    rows = _run_two_ranks(
+        _config(
+            tmp_path,
+            name="preview-failure",
+            max_steps=1,
+            resume=False,
+            preview_samples_per_event=2,
+        ),
+        _free_port(),
+        preview_failure_rank=0,
+    )
+
+    assert all(row["committed_steps"] == 1 for row in rows)
+    output_dir = tmp_path / "preview-failure"
+    assert not tuple(output_dir.rglob("*.jpg"))
+    manifest = json.loads(
+        (output_dir / "sample_manifest.json").read_text(encoding="utf-8")
+    )
+    assert all(record["media_path"] is None for record in manifest["records"])
 
 
 @pytest.mark.distributed

@@ -64,8 +64,6 @@ runtime:
   update_microbatch_size: 2
   deterministic: true
   progress: false
-  rollout_cache:
-    enabled: false
   distributed:
     mode: ddp
     device: cuda
@@ -75,7 +73,8 @@ runtime:
 artifacts:
   output_dir: ../runs/mg1_tiny_grpo_c20_interrupted
   checkpoint_every: 10
-  checkpoint_keep_last: 2
+  checkpoint_keep_last: 1
+  preview_samples_per_event: 0
 
 resume:
   from: null

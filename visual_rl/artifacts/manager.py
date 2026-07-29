@@ -20,12 +20,13 @@ from visual_rl.artifacts.manifest import (
     SampleManifest,
     SampleRecord,
 )
+from visual_rl.artifacts.preview import PreviewWriteResult, PreviewWriter
 from visual_rl.artifacts.serialization import (
     canonical_json_text,
     redact_artifact_config,
     strict_json_load,
 )
-from visual_rl.core.types import to_plain_dict
+from visual_rl.core.types import RolloutBatch, to_plain_dict
 from visual_rl.errors import ArtifactError, ResumeError
 
 
@@ -245,6 +246,7 @@ class ArtifactManager:
         if any(not isinstance(record, SampleRecord) for record in rows):
             raise TypeError("records must contain only SampleRecord values")
         sample_ids: set[str] = set()
+        media_paths: set[str] = set()
         for record in rows:
             if record.run_id != self.run_id:
                 raise ValueError("record run_id does not match manager run_id")
@@ -254,6 +256,11 @@ class ArtifactManager:
                 raise ValueError("staged records contain duplicate sample_id")
             sample_ids.add(record.sample_id)
             self._validate_record_paths(record)
+            if record.media_path is not None:
+                if record.media_path in media_paths:
+                    raise ValueError("staged records contain duplicate media_path")
+                media_paths.add(record.media_path)
+                self._validate_staged_preview(transaction, record)
         committed_ids = {
             row["sample_id"]
             for marker in read_authoritative_commit_chain(self.output_dir)
@@ -290,6 +297,19 @@ class ArtifactManager:
         _fsync_directory(step_dir)
         transaction.staged_steps.append(step)
         self._write_journal(transaction, checkpoint=None)
+
+    def stage_previews(
+        self,
+        transaction: StepArtifactTransaction,
+        batch: RolloutBatch,
+        *,
+        max_samples: int,
+    ) -> PreviewWriteResult:
+        """Best-effort encode selected media inside the open transaction."""
+
+        self._validate_transaction(transaction, expected_state="open")
+        writer = PreviewWriter(transaction.staging_dir)
+        return writer.write_batch(batch, max_samples=max_samples)
 
     def commit(
         self,
@@ -528,6 +548,8 @@ class ArtifactManager:
             completed_steps=completed_steps,
             checkpoint_path=str(checkpoint["final_path"]),
         )
+        for relative in _preview_paths_from_steps(steps):
+            self._publish_preview(transaction, relative)
         if staged_path.exists():
             _validated_directory_within(
                 staged_path,
@@ -799,6 +821,75 @@ class ArtifactManager:
                         path=str(path),
                     )
 
+    def _validate_staged_preview(
+        self,
+        transaction: StepArtifactTransaction,
+        record: SampleRecord,
+    ) -> None:
+        relative = _expected_preview_path(record)
+        if record.media_path != relative:
+            raise ValueError(
+                "media_path must match the canonical preview path for its record"
+            )
+        staged = transaction.staging_dir / relative
+        _require_lexically_within(
+            staged,
+            transaction.staging_dir,
+            label="staged preview",
+        )
+        if staged.is_symlink() or not staged.is_file():
+            raise ArtifactError(
+                "record media_path has no staged preview file",
+                path=str(staged),
+            )
+        final = self.output_dir / relative
+        _require_lexically_within(final, self.output_dir, label="preview")
+        if final.exists():
+            raise ArtifactError(
+                "preview destination already exists before commit",
+                path=str(final),
+            )
+
+    def _publish_preview(
+        self,
+        transaction: StepArtifactTransaction,
+        relative: str,
+    ) -> None:
+        staged = transaction.staging_dir / relative
+        final = self.output_dir / relative
+        _require_lexically_within(
+            staged,
+            transaction.staging_dir,
+            label="ready preview staging path",
+        )
+        _require_lexically_within(final, self.output_dir, label="ready preview")
+        staged_exists = staged.exists()
+        final_exists = final.exists()
+        if staged_exists and final_exists:
+            raise ArtifactError(
+                "ready transaction has both staged and final previews",
+                path=str(final),
+            )
+        if not staged_exists and not final_exists:
+            raise ArtifactError(
+                "ready transaction preview is missing",
+                path=str(staged),
+            )
+        if staged_exists:
+            if staged.is_symlink() or not staged.is_file():
+                raise ArtifactError(
+                    "ready staged preview must be a regular file",
+                    path=str(staged),
+                )
+            _safe_directory(final.parent, create=True)
+            os.replace(staged, final)
+            _fsync_directory(final.parent)
+        elif final.is_symlink() or not final.is_file():
+            raise ArtifactError(
+                "published preview must be a regular file",
+                path=str(final),
+            )
+
     def _commit_path(self, completed_steps: int) -> Path:
         return self.commits_dir / f"commit_{completed_steps:06d}.json"
 
@@ -1033,6 +1124,37 @@ def _validate_record_checkpoint_paths(
             raise ArtifactError(
                 "SampleRecord checkpoint_path does not match commit boundary"
             )
+
+
+def _expected_preview_path(record: SampleRecord) -> str:
+    extension = "jpg" if record.media_type == "image" else "mp4"
+    return (
+        f"previews/step_{record.step:06d}/"
+        f"rank_{record.rank}/sample_{record.sample_index:06d}.{extension}"
+    )
+
+
+def _preview_paths_from_steps(
+    steps: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for payload in steps:
+        for row in payload["manifest_records"]:
+            record = SampleRecord.from_dict(row)
+            relative = record.media_path
+            if relative is None:
+                continue
+            expected = _expected_preview_path(record)
+            if relative != expected:
+                raise ArtifactError(
+                    "SampleRecord media_path is not a canonical preview path"
+                )
+            if relative in seen:
+                raise ArtifactError("SampleRecord media_path is duplicated")
+            seen.add(relative)
+            paths.append(relative)
+    return tuple(paths)
 
 
 def _validate_checkpoint(value: Any) -> None:

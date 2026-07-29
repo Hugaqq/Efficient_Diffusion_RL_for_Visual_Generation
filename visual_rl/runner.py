@@ -9,12 +9,14 @@ import pickle
 import random
 from typing import Any
 import uuid
+import warnings
 
 from visual_rl.api_types import RunResult
 from visual_rl.artifacts.manifest import SampleRecord
 from visual_rl.configs.schema import VisualRLConfig
 from visual_rl.core.types import (
     FrozenMapping,
+    RolloutBatch,
     RuntimeBuildContext,
     StepContext,
     ValidatedRuntimeEnv,
@@ -389,6 +391,31 @@ class CommitCoordinator:
             ) from exc
         self.expected_step += 1
 
+    def stage_previews(
+        self,
+        batch: RolloutBatch,
+        *,
+        max_samples: int,
+    ) -> tuple[str | None, ...]:
+        """Stage rank-zero previews without retaining the rollout batch."""
+
+        if not self.strategy.is_main_process:
+            raise RuntimeError("only rank zero can stage previews")
+        if self.artifact_manager is None or self.transaction is None:
+            raise RuntimeError("rank zero has no open artifact transaction")
+        from visual_rl.artifacts.preview import PreviewWriteResult
+
+        result = self.artifact_manager.stage_previews(
+            self.transaction,
+            batch,
+            max_samples=max_samples,
+        )
+        if not isinstance(result, PreviewWriteResult):
+            raise TypeError("preview writer must return PreviewWriteResult")
+        for message in result.warnings:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        return result.media_paths
+
     def build_run_result(self) -> RunResult:
         if not self.strategy.is_main_process or self.artifact_manager is None:
             raise RuntimeError("only rank zero can build the authoritative result")
@@ -602,7 +629,6 @@ class ExperimentRunner:
         self.scaler: Any | None = None
         self.validated_training_state: Any | None = None
         self.progress: Any | None = None
-        self.rollout_cache: Any | None = None
         self.manifest_builder: Any | None = None
         self.coordinator: CommitCoordinator | None = None
         self._resources_closed = False
@@ -617,7 +643,6 @@ class ExperimentRunner:
             read_and_validate_training_state,
         )
         from visual_rl.artifacts.logging import TrainProgressPrinter
-        from visual_rl.rollout.cache import RolloutCache
         from visual_rl.runtime_factory import build_runtime_components
 
         self._reset_run_state()
@@ -713,21 +738,6 @@ class ExperimentRunner:
                 restore_training_state,
             )
 
-            def prepare_cache() -> None:
-                root = (
-                    self.config.artifacts.output_dir
-                    / "cache"
-                    / f"rank_{self.strategy.rank}"
-                    if self.config.runtime.rollout_cache.enabled
-                    else None
-                )
-                self.rollout_cache = RolloutCache(
-                    root,
-                    output_dir=self.config.artifacts.output_dir,
-                )
-
-            self.strategy.run_phase("cache_prepare", prepare_cache)
-
             def build_manifest_builder() -> None:
                 self.manifest_builder = ManifestBuilder(
                     run_id=preparation.run_id,
@@ -763,11 +773,18 @@ class ExperimentRunner:
                 self.config.artifacts.checkpoint_every
             )
             for step in range(preparation.start_step, target_steps):
-                self.coordinator.ensure_cycle(step)
-                step_result = self._execute_step(step)
                 should_checkpoint = (
                     (step + 1) % checkpoint_every == 0
                     or step + 1 == target_steps
+                )
+                should_preview = (
+                    self.config.artifacts.preview_samples_per_event > 0
+                    and (step == 0 or should_checkpoint)
+                )
+                self.coordinator.ensure_cycle(step)
+                step_result = self._execute_step(
+                    step,
+                    should_preview=should_preview,
                 )
                 self.coordinator.accept(
                     step_result,
@@ -958,15 +975,22 @@ class ExperimentRunner:
             noop_result=None,
         )
 
-    def _execute_step(self, step: int) -> StepResult:
+    def _execute_step(
+        self,
+        step: int,
+        *,
+        should_preview: bool,
+    ) -> StepResult:
         """Run the sole dataset-to-record step for single-process and DDP."""
 
+        if type(should_preview) is not bool:
+            raise TypeError("should_preview must be a bool")
         if (
             self.strategy is None
             or self.components is None
             or self.optimizer is None
-            or self.rollout_cache is None
             or self.manifest_builder is None
+            or self.coordinator is None
         ):
             raise RuntimeError("Runner step resources are not prepared")
         strategy = self.strategy
@@ -1033,10 +1057,6 @@ class ExperimentRunner:
             return result
 
         rewards = strategy.run_phase("reward", score_and_validate)
-        media_path, rollout_cache_path = strategy.run_phase(
-            "cache",
-            lambda: self.rollout_cache.save(batch),
-        )
         reward_metrics = strategy.run_phase(
             "reduce",
             lambda: strategy.reduce_reward_metrics(rewards),
@@ -1052,6 +1072,32 @@ class ExperimentRunner:
                 strategy=strategy,
             ),
         )
+        media_paths: tuple[str | None, ...] = (None,) * batch.batch_size
+        if should_preview:
+
+            def stage_previews() -> tuple[str | None, ...]:
+                if not strategy.is_main_process:
+                    return (None,) * batch.batch_size
+                assert self.coordinator is not None
+                return self.coordinator.stage_previews(
+                    batch,
+                    max_samples=(
+                        self.config.artifacts.preview_samples_per_event
+                    ),
+                )
+
+            media_paths = strategy.run_phase("preview", stage_previews)
+            if (
+                type(media_paths) is not tuple
+                or len(media_paths) != batch.batch_size
+                or any(
+                    item is not None and not isinstance(item, str)
+                    for item in media_paths
+                )
+            ):
+                raise TypeError(
+                    "preview phase must return one optional path per sample"
+                )
 
         def build_result() -> StepResult:
             from visual_rl.optimizers.update_engine import UpdateResult
@@ -1077,8 +1123,7 @@ class ExperimentRunner:
             records = self.manifest_builder.build_records(
                 batch,
                 rewards,
-                media_path=media_path,
-                rollout_cache_path=rollout_cache_path,
+                media_paths=media_paths,
             )
             metrics = StepMetrics(
                 values=FrozenMapping(values),
@@ -1148,7 +1193,6 @@ class ExperimentRunner:
         self.scaler = None
         self.validated_training_state = None
         self.progress = None
-        self.rollout_cache = None
         self.manifest_builder = None
         self.coordinator = None
         self._resources_closed = False

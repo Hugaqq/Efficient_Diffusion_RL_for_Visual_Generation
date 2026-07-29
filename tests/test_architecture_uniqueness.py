@@ -196,6 +196,34 @@ def test_experiment_runner_has_exactly_one_execute_step_definition_and_call():
     )
 
 
+def test_runner_has_no_production_rollout_cache_path() -> None:
+    path = PACKAGE / "runner.py"
+    source = path.read_text(encoding="utf-8")
+    imported_modules = {
+        node.module
+        for node in ast.walk(_tree(path))
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+
+    assert "visual_rl.rollout.cache" not in imported_modules
+    assert "rollout_cache" not in source
+
+
+def test_preview_encoding_is_not_owned_by_models_or_algorithms() -> None:
+    violations = []
+    for root in (PACKAGE / "model_adapters", PACKAGE / "optimizers"):
+        for path in root.rglob("*.py"):
+            tree = _tree(path)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module is not None
+                    and node.module.startswith("visual_rl.artifacts.preview")
+                ):
+                    violations.append((path, node.lineno))
+    assert violations == []
+
+
 def test_optimizer_plugin_step_is_called_only_inside_execute_step():
     path = PACKAGE / "runner.py"
     tree = _tree(path)

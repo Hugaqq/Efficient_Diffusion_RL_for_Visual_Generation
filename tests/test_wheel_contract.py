@@ -33,6 +33,7 @@ OPTIONAL_REQUIRES = {
         "requests>=2.32",
         "pillow>=10",
         "imageio>=2.34",
+        "imageio-ffmpeg>=0.6",
     ),
     "dev": ("pytest>=8.2", "ruff>=0.8"),
 }
