@@ -41,6 +41,18 @@ def test_exact_role_table_and_thirty_full_yaml_configs_resolve() -> None:
         }
 
 
+def test_experiment_configs_freeze_bounded_storage_policy() -> None:
+    no_preview_families = {"tiny_s100", "mg1_tiny_grpo"}
+    for family in interrupt_resume.FAMILY_ORDER:
+        expected_preview_count = 0 if family in no_preview_families else 2
+        for config in interrupt_resume.assert_config_family(family).values():
+            assert config.artifacts.preview_samples_per_event == (
+                expected_preview_count
+            )
+            assert config.artifacts.checkpoint_keep_last == 1
+            assert not hasattr(config.runtime, "rollout_cache")
+
+
 def test_four_real_families_freeze_batching_prompt_balance_and_q100_seeds() -> None:
     for family in (
         "flow_grpo_sd3",

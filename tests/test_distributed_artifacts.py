@@ -98,12 +98,7 @@ def _rank_records(*, rank: int, step: int = 0) -> tuple[SampleRecord, ...]:
     ).build_records(
         batch,
         _rewards(batch),
-        media_path=(
-            f"rollouts/rank_{rank:04d}/batch_{step:06d}.media.pt"
-        ),
-        rollout_cache_path=(
-            f"rollouts/rank_{rank:04d}/batch_{step:06d}.pt"
-        ),
+        media_paths=(None,) * batch.batch_size,
     )
 
 

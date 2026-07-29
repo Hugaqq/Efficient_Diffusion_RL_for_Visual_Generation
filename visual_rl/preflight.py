@@ -82,6 +82,7 @@ def run_preflight(
     fresh_checks.extend(_validate_capabilities(selected))
     fresh_checks.extend(_validate_group_size(selected, config))
     fresh_checks.extend(_validate_global_paths(config))
+    fresh_checks.extend(_validate_preview_dependencies(selected, config))
 
     runtime_env, topology_checks = _validate_runtime_environment(
         config.runtime,
@@ -299,6 +300,36 @@ def _validate_group_size(
             "algorithm.group_too_small",
             "rollout.params",
             f"resolved group size {group_size} is below algorithm minimum {minimum}",
+        ),
+    )
+
+
+def _validate_preview_dependencies(
+    selected: Sequence[tuple[str, str, Mapping[str, object], Any]],
+    config: Any,
+) -> tuple[ValidationCheck, ...]:
+    if config.artifacts.preview_samples_per_event == 0:
+        return ()
+    model_spec = next(
+        spec for kind, _name, _params, spec in selected if kind == "model"
+    )
+    dependency = (
+        "imageio_ffmpeg"
+        if "media.video" in model_spec.provides
+        else "PIL"
+    )
+    try:
+        available = importlib.util.find_spec(dependency) is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        available = False
+    if available:
+        return ()
+    return (
+        _error(
+            "artifacts.preview_dependency_missing",
+            "artifacts.preview_samples_per_event",
+            f"preview encoding requires Python dependency {dependency!r}",
+            volatile=True,
         ),
     )
 

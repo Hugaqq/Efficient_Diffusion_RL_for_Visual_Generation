@@ -71,7 +71,7 @@ optimizer:
   adam_weight_decay: 1.0e-4
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-  max_initial_logprob_delta: 1.0e-5
+  max_initial_logprob_delta: 1.0e-4
   require_initial_clipfrac_zero: true
   require_finite_gradients: true
   require_nonzero_gradients: true
@@ -83,8 +83,6 @@ runtime:
   update_microbatch_size: 6
   deterministic: true
   progress: true
-  rollout_cache:
-    enabled: true
   distributed:
     mode: single
     device: cuda
@@ -94,7 +92,8 @@ runtime:
 artifacts:
   output_dir: ../runs/tempflow_sd3_c20_interrupted
   checkpoint_every: 10
-  checkpoint_keep_last: 2
+  checkpoint_keep_last: 1
+  preview_samples_per_event: 2
 
 resume:
   from: null

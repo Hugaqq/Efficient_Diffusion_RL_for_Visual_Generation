@@ -1249,7 +1249,7 @@ def _rollout_native(
     )
     timesteps = (
         torch.as_tensor(adapter.pipeline.scheduler.timesteps)
-        .to(device=old_log_probs.device, dtype=torch.int64)
+        .to(device=old_log_probs.device)
         .reshape(1, transition_count)
         .expand(batch_size, transition_count)
         .clone()

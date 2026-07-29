@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from contextlib import contextmanager
-import math
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -99,6 +99,7 @@ class SD3TempFlowAdapter(ModelAdapter):
         self._sde_step = None
         self._encode_prompt = None
         self._gradient_checkpointing_state = None
+        self._policy_dtype_hook = None
 
     @property
     def train_module(self):
@@ -276,6 +277,7 @@ class SD3TempFlowAdapter(ModelAdapter):
                 getattr(pipeline, name).to(self.device, dtype=self.dtype)
             pipeline.transformer.to(self.device)
         pipeline.vae.to(self.device, dtype=torch.float32)
+        self._install_policy_dtype_guard(pipeline.transformer)
         self.pipeline = pipeline
         self.transformer = pipeline.transformer
         self._pipeline_full = pipeline_with_logprob
@@ -504,9 +506,11 @@ class SD3TempFlowAdapter(ModelAdapter):
         target_tensor = torch.stack(selected_targets)[:, None]
         log_tensor = torch.stack(selected_logs).reshape(len(request.prompts), 1)
         media_tensor = torch.stack(selected_media)
+        # FlowMatch schedulers can expose fractional timesteps (for example
+        # 833.3333).  Recompute must receive the exact scheduler value: casting
+        # it to int64 makes index_for_timestep() fail on a later training step.
         timestep_tensor = torch.stack(selected_timesteps).to(
             device=log_tensor.device,
-            dtype=torch.int64,
         )[:, None]
         std_tensor = torch.stack(selected_std).to(
             device=log_tensor.device,
@@ -754,10 +758,35 @@ class SD3TempFlowAdapter(ModelAdapter):
             self.max_sequence_length,
         )
         return (
-            prompt_embeds.to(self.device),
-            pooled.to(self.device),
-            negative_embeds.to(self.device),
-            negative_pooled.to(self.device),
+            prompt_embeds.to(device=self.device, dtype=self.dtype),
+            pooled.to(device=self.device, dtype=self.dtype),
+            negative_embeds.to(device=self.device, dtype=self.dtype),
+            negative_pooled.to(device=self.device, dtype=self.dtype),
+        )
+
+    def _install_policy_dtype_guard(self, transformer) -> None:
+        """Keep reference-pipeline latent forwards at the policy precision."""
+
+        import torch
+
+        if self._policy_dtype_hook is not None:
+            raise RuntimeError("SD3 policy dtype guard is already installed")
+
+        def match_hidden_state_dtype(_module, args, kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if (
+                not isinstance(hidden_states, torch.Tensor)
+                or not hidden_states.is_floating_point()
+                or hidden_states.dtype == self.dtype
+            ):
+                return None
+            updated = dict(kwargs)
+            updated["hidden_states"] = hidden_states.to(dtype=self.dtype)
+            return args, updated
+
+        self._policy_dtype_hook = transformer.register_forward_pre_hook(
+            match_hidden_state_dtype,
+            with_kwargs=True,
         )
 
     def _predict_noise(
@@ -933,6 +962,10 @@ class SD3TempFlowAdapter(ModelAdapter):
             raise AdapterNotLoadedError("sd3_tempflow is not fully constructed")
 
     def close(self) -> None:
+        dtype_hook = self._policy_dtype_hook
+        self._policy_dtype_hook = None
+        if dtype_hook is not None:
+            dtype_hook.remove()
         self.pipeline = None
         self.transformer = None
         self._pipeline_full = None
@@ -1081,10 +1114,8 @@ def _scheduler_timesteps(
     expected: int,
     device: object,
 ):
-    import torch
-
     values = _scheduler_values(scheduler, expected=expected)
-    return values.to(device=device, dtype=torch.int64)[None, :].expand(
+    return values.to(device=device)[None, :].expand(
         batch_size,
         expected,
     ).clone()

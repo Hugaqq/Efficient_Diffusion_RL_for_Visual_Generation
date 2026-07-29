@@ -44,6 +44,8 @@ def test_tiny_fixture_resolves_to_one_frozen_canonical_config():
         "beta": 0.0,
         "clip_range": 0.001,
     }
+    assert config.artifacts.preview_samples_per_event == 0
+    assert not hasattr(config.runtime, "rollout_cache")
     assert config.artifacts.output_dir == (
         TINY.parent / "runs" / "tiny-grpo"
     ).resolve()
@@ -67,6 +69,45 @@ def test_to_plain_dict_uses_yaml_resume_key_and_plain_containers(tmp_path):
     assert plain["resume"]["from"] == str((tmp_path / "run").resolve())
     assert isinstance(plain["reward"]["components"], list)
     assert isinstance(plain["model"]["params"], dict)
+    assert "rollout_cache" not in plain["runtime"]
+
+
+@pytest.mark.parametrize("value", [0, 1, 2])
+def test_preview_samples_per_event_accepts_only_bounded_integer_values(
+    tmp_path: Path,
+    value: int,
+) -> None:
+    values = _tiny_mapping()
+    values["artifacts"]["preview_samples_per_event"] = value
+
+    config = load(_write(tmp_path, values)).resolve()
+
+    assert config.artifacts.preview_samples_per_event == value
+
+
+@pytest.mark.parametrize("value", [True, -1, 3])
+def test_preview_samples_per_event_rejects_invalid_values(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    values = _tiny_mapping()
+    values["artifacts"]["preview_samples_per_event"] = value
+
+    with pytest.raises(ConfigError, match="preview_samples_per_event"):
+        load(_write(tmp_path, values)).resolve()
+
+
+def test_removed_runtime_rollout_cache_is_rejected_as_unknown_config(
+    tmp_path: Path,
+) -> None:
+    values = _tiny_mapping()
+    values["runtime"]["rollout_cache"] = {
+        "enabled": True,
+        "keep_last": 1,
+    }
+
+    with pytest.raises(ConfigError, match="unknown keys.*rollout_cache"):
+        load(_write(tmp_path, values)).resolve()
 
 
 @pytest.mark.parametrize(

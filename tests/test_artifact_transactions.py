@@ -96,7 +96,12 @@ def _rewards(batch: RolloutBatch) -> RewardBatch:
     )
 
 
-def _record(step: int, *, checkpoint_path: str | None = None) -> SampleRecord:
+def _record(
+    step: int,
+    *,
+    checkpoint_path: str | None = None,
+    media_path: str | None = None,
+) -> SampleRecord:
     batch = _batch(step)
     record = ManifestBuilder(
         run_id="run-test",
@@ -105,10 +110,13 @@ def _record(step: int, *, checkpoint_path: str | None = None) -> SampleRecord:
     ).build_records(
         batch,
         _rewards(batch),
-        media_path=None,
-        rollout_cache_path=None,
+        media_paths=(None,),
     )[0]
-    return replace(record, checkpoint_path=checkpoint_path)
+    return replace(
+        record,
+        checkpoint_path=checkpoint_path,
+        media_path=media_path,
+    )
 
 
 def _metrics(step: int) -> Any:
@@ -149,11 +157,18 @@ def _stage(
     step: int,
     *,
     checkpoint_path: str | None = None,
+    media_path: str | None = None,
 ) -> None:
     manager.stage_records(
         transaction,
         step=step,
-        records=(_record(step, checkpoint_path=checkpoint_path),),
+        records=(
+            _record(
+                step,
+                checkpoint_path=checkpoint_path,
+                media_path=media_path,
+            ),
+        ),
         metrics=_metrics(step),
     )
 
@@ -265,8 +280,7 @@ def test_manifest_builder_uses_only_typed_batch_fields(
     ).build_records(
         batch,
         _rewards(batch),
-        media_path="cache/rank_0/batch.media.pt",
-        rollout_cache_path="cache/rank_0/batch.json",
+        media_paths=("previews/step_000002/rank_0/sample_000000.jpg",),
     )
 
     assert len(records) == 1
@@ -275,6 +289,10 @@ def test_manifest_builder_uses_only_typed_batch_fields(
     assert record.step == batch.context.step
     assert record.seed == batch.context.seed
     assert record.rank == batch.context.rank
+    assert record.media_path == (
+        "previews/step_000002/rank_0/sample_000000.jpg"
+    )
+    assert record.rollout_cache_path is None
     assert record.checkpoint_path is None
     assert dict(record.model_metadata) == {
         "adapter": "fixture",
@@ -494,6 +512,220 @@ def test_ready_journal_recovers_after_checkpoint_publish_before_marker(
         assert recovered.manifest_path.is_file()
         assert recovered.metrics_path.is_file()
     assert not transaction.staging_dir.exists()
+
+
+def test_preview_and_checkpoint_publish_in_one_authoritative_commit(
+    tmp_path,
+) -> None:
+    run_dir = tmp_path / "run"
+    relative = "previews/step_000000/rank_0/sample_000000.jpg"
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        staged_preview = transaction.staging_dir / relative
+        staged_preview.parent.mkdir(parents=True)
+        staged_preview.write_bytes(b"jpeg-preview")
+        _stage(
+            manager,
+            transaction,
+            0,
+            checkpoint_path="checkpoint_000001",
+            media_path=relative,
+        )
+        marker = manager.commit(
+            transaction,
+            checkpoint_path=_checkpoint(
+                transaction.staging_dir / "checkpoint_000001",
+                "one",
+            ),
+        )
+
+        assert not staged_preview.exists()
+        assert (run_dir / relative).read_bytes() == b"jpeg-preview"
+        assert marker["steps"][0]["manifest_records"][0]["media_path"] == relative
+        manager.rebuild_projections()
+        assert (
+            SampleManifest.load(manager.manifest_path).records[0].media_path
+            == relative
+        )
+        manager.cleanup_published_staging(transaction)
+
+
+def test_ready_recovery_accepts_already_published_preview_and_checkpoint(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    relative = "previews/step_000000/rank_0/sample_000000.jpg"
+    manager = ArtifactManager(run_dir, "run-test", config={})
+    transaction = manager.begin_transaction()
+    staged_preview = transaction.staging_dir / relative
+    staged_preview.parent.mkdir(parents=True)
+    staged_preview.write_bytes(b"jpeg-preview")
+    _stage(
+        manager,
+        transaction,
+        0,
+        checkpoint_path="checkpoint_000001",
+        media_path=relative,
+    )
+    checkpoint = _checkpoint(
+        transaction.staging_dir / "checkpoint_000001",
+        "one",
+    )
+    original_write = manager_module._atomic_write_json
+
+    def fail_marker(path, value, *, root):
+        if path.parent.name == "commits":
+            raise OSError("injected marker failure after media publish")
+        return original_write(path, value, root=root)
+
+    monkeypatch.setattr(manager_module, "_atomic_write_json", fail_marker)
+    with pytest.raises(OSError, match="after media publish"):
+        manager.commit(transaction, checkpoint_path=checkpoint)
+    assert (run_dir / relative).read_bytes() == b"jpeg-preview"
+    assert (run_dir / "checkpoint_000001").is_dir()
+    assert not staged_preview.exists()
+    manager.close()
+
+    monkeypatch.setattr(manager_module, "_atomic_write_json", original_write)
+    with ArtifactManager.open_resume(run_dir) as recovered:
+        recovered.recover()
+        assert recovered.start_step == 1
+        assert (run_dir / relative).read_bytes() == b"jpeg-preview"
+        assert (
+            SampleManifest.load(recovered.manifest_path).records[0].media_path
+            == relative
+        )
+    assert not transaction.staging_dir.exists()
+
+
+def test_ready_recovery_completes_partially_published_preview_sequence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    manager = ArtifactManager(run_dir, "run-test", config={})
+    transaction = manager.begin_transaction()
+    first = "previews/step_000000/rank_0/sample_000000.jpg"
+    second = "previews/step_000001/rank_0/sample_000000.jpg"
+    for relative, payload in ((first, b"first"), (second, b"second")):
+        staged = transaction.staging_dir / relative
+        staged.parent.mkdir(parents=True)
+        staged.write_bytes(payload)
+    _stage(manager, transaction, 0, media_path=first)
+    _stage(
+        manager,
+        transaction,
+        1,
+        checkpoint_path="checkpoint_000002",
+        media_path=second,
+    )
+    checkpoint = _checkpoint(
+        transaction.staging_dir / "checkpoint_000002",
+        "two",
+    )
+    original_publish = manager._publish_preview
+    calls = 0
+
+    def fail_second(active_transaction, relative):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second preview publish failure")
+        return original_publish(active_transaction, relative)
+
+    monkeypatch.setattr(manager, "_publish_preview", fail_second)
+    with pytest.raises(OSError, match="second preview"):
+        manager.commit(transaction, checkpoint_path=checkpoint)
+    assert (run_dir / first).read_bytes() == b"first"
+    assert not (transaction.staging_dir / first).exists()
+    assert (transaction.staging_dir / second).read_bytes() == b"second"
+    assert not (run_dir / second).exists()
+    manager.close()
+
+    with ArtifactManager.open_resume(run_dir) as recovered:
+        recovered.recover()
+        assert recovered.start_step == 2
+        assert (run_dir / first).read_bytes() == b"first"
+        assert (run_dir / second).read_bytes() == b"second"
+        assert recovered.checkpoint_path == run_dir / "checkpoint_000002"
+
+
+def test_record_cannot_reference_missing_or_noncanonical_preview(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        with pytest.raises(ArtifactError, match="no staged preview"):
+            _stage(
+                manager,
+                transaction,
+                0,
+                media_path=(
+                    "previews/step_000000/rank_0/sample_000000.jpg"
+                ),
+            )
+        with pytest.raises(ValueError, match="canonical preview path"):
+            _stage(
+                manager,
+                transaction,
+                0,
+                media_path="previews/wrong.jpg",
+            )
+        manager.abort(transaction)
+
+
+def test_missing_preview_after_record_staging_is_fatal_before_marker(
+    tmp_path,
+) -> None:
+    run_dir = tmp_path / "run"
+    relative = "previews/step_000000/rank_0/sample_000000.jpg"
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        staged_preview = transaction.staging_dir / relative
+        staged_preview.parent.mkdir(parents=True)
+        staged_preview.write_bytes(b"jpeg-preview")
+        _stage(
+            manager,
+            transaction,
+            0,
+            checkpoint_path="checkpoint_000001",
+            media_path=relative,
+        )
+        staged_preview.unlink()
+
+        with pytest.raises(ArtifactError, match="preview is missing"):
+            manager.commit(
+                transaction,
+                checkpoint_path=_checkpoint(
+                    transaction.staging_dir / "checkpoint_000001",
+                    "one",
+                ),
+            )
+
+        assert not tuple((run_dir / "commits").glob("commit_*.json"))
+        assert not (run_dir / relative).exists()
+        assert transaction.state == "ready"
+
+
+def test_abort_removes_unrecorded_staged_preview(tmp_path) -> None:
+    run_dir = tmp_path / "run"
+    with ArtifactManager(run_dir, "run-test", config={}) as manager:
+        transaction = manager.begin_transaction()
+        result = manager.stage_previews(
+            transaction,
+            _batch(0),
+            max_samples=1,
+        )
+        assert result.media_paths == (
+            "previews/step_000000/rank_0/sample_000000.jpg",
+        )
+        staged = transaction.staging_dir / result.media_paths[0]
+        assert staged.is_file()
+
+        manager.abort(transaction)
+
+        assert not transaction.staging_dir.exists()
+        assert not (run_dir / result.media_paths[0]).exists()
 
 
 def test_open_only_before_first_marker_is_not_a_resume_locator(tmp_path) -> None:
