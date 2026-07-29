@@ -1,430 +1,190 @@
-"""Rank-local runtime-state checkpoint contracts."""
+"""Format-v5 two-rank checkpoint and resume contracts."""
 
 from __future__ import annotations
 
-from copy import deepcopy
-import hashlib
 import json
+from pathlib import Path
 import random
 
 import numpy as np
 import pytest
 import torch
 
+import visual_rl as vr
 from visual_rl.artifacts.checkpoint import (
+    RankState,
+    TrainingContract,
     apply_training_state,
-    capture_rng_state,
     read_and_validate_training_state,
-    restore_rng_state,
     save_training_state,
 )
+from visual_rl.core.types import RuntimeBuildContext
+from visual_rl.errors import ResumeError
+from visual_rl.model_adapters.tiny_diffusion import TinyDiffusionAdapter
 
 
-class _Optimizer:
-    def __init__(self) -> None:
-        self.loaded = None
+ROOT = Path(__file__).resolve().parents[1]
+TINY = ROOT / "tests" / "fixtures" / "configs" / "tiny_grpo.yaml"
 
-    def state_dict(self):
-        return {
-            "state": {0: {"step": torch.tensor(2)}},
-            "param_groups": [{"params": [0], "lr": 0.01}],
+
+def _adapter_optimizer():
+    adapter = TinyDiffusionAdapter.from_config(
+        {"image_size": 4},
+        RuntimeBuildContext(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            backend=None,
+            device=torch.device("cpu"),
+            precision="fp32",
+        ),
+    )
+    optimizer = torch.optim.AdamW(
+        [parameter for _name, parameter in adapter.named_parameters()],
+        lr=1.0e-4,
+    )
+    adapter.color_bias.grad = torch.tensor([0.5, -0.25, 0.125])
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return adapter, optimizer
+
+
+def _rank_state(rank: int, seed: int) -> RankState:
+    python_state = random.Random(seed).getstate()
+    numpy_state = np.random.RandomState(seed).get_state()
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return RankState.from_rng(
+        rank=rank,
+        python_state=python_state,
+        numpy_state=numpy_state,
+        torch_cpu=generator.get_state(),
+        torch_cuda=None,
+    )
+
+
+def test_two_rank_format_v5_restores_selected_rank_and_optimizer(
+    tmp_path: Path,
+) -> None:
+    original_python = random.getstate()
+    original_numpy = np.random.get_state()
+    original_torch = torch.get_rng_state()
+    try:
+        adapter, optimizer = _adapter_optimizer()
+        saved_parameter = adapter.color_bias.detach().clone()
+        saved_optimizer = optimizer.state_dict()
+        states = (_rank_state(0, 101), _rank_state(1, 202))
+        contract = TrainingContract(algorithm="grpo", version=2)
+        checkpoint = tmp_path / "checkpoint_000001"
+
+        metadata = save_training_state(
+            checkpoint,
+            adapter=adapter,
+            optimizer=optimizer,
+            scaler=None,
+            global_step=1,
+            training_contract=contract,
+            rank_states=states,
+            writer_rank=0,
+            writer_device=torch.device("cpu"),
+        )
+
+        payload = json.loads(
+            (checkpoint / "checkpoint.json").read_text(encoding="utf-8")
+        )
+        assert metadata.world_size == payload["world_size"] == 2
+        assert payload["format_version"] == 5
+        assert payload["training_contract"] == {
+            "algorithm": "grpo",
+            "version": 2,
+        }
+        assert set(path.name for path in checkpoint.iterdir()) == {
+            "adapter",
+            "checkpoint.json",
+            "training_state.pt",
         }
 
-    def load_state_dict(self, state) -> None:
-        self.loaded = state
-
-
-class _Plugin:
-    def __init__(self) -> None:
-        self.loaded = None
-
-    def state_dict(self):
-        return {"updates": 2}
-
-    def load_state_dict(self, state) -> None:
-        self.loaded = state
-
-
-def _rng_state(seed: int) -> dict:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    return capture_rng_state()
-
-
-def _draw_rng_values() -> tuple[float, float, torch.Tensor]:
-    return random.random(), float(np.random.random()), torch.rand(3)
-
-
-def _rank_entry(rank: int, seed: int) -> dict:
-    return {
-        "rank": rank,
-        "rng": _rng_state(seed),
-        "sampler_cursor": {"epoch": 3, "offset": rank + 4},
-        "runtime_identity": {"device": "cpu", "rank_seed": seed},
-    }
-
-
-def _checkpoint(path, distributed_state=None):
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "adapter.bin").write_bytes(b"adapter-state")
-    optimizer = _Optimizer()
-    plugin = _Plugin()
-    metadata = save_training_state(
-        path,
-        optimizer=optimizer,
-        plugin=plugin,
-        step=8,
-        config={},
-        implementation={},
-        distributed_state=distributed_state,
-    )
-    return optimizer, plugin, metadata
-
-
-def _refresh_training_state_hash(path) -> None:
-    state_path = path / "training_state.pt"
-    metadata_path = path / "checkpoint.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["training_state_sha256"] = hashlib.sha256(
-        state_path.read_bytes()
-    ).hexdigest()
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
-
-
-def test_two_rank_roundtrip_is_sorted_weights_only_safe_and_rank_local(tmp_path):
-    rank_zero = _rank_entry(0, 101)
-    rank_one = _rank_entry(1, 202)
-    checkpoint = tmp_path / "checkpoint_000008"
-    optimizer, plugin, metadata = _checkpoint(
-        checkpoint,
-        {
-            "world_size": 2,
-            "backend": "gloo",
-            "entries": [rank_one, rank_zero],
-        },
-    )
-
-    state = torch.load(
-        checkpoint / "training_state.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    assert metadata["distributed_state"] == {
-        "world_size": 2,
-        "backend": "gloo",
-    }
-    assert [entry["rank"] for entry in state["distributed_state"]["entries"]] == [
-        0,
-        1,
-    ]
-    assert [
-        entry["runtime_identity"]
-        for entry in state["distributed_state"]["entries"]
-    ] == [rank_zero["runtime_identity"], rank_one["runtime_identity"]]
-
-    restore_rng_state(rank_zero["rng"])
-    expected_zero = _draw_rng_values()
-    restore_rng_state(rank_one["rng"])
-    expected_one = _draw_rng_values()
-    validated = read_and_validate_training_state(
-        checkpoint,
-        config={},
-        expected_world_size=2,
-        expected_rank=1,
-    )
-    assert [
-        entry["runtime_identity"]
-        for entry in validated.state["distributed_state"]["entries"]
-    ] == [rank_zero["runtime_identity"], rank_one["runtime_identity"]]
-
-    assert apply_training_state(
-        validated,
-        optimizer=optimizer,
-        plugin=plugin,
-        rank=0,
-    ) == 8
-    actual_zero = _draw_rng_values()
-    assert actual_zero[0:2] == expected_zero[0:2]
-    assert torch.equal(actual_zero[2], expected_zero[2])
-
-    apply_training_state(validated, optimizer=optimizer, plugin=plugin, rank=1)
-    actual_one = _draw_rng_values()
-    assert actual_one[0:2] == expected_one[0:2]
-    assert torch.equal(actual_one[2], expected_one[2])
-    assert actual_zero[0:2] != actual_one[0:2]
-    assert not torch.equal(actual_zero[2], actual_one[2])
-
-
-def test_world_size_and_missing_rank_changes_are_rejected(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    _checkpoint(
-        checkpoint,
-        {
-            "world_size": 2,
-            "backend": "gloo",
-            "entries": [_rank_entry(0, 11), _rank_entry(1, 22)],
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="world size changed"):
-        read_and_validate_training_state(
+        with torch.no_grad():
+            adapter.color_bias.zero_()
+        optimizer.state.clear()
+        validated = read_and_validate_training_state(
             checkpoint,
-            config={},
-            expected_world_size=3,
-        )
-    with pytest.raises(RuntimeError, match="does not contain rank 2"):
-        read_and_validate_training_state(
-            checkpoint,
-            config={},
+            adapter=adapter,
+            optimizer=optimizer,
+            scaler=None,
+            expected_global_step=1,
             expected_world_size=2,
-            expected_rank=2,
+            expected_training_contract=contract,
         )
+        apply_training_state(
+            validated,
+            adapter=adapter,
+            optimizer=optimizer,
+            scaler=None,
+            optimizer_config=vr.load(TINY).resolve().optimizer,
+            rank=1,
+        )
+
+        torch.testing.assert_close(adapter.color_bias, saved_parameter)
+        assert optimizer.state_dict()["state"].keys() == saved_optimizer["state"].keys()
+        assert torch.equal(torch.get_rng_state(), states[1].torch_cpu)
+        with pytest.raises(ResumeError, match="already been applied"):
+            apply_training_state(
+                validated,
+                adapter=adapter,
+                optimizer=optimizer,
+                scaler=None,
+                optimizer_config=vr.load(TINY).resolve().optimizer,
+                rank=1,
+            )
+    finally:
+        random.setstate(original_python)
+        np.random.set_state(original_numpy)
+        torch.set_rng_state(original_torch)
 
 
 @pytest.mark.parametrize(
-    ("entries", "message"),
+    ("world_size", "contract", "message"),
     [
-        (
-            lambda: [_rank_entry(0, 1), _rank_entry(0, 2)],
-            "duplicate rank 0",
-        ),
-        (
-            lambda: [_rank_entry(0, 1)],
-            "missing ranks: \\[1\\]",
-        ),
+        (1, TrainingContract("grpo", 2), "world_size"),
+        (2, TrainingContract("grpo", 1), "training_contract"),
+        (2, TrainingContract("flash_grpo", 2), "training_contract"),
     ],
 )
-def test_malformed_rank_sets_fail_closed(tmp_path, entries, message):
-    checkpoint = tmp_path / "checkpoint_000008"
-    checkpoint.mkdir()
-    (checkpoint / "adapter.bin").write_bytes(b"adapter-state")
-
-    with pytest.raises(RuntimeError, match=message):
+def test_resume_rejects_topology_or_training_contract_drift(
+    tmp_path: Path,
+    world_size: int,
+    contract: TrainingContract,
+    message: str,
+) -> None:
+    original_python = random.getstate()
+    original_numpy = np.random.get_state()
+    original_torch = torch.get_rng_state()
+    try:
+        adapter, optimizer = _adapter_optimizer()
+        checkpoint = tmp_path / "checkpoint_000001"
         save_training_state(
             checkpoint,
-            optimizer=_Optimizer(),
-            plugin=_Plugin(),
-            step=8,
-            config={},
-            implementation={},
-            distributed_state={
-                "world_size": 2,
-                "backend": "gloo",
-                "entries": entries(),
-            },
-        )
-    assert not (checkpoint / "training_state.pt").exists()
-
-
-@pytest.mark.parametrize(
-    "unsafe_identity",
-    [object(), float("nan")],
-    ids=["object", "nan"],
-)
-def test_unsafe_runtime_identity_values_fail_before_persistence(
-    tmp_path,
-    unsafe_identity,
-):
-    checkpoint = tmp_path / "checkpoint_000008"
-    entry_zero = _rank_entry(0, 1)
-    entry_zero["runtime_identity"]["nested"] = {"value": unsafe_identity}
-    checkpoint.mkdir()
-    (checkpoint / "adapter.bin").write_bytes(b"adapter-state")
-
-    with pytest.raises(RuntimeError, match="runtime identity must be JSON-safe"):
-        save_training_state(
-            checkpoint,
-            optimizer=_Optimizer(),
-            plugin=_Plugin(),
-            step=8,
-            config={},
-            implementation={},
-            distributed_state={
-                "world_size": 1,
-                "backend": "gloo",
-                "entries": [entry_zero],
-            },
-        )
-    assert not (checkpoint / "training_state.pt").exists()
-
-
-def test_unsafe_rank_local_values_fail_before_persistence(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    entry_zero = _rank_entry(0, 1)
-    entry_zero["sampler_cursor"] = object()
-    checkpoint.mkdir()
-    (checkpoint / "adapter.bin").write_bytes(b"adapter-state")
-
-    with pytest.raises(RuntimeError, match="unsafe value type"):
-        save_training_state(
-            checkpoint,
-            optimizer=_Optimizer(),
-            plugin=_Plugin(),
-            step=8,
-            config={},
-            implementation={},
-            distributed_state={
-                "world_size": 1,
-                "backend": "gloo",
-                "entries": [entry_zero],
-            },
-        )
-    assert not (checkpoint / "training_state.pt").exists()
-
-
-def test_nested_runtime_identity_secrets_are_redacted_before_persistence(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    entry_zero = _rank_entry(0, 1)
-    entry_zero["runtime_identity"] = {
-        "device": "cpu",
-        "runtime": {
-            "worker": "worker-0",
-            "credentials": {
-                "api_token": "nested-api-token-plaintext",
-                "password": "nested-password-plaintext",
-            },
-            "headers": [
-                {"authorization": "Bearer nested-authorization-plaintext"},
-                {"cookie": "session=nested-cookie-plaintext"},
-            ],
-        },
-    }
-    _checkpoint(
-        checkpoint,
-        {
-            "world_size": 1,
-            "backend": "gloo",
-            "entries": [entry_zero],
-        },
-    )
-
-    secrets = (
-        "nested-api-token-plaintext",
-        "nested-password-plaintext",
-        "nested-authorization-plaintext",
-        "nested-cookie-plaintext",
-    )
-    checkpoint_bytes = (checkpoint / "training_state.pt").read_bytes()
-    for secret in secrets:
-        assert secret.encode() not in checkpoint_bytes
-
-    state = torch.load(
-        checkpoint / "training_state.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    identity = state["distributed_state"]["entries"][0]["runtime_identity"]
-    assert identity == {
-        "device": "cpu",
-        "runtime": {
-            "worker": "worker-0",
-            "credentials": {
-                "api_token": "[REDACTED]",
-                "password": "[REDACTED]",
-            },
-            "headers": [
-                {"authorization": "[REDACTED]"},
-                {"cookie": "[REDACTED]"},
-            ],
-        },
-    }
-    validated = read_and_validate_training_state(
-        checkpoint,
-        config={},
-        expected_world_size=1,
-        expected_rank=0,
-    )
-    assert (
-        validated.state["distributed_state"]["entries"][0]["runtime_identity"]
-        == identity
-    )
-
-
-def test_unredacted_runtime_identity_is_rejected_on_read(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    _checkpoint(
-        checkpoint,
-        {
-            "world_size": 1,
-            "backend": "gloo",
-            "entries": [_rank_entry(0, 1)],
-        },
-    )
-    state_path = checkpoint / "training_state.pt"
-    state = torch.load(state_path, map_location="cpu", weights_only=True)
-    state["distributed_state"]["entries"][0]["runtime_identity"]["nested"] = {
-        "api_token": "tampered-token-plaintext"
-    }
-    torch.save(state, state_path)
-    _refresh_training_state_hash(checkpoint)
-
-    with pytest.raises(RuntimeError, match="contains unredacted secrets"):
-        read_and_validate_training_state(checkpoint, config={})
-
-
-def test_tampered_unsorted_entries_are_rejected_on_read(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    _checkpoint(
-        checkpoint,
-        {
-            "world_size": 2,
-            "backend": "gloo",
-            "entries": [_rank_entry(0, 1), _rank_entry(1, 2)],
-        },
-    )
-    state_path = checkpoint / "training_state.pt"
-    state = torch.load(state_path, map_location="cpu", weights_only=True)
-    state["distributed_state"]["entries"].reverse()
-    torch.save(state, state_path)
-    _refresh_training_state_hash(checkpoint)
-
-    with pytest.raises(RuntimeError, match="sorted by rank"):
-        read_and_validate_training_state(checkpoint, config={})
-
-
-def test_single_process_checkpoint_remains_implicit_rank_zero(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    optimizer, plugin, metadata = _checkpoint(checkpoint)
-    assert "distributed_state" not in metadata
-
-    validated = read_and_validate_training_state(
-        checkpoint,
-        config={},
-        expected_world_size=1,
-        expected_rank=0,
-    )
-    assert apply_training_state(
-        validated,
-        optimizer=optimizer,
-        plugin=plugin,
-    ) == 8
-    with pytest.raises(RuntimeError, match="does not contain rank 1"):
-        read_and_validate_training_state(
-            checkpoint,
-            config={},
-            expected_rank=1,
+            adapter=adapter,
+            optimizer=optimizer,
+            scaler=None,
+            global_step=1,
+            training_contract=TrainingContract("grpo", 2),
+            rank_states=(_rank_state(0, 1), _rank_state(1, 2)),
+            writer_rank=0,
+            writer_device=torch.device("cpu"),
         )
 
-
-def test_training_state_ignores_prepositioned_fixed_temp_symlink(tmp_path):
-    checkpoint = tmp_path / "checkpoint_000008"
-    checkpoint.mkdir()
-    (checkpoint / "adapter.bin").write_bytes(b"adapter-state")
-    outside = tmp_path / "outside.pt"
-    outside.write_bytes(b"do-not-overwrite")
-    fixed_temp = checkpoint / "training_state.pt.tmp"
-    fixed_temp.symlink_to(outside)
-
-    before = deepcopy(outside.read_bytes())
-    _checkpoint(checkpoint)
-
-    assert outside.read_bytes() == before
-    assert fixed_temp.is_symlink()
-    assert torch.load(
-        checkpoint / "training_state.pt",
-        map_location="cpu",
-        weights_only=True,
-    )["step"] == 8
-    assert read_and_validate_training_state(checkpoint, config={}).step == 8
-    assert list(checkpoint.glob(".training_state.pt.tmp-*")) == []
+        with pytest.raises(ResumeError, match=message):
+            read_and_validate_training_state(
+                checkpoint,
+                adapter=adapter,
+                optimizer=optimizer,
+                scaler=None,
+                expected_global_step=1,
+                expected_world_size=world_size,
+                expected_training_contract=contract,
+            )
+    finally:
+        random.setstate(original_python)
+        np.random.set_state(original_numpy)
+        torch.set_rng_state(original_torch)

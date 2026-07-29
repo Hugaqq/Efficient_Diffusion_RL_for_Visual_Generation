@@ -1,309 +1,200 @@
-"""Flash-GRPO loss for selected single-step diffusion RL."""
+"""Flash-GRPO typed rectification preparation."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+import math
+from typing import TYPE_CHECKING
 
-from visual_rl.core.registry import ALGORITHMS
-from visual_rl.core.types import RolloutBatch
+from visual_rl.core.types import (
+    FrozenMapping,
+    MetricContribution,
+    ResolutionContext,
+    RolloutBatch,
+    RuntimeBuildContext,
+)
+from visual_rl.optimizers.advantages import AdvantageResult
+from visual_rl.optimizers.base import (
+    PolicyAlgorithm,
+    _resolve_algorithm_params,
+)
+from visual_rl.optimizers.objective import PolicyLossInputs
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
-class FlashGRPOAlgorithm:
-    _PREPARED_RECTIFICATION_KEY = "_visual_rl_flash_rectification_weights"
+class FlashGRPOAlgorithm(PolicyAlgorithm):
+    """Reference-coefficient Flash preparation with one global mean."""
 
-    objective_version: str = "legacy_v0"
+    TRAINING_CONTRACT_VERSION = 2
+    ADVANTAGE_DTYPE = "float32"
+    MIN_GROUP_SIZE = 2
+
     clip_range: float = 0.001
     adv_clip_max: float = 5.0
-    beta: float = 0.0
-    rectification: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("clip_range", self.clip_range),
+            ("adv_clip_max", self.adv_clip_max),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a finite number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 < float(self.clip_range) < 1.0:
+            raise ValueError("clip_range must satisfy 0 < clip_range < 1")
+        if float(self.adv_clip_max) <= 0.0:
+            raise ValueError("adv_clip_max must be positive")
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FlashGRPOAlgorithm":
-        if not isinstance(config, dict):
-            from dataclasses import asdict
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> FrozenMapping:
+        return _resolve_algorithm_params(raw, context, allow_beta=False)
 
-            config = asdict(config)
-        objective_version = str(config.get("objective_version", "legacy_v0"))
-        if objective_version == "legacy":
-            objective_version = "legacy_v0"
-        if objective_version not in {"legacy_v0", "reference_v1"}:
-            raise ValueError(
-                "Flash-GRPO objective_version must be legacy_v0 or reference_v1"
-            )
-        beta = float(config.get("beta", 0.0))
-        if objective_version == "reference_v1" and beta != 0.0:
-            raise ValueError("Flash-GRPO reference_v1 requires beta=0")
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> FlashGRPOAlgorithm:
+        del context
         return cls(
-            objective_version=objective_version,
-            clip_range=float(config.get("clip_range", 0.001)),
-            adv_clip_max=float(config.get("adv_clip_max", 5.0)),
-            beta=beta,
-            rectification=dict(config.get("rectification") or {}),
+            clip_range=float(resolved["clip_range"]),
+            adv_clip_max=float(resolved["adv_clip_max"]),
         )
 
-    def compute_loss(self, batch: RolloutBatch, rewards, new_log_probs):
+    def weight_normalization_request(
+        self,
+        batch: RolloutBatch,
+        advantages: AdvantageResult,
+    ) -> tuple["torch.Tensor", int] | None:
+        coefficient, base = _validate_inputs(batch, advantages)
+        coefficient = coefficient.to(
+            device=base.device,
+            dtype=base.dtype,
+        )
+        return coefficient.mean().detach(), batch.batch_size
+
+    def prepare_loss_inputs(
+        self,
+        batch: RolloutBatch,
+        advantages: AdvantageResult,
+        *,
+        normalization_mean: "torch.Tensor | None",
+    ) -> PolicyLossInputs:
         import torch
 
-        if self.objective_version == "reference_v1" and self.beta != 0.0:
-            raise ValueError(
-                "Flash-GRPO reference_v1 requires beta=0 until a reference-model "
-                "forward KL contract is available"
-            )
-        advantages = self._expand_advantages(rewards, new_log_probs)
-        advantages = advantages.clamp(-self.adv_clip_max, self.adv_clip_max)
-        rectification_weights = self._prepared_rectification_weights(
-            batch,
-            new_log_probs,
+        coefficient, base = _validate_inputs(batch, advantages)
+        if normalization_mean is None:
+            raise ValueError("Flash-GRPO requires a global coefficient mean")
+        mean = torch.as_tensor(
+            normalization_mean,
+            device=base.device,
+            dtype=base.dtype,
         )
-        if rectification_weights is None:
-            if self.objective_version == "reference_v1":
-                rectification_weights = self._reference_coefficients(
-                    batch, new_log_probs
-                )
-            else:
-                rectification_weights = self._rectification_weights(
-                    batch, new_log_probs
-                ).to(new_log_probs.device)
-        advantages = advantages * rectification_weights
-        old_log_probs = batch.old_log_probs.to(new_log_probs.device, dtype=new_log_probs.dtype)
-
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        unclipped = -advantages * ratio
-        clipped = -advantages * ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range)
-        policy_loss = torch.maximum(unclipped, clipped).mean()
-        approx_kl = 0.5 * ((new_log_probs - old_log_probs) ** 2).mean()
-        clipfrac = ((ratio - 1.0).abs() > self.clip_range).float().mean()
         if (
-            self.objective_version == "legacy_v0"
-            and batch.kl is not None
-            and self.beta > 0
+            mean.ndim != 0
+            or not bool(torch.isfinite(mean))
+            or not bool(mean > 0)
         ):
-            policy_loss = policy_loss + self.beta * batch.kl.to(new_log_probs.device, dtype=new_log_probs.dtype).mean()
+            raise ValueError(
+                "Flash-GRPO normalization mean must be finite and positive"
+            )
+        expanded = (
+            base[:, None]
+            .clamp(-self.adv_clip_max, self.adv_clip_max)
+            .detach()
+        )
+        weight = coefficient.to(
+            device=expanded.device,
+            dtype=expanded.dtype,
+        ) / mean
+        active_mask = batch.transition_mask.to(
+            device=expanded.device,
+            dtype=torch.bool,
+        )
+        inputs = PolicyLossInputs(
+            base_advantage=expanded,
+            algorithm_weight=weight.detach(),
+            active_mask=active_mask,
+            clip_range=float(self.clip_range),
+            reference_kl_weight=0.0,
+        )
+        inputs.validate_against(batch)
+        return inputs
 
-        return policy_loss, {
-            "approx_kl": approx_kl,
-            "clipfrac": clipfrac,
-            "policy_loss": policy_loss.detach(),
-            "flash_rectification_weight_mean": rectification_weights.mean().detach(),
-            "flash_selected_timestep_mean": self._selected_timestep_mean(batch, new_log_probs),
-            "flash_active_timestep_frac": (advantages != 0).float().mean().detach(),
+    def diagnostics(
+        self,
+        batch: RolloutBatch,
+        inputs: PolicyLossInputs,
+    ) -> Mapping[str, MetricContribution]:
+        import torch
+
+        inputs.validate_against(batch)
+        selected = batch.selected_timestep_index
+        if selected is None:
+            raise ValueError(
+                "Flash-GRPO requires selected_timestep_index diagnostics"
+            )
+        active_mask = inputs.active_mask
+        active_count = int(active_mask.sum().item())
+        effective_advantage = (
+            inputs.base_advantage * inputs.algorithm_weight
+        )
+        return {
+            "algorithm/flash_rectification_weight_mean": MetricContribution(
+                numerator=inputs.algorithm_weight.masked_select(active_mask)
+                .to(torch.float64)
+                .sum()
+                .detach(),
+                denominator=active_count,
+            ),
+            "algorithm/flash_selected_timestep_mean": MetricContribution(
+                numerator=selected.to(
+                    device=inputs.base_advantage.device,
+                    dtype=torch.float64,
+                )
+                .sum()
+                .detach(),
+                denominator=batch.batch_size,
+            ),
+            "algorithm/flash_active_timestep_frac": MetricContribution(
+                numerator=(
+                    (effective_advantage != 0) & active_mask
+                )
+                .to(torch.float64)
+                .sum()
+                .detach(),
+                denominator=active_count,
+            ),
         }
 
-    def prepare_batch(self, batch: RolloutBatch, advantages) -> RolloutBatch:
-        import torch
 
-        old_log_probs = torch.as_tensor(batch.old_log_probs)
-        if old_log_probs.ndim == 0 or old_log_probs.shape[0] != batch.batch_size:
-            raise ValueError(
-                "Flash-GRPO old_log_probs must have a batch dimension"
-            )
-        advantage_values = torch.as_tensor(advantages)
-        objective_dtype = (
-            torch.float64
-            if advantage_values.dtype == torch.float64
-            else torch.float32
-        )
-        old_log_probs = old_log_probs.to(dtype=objective_dtype)
-        if self.objective_version == "reference_v1":
-            weights = self._reference_coefficients(batch, old_log_probs)
-        else:
-            weights = self._rectification_weights(batch, old_log_probs)
-        model_tensors = dict(batch.model_tensors)
-        model_tensors[self._PREPARED_RECTIFICATION_KEY] = weights.detach()
-        return batch.replace(model_tensors=model_tensors)
+def _validate_inputs(
+    batch: RolloutBatch,
+    advantages: AdvantageResult,
+):
+    import torch
 
-    def requires_global_batch_reduction(self) -> bool:
-        """Match the published reference's cross-rank coefficient mean."""
-
-        return self.objective_version == "reference_v1"
-
-    def global_batch_reduction(
-        self,
-        batch: RolloutBatch,
-        advantages,
-    ) -> tuple[Any, int]:
-        """Return this rank's coefficient mean and sample count once per batch."""
-
-        import torch
-
-        advantage_values = torch.as_tensor(advantages)
-        objective_dtype = (
-            torch.float64
-            if advantage_values.dtype == torch.float64
-            else torch.float32
-        )
-        old_log_probs = torch.as_tensor(
-            batch.old_log_probs,
-            dtype=objective_dtype,
-        )
-        coefficient = self._reference_coefficient(batch, old_log_probs)
-        return coefficient.mean().detach(), coefficient.numel()
-
-    def apply_global_batch_reduction(
-        self,
-        batch: RolloutBatch,
-        advantages,
-        global_mean: Any,
-    ) -> RolloutBatch:
-        """Store globally normalized full-batch weights for every microbatch."""
-
-        import torch
-
-        advantage_values = torch.as_tensor(advantages)
-        objective_dtype = (
-            torch.float64
-            if advantage_values.dtype == torch.float64
-            else torch.float32
-        )
-        old_log_probs = torch.as_tensor(
-            batch.old_log_probs,
-            dtype=objective_dtype,
-        )
-        weights = self._reference_coefficients(
-            batch,
-            old_log_probs,
-            normalization_mean=global_mean,
-        )
-        model_tensors = dict(batch.model_tensors)
-        model_tensors[self._PREPARED_RECTIFICATION_KEY] = weights.detach()
-        return batch.replace(model_tensors=model_tensors)
-
-    @staticmethod
-    def reduction_weight(batch: RolloutBatch, advantages) -> int:
-        import torch
-
-        del advantages
-        old_log_probs = torch.as_tensor(batch.old_log_probs)
-        if old_log_probs.ndim == 0 or old_log_probs.shape[0] != batch.batch_size:
-            raise ValueError(
-                "Flash-GRPO old_log_probs must have a batch dimension"
-            )
-        return old_log_probs.numel()
-
-    def _prepared_rectification_weights(self, batch, new_log_probs):
-        import torch
-
-        weights = batch.model_tensors.get(self._PREPARED_RECTIFICATION_KEY)
-        if weights is None:
-            return None
-        weights = torch.as_tensor(
-            weights,
-            device=new_log_probs.device,
-            dtype=new_log_probs.dtype,
-        )
-        try:
-            return torch.broadcast_to(weights, new_log_probs.shape)
-        except RuntimeError as exc:
-            raise ValueError(
-                "Prepared Flash rectification weights cannot broadcast to "
-                f"log probabilities: {tuple(weights.shape)} != "
-                f"{tuple(new_log_probs.shape)}"
-            ) from exc
-
-    @staticmethod
-    def _expand_advantages(rewards, new_log_probs):
-        import torch
-
-        if not isinstance(rewards, torch.Tensor):
-            rewards = torch.as_tensor(rewards, dtype=torch.float32)
-        rewards = rewards.to(new_log_probs.device, dtype=new_log_probs.dtype)
-        if rewards.shape == new_log_probs.shape:
-            return rewards
-        if rewards.ndim != 1:
-            raise ValueError("Flash-GRPO advantages must be either [batch] or [batch, 1].")
-        return rewards[:, None].expand_as(new_log_probs)
-
-    def _rectification_weights(self, batch: RolloutBatch, new_log_probs):
-        import torch
-
-        config = self.rectification or {}
-        if config.get("enabled", True) is False or config.get("mode", "scheduler_formula") in {"none", None}:
-            return torch.ones_like(new_log_probs)
-
-        custom = batch.model_metadata.get("flash_rectification_weights")
-        if custom is not None:
-            weights = torch.as_tensor(custom, dtype=new_log_probs.dtype)
-            if weights.ndim == 1:
-                weights = weights[:, None]
-            if weights.shape != new_log_probs.shape:
-                weights = weights.expand_as(new_log_probs)
-            if config.get("normalize", True):
-                weights = weights / weights.mean().clamp_min(1e-6)
-            return weights
-
-        selected = batch.model_metadata.get("selected_timestep_indices", [0] * new_log_probs.shape[0])
-        num_steps = int(batch.model_metadata.get("num_steps", max(1, new_log_probs.shape[1])))
-        positions = torch.as_tensor(selected, dtype=new_log_probs.dtype)[:, None]
-        if config.get("mode", "scheduler_formula") == "scheduler_formula":
-            weights = torch.sqrt((num_steps - positions).clamp_min(1.0) / float(num_steps))
-        else:
-            raise ValueError(f"Unknown Flash rectification mode: {config.get('mode')}")
-        if config.get("normalize", True):
-            weights = weights / weights.mean().clamp_min(1e-6)
-        return weights.expand_as(new_log_probs)
-
-    @staticmethod
-    def _reference_coefficient(batch: RolloutBatch, new_log_probs):
-        import torch
-
-        coefficient = batch.model_tensors.get("coefficient")
-        if not isinstance(coefficient, torch.Tensor):
-            raise ValueError(
-                "Flash-GRPO reference_v1 requires model_tensors['coefficient']"
-            )
-        expected_shape = (new_log_probs.shape[0], 1)
-        if tuple(coefficient.shape) != expected_shape:
-            raise ValueError(
-                "Flash-GRPO reference_v1 coefficient must have shape "
-                f"[B,1], got {tuple(coefficient.shape)}"
-            )
-        coefficient = coefficient.to(
-            device=new_log_probs.device,
-            dtype=new_log_probs.dtype,
-        )
-        if not torch.isfinite(coefficient).all() or not (coefficient > 0).all():
-            raise ValueError(
-                "Flash-GRPO reference_v1 coefficient must be finite and positive"
-            )
-        return coefficient
-
-    @classmethod
-    def _reference_coefficients(
-        cls,
-        batch: RolloutBatch,
-        new_log_probs,
-        *,
-        normalization_mean: Any | None = None,
-    ):
-        import torch
-
-        coefficient = cls._reference_coefficient(batch, new_log_probs)
-        mean = (
-            coefficient.mean()
-            if normalization_mean is None
-            else torch.as_tensor(
-                normalization_mean,
-                device=coefficient.device,
-                dtype=coefficient.dtype,
-            )
-        )
-        if mean.ndim != 0 or not torch.isfinite(mean) or not (mean > 0):
-            raise ValueError(
-                "Flash-GRPO reference_v1 coefficient normalization mean must "
-                "be finite and positive"
-            )
-        return coefficient / mean
-
-    @staticmethod
-    def _selected_timestep_mean(batch: RolloutBatch, new_log_probs):
-        import torch
-
-        selected = batch.model_metadata.get("selected_timestep_indices")
-        if selected is None:
-            return torch.zeros((), dtype=new_log_probs.dtype, device=new_log_probs.device)
-        return torch.as_tensor(selected, dtype=new_log_probs.dtype, device=new_log_probs.device).mean().detach()
-
-
-ALGORITHMS.register("flash_grpo", FlashGRPOAlgorithm)
+    if not isinstance(batch, RolloutBatch):
+        raise TypeError("batch must be a RolloutBatch")
+    if not isinstance(advantages, AdvantageResult):
+        raise TypeError("advantages must be an AdvantageResult")
+    if batch.transition_count != 1:
+        raise ValueError("Flash-GRPO requires a physical T=1 rollout")
+    coefficient = batch.flash_coefficient
+    if coefficient is None:
+        raise ValueError("Flash-GRPO requires batch.flash_coefficient")
+    values = advantages.base_advantage
+    if values.dtype != torch.float32:
+        raise TypeError("Flash-GRPO base_advantage must use torch.float32")
+    if tuple(values.shape) != (batch.batch_size,):
+        raise ValueError("Flash-GRPO base_advantage must have shape [B]")
+    return coefficient, values

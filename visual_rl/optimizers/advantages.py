@@ -1,241 +1,150 @@
-"""Single-owner reward-to-advantage conversion for VisualRL optimizers."""
+"""The sole reward-to-group-advantage conversion."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Hashable, Sequence
-from typing import Any
+import math
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
-import numpy as np
-
-EPSILON = 1e-6
-
-
-def normalize_rewards(values: np.ndarray, epsilon: float = EPSILON) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
-    return (values - values.mean()) / (values.std() + float(epsilon))
+from visual_rl.core.types import (
+    MetricContribution,
+    RewardBatch,
+    RolloutBatch,
+)
 
 
-def calculate_zero_std_ratio(
-    prompts: list[str],
-    rewards: np.ndarray,
-    group_ids: Sequence[Hashable] | None = None,
-    epsilon: float = EPSILON,
-) -> float:
-    groups = _group_indices(group_ids if group_ids is not None else prompts)
-    if not groups:
-        return 0.0
-    values = np.asarray(rewards, dtype=np.float64)
-    return float(
-        sum(
-            float(np.std(values[indices])) <= float(epsilon)
-            for indices in groups.values()
-        )
-        / len(groups)
-    )
-
-
-@dataclass
+@dataclass(frozen=True)
 class AdvantageResult:
-    advantages: Any
-    metrics: dict[str, float]
+    """Detached group-relative advantage plus reducible diagnostics."""
+
+    base_advantage: Any
+    metrics: Mapping[str, MetricContribution]
+
+    def __post_init__(self) -> None:
+        import torch
+
+        if not isinstance(self.base_advantage, torch.Tensor):
+            raise TypeError("base_advantage must be a torch.Tensor")
+        if self.base_advantage.ndim != 1:
+            raise ValueError("base_advantage must have shape [B]")
+        if not self.base_advantage.is_floating_point():
+            raise TypeError("base_advantage must be floating point")
+        if (
+            self.base_advantage.requires_grad
+            or self.base_advantage.grad_fn is not None
+        ):
+            raise ValueError("base_advantage must be detached without grad_fn")
+        if not bool(torch.isfinite(self.base_advantage).all()):
+            raise ValueError("base_advantage must be finite")
+        if not isinstance(self.metrics, Mapping):
+            raise TypeError("metrics must be a mapping")
+        frozen_metrics: dict[str, MetricContribution] = {}
+        for key, contribution in self.metrics.items():
+            if not isinstance(key, str) or not key.startswith("advantage/"):
+                raise ValueError(
+                    "advantage metric keys must use the advantage/ namespace"
+                )
+            if not isinstance(contribution, MetricContribution):
+                raise TypeError(
+                    "advantage metrics must contain MetricContribution values"
+                )
+            frozen_metrics[key] = contribution
+        object.__setattr__(
+            self,
+            "metrics",
+            MappingProxyType(frozen_metrics),
+        )
 
 
-class AdvantageFunction:
-    """Convert one validated reward batch into per-sample advantages."""
-
-    def __call__(self, batch: Any, rewards: Any) -> AdvantageResult:
-        raise NotImplementedError
-
-
-class AdvantageComputer(AdvantageFunction):
-    """Normalize rewards exactly once, immediately before policy optimization."""
+class AdvantageComputer:
+    """Normalize the already-weighted reward once by typed occurrence group."""
 
     def __init__(
         self,
-        reward_weights: dict[str, float],
-        per_prompt: bool = True,
-        weight_advantages: bool = False,
-        use_global_std: bool = False,
-        max_group_std: bool = False,
-        mode: str = "grpo",
-        epsilon: float = EPSILON,
-        output_dtype: str = "float32",
-    ):
-        if use_global_std and max_group_std:
-            raise ValueError("use_global_std and max_group_std are mutually exclusive")
-        self.reward_weights = dict(reward_weights)
-        self.per_prompt = bool(per_prompt)
-        self.weight_advantages = bool(weight_advantages)
-        self.use_global_std = bool(use_global_std)
-        self.max_group_std = bool(max_group_std)
-        self.mode = str(mode)
+        *,
+        epsilon: float,
+        output_dtype: Literal["float32", "float64"],
+    ) -> None:
+        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+            raise TypeError("advantage epsilon must be a number, not bool")
         self.epsilon = float(epsilon)
-        if self.epsilon <= 0:
-            raise ValueError("advantage epsilon must be positive")
-        self.output_dtype = str(output_dtype)
-        if self.output_dtype not in {"float32", "float64"}:
-            raise ValueError("advantage output_dtype must be 'float32' or 'float64'")
+        if not math.isfinite(self.epsilon) or self.epsilon <= 0.0:
+            raise ValueError("advantage epsilon must be finite and positive")
+        if output_dtype not in {"float32", "float64"}:
+            raise ValueError("output_dtype must be float32 or float64")
+        self.output_dtype = output_dtype
 
-    def __call__(self, batch: Any, rewards: Any) -> AdvantageResult:
-        """Apply the canonical batch/reward contract while retaining ``compute``.
-
-        Formal rollout batches carry an explicit ``StepContext`` and use their
-        declared ``group_id``. Older batches preserve the historical grouping
-        by ``parent_prompt_index`` (falling back to the prompt itself).
-        """
-
-        if getattr(batch, "context", None) is not None:
-            group_ids = list(batch.group_id)
-        else:
-            group_ids = [
-                item.get("parent_prompt_index", prompt)
-                for prompt, item in zip(
-                    batch.prompts,
-                    batch.metadata,
-                    strict=True,
-                )
-            ]
-        return self.compute(
-            batch.prompts,
-            rewards.raw,
-            rewards.weighted_total,
-            group_ids=group_ids,
-        )
-
-    def compute(
+    def __call__(
         self,
-        prompts: list[str],
-        raw_rewards: dict[str, Any],
-        weighted_total: Any,
-        group_ids: Sequence[Hashable] | None = None,
+        batch: RolloutBatch,
+        rewards: RewardBatch,
     ) -> AdvantageResult:
         import torch
 
-        total_np = _to_numpy_vector(weighted_total, len(prompts), "weighted_total")
-        grouping_keys = group_ids if group_ids is not None else prompts
-        if len(grouping_keys) != len(prompts):
-            raise ValueError("group_ids must have one entry per sample")
-        groups = _group_indices(grouping_keys)
-        self._validate_groups(groups, len(prompts))
-        metrics = {
-            "zero_std_ratio": calculate_zero_std_ratio(
-                prompts,
-                total_np,
-                group_ids=group_ids,
-                epsilon=self.epsilon,
-            ),
-            "group_size": float(np.mean([len(indices) for indices in groups.values()])),
-            "trained_prompt_num": float(len(groups)),
-        }
-
-        if self.weight_advantages:
-            advantage_np = np.zeros(len(prompts), dtype=np.float64)
-            for name, weight in self.reward_weights.items():
-                if name not in raw_rewards:
-                    raise KeyError(f"Missing raw reward {name!r} for weighted advantages")
-                values = _to_numpy_vector(raw_rewards[name], len(prompts), name)
-                advantage_np += self._shape(values, groups) * float(weight)
-        else:
-            advantage_np = self._shape(total_np, groups)
-
-        return AdvantageResult(
-            advantages=torch.as_tensor(
-                advantage_np,
-                dtype={"float32": torch.float32, "float64": torch.float64}[
-                    self.output_dtype
-                ],
-            ),
-            metrics=metrics,
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("batch must be a RolloutBatch")
+        if not isinstance(rewards, RewardBatch):
+            raise TypeError("rewards must be a RewardBatch")
+        rewards.validate_against(batch)
+        values = rewards.weighted_total.detach().to(dtype=torch.float64)
+        groups: dict[str, list[int]] = {}
+        for row, group_id in enumerate(batch.group_id):
+            groups.setdefault(group_id, []).append(row)
+        singleton = tuple(
+            group_id for group_id, rows in groups.items() if len(rows) < 2
         )
-
-    def _shape(
-        self,
-        values: np.ndarray,
-        groups: dict[Hashable, np.ndarray],
-    ) -> np.ndarray:
-        if not self.per_prompt:
-            return _shape_one_group(
-                values,
-                self.mode,
-                values.std() + self.epsilon,
+        if singleton:
+            raise ValueError(
+                "group-relative advantage requires at least two rows per "
+                f"group: {singleton}"
             )
 
-        result = np.zeros_like(values, dtype=np.float64)
-        if self.use_global_std:
-            shared_std = float(values.std()) + self.epsilon
-        elif self.max_group_std:
-            shared_std = (
-                max(float(values[indices].std()) for indices in groups.values())
-                + self.epsilon
-            )
-        else:
-            shared_std = None
+        advantages = torch.empty_like(values)
+        zero_std_groups = 0
+        for rows in groups.values():
+            index = torch.tensor(rows, dtype=torch.long, device=values.device)
+            group_values = values.index_select(0, index)
+            std = group_values.std(correction=0)
+            if float(std.detach().cpu()) <= self.epsilon:
+                zero_std_groups += 1
+            normalized = (
+                group_values - group_values.mean()
+            ) / (std + self.epsilon)
+            advantages.index_copy_(0, index, normalized)
 
-        for indices in groups.values():
-            group_values = values[indices]
-            denominator = shared_std or float(group_values.std()) + self.epsilon
-            result[indices] = _shape_one_group(group_values, self.mode, denominator)
-        return result
-
-    def _validate_groups(
-        self,
-        groups: dict[Hashable, np.ndarray],
-        batch_size: int,
-    ) -> None:
-        if self.mode not in {"grpo", "dpo"}:
-            return
-        if self.per_prompt:
-            singleton_groups = [group for group, indices in groups.items() if len(indices) < 2]
-            if singleton_groups:
-                raise ValueError(
-                    "GRPO/DPO requires at least two samples for every group; "
-                    f"singleton groups: {singleton_groups}"
-                )
-        elif batch_size < 2:
-            raise ValueError("GRPO/DPO requires at least two samples to normalize advantages")
-
-    def state_dict(self) -> dict[str, Any]:
-        return {}
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state:
-            raise ValueError("AdvantageComputer has no persistent state")
-
-
-def _group_indices(keys: Sequence[Hashable]) -> dict[Hashable, np.ndarray]:
-    groups: dict[Hashable, list[int]] = {}
-    for index, key in enumerate(keys):
-        if not isinstance(key, Hashable):
-            raise ValueError(f"group_ids[{index}] must be hashable")
-        groups.setdefault(key, []).append(index)
-    return {
-        key: np.asarray(indices, dtype=np.int64)
-        for key, indices in groups.items()
-    }
-
-
-def _shape_one_group(values: np.ndarray, mode: str, denominator: float) -> np.ndarray:
-    if mode == "grpo":
-        return (values - values.mean()) / denominator
-    if mode == "rwr":
-        return values.astype(np.float64, copy=True)
-    if mode == "sft":
-        return (values == values.max()).astype(np.float64)
-    if mode == "dpo":
-        shaped = np.zeros_like(values, dtype=np.float64)
-        shaped[int(np.argmax(values))] = 1.0
-        shaped[int(np.argmin(values))] = -1.0
-        return shaped
-    raise ValueError(f"Unknown advantage mode: {mode}")
-
-
-def _to_numpy_vector(value: Any, expected: int, name: str) -> np.ndarray:
-    if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
-    array = np.asarray(value, dtype=np.float64)
-    if array.shape != (expected,):
-        raise ValueError(f"{name} must have shape ({expected},), got {array.shape}")
-    if not np.isfinite(array).all():
-        raise ValueError(f"{name} contains non-finite values")
-    return array
+        output_dtype = {
+            "float32": torch.float32,
+            "float64": torch.float64,
+        }[self.output_dtype]
+        group_count = len(groups)
+        metric_device = values.device
+        return AdvantageResult(
+            base_advantage=advantages.to(dtype=output_dtype).detach(),
+            metrics={
+                "advantage/zero_std_ratio": MetricContribution(
+                    numerator=torch.tensor(
+                        float(zero_std_groups),
+                        dtype=torch.float64,
+                        device=metric_device,
+                    ),
+                    denominator=group_count,
+                ),
+                "advantage/group_size_mean": MetricContribution(
+                    numerator=torch.tensor(
+                        float(sum(map(len, groups.values()))),
+                        dtype=torch.float64,
+                        device=metric_device,
+                    ),
+                    denominator=group_count,
+                ),
+                "advantage/trained_prompt_num": MetricContribution(
+                    numerator=torch.tensor(
+                        float(group_count),
+                        dtype=torch.float64,
+                        device=metric_device,
+                    ),
+                    denominator=None,
+                ),
+            },
+        )

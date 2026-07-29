@@ -1,0 +1,470 @@
+{
+  "algorithms": {
+    "flash_grpo": {
+      "active_transition_count": 14,
+      "algorithm_class": "visual_rl.optimizers.flash_grpo.FlashGRPOAlgorithm",
+      "algorithm_config": {
+        "adv_clip_max": 5.0,
+        "beta": 0.0,
+        "clip_range": 10.0,
+        "objective_version": "legacy_v0",
+        "rectification": null
+      },
+      "approx_kl": 0.05088687688112259,
+      "clipfrac": 0.0,
+      "diagnostics": {
+        "approx_kl": 0.05088687688112259,
+        "clipfrac": 0.0,
+        "flash_active_timestep_frac": 1.0,
+        "flash_rectification_weight_mean": 1.0,
+        "flash_selected_timestep_mean": 0.0,
+        "mask_semantics": "masked_select(batch.transition_mask): the 2 invalid transitions are excluded from loss/approx_kl/clipfrac",
+        "policy_loss": -0.72688227891922
+      },
+      "gradients": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            -0.3872436285018921,
+            0.1937701404094696,
+            0.19290730357170105
+          ]
+        }
+      },
+      "invalid_transition_count": 2,
+      "loss": -0.72688227891922,
+      "optimizer": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "lr": 0.1,
+        "type": "torch.optim.AdamW",
+        "weight_decay": 0.01
+      },
+      "parameter_delta": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999997168779373,
+            -0.09999998658895493
+          ]
+        }
+      },
+      "updated_parameters": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999997168779373,
+            -0.09999998658895493
+          ]
+        }
+      }
+    },
+    "grpo": {
+      "active_transition_count": 14,
+      "algorithm_class": "visual_rl.optimizers.grpo.GRPOAlgorithm",
+      "algorithm_config": {
+        "adv_clip_max": 5.0,
+        "beta": 0.0,
+        "clip_range": 10.0
+      },
+      "approx_kl": 0.05088687688112259,
+      "clipfrac": 0.0,
+      "diagnostics": {
+        "approx_kl": 0.05088687688112259,
+        "clipfrac": 0.0,
+        "mask_semantics": "masked_select(batch.transition_mask): the 2 invalid transitions are excluded from loss/approx_kl/clipfrac",
+        "policy_loss": -0.72688227891922
+      },
+      "gradients": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            -0.3872436285018921,
+            0.1937701404094696,
+            0.19290730357170105
+          ]
+        }
+      },
+      "invalid_transition_count": 2,
+      "loss": -0.72688227891922,
+      "optimizer": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "lr": 0.1,
+        "type": "torch.optim.AdamW",
+        "weight_decay": 0.01
+      },
+      "parameter_delta": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999997168779373,
+            -0.09999998658895493
+          ]
+        }
+      },
+      "updated_parameters": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999997168779373,
+            -0.09999998658895493
+          ]
+        }
+      }
+    },
+    "tempflow_grpo": {
+      "active_transition_count": 16,
+      "algorithm_class": "visual_rl.optimizers.tempflow_grpo.TempFlowGRPOAlgorithm",
+      "algorithm_config": {
+        "adv_clip_max": 5.0,
+        "advantage_dtype": "float32",
+        "beta": 0.0,
+        "clip_range": 10.0,
+        "credit_assignment": "branch_timestep",
+        "noise_weighting": null,
+        "objective_version": "legacy",
+        "preserve_advantage_dtype": false
+      },
+      "approx_kl": 0.051034823060035706,
+      "clipfrac": 0.0,
+      "diagnostics": {
+        "approx_kl": 0.051034823060035706,
+        "clipfrac": 0.0,
+        "mask_semantics": "legacy objective_version ignores batch.transition_mask: all 16 transitions enter the mean (reduction_weight=numel)",
+        "policy_loss": -0.7264033555984497,
+        "tempflow_active_timestep_frac": 1.0,
+        "tempflow_noise_weight_mean": 1.0
+      },
+      "gradients": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            -0.38728952407836914,
+            0.19371816515922546,
+            0.19329902529716492
+          ]
+        }
+      },
+      "invalid_transition_count": 2,
+      "loss": -0.7264033555984497,
+      "optimizer": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "eps": 1e-08,
+        "lr": 0.1,
+        "type": "torch.optim.AdamW",
+        "weight_decay": 0.01
+      },
+      "parameter_delta": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999998658895493,
+            -0.09999997913837433
+          ]
+        }
+      },
+      "updated_parameters": {
+        "color_bias": {
+          "dtype": "torch.float32",
+          "shape": [
+            3
+          ],
+          "values": [
+            0.09999999403953552,
+            -0.09999998658895493,
+            -0.09999997913837433
+          ]
+        }
+      }
+    }
+  },
+  "batch": {
+    "kl": {
+      "dtype": "torch.float32",
+      "shape": [
+        4,
+        4
+      ],
+      "values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "latents_sha256": "699ee03f6eb39d536f842fea2662946f7eb7efd3d42c28373c2d3a4123d0e662",
+    "media_sha256": "30b4c6c4f69fd90faed4a8b1a8a5b0e06dad034762ca65ec7980188afdeae53d",
+    "next_latents_sha256": "63bbfeb91e215325c8ef4a7d3548d4c6b63caa27e3535717ae377abdabfdc2e4",
+    "old_log_probs": {
+      "dtype": "torch.float32",
+      "shape": [
+        4,
+        4
+      ],
+      "values": [
+        -0.0024701175279915333,
+        -0.0021150028333067894,
+        -0.0027411121409386396,
+        -0.002303767018020153,
+        -0.002340358914807439,
+        -0.0023814719170331955,
+        -0.002917572855949402,
+        -0.002360402373597026,
+        -0.0026580432895570993,
+        -0.0022510394919663668,
+        -0.0027793135959655046,
+        -0.002293192781507969,
+        -0.002684160368517041,
+        -0.0025002951733767986,
+        -0.0023359183687716722,
+        -0.002300678752362728
+      ]
+    },
+    "student_new_log_probs_at_init": {
+      "dtype": "torch.float32",
+      "shape": [
+        4,
+        4
+      ],
+      "values": [
+        -0.3252803683280945,
+        -0.3168698847293854,
+        -0.31966742873191833,
+        -0.3166210949420929,
+        -0.32677990198135376,
+        -0.3292829096317291,
+        -0.32328304648399353,
+        -0.316291868686676,
+        -0.31773197650909424,
+        -0.32103532552719116,
+        -0.32566413283348083,
+        -0.3228141665458679,
+        -0.3220367133617401,
+        -0.3193797171115875,
+        -0.32330402731895447,
+        -0.32476672530174255
+      ]
+    },
+    "teacher_target_bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3
+      ],
+      "values": [
+        0.800000011920929,
+        -0.4000000059604645,
+        -0.4000000059604645
+      ]
+    },
+    "timesteps": {
+      "dtype": "torch.int64",
+      "shape": [
+        4,
+        4
+      ],
+      "values": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        0.0,
+        1.0,
+        2.0,
+        3.0
+      ]
+    }
+  },
+  "config": {
+    "advantages": "torch.ones_like(batch.old_log_probs)  # [B,T] all ones",
+    "batch_size": 4,
+    "channels": 3,
+    "device": "cpu",
+    "dtype": "torch.float32",
+    "image_size": 8,
+    "learning_rate": 0.1,
+    "num_steps": 4,
+    "optimizer": {
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "lr": 0.1,
+      "type": "torch.optim.AdamW",
+      "weight_decay": 0.01
+    },
+    "seed": 123,
+    "target_bias": [
+      0.8,
+      -0.4,
+      -0.4
+    ]
+  },
+  "mask": {
+    "active_transition_count": 14,
+    "invalid_transition_count": 2,
+    "invalid_transitions": [
+      [
+        1,
+        0
+      ],
+      [
+        3,
+        2
+      ]
+    ],
+    "note": "Deterministic transition_mask with exactly two invalid transitions at [batch, transition] coordinates listed in invalid_transitions; all other entries are True. The teacher rollout itself is identical to scripts/loss_probe.py (which uses the default all-True mask).",
+    "transition_mask": [
+      [
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        false,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        true
+      ],
+      [
+        true,
+        true,
+        false,
+        true
+      ]
+    ]
+  },
+  "purpose": "Characterization of the v0.6 supervised TinyDiffusionAdapter probe (scripts/loss_probe.py) before that script is deleted. Records exact GRPO/Flash-GRPO/TempFlow-GRPO loss, approx-KL/clipfrac, mask, per-parameter gradient and one-step parameter delta literals.",
+  "schema": "visual_rl.characterization/v0_6_loss_probe.v1",
+  "source": {
+    "code_revision": "5ce1ef7d91048f7291457269aa8b22e05d32b1d8",
+    "generator": "torch.Generator(device='cpu').manual_seed(123) constructed inside TinyDiffusionAdapter.sample from rollout_config['seed']; seed_everything(123) from visual_rl.core.seed called first",
+    "numpy_version": "1.26.4",
+    "probe_config_class": "scripts.loss_probe.TinyLossProbeConfig",
+    "python_version": "3.10.20",
+    "script": "scripts/loss_probe.py",
+    "torch_version": "2.12.0"
+  },
+  "v0_7_cutover": {
+    "clipped_surrogate": {
+      "active_transition_count": 3,
+      "approx_kl": 0.03418934221293305,
+      "clipfrac": 0.6666666666666666,
+      "policy_loss": -0.7166666666666667
+    },
+    "flow_reference": {
+      "beta": 0.3,
+      "policy_loss": -1.1,
+      "reference_kl": 1.25,
+      "total_loss": -0.7250000000000001
+    },
+    "note": "Final v0.7 typed objective oracle appended without changing or reinterpreting any v0.6 characterization entry."
+  },
+  "supervised_fit": {
+    "fit_loss": 0.051034823060035706,
+    "gradients": {
+      "color_bias": {
+        "dtype": "torch.float32",
+        "shape": [
+          3
+        ],
+        "values": [
+          -0.17026768624782562,
+          0.0852290540933609,
+          0.08497851341962814
+        ]
+      }
+    },
+    "note": "The probe's own descent signal: fit_loss = 0.5 * mean((new - old)^2) over ALL transitions (mask not applied), plus transition NLL; gradient and one AdamW step from the same initial student.",
+    "optimizer": {
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "lr": 0.1,
+      "type": "torch.optim.AdamW",
+      "weight_decay": 0.01
+    },
+    "parameter_delta": {
+      "color_bias": {
+        "dtype": "torch.float32",
+        "shape": [
+          3
+        ],
+        "values": [
+          0.09999998658895493,
+          -0.09999997913837433,
+          -0.09999998658895493
+        ]
+      }
+    },
+    "transition_nll": 0.3219255805015564
+  }
+}

@@ -1,26 +1,26 @@
 """Policy algorithms, advantage computation, and update plugins."""
 
 from visual_rl.optimizers.base import OptimizerPlugin
-from visual_rl.optimizers.advantages import AdvantageComputer, AdvantageFunction, AdvantageResult
+from visual_rl.optimizers.advantages import (
+    AdvantageComputer,
+    AdvantageResult,
+)
 from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
-from visual_rl.optimizers.factory import build_algorithm, build_optimizer_plugin
 from visual_rl.optimizers.objective import (
-    AlgorithmPolicyObjective,
     ObjectiveOutput,
+    PolicyLossInputs,
     PolicyObjective,
 )
-from visual_rl.optimizers.update_engine import UpdateEngine
+from visual_rl.optimizers.update_engine import UpdateEngine, UpdateResult
 
 __all__ = [
     "OptimizerPlugin",
-    "AdvantageFunction",
     "AdvantageComputer",
     "AdvantageResult",
+    "PolicyLossInputs",
     "PolicyObjective",
-    "AlgorithmPolicyObjective",
     "ObjectiveOutput",
     "UpdateEngine",
+    "UpdateResult",
     "AlgorithmOptimizerPlugin",
-    "build_algorithm",
-    "build_optimizer_plugin",
 ]

@@ -1,134 +1,221 @@
-"""Cheap image rewards for local visual RL tests."""
+"""Deterministic local image rewards used by builtin SD3 experiments."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import math
 import re
-from typing import Any
+from typing import ClassVar
 
 import numpy as np
 
-from visual_rl.core.registry import REWARD_CLIENTS
+from visual_rl.core.types import (
+    FrozenMapping,
+    ResolutionContext,
+    RewardVector,
+    RolloutBatch,
+    RuntimeBuildContext,
+    StepContext,
+)
+from visual_rl.feedback.base import RewardClient
 
+__all__ = [
+    "PromptColorGuardedRewardClient",
+    "PromptColorMarginRewardClient",
+    "PromptColorRewardClient",
+]
 
 COLOR_TO_INDEX = {"red": 0, "green": 1, "blue": 2}
+_COLOR_KEYS = frozenset(COLOR_TO_INDEX)
 
 
-@dataclass
-class PromptColorRewardClient:
-    name: str = "prompt_color"
-    default_color: str = "red"
+@dataclass(frozen=True)
+class PromptColorRewardClient(RewardClient):
+    """Bounded target-channel margin for image contract tests."""
 
-    def score(self, media: Any, prompts: list[str], metadata: list[dict[str, Any]]) -> tuple[np.ndarray, dict[str, Any]]:
-        images = self._to_numpy_images(media)
-        scores = []
-        targets = []
-        for index, prompt in enumerate(prompts):
-            color = str(metadata[index].get("target_color") or self._color_from_prompt(prompt))
-            target = COLOR_TO_INDEX.get(color, COLOR_TO_INDEX[self.default_color])
-            channel_means = images[index].reshape(3, -1).mean(axis=1)
-            target_score = channel_means[target]
-            distractor_score = np.delete(channel_means, target).mean()
-            scores.append(float(np.clip(0.5 + target_score - distractor_score, 0.0, 1.0)))
-            targets.append(color)
-        return np.asarray(scores, dtype=np.float32), {"targets": targets}
+    default_color: str
+    name: ClassVar[str] = "prompt_color"
 
-    def _color_from_prompt(self, prompt: str) -> str:
-        tokens = set(re.findall(r"[a-z]+", prompt.lower()))
-        matches = [color for color in COLOR_TO_INDEX if color in tokens]
-        if len(matches) == 1:
-            return matches[0]
-        return self.default_color
+    @classmethod
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> Mapping[str, object]:
+        del context
+        default_color = _resolve_default_color(raw, component=cls.name)
+        return FrozenMapping({"default_color": default_color})
 
-    @staticmethod
-    def _to_numpy_images(media: Any) -> np.ndarray:
-        try:
-            import torch
-
-            if isinstance(media, torch.Tensor):
-                media = media.detach().cpu().float().numpy()
-        except Exception:  # noqa: BLE001 - numpy fallback below reports shape issues
-            pass
-        images = np.asarray(media, dtype=np.float32)
-        if images.ndim == 5:
-            images = images[:, -1]
-        if images.ndim != 4:
-            raise ValueError(f"prompt_color expects [B, C, H, W] or [B, T, C, H, W], got {images.shape}")
-        if images.shape[1] == 3:
-            return images
-        if images.shape[-1] == 3:
-            return np.moveaxis(images, -1, 1)
-        raise ValueError(f"prompt_color cannot locate RGB channel in shape {images.shape}")
-
-
-@dataclass
-class PromptColorMarginRewardClient(PromptColorRewardClient):
-    """Unclipped RGB margin for branch-relative optimization."""
-
-    name: str = "prompt_color_margin"
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> PromptColorRewardClient:
+        del context
+        return cls(
+            default_color=_resolve_default_color(resolved, component=cls.name)
+        )
 
     def score(
         self,
-        media: Any,
-        prompts: list[str],
-        metadata: list[dict[str, Any]],
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        images = self._to_numpy_images(media)
-        scores = []
-        targets = []
-        for index, prompt in enumerate(prompts):
-            color = str(
-                metadata[index].get("target_color")
-                or self._color_from_prompt(prompt)
-            )
-            target = COLOR_TO_INDEX.get(color, COLOR_TO_INDEX[self.default_color])
-            channel_means = images[index].reshape(3, -1).mean(axis=1)
-            target_score = channel_means[target]
-            distractor_score = np.delete(channel_means, target).mean()
-            scores.append(float(target_score - distractor_score))
-            targets.append(color)
-        return np.asarray(scores, dtype=np.float32), {
-            "targets": targets,
-            "score_kind": "unclipped_target_channel_margin",
-        }
-
-
-@dataclass
-class PromptColorGuardedRewardClient(PromptColorRewardClient):
-    """Bounded color reward with cheap anti-saturation image guardrails.
-
-    This remains a lightweight diagnostic reward rather than a semantic image
-    quality model.  Its purpose is to make the RGB-control experiment harder to
-    solve by globally saturating, whitening, darkening, or flattening an image.
-    """
-
-    name: str = "prompt_color_guarded"
-    margin_clip: float = 0.35
-    saturation_max: float = 0.60
-    luminance_min: float = 0.12
-    luminance_max: float = 0.88
-    spatial_std_min: float = 0.08
-    spatial_std_max: float = 0.38
-    saturation_penalty_weight: float = 2.0
-    luminance_penalty_weight: float = 1.0
-    spatial_penalty_weight: float = 1.0
-
-    def score(
-        self,
-        media: Any,
-        prompts: list[str],
-        metadata: list[dict[str, Any]],
-    ) -> tuple[np.ndarray, dict[str, Any]]:
-        images = np.clip(self._to_numpy_images(media), 0.0, 1.0)
+        batch: RolloutBatch,
+        context: StepContext,
+    ) -> RewardVector:
+        images = _image_batch(batch, context)
         scores: list[float] = []
-        targets: list[str] = []
-        details: list[dict[str, float]] = []
-        for index, prompt in enumerate(prompts):
-            color = str(
-                metadata[index].get("target_color")
-                or self._color_from_prompt(prompt)
+        records: list[dict[str, object]] = []
+        for index, prompt in enumerate(batch.prompts):
+            color = _target_color(
+                prompt,
+                batch.metadata[index],
+                default=self.default_color,
             )
-            target = COLOR_TO_INDEX.get(color, COLOR_TO_INDEX[self.default_color])
+            target = COLOR_TO_INDEX[color]
+            channel_means = images[index].reshape(3, -1).mean(axis=1)
+            target_score = channel_means[target]
+            distractor_score = np.delete(channel_means, target).mean()
+            raw_margin = float(target_score - distractor_score)
+            scores.append(float(np.clip(0.5 + raw_margin, 0.0, 1.0)))
+            records.append({"target_color": color, "raw_margin": raw_margin})
+        return _reward_vector(
+            batch,
+            scores,
+            shared={"score_kind": "bounded_target_channel_margin"},
+            records=records,
+        )
+
+    def close(self) -> None:
+        """Pure client: no owned resource."""
+
+
+@dataclass(frozen=True)
+class PromptColorMarginRewardClient(RewardClient):
+    """Unclipped target-channel margin for branch-relative optimization."""
+
+    default_color: str
+    name: ClassVar[str] = "prompt_color_margin"
+
+    @classmethod
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> Mapping[str, object]:
+        del context
+        default_color = _resolve_default_color(raw, component=cls.name)
+        return FrozenMapping({"default_color": default_color})
+
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> PromptColorMarginRewardClient:
+        del context
+        return cls(
+            default_color=_resolve_default_color(resolved, component=cls.name)
+        )
+
+    def score(
+        self,
+        batch: RolloutBatch,
+        context: StepContext,
+    ) -> RewardVector:
+        images = _image_batch(batch, context)
+        scores: list[float] = []
+        records: list[dict[str, object]] = []
+        for index, prompt in enumerate(batch.prompts):
+            color = _target_color(
+                prompt,
+                batch.metadata[index],
+                default=self.default_color,
+            )
+            target = COLOR_TO_INDEX[color]
+            channel_means = images[index].reshape(3, -1).mean(axis=1)
+            margin = float(
+                channel_means[target] - np.delete(channel_means, target).mean()
+            )
+            scores.append(margin)
+            records.append({"target_color": color, "raw_margin": margin})
+        return _reward_vector(
+            batch,
+            scores,
+            shared={"score_kind": "unclipped_target_channel_margin"},
+            records=records,
+        )
+
+    def close(self) -> None:
+        """Pure client: no owned resource."""
+
+
+_GUARDED_KEYS = frozenset(
+    {
+        "default_color",
+        "margin_clip",
+        "saturation_max",
+        "luminance_min",
+        "luminance_max",
+        "spatial_std_min",
+        "spatial_std_max",
+        "saturation_penalty_weight",
+        "luminance_penalty_weight",
+        "spatial_penalty_weight",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PromptColorGuardedRewardClient(RewardClient):
+    """Color margin with bounded pixel-level anti-collapse penalties."""
+
+    default_color: str
+    margin_clip: float
+    saturation_max: float
+    luminance_min: float
+    luminance_max: float
+    spatial_std_min: float
+    spatial_std_max: float
+    saturation_penalty_weight: float
+    luminance_penalty_weight: float
+    spatial_penalty_weight: float
+    name: ClassVar[str] = "prompt_color_guarded"
+
+    @classmethod
+    def resolve_params(
+        cls,
+        raw: Mapping[str, object],
+        context: ResolutionContext,
+    ) -> Mapping[str, object]:
+        del context
+        return FrozenMapping(_resolve_guarded_params(raw))
+
+    @classmethod
+    def from_config(
+        cls,
+        resolved: Mapping[str, object],
+        context: RuntimeBuildContext,
+    ) -> PromptColorGuardedRewardClient:
+        del context
+        params = _resolve_guarded_params(resolved)
+        return cls(**params)
+
+    def score(
+        self,
+        batch: RolloutBatch,
+        context: StepContext,
+    ) -> RewardVector:
+        images = np.clip(_image_batch(batch, context), 0.0, 1.0)
+        scores: list[float] = []
+        records: list[dict[str, object]] = []
+        for index, prompt in enumerate(batch.prompts):
+            color = _target_color(
+                prompt,
+                batch.metadata[index],
+                default=self.default_color,
+            )
+            target = COLOR_TO_INDEX[color]
             image = images[index]
             channel_means = image.reshape(3, -1).mean(axis=1)
             raw_margin = float(
@@ -140,7 +227,13 @@ class PromptColorGuardedRewardClient(PromptColorRewardClient):
             maximum = image.max(axis=0)
             minimum = image.min(axis=0)
             saturation = float(
-                np.mean(np.where(maximum > 1e-6, (maximum - minimum) / maximum, 0.0))
+                np.mean(
+                    np.where(
+                        maximum > 1e-6,
+                        (maximum - minimum) / maximum,
+                        0.0,
+                    )
+                )
             )
             luminance = float(
                 np.mean(
@@ -168,9 +261,9 @@ class PromptColorGuardedRewardClient(PromptColorRewardClient):
                 - self.spatial_penalty_weight * spatial_penalty
             )
             scores.append(float(score))
-            targets.append(color)
-            details.append(
+            records.append(
                 {
+                    "target_color": color,
                     "raw_margin": raw_margin,
                     "bounded_margin": bounded_margin,
                     "saturation_mean": saturation,
@@ -179,21 +272,161 @@ class PromptColorGuardedRewardClient(PromptColorRewardClient):
                     "penalty_total": float(bounded_margin - score),
                 }
             )
-        return np.asarray(scores, dtype=np.float32), {
-            "targets": targets,
-            "score_kind": "bounded_color_margin_with_pixel_guardrails",
-            "thresholds": {
+        return _reward_vector(
+            batch,
+            scores,
+            shared={
+                "score_kind": "bounded_color_margin_with_pixel_guardrails",
                 "margin_clip": self.margin_clip,
                 "saturation_max": self.saturation_max,
                 "luminance_min": self.luminance_min,
                 "luminance_max": self.luminance_max,
                 "spatial_std_min": self.spatial_std_min,
                 "spatial_std_max": self.spatial_std_max,
+                "saturation_penalty_weight": self.saturation_penalty_weight,
+                "luminance_penalty_weight": self.luminance_penalty_weight,
+                "spatial_penalty_weight": self.spatial_penalty_weight,
             },
-            "records": details,
-        }
+            records=records,
+        )
+
+    def close(self) -> None:
+        """Pure client: no owned resource."""
 
 
-REWARD_CLIENTS.register("prompt_color", PromptColorRewardClient)
-REWARD_CLIENTS.register("prompt_color_margin", PromptColorMarginRewardClient)
-REWARD_CLIENTS.register("prompt_color_guarded", PromptColorGuardedRewardClient)
+def _resolve_default_color(
+    raw: Mapping[str, object],
+    *,
+    component: str,
+) -> str:
+    _require_exact_keys(raw, {"default_color"}, component=component)
+    color = raw["default_color"]
+    if not isinstance(color, str) or color not in _COLOR_KEYS:
+        raise ValueError(
+            f"{component}.default_color must be one of {sorted(_COLOR_KEYS)}"
+        )
+    return color
+
+
+def _resolve_guarded_params(raw: Mapping[str, object]) -> dict[str, object]:
+    _require_exact_keys(raw, set(_GUARDED_KEYS), component="prompt_color_guarded")
+    default_color = raw["default_color"]
+    if not isinstance(default_color, str) or default_color not in _COLOR_KEYS:
+        raise ValueError(
+            "prompt_color_guarded.default_color must be one of "
+            f"{sorted(_COLOR_KEYS)}"
+        )
+    values = {
+        key: _finite_number(raw[key], field=f"prompt_color_guarded.{key}")
+        for key in _GUARDED_KEYS
+        if key != "default_color"
+    }
+    for key in (
+        "margin_clip",
+        "saturation_penalty_weight",
+        "luminance_penalty_weight",
+        "spatial_penalty_weight",
+    ):
+        if values[key] <= 0:
+            raise ValueError(f"prompt_color_guarded.{key} must be positive")
+    for key in (
+        "saturation_max",
+        "luminance_min",
+        "luminance_max",
+        "spatial_std_min",
+        "spatial_std_max",
+    ):
+        if not 0.0 <= values[key] <= 1.0:
+            raise ValueError(f"prompt_color_guarded.{key} must be in [0, 1]")
+    if values["luminance_min"] >= values["luminance_max"]:
+        raise ValueError(
+            "prompt_color_guarded luminance_min must be less than luminance_max"
+        )
+    if values["spatial_std_min"] >= values["spatial_std_max"]:
+        raise ValueError(
+            "prompt_color_guarded spatial_std_min must be less than spatial_std_max"
+        )
+    return {"default_color": default_color, **values}
+
+
+def _finite_number(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be a finite number")
+    return result
+
+
+def _require_exact_keys(
+    raw: Mapping[str, object],
+    expected: set[str],
+    *,
+    component: str,
+) -> None:
+    if not isinstance(raw, Mapping):
+        raise TypeError(f"{component} params must be a mapping")
+    actual = set(raw)
+    if actual != expected:
+        raise ValueError(
+            f"{component} params must contain exactly {sorted(expected)}; "
+            f"missing={sorted(expected - actual)}, "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _image_batch(batch: RolloutBatch, context: StepContext) -> np.ndarray:
+    if batch.context is not context:
+        raise ValueError("batch.context must be the identical StepContext")
+    if batch.media_layout != "BCHW":
+        raise ValueError("prompt color rewards require media_layout='BCHW'")
+    media = batch.media
+    try:
+        import torch
+
+        if isinstance(media, torch.Tensor):
+            media = media.detach().to(device="cpu", dtype=torch.float32).numpy()
+    except ModuleNotFoundError:  # pragma: no cover - RolloutBatch requires torch
+        pass
+    images = np.asarray(media, dtype=np.float32)
+    if (
+        images.ndim != 4
+        or images.shape[0] != batch.batch_size
+        or images.shape[1] != 3
+    ):
+        raise ValueError("prompt color rewards require media shape [B, 3, H, W]")
+    if not np.isfinite(images).all():
+        raise ValueError("prompt color media must be finite")
+    return images
+
+
+def _target_color(
+    prompt: str,
+    metadata: Mapping[str, object],
+    *,
+    default: str,
+) -> str:
+    declared = metadata.get("target_color")
+    if isinstance(declared, str) and declared in _COLOR_KEYS:
+        return declared
+    tokens = set(re.findall(r"[a-z]+", prompt.lower()))
+    matches = [color for color in COLOR_TO_INDEX if color in tokens]
+    return matches[0] if len(matches) == 1 else default
+
+
+def _reward_vector(
+    batch: RolloutBatch,
+    scores: list[float],
+    *,
+    shared: Mapping[str, object],
+    records: list[dict[str, object]],
+) -> RewardVector:
+    import torch
+
+    values = torch.tensor(scores, dtype=torch.float32).detach().contiguous()
+    return RewardVector(
+        sample_id=batch.sample_id,
+        values=values,
+        shared_metadata=shared,
+        sample_metadata=tuple(records),
+    )

@@ -1,152 +1,219 @@
-"""Convert rollout and reward batches into per-sample manifest records."""
+"""Build the sole persistent sample records from typed runtime contracts."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from visual_rl.artifacts.manifest import SampleRecord
-from visual_rl.artifacts.serialization import to_jsonable
-from visual_rl.core.types import RewardBatch, RolloutBatch
+from visual_rl.core.types import (
+    FrozenMapping,
+    RewardBatch,
+    RolloutBatch,
+    to_plain_dict,
+)
 
 
 class ManifestBuilder:
-    """Stateless per-batch conversion with a stable run identifier."""
+    """Pure per-rank projection with one stable run/model/rollout identity."""
 
-    def __init__(self, run_id: str):
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        media_type: str,
+        rollout_type: str,
+    ) -> None:
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
+        if media_type not in {"image", "video"}:
+            raise ValueError("media_type must be 'image' or 'video'")
+        if rollout_type not in {
+            "full_trajectory",
+            "single_step",
+            "branching",
+        }:
+            raise ValueError(
+                "rollout_type must be full_trajectory, single_step, or branching"
+            )
         self.run_id = run_id
+        self.media_type = media_type
+        self.rollout_type = rollout_type
 
     def build_records(
         self,
-        *,
-        step: int,
         batch: RolloutBatch,
         rewards: RewardBatch,
-        media_type: str,
-        rollout_type: str | None = None,
-        media_paths: Sequence[str | Path | None] | str | Path | None = None,
-        rollout_cache_path: str | Path | None = None,
-        checkpoint_path: str | Path | None = None,
-    ) -> list[SampleRecord]:
-        if step < 0:
-            raise ValueError("step must be non-negative")
-        if media_type not in {"image", "video"}:
-            raise ValueError(f"Unsupported media type: {media_type!r}")
+        *,
+        media_paths: tuple[str | Path | None, ...],
+    ) -> tuple[SampleRecord, ...]:
+        """Project a validated batch without accepting duplicate identity inputs."""
 
-        batch.validate_lightweight()
-        batch_size = len(batch.prompts)
+        if not isinstance(batch, RolloutBatch):
+            raise TypeError("batch must be a RolloutBatch")
+        if not isinstance(rewards, RewardBatch):
+            raise TypeError("rewards must be a RewardBatch")
         rewards.validate_against(batch)
-        if batch.context is not None and batch.context.step != step:
-            raise ValueError(
-                "artifact step must match batch.context.step: "
-                f"{step} != {batch.context.step}"
+        if type(media_paths) is not tuple or len(media_paths) != batch.batch_size:
+            raise ValueError("media_paths must be a tuple with shape [B]")
+        normalized_media_paths = tuple(
+            self._relative_path(f"media_paths[{index}]", value)
+            for index, value in enumerate(media_paths)
+        )
+
+        records = []
+        for index in range(batch.batch_size):
+            branch_id = (
+                None if batch.branch_id is None else batch.branch_id[index]
             )
-        resolved_media_paths = self._resolve_media_paths(media_paths, batch_size)
-        model_metadata = to_jsonable(dict(batch.model_metadata))
-        resolved_rollout_type = rollout_type or batch.model_metadata.get("rollout")
-
-        records: list[SampleRecord] = []
-        for index in range(batch_size):
-            prompt_metadata = to_jsonable(dict(batch.metadata[index]))
-            branch_id = to_jsonable(self._batch_item(batch.branch_id, index))
-            record = SampleRecord(
-                run_id=self.run_id,
-                sample_id=str(self._batch_item(batch.sample_id, index)),
-                sample_index=index,
-                step=step,
-                prompt=batch.prompts[index],
-                media_type=media_type,
-                prompt_metadata=prompt_metadata,
-                seed=(
-                    int(batch.context.seed)
-                    if batch.context is not None
-                    else None
-                ),
-                rollout_type=str(resolved_rollout_type)
-                if resolved_rollout_type is not None
-                else None,
-                timestep_summary=self._timestep_summary(
-                    batch,
-                    index,
-                    prompt_metadata,
-                    branch_id,
-                ),
-                reward_values=self._reward_values(rewards, index),
-                media_path=resolved_media_paths[index],
-                rollout_cache_path=self._path_string(rollout_cache_path),
-                checkpoint_path=self._path_string(checkpoint_path),
-                model_metadata=dict(model_metadata),
-                prompt_id=str(self._batch_item(batch.prompt_id, index)),
-                group_id=str(self._batch_item(batch.group_id, index)),
-                branch_id=branch_id,
+            records.append(
+                SampleRecord(
+                    run_id=self.run_id,
+                    sample_id=batch.sample_id[index],
+                    sample_index=index,
+                    step=batch.context.step,
+                    rank=batch.context.rank,
+                    prompt=batch.prompts[index],
+                    media_type=self.media_type,
+                    prompt_metadata=FrozenMapping(batch.metadata[index]),
+                    seed=batch.context.seed,
+                    rollout_type=self.rollout_type,
+                    timestep_summary=FrozenMapping(
+                        self._timestep_summary(batch, index)
+                    ),
+                    reward_values=FrozenMapping(
+                        self._reward_values(rewards, index)
+                    ),
+                    media_path=normalized_media_paths[index],
+                    rollout_cache_path=None,
+                    checkpoint_path=None,
+                    model_metadata=FrozenMapping(batch.artifact_metadata),
+                    prompt_id=batch.prompt_id[index],
+                    group_id=batch.group_id[index],
+                    branch_id=branch_id,
+                )
             )
-            records.append(record)
-        return records
+        return tuple(records)
 
-    @staticmethod
-    def _batch_item(value: Any, index: int) -> Any:
-        return value[index]
-
-    @classmethod
-    def _reward_values(cls, rewards: RewardBatch, index: int) -> dict[str, Any]:
-        return {
-            "raw": {
-                name: to_jsonable(cls._batch_item(values, index))
-                for name, values in rewards.raw.items()
-            },
-            "weighted": {
-                name: to_jsonable(cls._batch_item(values, index))
-                for name, values in rewards.weighted.items()
-            },
-            "weighted_total": to_jsonable(
-                cls._batch_item(rewards.weighted_total, index)
-            ),
-            "valid": bool(to_jsonable(cls._batch_item(rewards.valid_mask, index))),
-        }
-
-    @classmethod
     def _timestep_summary(
-        cls,
+        self,
         batch: RolloutBatch,
         index: int,
-        prompt_metadata: Mapping[str, Any],
-        branch_id: Any,
     ) -> dict[str, Any]:
-        values = to_jsonable(cls._batch_item(batch.timesteps, index))
+        values = self._finite_number_list(
+            batch.timesteps[index],
+            label="timesteps",
+        )
         summary: dict[str, Any] = {
             "values": values,
-            "count": len(values) if isinstance(values, list) else 1,
-            "branch_id": branch_id,
+            "count": batch.transition_count,
         }
-        for key in (
-            "selected_timestep",
-            "selected_timestep_index",
-            "branch_step_index",
-            "branch_timestep_value",
+        if len(values) != batch.transition_count:
+            raise ValueError("timesteps row does not match transition_count")
+        if self.rollout_type == "single_step":
+            selected = batch.selected_timestep_index
+            if selected is None:
+                raise ValueError(
+                    "single_step rollout requires selected_timestep_index"
+                )
+            summary["selected_timestep_index"] = int(selected[index].item())
+        elif self.rollout_type == "branching":
+            branch_step = batch.branch_step_index
+            trajectory_step = batch.trajectory_step_index
+            if branch_step is None or trajectory_step is None:
+                raise ValueError(
+                    "branching rollout requires branch_step_index and "
+                    "trajectory_step_index"
+                )
+            summary["branch_step_index"] = int(branch_step[index].item())
+            summary["trajectory_step_index"] = self._finite_number_list(
+                trajectory_step,
+                label="trajectory_step_index",
+            )
+        elif (
+            batch.selected_timestep_index is not None
+            or batch.branch_step_index is not None
+            or batch.trajectory_step_index is not None
         ):
-            if key in prompt_metadata:
-                summary[key] = prompt_metadata[key]
+            raise ValueError(
+                "full_trajectory rollout cannot carry selected/branch indices"
+            )
         return summary
 
-    @classmethod
-    def _resolve_media_paths(
-        cls,
-        media_paths: Sequence[str | Path | None] | str | Path | None,
-        batch_size: int,
-    ) -> list[str | None]:
-        if media_paths is None:
-            return [None] * batch_size
-        if isinstance(media_paths, (str, Path)):
-            return [cls._path_string(media_paths)] * batch_size
-        if len(media_paths) != batch_size:
-            raise ValueError(
-                f"media_paths length must be {batch_size}, got {len(media_paths)}"
+    @staticmethod
+    def _reward_values(
+        rewards: RewardBatch,
+        index: int,
+    ) -> dict[str, Any]:
+        raw: dict[str, float] = {}
+        weighted: dict[str, float] = {}
+        shared: dict[str, Any] = {}
+        sample: dict[str, Any] = {}
+        for name in rewards.raw:
+            raw[name] = ManifestBuilder._finite_scalar(
+                rewards.raw[name][index],
+                label=f"raw.{name}",
             )
-        return [cls._path_string(path) for path in media_paths]
+            weighted[name] = ManifestBuilder._finite_scalar(
+                rewards.weighted[name][index],
+                label=f"weighted.{name}",
+            )
+            shared[name] = to_plain_dict(rewards.shared_metadata[name])
+            sample[name] = to_plain_dict(rewards.sample_metadata[name][index])
+        return {
+            "raw": raw,
+            "weighted": weighted,
+            "weighted_total": ManifestBuilder._finite_scalar(
+                rewards.weighted_total[index],
+                label="weighted_total",
+            ),
+            "valid": True,
+            "shared_metadata": shared,
+            "sample_metadata": sample,
+        }
 
     @staticmethod
-    def _path_string(path: str | Path | None) -> str | None:
-        return str(path) if path is not None else None
+    def _finite_scalar(value: Any, *, label: str) -> float:
+        import math
+
+        if getattr(value, "numel", lambda: 0)() != 1:
+            raise ValueError(f"{label} must be a scalar tensor")
+        result = float(value.detach().cpu().item())
+        if not math.isfinite(result):
+            raise ValueError(f"{label} must be finite")
+        return result
+
+    @staticmethod
+    def _finite_number_list(value: Any, *, label: str) -> list[int | float]:
+        import math
+
+        plain = value.detach().cpu().tolist()
+        if not isinstance(plain, list):
+            plain = [plain]
+        result: list[int | float] = []
+        for item in plain:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise TypeError(f"{label} must contain JSON numbers")
+            if not math.isfinite(float(item)):
+                raise ValueError(f"{label} must contain finite values")
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _relative_path(
+        name: str,
+        value: str | Path | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        candidate = value.as_posix() if isinstance(value, Path) else value
+        if not isinstance(candidate, str) or not candidate or "\\" in candidate:
+            raise ValueError(f"{name} must be a relative POSIX path")
+        path = PurePosixPath(candidate)
+        if path.is_absolute() or any(
+            part in {"", ".", ".."} for part in path.parts
+        ):
+            raise ValueError(f"{name} must be a normalized relative POSIX path")
+        if path.as_posix() != candidate:
+            raise ValueError(f"{name} must be a normalized relative POSIX path")
+        return candidate
