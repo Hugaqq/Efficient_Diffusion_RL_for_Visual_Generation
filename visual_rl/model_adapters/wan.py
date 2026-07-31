@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
 import inspect
 import math
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -26,9 +26,11 @@ from visual_rl.model_adapters.diffusers_common import (
     apply_peft_lora,
     configure_gradient_checkpointing,
     make_generator,
-    reference_repo_import_path,
     resolve_torch_dtype,
     verify_gradient_checkpointing,
+)
+from visual_rl.model_adapters.diffusion_transition import (
+    wan_sde_step_with_logprob,
 )
 
 WAN_VAE_TEMPORAL_STRIDE = 4
@@ -36,7 +38,6 @@ WAN_VAE_TEMPORAL_STRIDE = 4
 _COMMON_REQUIRED = frozenset(
     {
         "checkpoint",
-        "reference_repo",
         "lora_rank",
         "lora_alpha",
         "lora_target_modules",
@@ -50,46 +51,9 @@ _COMMON_REQUIRED = frozenset(
 _OPTIONAL_DEFAULTS: Mapping[str, object] = {
     "local_files_only": True,
     "low_cpu_mem_usage": True,
+    "offload_frozen_modules_during_update": False,
+    "vae_tiling": False,
 }
-_WORLD_PIPELINE_KEYS = frozenset(
-    {
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "height",
-        "width",
-        "num_frames",
-        "num_inference_steps",
-        "guidance_scale",
-        "num_videos_per_prompt",
-        "generator",
-        "latents",
-        "output_type",
-        "return_dict",
-        "max_sequence_length",
-        "callback_on_step_end",
-        "callback_on_step_end_tensor_inputs",
-        "kl_reward",
-        "save_latents_vis",
-    }
-)
-_FLASH_PIPELINE_KEYS = frozenset(
-    {
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "height",
-        "width",
-        "num_frames",
-        "num_inference_steps",
-        "guidance_scale",
-        "num_videos_per_prompt",
-        "generator",
-        "output_type",
-        "return_dict",
-        "max_sequence_length",
-        "index",
-        "kl_reward",
-    }
-)
 
 
 class _WanAdapterCore(ModelAdapter):
@@ -103,7 +67,6 @@ class _WanAdapterCore(ModelAdapter):
         self,
         *,
         checkpoint: Path,
-        reference_repo: Path,
         lora_rank: int,
         lora_alpha: int,
         lora_target_modules: tuple[str, ...],
@@ -116,9 +79,10 @@ class _WanAdapterCore(ModelAdapter):
         local_files_only: bool,
         low_cpu_mem_usage: bool,
         context: RuntimeBuildContext,
+        offload_frozen_modules_during_update: bool = False,
+        vae_tiling: bool = False,
     ) -> None:
         self.checkpoint = checkpoint
-        self.reference_repo = reference_repo
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_target_modules = lora_target_modules
@@ -130,6 +94,10 @@ class _WanAdapterCore(ModelAdapter):
         self.max_sequence_length = max_sequence_length
         self.local_files_only = local_files_only
         self.low_cpu_mem_usage = low_cpu_mem_usage
+        self.offload_frozen_modules_during_update = (
+            offload_frozen_modules_during_update
+        )
+        self.vae_tiling = vae_tiling
         self.device = context.device
         self.dtype = resolve_torch_dtype(context.precision)
         self.train_cfg = guidance_scale > 1.0
@@ -137,6 +105,10 @@ class _WanAdapterCore(ModelAdapter):
         self.transformer = None
         self.scheduler = None
         self._gradient_checkpointing_state = None
+        self._frozen_modules_offloaded = False
+        self._text_encoders_active = False
+        self._vae_active = False
+        self._policy_active = False
 
     @property
     def train_module(self):
@@ -179,11 +151,6 @@ class _WanAdapterCore(ModelAdapter):
             context,
             "checkpoint",
         )
-        values["reference_repo"] = _resolve_path(
-            values["reference_repo"],
-            context,
-            "reference_repo",
-        )
         for key in ("lora_rank", "lora_alpha", "height", "width"):
             values[key] = _positive_int(values[key], key)
         values["max_sequence_length"] = _positive_int(
@@ -202,6 +169,8 @@ class _WanAdapterCore(ModelAdapter):
             "gradient_checkpointing",
             "local_files_only",
             "low_cpu_mem_usage",
+            "offload_frozen_modules_during_update",
+            "vae_tiling",
         ):
             if type(values[key]) is not bool:
                 raise ConfigError(
@@ -238,7 +207,7 @@ class _WanAdapterCore(ModelAdapter):
     ) -> tuple[ValidationCheck, ...]:
         del context
         checks: list[ValidationCheck] = []
-        for key in ("checkpoint", "reference_repo"):
+        for key in ("checkpoint",):
             value = resolved.get(key)
             if not isinstance(value, Path) or not value.is_absolute():
                 checks.append(
@@ -270,7 +239,6 @@ class _WanAdapterCore(ModelAdapter):
     ) -> _WanAdapterCore:
         adapter = cls(
             checkpoint=_require_path(resolved, "checkpoint"),
-            reference_repo=_require_path(resolved, "reference_repo"),
             lora_rank=int(resolved["lora_rank"]),
             lora_alpha=int(resolved["lora_alpha"]),
             lora_target_modules=tuple(resolved["lora_target_modules"]),
@@ -283,13 +251,16 @@ class _WanAdapterCore(ModelAdapter):
             local_files_only=bool(resolved["local_files_only"]),
             low_cpu_mem_usage=bool(resolved["low_cpu_mem_usage"]),
             context=context,
+            offload_frozen_modules_during_update=bool(
+                resolved["offload_frozen_modules_during_update"]
+            ),
+            vae_tiling=bool(resolved["vae_tiling"]),
         )
         adapter._load_base_pipeline()
         return adapter
 
     def _load_base_pipeline(self) -> None:
         import torch
-
         from diffusers import WanPipeline
 
         pipeline = WanPipeline.from_pretrained(
@@ -298,18 +269,16 @@ class _WanAdapterCore(ModelAdapter):
             local_files_only=self.local_files_only,
             low_cpu_mem_usage=self.low_cpu_mem_usage,
         )
-        pipeline = pipeline.to(self.device)
         vae = getattr(pipeline, "vae", None)
         if vae is not None:
             vae.requires_grad_(False)
-            vae.to(device=self.device, dtype=torch.float32)
             vae.eval()
+            self._configure_vae_decode(vae)
         for name in ("text_encoder", "text_encoder_2"):
             encoder = getattr(pipeline, name, None)
             if encoder is None:
                 continue
             encoder.requires_grad_(False)
-            encoder.to(device=self.device, dtype=self.dtype)
             encoder.eval()
         base_transformer = pipeline.transformer
         checkpointing_state = configure_gradient_checkpointing(
@@ -324,6 +293,30 @@ class _WanAdapterCore(ModelAdapter):
             target_modules=self.lora_target_modules,
         )
         pipeline.transformer = transformer
+        if (
+            self.offload_frozen_modules_during_update
+            and torch.device(self.device).type == "cuda"
+        ):
+            for name in ("text_encoder", "text_encoder_2"):
+                encoder = getattr(pipeline, name, None)
+                if encoder is not None:
+                    encoder.to("cpu", dtype=self.dtype)
+            if vae is not None:
+                vae.to("cpu", dtype=torch.float32)
+            transformer.to(self.device)
+            self._frozen_modules_offloaded = True
+            self._policy_active = True
+        else:
+            pipeline = pipeline.to(self.device)
+            if vae is not None:
+                vae.to(device=self.device, dtype=torch.float32)
+            for name in ("text_encoder", "text_encoder_2"):
+                encoder = getattr(pipeline, name, None)
+                if encoder is not None:
+                    encoder.to(device=self.device, dtype=self.dtype)
+            self._text_encoders_active = True
+            self._vae_active = vae is not None
+            self._policy_active = True
         self.pipeline = pipeline
         self.transformer = transformer
         self.scheduler = pipeline.scheduler
@@ -332,6 +325,16 @@ class _WanAdapterCore(ModelAdapter):
             checkpointing_state,
             context=f"{self._COMPONENT_NAME} active transformer",
         )
+
+    def _configure_vae_decode(self, vae) -> None:
+        if not self.vae_tiling:
+            return
+        enable_tiling = getattr(vae, "enable_tiling", None)
+        if not callable(enable_tiling):
+            raise RunError(
+                "Wan vae_tiling requires VAE.enable_tiling() support"
+            )
+        enable_tiling()
 
     def sample(self, request: RolloutRequest) -> RolloutBatch:
         self._ensure_loaded()
@@ -352,7 +355,10 @@ class _WanAdapterCore(ModelAdapter):
             batch.validate_against(request)
             return batch
         finally:
-            self.train_module.train(was_training)
+            try:
+                self.train_module.train(was_training)
+            finally:
+                self._offload_frozen_modules_for_update()
 
     def _sample_world(self, request: RolloutRequest) -> RolloutBatch:
         import torch
@@ -365,29 +371,15 @@ class _WanAdapterCore(ModelAdapter):
             request.prompts,
             generator,
         )
-        pipeline_fn = self._load_pipeline_function()
-        kwargs = {
-            "prompt_embeds": prompt_embeds,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "height": self.height,
-            "width": self.width,
-            "num_frames": self.frames,
-            "num_inference_steps": request.num_steps,
-            "guidance_scale": self.guidance_scale,
-            "num_videos_per_prompt": 1,
-            "generator": generator,
-            "latents": base_latents,
-            "output_type": "pt",
-            "return_dict": False,
-            "max_sequence_length": self.max_sequence_length,
-            "callback_on_step_end": callback,
-            "callback_on_step_end_tensor_inputs": ["latents"],
-            "kl_reward": 0.0,
-            "save_latents_vis": False,
-        }
-        self._validate_pipeline_kwargs(kwargs)
         with torch.no_grad():
-            result = pipeline_fn(self.pipeline, **kwargs)
+            result = self._run_world_pipeline(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                num_steps=request.num_steps,
+                generator=generator,
+                latents=base_latents,
+                callback=callback,
+            )
         media, states, log_probs, timesteps = self._normalize_world_result(
             result,
             batch_size=len(request.prompts),
@@ -418,11 +410,7 @@ class _WanAdapterCore(ModelAdapter):
             selected_timestep_index=None,
             flash_coefficient=None,
             branch_step_index=None,
-            trajectory_step_index=torch.arange(
-                request.num_steps,
-                dtype=torch.int64,
-                device=timesteps.device,
-            ),
+            trajectory_step_index=None,
             transition_std_dev=None,
             recompute_payload=payload,
             artifact_metadata={
@@ -441,7 +429,6 @@ class _WanAdapterCore(ModelAdapter):
         prompt_embeds, negative_prompt_embeds = self._encode_prompt(
             request.prompts
         )
-        pipeline_fn = self._load_pipeline_function()
         grouped_positions: list[int] = []
         chunks: dict[str, list[Any]] = {
             key: []
@@ -470,26 +457,14 @@ class _WanAdapterCore(ModelAdapter):
             )
             seed = _selected_seed(request.context.seed, selected_index)
             generator = make_generator(self.device, seed)
-            kwargs = {
-                "prompt_embeds": prompt_group,
-                "negative_prompt_embeds": negative_group,
-                "height": self.height,
-                "width": self.width,
-                "num_frames": self.frames,
-                "num_inference_steps": request.num_steps,
-                "guidance_scale": self.guidance_scale,
-                "num_videos_per_prompt": 1,
-                "generator": generator,
-                "output_type": "pt",
-                "return_dict": False,
-                "max_sequence_length": self.max_sequence_length,
-                "index": selected_index,
-                "kl_reward": 0.0,
-            }
-            self._validate_pipeline_kwargs(kwargs)
-            with self._fork_rng(seed):
-                with torch.no_grad():
-                    result = pipeline_fn(self.pipeline, **kwargs)
+            with self._fork_rng(seed), torch.no_grad():
+                result = self._run_flash_pipeline(
+                    prompt_embeds=prompt_group,
+                    negative_prompt_embeds=negative_group,
+                    num_steps=request.num_steps,
+                    generator=generator,
+                    selected_index=selected_index,
+                )
             (
                 media,
                 latent,
@@ -580,11 +555,15 @@ class _WanAdapterCore(ModelAdapter):
         import torch
 
         was_training = self.train_module.training
-        self.train_module.train(True)
+        # Match rollout mode exactly.  Evaluation mode keeps autograd enabled
+        # while preventing dropout from perturbing the policy ratio.
+        self.train_module.eval()
         try:
-            parameter = next(iter(self.train_module.parameters()), None)
-            device = parameter.device if parameter is not None else self.device
-            dtype = parameter.dtype if parameter is not None else self.dtype
+            device, dtype = _wan_module_device_and_dtype(
+                self.train_module,
+                fallback_device=self.device,
+                fallback_dtype=self.dtype,
+            )
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(
@@ -597,26 +576,12 @@ class _WanAdapterCore(ModelAdapter):
                 sample = batch.latents[:, step].to(device=device)
                 timestep = batch.timesteps[:, step].to(device=device)
                 next_sample = batch.next_latents[:, step].to(device=device)
-                prediction = self.train_module(
-                    hidden_states=sample.to(dtype=dtype),
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    return_dict=False,
-                )[0]
-                if self.train_cfg:
-                    if negative_prompt_embeds is None:
-                        raise RunError(
-                            "negative_prompt_embeds are required for Wan CFG"
-                        )
-                    negative = self.train_module(
-                        hidden_states=sample.to(dtype=dtype),
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        return_dict=False,
-                    )[0]
-                    prediction = negative + self.guidance_scale * (
-                        prediction - negative
-                    )
+                prediction = self._wan_prediction(
+                    sample,
+                    timestep,
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                )
                 kwargs: dict[str, object] = {
                     "prev_sample": next_sample.float(),
                 }
@@ -661,6 +626,8 @@ class _WanAdapterCore(ModelAdapter):
             stats.validate_against(batch, require_reference=False)
             return stats
         finally:
+            if self.pipeline is not None:
+                self.pipeline._current_timestep = None
             self.train_module.train(was_training)
 
     def _encode_prompt(self, prompts: tuple[str, ...]):
@@ -668,57 +635,397 @@ class _WanAdapterCore(ModelAdapter):
             getattr(self.pipeline, "encode_prompt", None)
         ):
             raise RunError("WanPipeline.encode_prompt is required")
-        encoded = self.pipeline.encode_prompt(
-            prompt=list(prompts),
-            negative_prompt=[""] * len(prompts),
-            do_classifier_free_guidance=self.train_cfg,
-            num_videos_per_prompt=1,
-            prompt_embeds=None,
-            negative_prompt_embeds=None,
-            max_sequence_length=self.max_sequence_length,
-            device=self.device,
-        )
+        self._activate_text_encoders_for_prompt()
+        try:
+            encoded = self.pipeline.encode_prompt(
+                prompt=list(prompts),
+                negative_prompt=[""] * len(prompts),
+                do_classifier_free_guidance=self.train_cfg,
+                num_videos_per_prompt=1,
+                prompt_embeds=None,
+                negative_prompt_embeds=None,
+                max_sequence_length=self.max_sequence_length,
+                device=self.device,
+            )
+        finally:
+            self._offload_text_encoders()
+            self._activate_policy_module()
         if not isinstance(encoded, tuple) or len(encoded) < 2:
             raise RunError(
                 "WanPipeline.encode_prompt must return positive/negative embeddings"
             )
         return encoded[0], encoded[1]
 
-    def _load_pipeline_function(self):
-        with reference_repo_import_path(self.reference_repo):
-            if self._BACKEND == "flash":
-                from flow_grpo.diffusers_patch.wan2_1_pipeline_with_logprob_sample import (
-                    wan_pipeline_with_logprob,
-                )
-            else:
-                from flow_grpo.diffusers_patch.wan_pipeline_with_logprob import (
-                    wan_pipeline_with_logprob,
-                )
-        return wan_pipeline_with_logprob
-
     def _load_sde_function(self):
-        with reference_repo_import_path(self.reference_repo):
-            if self._BACKEND == "flash":
-                from flow_grpo.diffusers_patch.wan2_1_pipeline_with_logprob_sample import (
-                    sde_step_with_logprob,
-                )
-            else:
-                from flow_grpo.diffusers_patch.wan_pipeline_with_logprob import (
-                    sde_step_with_logprob,
-                )
-        return sde_step_with_logprob
+        variant = "flash" if self._BACKEND == "flash" else "world_r1"
 
-    def _validate_pipeline_kwargs(self, kwargs: Mapping[str, object]) -> None:
-        allowed = (
-            _FLASH_PIPELINE_KEYS
-            if self._BACKEND == "flash"
-            else _WORLD_PIPELINE_KEYS
-        )
-        if set(kwargs) != allowed:
-            raise RunError(
-                f"{self._COMPONENT_NAME} pipeline kwargs differ from the "
-                f"frozen contract: {sorted(set(kwargs) ^ allowed)}"
+        def step(
+            scheduler,
+            model_output,
+            timestep,
+            sample,
+            *,
+            prev_sample=None,
+            generator=None,
+            determistic: bool = False,
+            return_dt_and_std_dev_t: bool = False,
+        ):
+            return wan_sde_step_with_logprob(
+                scheduler,
+                model_output,
+                timestep,
+                sample,
+                variant=variant,
+                prev_sample=prev_sample,
+                generator=generator,
+                deterministic=determistic,
+                return_flash_coefficient=return_dt_and_std_dev_t,
             )
+
+        return step
+
+    def _run_world_pipeline(
+        self,
+        *,
+        prompt_embeds,
+        negative_prompt_embeds,
+        num_steps: int,
+        generator,
+        latents,
+        callback,
+    ):
+        import torch
+
+        timesteps, latents = self._prepare_native_wan_rollout(
+            prompt_embeds=prompt_embeds,
+            num_steps=num_steps,
+            generator=generator,
+            latents=latents,
+        )
+        states = [latents]
+        log_probs = []
+        for index, timestep in enumerate(timesteps):
+            prediction = self._wan_prediction(
+                latents,
+                timestep,
+                prompt_embeds,
+                negative_prompt_embeds,
+            )
+            next_latents = self.scheduler.step(
+                prediction.float(),
+                timestep,
+                latents.float(),
+                return_dict=False,
+            )[0]
+            transition = wan_sde_step_with_logprob(
+                self.scheduler,
+                prediction.float(),
+                timestep.reshape(1),
+                latents.float(),
+                variant="world_r1",
+                prev_sample=next_latents.float(),
+            )
+            log_prob = transition[1]
+            if callback is not None:
+                outputs = callback(
+                    self.pipeline,
+                    index,
+                    timestep,
+                    {"latents": next_latents},
+                )
+                if not isinstance(outputs, Mapping):
+                    raise RunError(
+                        "World-R1 camera callback must return a mapping"
+                    )
+                next_latents = outputs.get("latents", next_latents)
+                log_prob = wan_sde_step_with_logprob(
+                    self.scheduler,
+                    prediction.float(),
+                    timestep.reshape(1),
+                    latents.float(),
+                    variant="world_r1",
+                    prev_sample=next_latents.float(),
+                )[1]
+            latents = next_latents
+            states.append(latents)
+            log_probs.append(log_prob)
+        self.pipeline._current_timestep = None
+        media = self._decode_wan_latents(latents)
+        zeros = [torch.zeros_like(value) for value in log_probs]
+        return media, states, log_probs, zeros, timesteps
+
+    def _run_flash_pipeline(
+        self,
+        *,
+        prompt_embeds,
+        negative_prompt_embeds,
+        num_steps: int,
+        generator,
+        selected_index: int,
+    ):
+        import torch
+
+        timesteps, latents = self._prepare_native_wan_rollout(
+            prompt_embeds=prompt_embeds,
+            num_steps=num_steps,
+            generator=generator,
+            latents=None,
+        )
+        if not 0 <= selected_index < len(timesteps):
+            raise RunError("Flash selected timestep is outside the scheduler")
+        selected_source = None
+        selected_target = None
+        selected_log_prob = None
+        for index, timestep in enumerate(timesteps):
+            prediction = self._wan_prediction(
+                latents,
+                timestep,
+                prompt_embeds,
+                negative_prompt_embeds,
+            )
+            if index == selected_index:
+                selected_source = latents
+                transition = wan_sde_step_with_logprob(
+                    self.scheduler,
+                    prediction.float(),
+                    timestep.reshape(1),
+                    latents.float(),
+                    variant="flash",
+                )
+                latents, selected_log_prob = transition[:2]
+                selected_target = latents
+            else:
+                latents = wan_sde_step_with_logprob(
+                    self.scheduler,
+                    prediction.float(),
+                    timestep.reshape(1),
+                    latents.float(),
+                    variant="flash",
+                    deterministic=True,
+                )[0]
+        self.pipeline._current_timestep = None
+        if (
+            selected_source is None
+            or selected_target is None
+            or selected_log_prob is None
+        ):
+            raise RunError("Flash sampler did not execute its transition")
+        media = self._decode_wan_latents(latents)
+        zeros = [torch.zeros_like(selected_log_prob)]
+        return (
+            media,
+            [selected_source, selected_target],
+            [selected_log_prob],
+            zeros,
+            selected_index,
+        )
+
+    def _prepare_native_wan_rollout(
+        self,
+        *,
+        prompt_embeds,
+        num_steps: int,
+        generator,
+        latents,
+    ):
+        import torch
+
+        pipeline = self.pipeline
+        pipeline._guidance_scale = self.guidance_scale
+        pipeline._attention_kwargs = None
+        pipeline._current_timestep = None
+        pipeline._interrupt = False
+        self.scheduler.set_timesteps(num_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+        config = getattr(self.train_module, "config", None)
+        channels = getattr(config, "in_channels", None)
+        if type(channels) is not int or channels <= 0:
+            raise RunError("Wan transformer.config.in_channels must be positive")
+        prepared = pipeline.prepare_latents(
+            prompt_embeds.shape[0],
+            channels,
+            self.height,
+            self.width,
+            self.frames,
+            torch.float32,
+            self.device,
+            generator,
+            latents,
+        )
+        return timesteps, prepared
+
+    def _wan_prediction(
+        self,
+        latents,
+        timestep,
+        prompt_embeds,
+        negative_prompt_embeds,
+    ):
+        import torch
+
+        pipeline_config = getattr(self.pipeline, "config", object())
+        if bool(getattr(pipeline_config, "expand_timesteps", False)):
+            mask = torch.ones_like(latents, dtype=torch.float32)
+            values = (mask[0][0][:, ::2, ::2] * timestep).flatten()
+            model_timestep = values.unsqueeze(0).expand(latents.shape[0], -1)
+        else:
+            model_timestep = timestep.expand(latents.shape[0])
+        _, dtype = _wan_module_device_and_dtype(
+            self.train_module,
+            fallback_device=self.device,
+            fallback_dtype=self.dtype,
+        )
+        hidden_states = latents.to(dtype=dtype)
+        self.pipeline._current_timestep = timestep
+        with _cache_context(self.train_module, "cond"):
+            prediction = self.train_module(
+                hidden_states=hidden_states,
+                timestep=model_timestep,
+                encoder_hidden_states=prompt_embeds.to(dtype=dtype),
+                attention_kwargs=None,
+                return_dict=False,
+            )[0]
+        if self.train_cfg:
+            if negative_prompt_embeds is None:
+                raise RunError("Wan CFG requires negative prompt embeddings")
+            with _cache_context(self.train_module, "uncond"):
+                negative = self.train_module(
+                    hidden_states=hidden_states,
+                    timestep=model_timestep,
+                    encoder_hidden_states=negative_prompt_embeds.to(dtype=dtype),
+                    attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+            prediction = negative + self.guidance_scale * (
+                prediction - negative
+            )
+        return prediction
+
+    def _decode_wan_latents(self, latents):
+        import torch
+
+        self._activate_vae_for_decode()
+        try:
+            vae = self.pipeline.vae
+            dtype = _module_dtype(vae, fallback=torch.float32)
+            parameter = next(iter(vae.parameters()), None)
+            device = parameter.device if parameter is not None else self.device
+            latents = latents.to(device=device, dtype=dtype)
+            mean = (
+                torch.tensor(vae.config.latents_mean)
+                .view(1, vae.config.z_dim, 1, 1, 1)
+                .to(latents)
+            )
+            inverse_std = (
+                1.0
+                / torch.tensor(vae.config.latents_std)
+                .view(1, vae.config.z_dim, 1, 1, 1)
+                .to(latents)
+            )
+            decoded = vae.decode(
+                latents / inverse_std + mean,
+                return_dict=False,
+            )[0]
+            return self.pipeline.video_processor.postprocess_video(
+                decoded,
+                output_type="pt",
+            )
+        finally:
+            self._offload_vae_after_decode()
+
+    def _activate_text_encoders_for_prompt(self) -> None:
+        if not self._cuda_offload_enabled():
+            return
+        if self._text_encoders_active:
+            return
+
+        import torch
+
+        if self._policy_active:
+            self.train_module.to("cpu")
+            self._policy_active = False
+            torch.cuda.empty_cache()
+        for name in ("text_encoder", "text_encoder_2"):
+            encoder = getattr(self.pipeline, name, None)
+            if encoder is not None:
+                encoder.to(self.device, dtype=self.dtype)
+        self._text_encoders_active = True
+        self._frozen_modules_offloaded = False
+
+    def _offload_text_encoders(self) -> None:
+        if not self._cuda_offload_enabled() or not self._text_encoders_active:
+            return
+
+        import torch
+
+        for name in ("text_encoder", "text_encoder_2"):
+            encoder = getattr(self.pipeline, name, None)
+            if encoder is not None:
+                encoder.to("cpu", dtype=self.dtype)
+        torch.cuda.empty_cache()
+        self._text_encoders_active = False
+        self._frozen_modules_offloaded = not self._vae_active
+
+    def _activate_policy_module(self) -> None:
+        if not self._cuda_offload_enabled() or self._policy_active:
+            return
+        if self._text_encoders_active:
+            raise RunError(
+                "Wan policy cannot move to CUDA while text encoders are active"
+            )
+        self.train_module.to(self.device)
+        self._policy_active = True
+
+    def _activate_vae_for_decode(self) -> None:
+        if not self._cuda_offload_enabled() or self._vae_active:
+            return
+
+        import torch
+
+        if self._text_encoders_active:
+            raise RunError(
+                "Wan VAE cannot move to CUDA while text encoders are active"
+            )
+        if self._policy_active:
+            self.train_module.to("cpu")
+            self._policy_active = False
+            torch.cuda.empty_cache()
+        try:
+            self.pipeline.vae.to(self.device, dtype=torch.float32)
+        except BaseException:
+            # A partially moved VAE must not remain beside the restored policy.
+            self.pipeline.vae.to("cpu", dtype=torch.float32)
+            torch.cuda.empty_cache()
+            self._activate_policy_module()
+            raise
+        self._vae_active = True
+        self._frozen_modules_offloaded = False
+
+    def _offload_vae_after_decode(self) -> None:
+        if not self._cuda_offload_enabled():
+            return
+
+        if self._vae_active:
+            import torch
+
+            self.pipeline.vae.to("cpu", dtype=torch.float32)
+            torch.cuda.empty_cache()
+            self._vae_active = False
+        self._frozen_modules_offloaded = not self._text_encoders_active
+        self._activate_policy_module()
+
+    def _offload_frozen_modules_for_update(self) -> None:
+        self._offload_text_encoders()
+        self._offload_vae_after_decode()
+        self._activate_policy_module()
+
+    def _cuda_offload_enabled(self) -> bool:
+        import torch
+
+        return (
+            self.offload_frozen_modules_during_update
+            and torch.device(self.device).type == "cuda"
+        )
 
     def _prepare_world_camera(
         self,
@@ -859,6 +1166,10 @@ class _WanAdapterCore(ModelAdapter):
         self.pipeline = None
         self.transformer = None
         self.scheduler = None
+        self._frozen_modules_offloaded = False
+        self._text_encoders_active = False
+        self._vae_active = False
+        self._policy_active = False
 
 
 class WanFlashAdapter(_WanAdapterCore):
@@ -939,13 +1250,12 @@ class WanWorldR1Adapter(_WanAdapterCore):
         prompts: tuple[str, ...],
         generator: object,
     ):
-        with reference_repo_import_path(self.reference_repo):
-            from flow_grpo.diffusers_patch.camera_trajectory_utils import (
-                build_stepwise_delta_callback,
-                get_camera_trajectories_for_batch,
-                lowpass_latent_delta,
-                prepare_latents_with_camera,
-            )
+        from visual_rl.model_adapters.world_r1_camera import (
+            build_stepwise_delta_callback,
+            get_camera_trajectories_for_batch,
+            lowpass_latent_delta,
+            prepare_latents_with_camera,
+        )
 
         _require_camera_signatures(
             get_camera_trajectories_for_batch,
@@ -1107,6 +1417,56 @@ def _restore_order(value, grouped_positions: Sequence[int]):
         inverse[original_row] = grouped_row
     index = torch.tensor(inverse, dtype=torch.int64, device=value.device)
     return value.index_select(0, index)
+
+
+def _module_dtype(module, *, fallback):
+    parameter = next(iter(module.parameters()), None)
+    return parameter.dtype if parameter is not None else fallback
+
+
+def _wan_module_device_and_dtype(
+    module,
+    *,
+    fallback_device,
+    fallback_dtype,
+):
+    """Resolve Wan's activation contract from its input convolution.
+
+    PEFT can enumerate a FP32 LoRA parameter before the frozen BF16 Wan
+    transformer.  That parameter is not a valid activation-dtype oracle:
+    feeding FP32 latents into Wan's BF16 ``patch_embedding`` fails before the
+    LoRA branch is reached.
+    """
+
+    base_model = module
+    get_base_model = getattr(module, "get_base_model", None)
+    if callable(get_base_model):
+        resolved = get_base_model()
+        if resolved is not None:
+            base_model = resolved
+
+    patch_embedding = getattr(base_model, "patch_embedding", None)
+    if patch_embedding is not None:
+        parameter = next(iter(patch_embedding.parameters()), None)
+        if parameter is not None:
+            return parameter.device, parameter.dtype
+
+    for name, parameter in base_model.named_parameters():
+        if "patch_embedding." in name:
+            return parameter.device, parameter.dtype
+    for parameter in base_model.parameters():
+        if not parameter.requires_grad:
+            return parameter.device, parameter.dtype
+
+    parameter = next(iter(module.parameters()), None)
+    if parameter is not None:
+        return parameter.device, parameter.dtype
+    return fallback_device, fallback_dtype
+
+
+def _cache_context(module, name: str):
+    factory = getattr(module, "cache_context", None)
+    return factory(name) if callable(factory) else nullcontext()
 
 
 def _stack_state_sequence(

@@ -341,6 +341,40 @@ def test_rollout_batch_slice_moves_all_sample_fields_but_not_t_axis():
     assert selected.artifact_metadata is batch.artifact_metadata
 
 
+def test_rollout_batch_transition_slice_moves_only_transition_fields():
+    request = _request()
+    batch = dataclasses.replace(
+        _batch(request),
+        trajectory_step_index=torch.tensor([10, 11], dtype=torch.int64),
+        transition_std_dev=torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+    )
+
+    selected = batch.slice_transitions(1, 2)
+
+    assert selected.prompts is batch.prompts
+    assert selected.media is batch.media
+    assert (
+        selected.recompute_payload["noise"]
+        is batch.recompute_payload["noise"]
+    )
+    assert selected.artifact_metadata is batch.artifact_metadata
+    assert selected.latents.shape[:2] == (2, 1)
+    torch.testing.assert_close(selected.timesteps, batch.timesteps[:, 1:2])
+    torch.testing.assert_close(
+        selected.trajectory_step_index,
+        batch.trajectory_step_index[1:2],
+    )
+    torch.testing.assert_close(
+        selected.transition_std_dev,
+        batch.transition_std_dev[:, 1:2],
+    )
+    assert batch.slice_transitions(0, 2) is batch
+    with pytest.raises(IndexError, match="transition interval"):
+        batch.slice_transitions(2, 2)
+    with pytest.raises(TypeError, match="must be an integer"):
+        batch.slice_transitions(0, False)
+
+
 def test_reward_contract_is_cpu_float32_detached_and_ordered():
     batch = _batch()
     rewards = RewardBatch(
@@ -510,7 +544,6 @@ def _runtime_context() -> RuntimeBuildContext:
 def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
     params: dict[str, object] = {
         "checkpoint": "checkpoint",
-        "reference_repo": "reference",
         "lora_rank": 4,
         "lora_alpha": 8,
         "lora_target_modules": ["to_q", "to_v"],
@@ -545,7 +578,6 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
             },
             {
                 "checkpoint",
-                "reference_repo",
                 "lora_rank",
                 "lora_alpha",
                 "lora_target_modules",
@@ -555,6 +587,8 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
                 "max_sequence_length",
                 "local_files_only",
                 "low_cpu_mem_usage",
+                "offload_frozen_modules_during_update",
+                "policy_forward_microbatch_size",
             },
         ),
         (
@@ -562,7 +596,6 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
             _heavy_model_params(frames=9),
             {
                 "checkpoint",
-                "reference_repo",
                 "lora_rank",
                 "lora_alpha",
                 "lora_target_modules",
@@ -574,6 +607,8 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
                 "max_sequence_length",
                 "local_files_only",
                 "low_cpu_mem_usage",
+                "offload_frozen_modules_during_update",
+                "vae_tiling",
             },
         ),
         (
@@ -581,7 +616,6 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
             _heavy_model_params(),
             {
                 "checkpoint",
-                "reference_repo",
                 "lora_rank",
                 "lora_alpha",
                 "lora_target_modules",
@@ -592,6 +626,8 @@ def _heavy_model_params(*, frames: int | None = None) -> dict[str, object]:
                 "max_sequence_length",
                 "local_files_only",
                 "low_cpu_mem_usage",
+                "offload_frozen_modules_during_update",
+                "vae_tiling",
             },
         ),
     ],
@@ -606,10 +642,15 @@ def test_model_resolvers_have_one_exact_parameter_table(
     assert set(resolved) == expected_keys
     if "checkpoint" in resolved:
         assert resolved["checkpoint"] == (tmp_path / "checkpoint").resolve()
-        assert resolved["reference_repo"] == (tmp_path / "reference").resolve()
         assert resolved["lora_target_modules"] == ("to_q", "to_v")
         assert resolved["local_files_only"] is True
         assert resolved["low_cpu_mem_usage"] is True
+        if "offload_frozen_modules_during_update" in resolved:
+            assert resolved["offload_frozen_modules_during_update"] is False
+        if "vae_tiling" in resolved:
+            assert resolved["vae_tiling"] is False
+        if "policy_forward_microbatch_size" in resolved:
+            assert resolved["policy_forward_microbatch_size"] is None
 
     for key_to_remove in raw:
         invalid = dict(raw)
@@ -737,7 +778,6 @@ def test_heavy_from_config_consumes_only_resolved_fields(
     monkeypatch.setattr(factory, "_load_base_pipeline", lambda self: None)
     adapter = factory.from_config(resolved, _runtime_context())
     assert adapter.checkpoint is resolved["checkpoint"]
-    assert adapter.reference_repo is resolved["reference_repo"]
     assert adapter.lora_target_modules == resolved["lora_target_modules"]
     assert adapter.device == torch.device("cpu")
     assert adapter.dtype == torch.float32
@@ -764,16 +804,17 @@ def test_wan_components_are_two_real_classes_without_backend_alias():
     }
 
 
-def test_world_r1_camera_path_uses_one_scoped_exact_helper_contract(tmp_path):
-    fixture_repo = (
-        Path(__file__).parent
-        / "fixtures"
-        / "reference_repos"
-        / "world_r1_camera_v1"
-    ).resolve()
+def test_world_r1_camera_helper_has_no_external_sampler_or_demo_entrypoint():
+    from visual_rl.model_adapters import world_r1_camera
+
+    source = inspect.getsource(world_r1_camera)
+    assert "wan_pipeline_with_logprob" not in source
+    assert "__main__" not in source
+
+
+def test_world_r1_camera_path_uses_bundled_exact_helper_contract(tmp_path):
     adapter = WanWorldR1Adapter(
         checkpoint=(tmp_path / "checkpoint").resolve(),
-        reference_repo=fixture_repo,
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q", "to_v"),

@@ -25,6 +25,7 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
         require_initial_clipfrac_zero: bool,
         require_finite_gradients: bool,
         require_nonzero_gradients: bool,
+        transition_microbatch_size: int | None = None,
     ) -> None:
         self.algorithm = algorithm
         self.advantage_computer = advantage_computer
@@ -39,6 +40,7 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
             require_nonzero_gradients=require_nonzero_gradients,
             max_grad_norm=max_grad_norm,
             update_microbatch_size=update_microbatch_size,
+            transition_microbatch_size=transition_microbatch_size,
             precision=precision,
         )
         self.max_initial_logprob_delta = (
@@ -46,6 +48,9 @@ class AlgorithmOptimizerPlugin(OptimizerPlugin):
         )
         self.max_grad_norm = self.update_engine.max_grad_norm
         self.update_microbatch_size = self.update_engine.update_microbatch_size
+        self.transition_microbatch_size = (
+            self.update_engine.transition_microbatch_size
+        )
         self.precision = self.update_engine.precision
 
     def build_optimizer(

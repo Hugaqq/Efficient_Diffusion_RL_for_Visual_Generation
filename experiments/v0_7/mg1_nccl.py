@@ -203,6 +203,7 @@ def _run_role(
                         identity,
                         output_dir,
                         spec.target_steps,
+                        timeout_s=spec.run_timeout_s,
                     )
                 try:
                     exit_code = process.wait(timeout=60.0)

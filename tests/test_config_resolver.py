@@ -45,6 +45,7 @@ def test_tiny_fixture_resolves_to_one_frozen_canonical_config():
     }
     assert config.artifacts.preview_samples_per_event == 0
     assert not hasattr(config.runtime, "rollout_cache")
+    assert config.runtime.transition_microbatch_size is None
     assert config.artifacts.output_dir == (TINY.parent / "runs" / "tiny-grpo").resolve()
     assert isinstance(config.model.params, FrozenMapping)
     with pytest.raises(FrozenInstanceError):
@@ -152,7 +153,6 @@ def test_relative_global_and_component_paths_share_yaml_directory(tmp_path):
         "adapter_checkpoint": "adapters/warm-start",
         "params": {
             "checkpoint": "models/sd3",
-            "reference_repo": "references/tempflow",
             "lora_rank": 8,
             "lora_alpha": 16,
             "lora_target_modules": ["to_q", "to_k"],
@@ -184,10 +184,6 @@ def test_relative_global_and_component_paths_share_yaml_directory(tmp_path):
         == (tmp_path / "adapters" / "warm-start").resolve()
     )
     assert config.model.params["checkpoint"] == (tmp_path / "models" / "sd3").resolve()
-    assert (
-        config.model.params["reference_repo"]
-        == (tmp_path / "references" / "tempflow").resolve()
-    )
 
 
 @pytest.mark.parametrize("relationship", ["same", "inside", "contains"])
@@ -226,6 +222,7 @@ def test_resume_is_in_place_and_mutually_exclusive_with_adapter_warm_start(tmp_p
         ("dataset.repeat_per_prompt", 0),
         ("runtime.max_steps", 0),
         ("runtime.update_microbatch_size", False),
+        ("runtime.transition_microbatch_size", False),
         ("optimizer.learning_rate", 0.0),
         ("optimizer.adam_beta1", 1.0),
         ("algorithm.advantage.epsilon", float("inf")),
@@ -243,6 +240,21 @@ def test_global_numeric_contract_rejects_bool_boundaries_and_nonfinite(
     cursor[segments[-1]] = value
 
     with pytest.raises(ConfigError):
+        load(_write(tmp_path, values)).resolve()
+
+
+def test_transition_microbatch_size_accepts_only_optional_positive_integer(
+    tmp_path,
+):
+    values = _tiny_mapping()
+    values["runtime"]["transition_microbatch_size"] = 1
+    assert (
+        load(_write(tmp_path, values)).resolve().runtime.transition_microbatch_size
+        == 1
+    )
+
+    values["runtime"]["transition_microbatch_size"] = 0
+    with pytest.raises(ConfigError, match="transition_microbatch_size"):
         load(_write(tmp_path, values)).resolve()
 
 

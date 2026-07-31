@@ -132,6 +132,7 @@ class RuntimeConfig:
     batch_size: int
     precision: Precision
     update_microbatch_size: int
+    transition_microbatch_size: int | None
     deterministic: bool
     progress: bool
     distributed: DistributedConfig
@@ -415,18 +416,21 @@ def config_from_mapping(
         ),
     )
 
-    runtime_raw = _section(
-        root,
-        "runtime",
+    runtime_raw = dict(_mapping(root["runtime"], path="runtime"))
+    runtime_raw.setdefault("transition_microbatch_size", None)
+    _exact_keys(
+        runtime_raw,
         {
             "max_steps",
             "batch_size",
             "precision",
             "update_microbatch_size",
+            "transition_microbatch_size",
             "deterministic",
             "progress",
             "distributed",
         },
+        path="runtime",
     )
     distributed_raw = _mapping(
         runtime_raw["distributed"], path="runtime.distributed"
@@ -471,6 +475,10 @@ def config_from_mapping(
         update_microbatch_size=_positive_int(
             runtime_raw["update_microbatch_size"],
             path="runtime.update_microbatch_size",
+        ),
+        transition_microbatch_size=_optional_positive_int(
+            runtime_raw["transition_microbatch_size"],
+            path="runtime.transition_microbatch_size",
         ),
         deterministic=_boolean(
             runtime_raw["deterministic"], path="runtime.deterministic"

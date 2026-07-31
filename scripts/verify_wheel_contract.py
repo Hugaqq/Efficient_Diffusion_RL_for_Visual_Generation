@@ -26,9 +26,9 @@ FORBIDDEN_PAYLOAD_SEGMENTS = {
     "run",
     "runs",
     "scripts",
-    "services",
     "tests",
 }
+SERVICE_PREFIX = "services/world_r1_strict/"
 
 
 def verify_wheel_contract(
@@ -85,24 +85,36 @@ def verify_wheel_contract(
             package_names = {
                 name
                 for name in names
-                if name.startswith("visual_rl/")
+                if name.startswith("visual_rl/") or name.startswith(SERVICE_PREFIX)
             }
             expected_package_names = {
                 path.relative_to(root).as_posix()
-                for path in (root / "visual_rl").rglob("*")
+                for path in (root / "visual_rl").rglob("*.py")
                 if path.is_file()
                 and "__pycache__" not in path.parts
-                and path.suffix == ".py"
             }
+            expected_package_names.update(
+                path.relative_to(root).as_posix()
+                for path in (root / "services/world_r1_strict").rglob("*")
+                if path.is_file()
+                and "__pycache__" not in path.parts
+                and path.suffix != ".pyc"
+            )
             if package_names != expected_package_names:
                 missing = sorted(expected_package_names - package_names)
                 extra = sorted(package_names - expected_package_names)
                 errors.append(
-                    f"wheel/source visual_rl file set mismatch: "
+                    f"wheel/source runtime file set mismatch: "
                     f"missing={missing}, extra={extra}"
                 )
             for name in names:
                 path = PurePosixPath(name)
+                if name.startswith(SERVICE_PREFIX):
+                    continue
+                if path.parts and path.parts[0] == "services" and not name.startswith(
+                    SERVICE_PREFIX
+                ):
+                    errors.append(f"forbidden wheel payload: {name}")
                 if any(part in FORBIDDEN_PAYLOAD_SEGMENTS for part in path.parts):
                     errors.append(f"forbidden wheel payload: {name}")
             if record_name not in names:

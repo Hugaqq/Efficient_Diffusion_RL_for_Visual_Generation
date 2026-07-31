@@ -765,6 +765,38 @@ class RolloutBatch:
             },
         )
 
+    def slice_transitions(self, start: int, stop: int) -> RolloutBatch:
+        """Select one non-empty contiguous transition interval."""
+
+        for name, value in (("start", start), ("stop", stop)):
+            if type(value) is not int:
+                raise TypeError(f"transition {name} must be an integer")
+        if not 0 <= start < stop <= self.transition_count:
+            raise IndexError(
+                "transition interval must satisfy "
+                f"0 <= start < stop <= {self.transition_count}"
+            )
+        if start == 0 and stop == self.transition_count:
+            return self
+        return dataclass_replace(
+            self,
+            latents=self.latents[:, start:stop],
+            next_latents=self.next_latents[:, start:stop],
+            timesteps=self.timesteps[:, start:stop],
+            old_log_probs=self.old_log_probs[:, start:stop],
+            transition_mask=self.transition_mask[:, start:stop],
+            trajectory_step_index=(
+                None
+                if self.trajectory_step_index is None
+                else self.trajectory_step_index[start:stop]
+            ),
+            transition_std_dev=(
+                None
+                if self.transition_std_dev is None
+                else self.transition_std_dev[:, start:stop]
+            ),
+        )
+
     def to(self, device: Any, dtype: Any = None) -> RolloutBatch:
         import torch
 

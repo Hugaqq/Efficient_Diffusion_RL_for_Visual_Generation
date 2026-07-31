@@ -226,15 +226,14 @@ class PromptColorGuardedRewardClient(RewardClient):
             )
             maximum = image.max(axis=0)
             minimum = image.min(axis=0)
-            saturation = float(
-                np.mean(
-                    np.where(
-                        maximum > 1e-6,
-                        (maximum - minimum) / maximum,
-                        0.0,
-                    )
-                )
+            saturation_ratio = np.zeros_like(maximum)
+            np.divide(
+                maximum - minimum,
+                maximum,
+                out=saturation_ratio,
+                where=maximum > 1e-6,
             )
+            saturation = float(np.mean(saturation_ratio))
             luminance = float(
                 np.mean(
                     0.2126 * image[0]

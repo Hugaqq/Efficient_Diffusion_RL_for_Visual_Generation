@@ -587,9 +587,7 @@ def _resolve_setup(repo_root: Path, case: dict[str, Any]):
         raise ValueError("group size must divide into update microbatches")
     if transition_count < 1:
         raise ValueError("native case requires at least one transition")
-    reference_repo = config.model.params["reference_repo"]
-    if not isinstance(reference_repo, Path) or not reference_repo.is_absolute():
-        raise ValueError("reference_repo must be one resolved absolute path")
+    reference_repo = (repo_root / "reference_code/TempFlow-GRPO-main").resolve()
     required_files = (
         reference_repo / "scripts" / "train_sd3.py",
         reference_repo / "flow_grpo" / "stat_tracking.py",
@@ -608,21 +606,17 @@ def _resolve_setup(repo_root: Path, case: dict[str, Any]):
             "reference repo is missing required native modules: "
             + ", ".join(path.relative_to(reference_repo).as_posix() for path in missing_files)
         )
-    return config, _NativeComputeLogProbView.from_resolved(config)
+    return config, _NativeComputeLogProbView.from_resolved(config), reference_repo
 
 
 @contextmanager
 def _scoped_native_helpers(reference_repo: Path) -> Iterator[_NativeHelpers]:
     """Import the actual reference script without retaining its modules."""
 
-    from visual_rl.model_adapters.diffusers_common import (
-        reference_repo_import_path,
-    )
-
     module_name = "_visualrl_native_flow_grpo_train_sd3"
     script = reference_repo / "scripts" / "train_sd3.py"
     previous = sys.modules.pop(module_name, None)
-    with reference_repo_import_path(reference_repo):
+    with _reference_repo_import_path(reference_repo):
         spec = importlib.util.spec_from_file_location(module_name, script)
         if spec is None or spec.loader is None:
             raise RuntimeError("cannot create native train_sd3 import spec")
@@ -675,6 +669,36 @@ def _scoped_native_helpers(reference_repo: Path) -> Iterator[_NativeHelpers]:
             sys.modules.pop(module_name, None)
             if previous is not None:
                 sys.modules[module_name] = previous
+
+
+@contextmanager
+def _reference_repo_import_path(repo_root: Path) -> Iterator[Path]:
+    if not repo_root.is_absolute() or not repo_root.is_dir():
+        raise ValueError("native reference repo must be one absolute directory")
+    previous_path = list(sys.path)
+    previous_modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name == "flow_grpo" or name.startswith("flow_grpo.")
+    }
+    for name in previous_modules:
+        sys.modules.pop(name, None)
+    sys.path.insert(0, str(repo_root))
+    try:
+        yield repo_root
+    finally:
+        sys.path[:] = previous_path
+        for name, module in tuple(sys.modules.items()):
+            module_file = getattr(module, "__file__", None)
+            if not (name == "flow_grpo" or name.startswith("flow_grpo.")):
+                continue
+            if module_file is None:
+                sys.modules.pop(name, None)
+                continue
+            resolved = Path(module_file).resolve()
+            if resolved == repo_root or repo_root in resolved.parents:
+                sys.modules.pop(name, None)
+        sys.modules.update(previous_modules)
 
 
 def _native_tracker_advantages(
@@ -1763,6 +1787,7 @@ def _run_real_parity(
     case: Mapping[str, Any],
     config: Any,
     view: _NativeComputeLogProbView,
+    reference_repo: Path,
 ) -> dict[str, Any]:
     """Execute the fixed real-CUDA 14-item comparison."""
 
@@ -1811,9 +1836,7 @@ def _run_real_parity(
         _clone_named_parameters(visual_named, native_named)
         construction_rng = _RngSnapshot.capture()
 
-        with _scoped_native_helpers(
-            config.model.params["reference_repo"]
-        ) as helpers:
+        with _scoped_native_helpers(reference_repo) as helpers:
             prompts = (str(case["prompt"]),) * batch_size
             visual_prompt_values = visual_adapter._prompt_payload(prompts)
             visual_prompt = {
@@ -2204,7 +2227,7 @@ def main() -> int:
                 raise RuntimeError(
                     "missing native dependencies: " + ", ".join(missing)
                 )
-            config, view = _resolve_setup(repo_root, case)
+            config, view, reference_repo = _resolve_setup(repo_root, case)
             precision = config.runtime.precision
             report = _run_real_parity(
                 repo_root=repo_root,
@@ -2212,6 +2235,7 @@ def main() -> int:
                 case=case,
                 config=config,
                 view=view,
+                reference_repo=reference_repo,
             )
     except BaseException as exc:
         report = _failure_report(

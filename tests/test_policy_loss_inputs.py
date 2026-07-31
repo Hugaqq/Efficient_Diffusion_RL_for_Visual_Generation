@@ -135,6 +135,42 @@ def test_policy_loss_inputs_slice_keeps_one_detached_tensor_contract() -> None:
         inputs.slice([1, 1])
 
 
+def test_policy_loss_inputs_transition_slice_keeps_the_same_objective_contract() -> None:
+    inputs = PolicyLossInputs(
+        base_advantage=torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        algorithm_weight=torch.ones(4, 3),
+        active_mask=torch.tensor(
+            [
+                [True, False, True],
+                [True, True, False],
+                [False, True, True],
+                [True, True, True],
+            ]
+        ),
+        clip_range=0.2,
+        reference_kl_weight=0.3,
+    )
+
+    sliced = inputs.slice_transitions(1, 3)
+
+    torch.testing.assert_close(
+        sliced.base_advantage,
+        inputs.base_advantage[:, 1:3],
+    )
+    torch.testing.assert_close(
+        sliced.algorithm_weight,
+        inputs.algorithm_weight[:, 1:3],
+    )
+    assert torch.equal(sliced.active_mask, inputs.active_mask[:, 1:3])
+    assert sliced.clip_range == inputs.clip_range
+    assert sliced.reference_kl_weight == inputs.reference_kl_weight
+    assert inputs.slice_transitions(0, 3) is inputs
+    with pytest.raises(IndexError, match="transition interval"):
+        inputs.slice_transitions(1, 1)
+    with pytest.raises(TypeError, match="must be an integer"):
+        inputs.slice_transitions(True, 2)
+
+
 def test_policy_loss_inputs_rejects_grad_and_nonpositive_active_weight() -> None:
     with pytest.raises(ValueError, match="detached"):
         PolicyLossInputs(

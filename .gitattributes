@@ -1,0 +1,4 @@
+# Keep revision-pinned third-party sources and license texts byte-for-byte.
+# First-party files continue to use Git's normal whitespace checks.
+services/world_r1_strict/native/** -whitespace
+services/world_r1_strict/licenses/** -whitespace

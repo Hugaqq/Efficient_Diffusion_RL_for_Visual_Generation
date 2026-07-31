@@ -48,8 +48,12 @@ torchrun --standalone --nproc-per-node=2 run_experiment.py
 `artifacts.output_dir` 指向已有 run directory。恢复只信任 authoritative
 commit marker 和 format-v5 checkpoint；projection 文件不是恢复身份来源。
 
-W04 已对 Tiny/SD3 reference statistics 和数值合同完成本地测试。真实
-Flow native CUDA、C20/Q100 与 MG1/NCCL 仍是 `not_run`，因此当前不能把源码级
-deterministic tests 外推为真实设备上的逐元素 parity。
+W04 已对 Tiny/SD3 reference statistics 和数值合同完成本地测试。Flow、
+TempFlow、Flash 和 World-R1 的 BF16 operational C20 已在真实 RTX 5090
+上完成 continuous/interrupted-resume semantic parity，详见
+[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)。Flow native
+FP32 CUDA、Q100、MG1/NCCL 和 clean-candidate release evidence 仍是
+`not_run`，因此不能把 operational C20 外推成逐 tensor native parity 或完整
+设备确定性结论。
 
 实验与发布状态见 [v0.7 acceptance](V0_7_ACCEPTANCE.md)。

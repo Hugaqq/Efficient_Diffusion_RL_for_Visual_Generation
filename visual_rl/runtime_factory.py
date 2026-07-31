@@ -90,6 +90,9 @@ def build_runtime_components(
             algorithm=algorithm,
             advantage_computer=advantage_computer,
             update_microbatch_size=config.runtime.update_microbatch_size,
+            transition_microbatch_size=(
+                config.runtime.transition_microbatch_size
+            ),
             precision=config.runtime.precision,
             max_grad_norm=config.optimizer.max_grad_norm,
             max_initial_logprob_delta=config.optimizer.max_initial_logprob_delta,

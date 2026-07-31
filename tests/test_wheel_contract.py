@@ -73,7 +73,17 @@ def _build_wheel(
     package_paths = sorted(
         path
         for path in (ROOT / "visual_rl").rglob("*.py")
-        if "__pycache__" not in path.parts
+        if path.is_file()
+        and "__pycache__" not in path.parts
+    )
+    package_paths.extend(
+        sorted(
+            path
+            for path in (ROOT / "services/world_r1_strict").rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix != ".pyc"
+        )
     )
     if omit_source:
         package_paths.pop()
@@ -139,6 +149,18 @@ def test_valid_synthetic_wheel_matches_source_and_metadata(tmp_path: Path) -> No
     assert verify_wheel_contract(ROOT, tmp_path) == ()
     with zipfile.ZipFile(wheel) as archive:
         assert "visual_rl/callbacks.py" in archive.namelist()
+        assert "services/world_r1_strict/reward_general_app.py" in archive.namelist()
+        assert (
+            "services/world_r1_strict/native/assets/"
+            "bpe_simple_vocab_16e6.txt.gz"
+        ) in archive.namelist()
+        assert (
+            "services/world_r1_strict/native/depth_anything_3/configs/"
+            "reconstruction-giant.yaml"
+        ) in archive.namelist()
+        assert (
+            "services/world_r1_strict/licenses/WORLD_R1_LICENSE"
+        ) in archive.namelist()
 
 
 def test_checker_accepts_equivalent_normalized_specifier_order(
@@ -197,6 +219,13 @@ def test_checker_rejects_entry_points_and_forbidden_payload(tmp_path: Path) -> N
     original = tmp_path / "visual_rl-0.7.0-py3-none-any.whl"
     with zipfile.ZipFile(original, "a") as archive:
         archive.writestr("tests/not_allowed.py", b"pass\n")
+    errors = verify_wheel_contract(ROOT, tmp_path)
+    assert any("forbidden wheel payload" in error for error in errors)
+
+    original.unlink()
+    _build_wheel(tmp_path)
+    with zipfile.ZipFile(original, "a") as archive:
+        archive.writestr("services/not_allowed.py", b"pass\n")
     errors = verify_wheel_contract(ROOT, tmp_path)
     assert any("forbidden wheel payload" in error for error in errors)
 

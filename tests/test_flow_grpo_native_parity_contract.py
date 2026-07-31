@@ -327,7 +327,7 @@ def test_main_success_dispatch_is_reachable_and_stdout_is_one_json(
     monkeypatch.setattr(
         harness,
         "_resolve_setup",
-        lambda _root, _case: (config, view),
+        lambda root, _case: (config, view, root / "reference_code"),
     )
 
     def run(**kwargs):
@@ -343,6 +343,7 @@ def test_main_success_dispatch_is_reachable_and_stdout_is_one_json(
     assert len(calls) == 1
     assert calls[0]["config"] is config
     assert calls[0]["view"] is view
+    assert calls[0]["reference_repo"].name == "reference_code"
 
 
 def test_main_serializer_self_check_degrades_to_failure_schema(
@@ -361,7 +362,7 @@ def test_main_serializer_self_check_degrades_to_failure_schema(
     monkeypatch.setattr(
         harness,
         "_resolve_setup",
-        lambda _root, _case: (config, view),
+        lambda root, _case: (config, view, root / "reference_code"),
     )
     monkeypatch.setattr(
         harness,

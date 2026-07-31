@@ -25,10 +25,13 @@ Fixed entry modules:
 - `python -m experiments.v0_7.world_r1_wan`
 - `python -m experiments.v0_7.mg1_nccl`
 
-These commands require the documented GPU/model/reference/reward environment.
-They are not part of source-preparation tests and have not been run in this
-round. There is no CLI option, YAML overlay, experiment Runner, checkpoint
-loader, or plugin path.
+These commands require the documented GPU/model/reward environment. Bounded
+engineering runs using the same public API and fixed role configurations have
+completed Flow, TempFlow, Flash and World-R1 C20
+continuous/interrupted-resume parity. They are documented separately in
+`docs/V0_7_OPERATIONAL_EVIDENCE.md` because a dirty engineering candidate
+cannot populate the clean-candidate final evidence envelope. There is no CLI
+option, YAML overlay, experiment Runner, checkpoint loader, or plugin path.
 
 Q100 aggregation is read-only: `offline_aggregate.py` first calls the public
 status/audit APIs for exactly the twelve paths in `evidence/q100_inputs.json`,
@@ -41,5 +44,6 @@ outputs before scanning. `verify_evidence.py` then requires the exact six
 semantic-family results, 30 roles, Flow native report, MG1 internal results,
 all-role environment attempts, Q100 digest, and the current clean Git HEAD.
 
-See `docs/V0_7_USER_GUIDE.md` for environment and usage details and
-`docs/V0_7_ACCEPTANCE.md` for the explicit `not_run` matrix.
+See `docs/V0_7_USER_GUIDE.md` for environment and usage details,
+`docs/V0_7_OPERATIONAL_EVIDENCE.md` for bounded real-model results, and
+`docs/V0_7_ACCEPTANCE.md` for the formal gate matrix.

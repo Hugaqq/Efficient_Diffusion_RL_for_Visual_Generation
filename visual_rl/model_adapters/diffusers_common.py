@@ -2,55 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
-import sys
-from typing import Any, Iterator
+from typing import Any
 
 
 class AdapterNotLoadedError(RuntimeError):
     """Raised when a real-model adapter has not finished construction."""
-
-
-@contextmanager
-def reference_repo_import_path(repo_root: Path) -> Iterator[Path]:
-    """Expose exactly one resolved reference repository for a scoped import.
-
-    Reference modules are removed again on exit, so two experiments cannot
-    accidentally share helpers imported from different repository identities.
-    """
-
-    if not isinstance(repo_root, Path) or not repo_root.is_absolute():
-        raise ValueError("reference_repo must be an absolute pathlib.Path")
-    if not repo_root.is_dir():
-        raise FileNotFoundError(
-            f"reference_repo does not exist or is not a directory: {repo_root}"
-        )
-    previous_path = list(sys.path)
-    previous_modules = {
-        name: module
-        for name, module in tuple(sys.modules.items())
-        if name == "flow_grpo" or name.startswith("flow_grpo.")
-    }
-    for name in previous_modules:
-        sys.modules.pop(name, None)
-    sys.path.insert(0, str(repo_root))
-    try:
-        yield repo_root
-    finally:
-        sys.path[:] = previous_path
-        for name, module in tuple(sys.modules.items()):
-            module_file = getattr(module, "__file__", None)
-            if not (name == "flow_grpo" or name.startswith("flow_grpo.")):
-                continue
-            if module_file is None:
-                sys.modules.pop(name, None)
-                continue
-            resolved_file = Path(module_file).resolve()
-            if resolved_file == repo_root or repo_root in resolved_file.parents:
-                sys.modules.pop(name, None)
-        sys.modules.update(previous_modules)
 
 
 @dataclass(frozen=True)

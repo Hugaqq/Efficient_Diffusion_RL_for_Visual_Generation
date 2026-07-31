@@ -55,7 +55,7 @@ GOLDEN_MATRIX = {
     ("model", "wan_world_r1"): (
         {"media.video", "sampling.full_trajectory", "conditioning.camera"},
         set(),
-        (*_MODEL_DEPS, "einops", "rp"),
+        _MODEL_DEPS,
     ),
     ("rollout", "full_trajectory"): (
         {"rollout.full_trajectory"},

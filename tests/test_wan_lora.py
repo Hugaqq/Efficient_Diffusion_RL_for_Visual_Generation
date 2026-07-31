@@ -65,7 +65,6 @@ def _runtime_context() -> RuntimeBuildContext:
 def _adapter(tmp_path: Path, *, gradient_checkpointing: bool) -> WanFlashAdapter:
     return WanFlashAdapter(
         checkpoint=tmp_path / "checkpoint",
-        reference_repo=tmp_path / "reference",
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q", "to_v"),

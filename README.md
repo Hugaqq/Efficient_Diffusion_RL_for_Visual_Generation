@@ -19,15 +19,22 @@ Runner。
 ## 当前证据状态
 
 源码、固定实验配置、离线验证工具、全仓自动化、Tiny single/Gloo API smoke
-和基础 wheel 构建/隔离安装已经在本地验证。真实 Flow-GRPO、
-TempFlow-GRPO、Flash-GRPO、World-R1 的 C20/Q100，Flow native parity，
-MG1/NCCL、远端执行和上传当前均为 `not_run`。`not_run` 不是通过、跳过即
-成功或质量提升声明。
+和基础 wheel 构建/隔离安装已经在本地验证。远端 32 GB RTX 5090 上的 BF16
+operational C20 已完成 Flow-GRPO、TempFlow-GRPO 和 Flash-GRPO 的
+continuous/interrupted-resume、public audit 与 semantic parity；World-R1
+C20 正在运行。精确 digest、显存峰值、artifact 位置和证据边界见
+[operational C20 evidence](docs/V0_7_OPERATIONAL_EVIDENCE.md)。
+
+这些运行来自 dirty engineering candidate，不替代仍为 `not_run` 的 Flow
+FP32 native parity、Q100、多 seed reward-improvement、MG1/NCCL 和最终
+clean-commit release envelope。`not_run` 不是通过、跳过即成功或质量提升
+声明。
 
 当前文档：
 
 - [v0.7 用户指南](docs/V0_7_USER_GUIDE.md)
 - [v0.7 验收矩阵](docs/V0_7_ACCEPTANCE.md)
+- [v0.7 operational C20 evidence](docs/V0_7_OPERATIONAL_EVIDENCE.md)
 - [项目边界](docs/V0_7_SCOPE.md)
 - [项目概览](docs/PROJECT_OVERVIEW.md)
 - [固定实验计划](experiments/EXPERIMENT_PLAN.md)
@@ -196,10 +203,11 @@ clip fraction 只在一个公共 objective 内计算。
 ```bash
 conda run -n visual-rl python -m pytest -q tests/test_experiment_api.py
 conda run -n visual-rl python -m pytest -q tests/test_documentation_contract.py
-conda run -n visual-rl python -m ruff check visual_rl tests
+conda run -n visual-rl python -m ruff check \
+  --select E4,E7,E9,F visual_rl tests
 ```
 
 确定性边界见
 [docs/DETERMINISTIC_RUNTIME.md](docs/DETERMINISTIC_RUNTIME.md)。World-R1
-companion service 的独立部署见
+companion service 与训练包使用同一个 wheel；独立服务环境的部署步骤见
 [services/world_r1_strict/README.md](services/world_r1_strict/README.md)。

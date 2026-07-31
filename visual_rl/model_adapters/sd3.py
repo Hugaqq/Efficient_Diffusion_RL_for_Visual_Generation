@@ -25,9 +25,11 @@ from visual_rl.model_adapters.diffusers_common import (
     apply_peft_lora,
     configure_gradient_checkpointing,
     make_generator,
-    reference_repo_import_path,
     resolve_torch_dtype,
     verify_gradient_checkpointing,
+)
+from visual_rl.model_adapters.diffusion_transition import (
+    sd3_sde_step_with_logprob,
 )
 
 SD3_REFERENCE_NOISE_LEVEL = 0.7
@@ -35,7 +37,6 @@ SD3_REFERENCE_NOISE_LEVEL = 0.7
 _REQUIRED_PARAMS = frozenset(
     {
         "checkpoint",
-        "reference_repo",
         "lora_rank",
         "lora_alpha",
         "lora_target_modules",
@@ -48,6 +49,8 @@ _REQUIRED_PARAMS = frozenset(
 _DEFAULT_PARAMS: Mapping[str, object] = {
     "local_files_only": True,
     "low_cpu_mem_usage": True,
+    "offload_frozen_modules_during_update": False,
+    "policy_forward_microbatch_size": None,
 }
 _PROMPT_PAYLOAD_KEYS = (
     "prompt_embeds",
@@ -67,7 +70,6 @@ class SD3TempFlowAdapter(ModelAdapter):
         self,
         *,
         checkpoint: Path,
-        reference_repo: Path,
         lora_rank: int,
         lora_alpha: int,
         lora_target_modules: tuple[str, ...],
@@ -78,9 +80,10 @@ class SD3TempFlowAdapter(ModelAdapter):
         local_files_only: bool,
         low_cpu_mem_usage: bool,
         context: RuntimeBuildContext,
+        offload_frozen_modules_during_update: bool = False,
+        policy_forward_microbatch_size: int | None = None,
     ) -> None:
         self.checkpoint = checkpoint
-        self.reference_repo = reference_repo
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_target_modules = lora_target_modules
@@ -90,16 +93,22 @@ class SD3TempFlowAdapter(ModelAdapter):
         self.max_sequence_length = max_sequence_length
         self.local_files_only = local_files_only
         self.low_cpu_mem_usage = low_cpu_mem_usage
+        self.offload_frozen_modules_during_update = (
+            offload_frozen_modules_during_update
+        )
+        self.policy_forward_microbatch_size = policy_forward_microbatch_size
         self.device = context.device
         self.dtype = resolve_torch_dtype(context.precision)
         self.pipeline = None
         self.transformer = None
-        self._pipeline_full = None
-        self._pipeline_branching = None
         self._sde_step = None
         self._encode_prompt = None
         self._gradient_checkpointing_state = None
         self._policy_dtype_hook = None
+        self._frozen_modules_offloaded = False
+        self._text_encoders_active = False
+        self._vae_active = False
+        self._policy_active = False
 
     @property
     def train_module(self):
@@ -134,13 +143,13 @@ class SD3TempFlowAdapter(ModelAdapter):
             context,
             "checkpoint",
         )
-        values["reference_repo"] = _resolve_path(
-            values["reference_repo"],
-            context,
-            "reference_repo",
-        )
         for key in ("lora_rank", "lora_alpha", "resolution", "max_sequence_length"):
             values[key] = _positive_int(values[key], key)
+        if values["policy_forward_microbatch_size"] is not None:
+            values["policy_forward_microbatch_size"] = _positive_int(
+                values["policy_forward_microbatch_size"],
+                "policy_forward_microbatch_size",
+            )
         values["lora_target_modules"] = _target_modules(
             values["lora_target_modules"]
         )
@@ -148,6 +157,7 @@ class SD3TempFlowAdapter(ModelAdapter):
             "gradient_checkpointing",
             "local_files_only",
             "low_cpu_mem_usage",
+            "offload_frozen_modules_during_update",
         ):
             if type(values[key]) is not bool:
                 raise ConfigError(
@@ -175,7 +185,7 @@ class SD3TempFlowAdapter(ModelAdapter):
     ) -> tuple[ValidationCheck, ...]:
         del cls, context
         checks = []
-        for key in ("checkpoint", "reference_repo"):
+        for key in ("checkpoint",):
             value = resolved.get(key)
             if not isinstance(value, Path) or not value.is_absolute():
                 checks.append(
@@ -205,7 +215,6 @@ class SD3TempFlowAdapter(ModelAdapter):
     ) -> SD3TempFlowAdapter:
         adapter = cls(
             checkpoint=_require_path(resolved, "checkpoint"),
-            reference_repo=_require_path(resolved, "reference_repo"),
             lora_rank=int(resolved["lora_rank"]),
             lora_alpha=int(resolved["lora_alpha"]),
             lora_target_modules=tuple(resolved["lora_target_modules"]),
@@ -216,6 +225,14 @@ class SD3TempFlowAdapter(ModelAdapter):
             local_files_only=bool(resolved["local_files_only"]),
             low_cpu_mem_usage=bool(resolved["low_cpu_mem_usage"]),
             context=context,
+            offload_frozen_modules_during_update=bool(
+                resolved["offload_frozen_modules_during_update"]
+            ),
+            policy_forward_microbatch_size=(
+                None
+                if resolved["policy_forward_microbatch_size"] is None
+                else int(resolved["policy_forward_microbatch_size"])
+            ),
         )
         adapter._load_base_pipeline()
         return adapter
@@ -229,20 +246,6 @@ class SD3TempFlowAdapter(ModelAdapter):
             raise ImportError(
                 "Install visual-rl[train] to use sd3_tempflow"
             ) from exc
-
-        with reference_repo_import_path(self.reference_repo):
-            from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import (
-                pipeline_with_logprob,
-            )
-            from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob_perstep import (
-                pipeline_with_logprob as pipeline_with_logprob_perstep,
-            )
-            from flow_grpo.diffusers_patch.sd3_sde_with_logprob import (
-                sde_step_with_logprob,
-            )
-            from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import (
-                encode_prompt,
-            )
 
         pipeline = StableDiffusion3Pipeline.from_pretrained(
             str(self.checkpoint),
@@ -271,19 +274,31 @@ class SD3TempFlowAdapter(ModelAdapter):
             alpha=self.lora_alpha,
             target_modules=self.lora_target_modules,
         )
-        pipeline = pipeline.to(self.device)
-        if torch.device(self.device).type == "cuda":
+        if (
+            self.offload_frozen_modules_during_update
+            and torch.device(self.device).type == "cuda"
+        ):
             for name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
-                getattr(pipeline, name).to(self.device, dtype=self.dtype)
+                getattr(pipeline, name).to("cpu", dtype=self.dtype)
             pipeline.transformer.to(self.device)
-        pipeline.vae.to(self.device, dtype=torch.float32)
+            pipeline.vae.to("cpu", dtype=torch.float32)
+            self._frozen_modules_offloaded = True
+            self._policy_active = True
+        else:
+            pipeline = pipeline.to(self.device)
+            if torch.device(self.device).type == "cuda":
+                for name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+                    getattr(pipeline, name).to(self.device, dtype=self.dtype)
+                pipeline.transformer.to(self.device)
+            pipeline.vae.to(self.device, dtype=torch.float32)
+            self._text_encoders_active = True
+            self._vae_active = True
+            self._policy_active = True
         self._install_policy_dtype_guard(pipeline.transformer)
         self.pipeline = pipeline
         self.transformer = pipeline.transformer
-        self._pipeline_full = pipeline_with_logprob
-        self._pipeline_branching = pipeline_with_logprob_perstep
-        self._sde_step = sde_step_with_logprob
-        self._encode_prompt = encode_prompt
+        self._sde_step = sd3_sde_step_with_logprob
+        self._encode_prompt = pipeline.encode_prompt
         self._gradient_checkpointing_state = verify_gradient_checkpointing(
             self.transformer,
             checkpointing_state,
@@ -306,7 +321,10 @@ class SD3TempFlowAdapter(ModelAdapter):
             batch.validate_against(request)
             return batch
         finally:
-            self.train_module.train(was_training)
+            try:
+                self.train_module.train(was_training)
+            finally:
+                self._offload_frozen_modules_for_update()
 
     def _sample_full(self, request: RolloutRequest) -> RolloutBatch:
         import torch
@@ -318,26 +336,15 @@ class SD3TempFlowAdapter(ModelAdapter):
             negative_pooled_prompt_embeds,
         ) = self._prompt_payload(request.prompts)
         generator = make_generator(self.device, request.context.seed)
-        kwargs = {
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled_prompt_embeds,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
-            "num_inference_steps": request.num_steps,
-            "guidance_scale": self.guidance_scale,
-            "generator": generator,
-            "output_type": "pt",
-            "height": self.resolution,
-            "width": self.resolution,
-            "return_dict": False,
-            "max_sequence_length": self.max_sequence_length,
-            "kl_reward": 0.0,
-        }
-        with torch.no_grad(), self._bind_sde_generator(
-            self._pipeline_full,
-            generator,
-        ):
-            result = self._pipeline_full(self.pipeline, **kwargs)
+        with torch.no_grad():
+            result = self._run_full_pipeline(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                num_steps=request.num_steps,
+                generator=generator,
+            )
         if not isinstance(result, (tuple, list)) or len(result) not in {3, 4}:
             raise RunError("SD3 full pipeline must return three or four values")
         media, states_raw, log_probs_raw = result[:3]
@@ -420,26 +427,16 @@ class SD3TempFlowAdapter(ModelAdapter):
             negative_pooled_prompt_embeds,
         ) = self._prompt_payload(parent_prompts)
         generator = make_generator(self.device, request.context.seed)
-        kwargs = {
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled_prompt_embeds,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
-            "num_inference_steps": request.num_steps,
-            "guidance_scale": self.guidance_scale,
-            "generator": generator,
-            "output_type": "pt",
-            "height": self.resolution,
-            "width": self.resolution,
-            "return_dict": False,
-            "max_sequence_length": self.max_sequence_length,
-            "kl_reward": 0.0,
-        }
-        with (
-            torch.no_grad(),
-            self._bind_branch_sde_generator(generator, request.group_size),
-        ):
-            result = self._pipeline_branching(self.pipeline, **kwargs)
+        with torch.no_grad():
+            result = self._run_branching_pipeline(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                num_steps=request.num_steps,
+                branch_count=request.group_size,
+                generator=generator,
+            )
         if not isinstance(result, (tuple, list)) or len(result) != 5:
             raise RunError("SD3 branching pipeline must return exactly five values")
         branch_media, main_states_raw, branch_states, log_probs, _kls = result
@@ -578,6 +575,8 @@ class SD3TempFlowAdapter(ModelAdapter):
         require_reference: bool = False,
     ) -> PolicyRecomputeStats:
         self._ensure_loaded()
+        self._offload_frozen_modules_for_update()
+        self._activate_policy_module()
         payload = []
         for key in _PROMPT_PAYLOAD_KEYS:
             value = batch.recompute_payload.get(key)
@@ -594,7 +593,10 @@ class SD3TempFlowAdapter(ModelAdapter):
         import torch
 
         was_training = self.train_module.training
-        self.train_module.train(True)
+        # Rollout and recompute must use the same deterministic module mode.
+        # ``eval`` disables dropout but does not disable autograd, so LoRA
+        # gradients still flow while old/new log-prob remain comparable.
+        self.train_module.eval()
         try:
             new_log_probs = []
             current_means = []
@@ -732,37 +734,364 @@ class SD3TempFlowAdapter(ModelAdapter):
         with context:
             yield
 
+    def _run_full_pipeline(
+        self,
+        *,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        negative_prompt_embeds,
+        negative_pooled_prompt_embeds,
+        num_steps: int,
+        generator,
+    ):
+        timesteps, latents = self._prepare_native_sd3_rollout(
+            prompt_embeds=prompt_embeds,
+            num_steps=num_steps,
+            generator=generator,
+        )
+        states = [latents]
+        log_probs = []
+        for timestep in timesteps:
+            expanded = timestep.expand(latents.shape[0])
+            prediction = self._predict_noise(
+                latents,
+                expanded,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            )
+            latents, log_prob, _mean, _std = sd3_sde_step_with_logprob(
+                self.pipeline.scheduler,
+                prediction.float(),
+                expanded,
+                latents.float(),
+                generator=generator,
+            )
+            states.append(latents)
+            log_probs.append(log_prob)
+        return self._decode_sd3_latents(latents), states, log_probs
+
+    def _run_branching_pipeline(
+        self,
+        *,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        negative_prompt_embeds,
+        negative_pooled_prompt_embeds,
+        num_steps: int,
+        branch_count: int,
+        generator,
+    ):
+        import torch
+
+        timesteps, latents = self._prepare_native_sd3_rollout(
+            prompt_embeds=prompt_embeds,
+            num_steps=num_steps,
+            generator=generator,
+        )
+        main_states = [latents]
+        branch_states = []
+        branch_log_probs = []
+        branch_final_latents = []
+        parent_count = latents.shape[0]
+        positive_branch = prompt_embeds.repeat_interleave(branch_count, dim=0)
+        pooled_branch = pooled_prompt_embeds.repeat_interleave(
+            branch_count,
+            dim=0,
+        )
+        negative_branch = negative_prompt_embeds.repeat_interleave(
+            branch_count,
+            dim=0,
+        )
+        negative_pooled_branch = (
+            negative_pooled_prompt_embeds.repeat_interleave(
+                branch_count,
+                dim=0,
+            )
+        )
+        for index, timestep in enumerate(timesteps[:-1]):
+            expanded = timestep.expand(parent_count)
+            prediction = self._predict_noise(
+                latents,
+                expanded,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            )
+            ode_latents = sd3_sde_step_with_logprob(
+                self.pipeline.scheduler,
+                prediction.float(),
+                expanded,
+                latents.float(),
+                deterministic=True,
+            )[0]
+            branch_source = latents.repeat_interleave(branch_count, dim=0)
+            branch_prediction = prediction.repeat_interleave(
+                branch_count,
+                dim=0,
+            )
+            branch_timestep = timestep.expand(parent_count * branch_count)
+            sampled, log_prob, _mean, _std = sd3_sde_step_with_logprob(
+                self.pipeline.scheduler,
+                branch_prediction.float(),
+                branch_timestep,
+                branch_source.float(),
+                generator=generator,
+            )
+            branch_states.append(sampled)
+            branch_log_probs.append(log_prob)
+
+            branch_latents = sampled
+            for inner_timestep in timesteps[index + 1 :]:
+                inner_expanded = inner_timestep.expand(branch_latents.shape[0])
+                inner_prediction = self._predict_noise(
+                    branch_latents,
+                    inner_expanded,
+                    positive_branch,
+                    pooled_branch,
+                    negative_branch,
+                    negative_pooled_branch,
+                )
+                branch_latents = sd3_sde_step_with_logprob(
+                    self.pipeline.scheduler,
+                    inner_prediction.float(),
+                    inner_expanded,
+                    branch_latents.float(),
+                    deterministic=True,
+                )[0]
+            branch_final_latents.append(branch_latents)
+            latents = ode_latents
+            main_states.append(latents)
+        # Branching exposes one reward candidate for every possible branch
+        # timestep.  Decode them in one VAE phase so CPU offload moves the
+        # policy and VAE exactly once per training step rather than once per
+        # candidate timestep.
+        branch_media = self._decode_sd3_latent_sequence(branch_final_latents)
+        zeros = [torch.zeros_like(value) for value in branch_log_probs]
+        return (
+            branch_media,
+            main_states,
+            branch_states,
+            branch_log_probs,
+            zeros,
+        )
+
+    def _prepare_native_sd3_rollout(
+        self,
+        *,
+        prompt_embeds,
+        num_steps: int,
+        generator,
+    ):
+        from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+            calculate_shift,
+            retrieve_timesteps,
+        )
+
+        pipeline = self.pipeline
+        pipeline._guidance_scale = self.guidance_scale
+        pipeline._skip_layer_guidance_scale = 0.0
+        pipeline._clip_skip = None
+        pipeline._joint_attention_kwargs = None
+        pipeline._interrupt = False
+        channels = getattr(getattr(self.train_module, "config", None), "in_channels", None)
+        if type(channels) is not int or channels <= 0:
+            raise RunError("SD3 transformer.config.in_channels must be positive")
+        latents = pipeline.prepare_latents(
+            prompt_embeds.shape[0],
+            channels,
+            self.resolution,
+            self.resolution,
+            prompt_embeds.dtype,
+            self.device,
+            generator,
+            None,
+        ).float()
+        scheduler_kwargs = {}
+        scheduler_config = pipeline.scheduler.config
+        if bool(scheduler_config.get("use_dynamic_shifting", False)):
+            patch_size = int(self.train_module.config.patch_size)
+            image_sequence_length = (
+                latents.shape[-2] // patch_size
+            ) * (latents.shape[-1] // patch_size)
+            scheduler_kwargs["mu"] = calculate_shift(
+                image_sequence_length,
+                scheduler_config.get("base_image_seq_len", 256),
+                scheduler_config.get("max_image_seq_len", 4096),
+                scheduler_config.get("base_shift", 0.5),
+                scheduler_config.get("max_shift", 1.16),
+            )
+        timesteps, _ = retrieve_timesteps(
+            pipeline.scheduler,
+            num_steps,
+            self.device,
+            **scheduler_kwargs,
+        )
+        pipeline._num_timesteps = len(timesteps)
+        return timesteps, latents
+
+    def _decode_sd3_latents(self, latents):
+        return self._decode_sd3_latent_sequence((latents,))[0]
+
+    def _decode_sd3_latent_sequence(self, latent_sequence):
+        values = tuple(latent_sequence)
+        if not values:
+            raise RunError("SD3 decode sequence must not be empty")
+        self._activate_vae_for_decode()
+        try:
+            return [
+                self._decode_sd3_latents_with_active_vae(latents)
+                for latents in values
+            ]
+        finally:
+            self._offload_vae_after_decode()
+
+    def _decode_sd3_latents_with_active_vae(self, latents):
+        vae = self.pipeline.vae
+        parameter = next(iter(vae.parameters()))
+        value = (
+            latents / vae.config.scaling_factor
+        ) + vae.config.shift_factor
+        value = value.to(device=parameter.device, dtype=parameter.dtype)
+        image = vae.decode(value, return_dict=False)[0]
+        return self.pipeline.image_processor.postprocess(
+            image,
+            output_type="pt",
+        )
+
     def _prompt_payload(self, prompts: tuple[str, ...]):
         if not callable(self._encode_prompt):
             raise RunError("SD3 prompt encoder is unavailable")
-        encoders = [
-            self.pipeline.text_encoder,
-            self.pipeline.text_encoder_2,
-            self.pipeline.text_encoder_3,
-        ]
-        tokenizers = [
-            self.pipeline.tokenizer,
-            self.pipeline.tokenizer_2,
-            self.pipeline.tokenizer_3,
-        ]
-        prompt_embeds, pooled = self._encode_prompt(
-            encoders,
-            tokenizers,
-            list(prompts),
-            self.max_sequence_length,
-        )
-        negative_embeds, negative_pooled = self._encode_prompt(
-            encoders,
-            tokenizers,
-            [""] * len(prompts),
-            self.max_sequence_length,
-        )
+        self._activate_text_encoders_for_prompt()
+        try:
+            result = self._encode_prompt(
+                prompt=list(prompts),
+                prompt_2=None,
+                prompt_3=None,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt=[""] * len(prompts),
+                negative_prompt_2=None,
+                negative_prompt_3=None,
+                prompt_embeds=None,
+                negative_prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                negative_pooled_prompt_embeds=None,
+                clip_skip=None,
+                max_sequence_length=self.max_sequence_length,
+                lora_scale=None,
+            )
+        finally:
+            self._offload_text_encoders()
+            self._activate_policy_module()
+        if not isinstance(result, tuple) or len(result) != 4:
+            raise RunError("SD3 encode_prompt must return exactly four tensors")
+        prompt_embeds, negative_embeds, pooled, negative_pooled = result
         return (
             prompt_embeds.to(device=self.device, dtype=self.dtype),
             pooled.to(device=self.device, dtype=self.dtype),
             negative_embeds.to(device=self.device, dtype=self.dtype),
             negative_pooled.to(device=self.device, dtype=self.dtype),
         )
+
+    def _activate_text_encoders_for_prompt(self) -> None:
+        if not self.offload_frozen_modules_during_update:
+            return
+
+        import torch
+
+        if torch.device(self.device).type != "cuda":
+            return
+        if self._text_encoders_active:
+            return
+        if self._policy_active:
+            self.train_module.to("cpu")
+            self._policy_active = False
+            torch.cuda.empty_cache()
+        for module_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            getattr(self.pipeline, module_name).to(self.device, dtype=self.dtype)
+        self._text_encoders_active = True
+        self._frozen_modules_offloaded = False
+
+    def _offload_text_encoders(self) -> None:
+        if not self.offload_frozen_modules_during_update:
+            return
+
+        import torch
+
+        if torch.device(self.device).type != "cuda":
+            return
+        if not self._text_encoders_active:
+            return
+        for module_name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            getattr(self.pipeline, module_name).to("cpu", dtype=self.dtype)
+        torch.cuda.empty_cache()
+        self._text_encoders_active = False
+        self._frozen_modules_offloaded = not self._vae_active
+
+    def _activate_policy_module(self) -> None:
+        if not self.offload_frozen_modules_during_update:
+            return
+
+        import torch
+
+        if torch.device(self.device).type != "cuda" or self._policy_active:
+            return
+        if self._text_encoders_active:
+            raise RunError(
+                "SD3 policy cannot move to CUDA while text encoders are active"
+            )
+        self.train_module.to(self.device)
+        self._policy_active = True
+
+    def _activate_vae_for_decode(self) -> None:
+        if not self.offload_frozen_modules_during_update:
+            return
+
+        import torch
+
+        if torch.device(self.device).type != "cuda" or self._vae_active:
+            return
+        if self._text_encoders_active:
+            raise RunError(
+                "SD3 VAE cannot move to CUDA while text encoders are active"
+            )
+        if self._policy_active:
+            self.train_module.to("cpu")
+            self._policy_active = False
+            torch.cuda.empty_cache()
+        try:
+            self.pipeline.vae.to(self.device, dtype=torch.float32)
+        except BaseException:
+            # Do not leave a partially moved VAE beside a disabled policy.
+            self.pipeline.vae.to("cpu", dtype=torch.float32)
+            torch.cuda.empty_cache()
+            self._activate_policy_module()
+            raise
+        self._vae_active = True
+        self._frozen_modules_offloaded = False
+
+    def _offload_vae_after_decode(self) -> None:
+        if not self.offload_frozen_modules_during_update:
+            return
+
+        import torch
+
+        if torch.device(self.device).type != "cuda":
+            return
+        if self._vae_active:
+            self.pipeline.vae.to("cpu", dtype=torch.float32)
+            torch.cuda.empty_cache()
+            self._vae_active = False
+        self._frozen_modules_offloaded = not self._text_encoders_active
+        self._activate_policy_module()
+
+    def _offload_frozen_modules_for_update(self) -> None:
+        self._offload_text_encoders()
+        self._offload_vae_after_decode()
 
     def _install_policy_dtype_guard(self, transformer) -> None:
         """Keep reference-pipeline latent forwards at the policy precision."""
@@ -790,6 +1119,43 @@ class SD3TempFlowAdapter(ModelAdapter):
         )
 
     def _predict_noise(
+        self,
+        latent,
+        timestep,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        negative_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    ):
+        import torch
+
+        batch_size = int(latent.shape[0])
+        microbatch_size = self.policy_forward_microbatch_size
+        if microbatch_size is None or microbatch_size >= batch_size:
+            return self._predict_noise_microbatch(
+                latent,
+                timestep,
+                prompt_embeds,
+                pooled_prompt_embeds,
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            )
+        outputs = []
+        for start in range(0, batch_size, microbatch_size):
+            stop = min(start + microbatch_size, batch_size)
+            outputs.append(
+                self._predict_noise_microbatch(
+                    latent[start:stop],
+                    timestep[start:stop],
+                    prompt_embeds[start:stop],
+                    pooled_prompt_embeds[start:stop],
+                    negative_prompt_embeds[start:stop],
+                    negative_pooled_prompt_embeds[start:stop],
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+    def _predict_noise_microbatch(
         self,
         latent,
         timestep,
@@ -849,114 +1215,10 @@ class SD3TempFlowAdapter(ModelAdapter):
             * torch.sqrt(delta)
         )
 
-    @contextmanager
-    def _bind_sde_generator(self, pipeline_function, generator):
-        globals_mapping = _sde_globals(pipeline_function)
-        original = (
-            globals_mapping.get("sde_step_with_logprob")
-            if globals_mapping is not None
-            else None
-        )
-        if not callable(original):
-            yield
-            return
-
-        def seeded(*args, **kwargs):
-            deterministic = bool(kwargs.get("determistic", False))
-            positional_previous = len(args) >= 5 and args[4] is not None
-            positional_generator = len(args) >= 6 and args[5] is not None
-            if (
-                not deterministic
-                and not positional_previous
-                and not positional_generator
-                and kwargs.get("prev_sample") is None
-                and kwargs.get("generator") is None
-            ):
-                kwargs["generator"] = generator
-            return original(*args, **kwargs)
-
-        globals_mapping["sde_step_with_logprob"] = seeded
-        try:
-            yield
-        finally:
-            if globals_mapping.get("sde_step_with_logprob") is seeded:
-                globals_mapping["sde_step_with_logprob"] = original
-
-    @contextmanager
-    def _bind_branch_sde_generator(self, generator, branch_count: int):
-        globals_mapping = _sde_globals(self._pipeline_branching)
-        original = (
-            globals_mapping.get("sde_step_with_logprob")
-            if globals_mapping is not None
-            else None
-        )
-        if not callable(original) or not callable(self._sde_step):
-            raise RunError("SD3 branching SDE helper cannot be bound")
-        ordinary = self._sde_step
-        bound_generator = generator
-
-        def shared(
-            scheduler,
-            model_output,
-            timestep,
-            sample,
-            prev_sample=None,
-            generator=None,
-            determistic=False,
-        ):
-            import torch
-
-            if determistic or prev_sample is not None:
-                return ordinary(
-                    scheduler,
-                    model_output,
-                    timestep,
-                    sample,
-                    prev_sample=sample if determistic else prev_sample,
-                    generator=None,
-                    determistic=determistic,
-                )
-            parent_count = sample.shape[0]
-            expanded_sample = sample.repeat_interleave(branch_count, dim=0)
-            expanded_output = model_output.repeat_interleave(branch_count, dim=0)
-            timestep_values = torch.as_tensor(
-                timestep,
-                device=sample.device,
-            ).reshape(-1)
-            if timestep_values.numel() == 1:
-                expanded_timestep = timestep_values.expand(
-                    parent_count * branch_count
-                )
-            elif timestep_values.numel() == parent_count:
-                expanded_timestep = timestep_values.repeat_interleave(
-                    branch_count
-                )
-            else:
-                raise RunError("SD3 branch timestep does not align with parents")
-            return ordinary(
-                scheduler,
-                expanded_output,
-                expanded_timestep,
-                expanded_sample,
-                generator=(
-                    generator if generator is not None else bound_generator
-                ),
-                determistic=False,
-            )
-
-        globals_mapping["sde_step_with_logprob"] = shared
-        try:
-            yield
-        finally:
-            if globals_mapping.get("sde_step_with_logprob") is shared:
-                globals_mapping["sde_step_with_logprob"] = original
-
     def _ensure_loaded(self) -> None:
         if (
             self.pipeline is None
             or self.transformer is None
-            or not callable(self._pipeline_full)
-            or not callable(self._pipeline_branching)
             or not callable(self._sde_step)
         ):
             raise AdapterNotLoadedError("sd3_tempflow is not fully constructed")
@@ -968,10 +1230,12 @@ class SD3TempFlowAdapter(ModelAdapter):
             dtype_hook.remove()
         self.pipeline = None
         self.transformer = None
-        self._pipeline_full = None
-        self._pipeline_branching = None
         self._sde_step = None
         self._encode_prompt = None
+        self._frozen_modules_offloaded = False
+        self._text_encoders_active = False
+        self._vae_active = False
+        self._policy_active = False
 
 
 def _resolve_path(
@@ -1137,20 +1401,6 @@ def _group_layout(
         for branch, row in enumerate(rows):
             row_branch[row] = branch
     return parent_rows, row_to_parent, row_branch
-
-
-def _sde_globals(function: object) -> dict[str, Any] | None:
-    seen: set[int] = set()
-    current = function
-    while callable(current) and id(current) not in seen:
-        seen.add(id(current))
-        mapping = getattr(current, "__globals__", None)
-        if isinstance(mapping, dict) and callable(
-            mapping.get("sde_step_with_logprob")
-        ):
-            return mapping
-        current = getattr(current, "__wrapped__", None)
-    return None
 
 
 __all__ = [

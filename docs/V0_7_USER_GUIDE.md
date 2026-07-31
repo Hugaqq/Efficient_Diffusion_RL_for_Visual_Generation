@@ -17,9 +17,10 @@ import visual_rl as vr
 print(vr.__version__)
 ```
 
-Model training additionally needs the `train` extra and the model/reference
-repositories selected by the complete YAML. Installing the package does not
-download checkpoints or reference repositories.
+Model training additionally needs the `train` extra and the local model
+checkpoints selected by the complete YAML. All four recipe implementations are
+bundled in framecode; no runtime reference source repository is required.
+Installing the package does not download checkpoint data.
 
 ## Validate and run one complete YAML
 
@@ -99,8 +100,41 @@ python -m experiments.v0_7.mg1_nccl
 
 Do not run these merely to test installation: they are real training suites.
 They require explicit experiment authorization, the frozen checkpoints and
-reference source trees, compatible CUDA GPUs, and the declared World-R1
-endpoint. W06 did not execute them.
+compatible CUDA GPUs, and the declared local World-R1 reward endpoints.
+The reward service implementation and static resources are bundled in the
+same wheel under `services.world_r1_strict`; no framecode or World-R1 checkout
+is required at runtime. Its HPS, Qwen and DA3 weights remain separately
+supplied local model data.
+
+## Precision and frozen-module CPU offload
+
+The bounded operational C20 configurations use BF16 and enable:
+
+```yaml
+model:
+  params:
+    gradient_checkpointing: true
+    offload_frozen_modules_during_update: true
+```
+
+Wan C20 configurations also enable `vae_tiling`. The offload lifecycle is part
+of the existing SD3/Wan adapters:
+
+1. restore the frozen text encoders needed for prompt encoding;
+2. keep the trainable transformer/LoRA on the training GPU for rollout;
+3. restore the frozen VAE only for media decode;
+4. move the text encoders and VAE to CPU before policy recompute/backward;
+5. restore them lazily for the next step.
+
+Failure paths perform the same cleanup, repeated restore/offload calls are
+idempotent, and checkpoints do not encode the transient device placement.
+Callbacks do not manage this lifecycle.
+
+The top-level `configs/flow_grpo_sd3.yaml` intentionally remains FP32 because it
+is the frozen input to the separate 14-item native-parity oracle. On a 32 GB
+GPU, use the BF16 operational role configuration
+`experiments/v0_7/configs/flow_grpo_sd3_c20_continuous.yaml`; do not rewrite an
+FP32 parity result as BF16 evidence.
 
 ## Read-only run inspection
 
@@ -145,7 +179,10 @@ current clean Git HEAD.
 - C20 proves bounded mechanical behavior; it does not prove reward improvement.
 - Q100 reward claims require three complete audited seeds and the preregistered
   statistics in the acceptance document.
-- No real C20, Q100, Flow native, MG1/NCCL, remote run, or upload was performed
-  during W06 source preparation.
+- Flow, TempFlow, Flash and World-R1 operational C20 evidence now exists on a
+  dirty engineering wheel. This does not alter the pending clean-candidate,
+  Q100, Flow native or MG1 gates.
 
-See [V0_7_ACCEPTANCE.md](V0_7_ACCEPTANCE.md) for the current evidence matrix.
+See [V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md) for bounded
+real-model results and [V0_7_ACCEPTANCE.md](V0_7_ACCEPTANCE.md) for the formal
+gate matrix.

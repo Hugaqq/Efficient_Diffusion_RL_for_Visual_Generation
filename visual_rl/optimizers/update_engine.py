@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import math
 from types import MappingProxyType
@@ -99,6 +98,7 @@ class UpdateEngine:
         require_nonzero_gradients: bool = False,
         max_grad_norm: float | None = None,
         update_microbatch_size: int | None = None,
+        transition_microbatch_size: int | None = None,
         precision: str = "fp32",
     ) -> None:
         if not callable(advantage_function):
@@ -131,19 +131,28 @@ class UpdateEngine:
             allow_zero=False,
         )
         self.update_microbatch_size = self._validated_microbatch_size(
-            update_microbatch_size
+            update_microbatch_size,
+            name="update_microbatch_size",
+        )
+        self.transition_microbatch_size = self._validated_microbatch_size(
+            transition_microbatch_size,
+            name="transition_microbatch_size",
         )
         if not isinstance(precision, str) or precision not in self._PRECISIONS:
             raise ValueError("precision must be one of: fp32, bf16, fp16")
         self.precision = precision
 
     @staticmethod
-    def _validated_microbatch_size(value: Any) -> int | None:
+    def _validated_microbatch_size(
+        value: Any,
+        *,
+        name: str,
+    ) -> int | None:
         if value is None:
             return None
         if type(value) is not int or value <= 0:
             raise ValueError(
-                "update_microbatch_size must be a positive integer or None"
+                f"{name} must be a positive integer or None"
             )
         return value
 
@@ -374,6 +383,7 @@ class UpdateEngine:
         batch: RolloutBatch,
         inputs: PolicyLossInputs,
         microbatch_size: int | None,
+        transition_microbatch_size: int | None,
     ) -> tuple[tuple[RolloutBatch, PolicyLossInputs, int], ...]:
         import torch
 
@@ -395,30 +405,45 @@ class UpdateEngine:
                 range(start, min(start + size, batch.batch_size))
             )
             micro_inputs = inputs.slice(indices)
-            active_count = int(micro_inputs.active_mask.sum().item())
-            if active_count <= 0:
-                raise ValueError("every fixed microbatch slot must be active")
-            slots.append(
-                (
-                    batch if len(indices) == batch.batch_size else batch.slice(indices),
-                    inputs if len(indices) == batch.batch_size else micro_inputs,
-                    active_count,
-                )
+            micro_batch = (
+                batch
+                if len(indices) == batch.batch_size
+                else batch.slice(indices)
             )
+            transition_size = (
+                transition_microbatch_size or micro_batch.transition_count
+            )
+            for transition_start in range(
+                0,
+                micro_batch.transition_count,
+                transition_size,
+            ):
+                transition_stop = min(
+                    transition_start + transition_size,
+                    micro_batch.transition_count,
+                )
+                transition_inputs = micro_inputs.slice_transitions(
+                    transition_start,
+                    transition_stop,
+                )
+                active_count = int(
+                    transition_inputs.active_mask.sum().item()
+                )
+                if active_count <= 0:
+                    continue
+                slots.append(
+                    (
+                        micro_batch.slice_transitions(
+                            transition_start,
+                            transition_stop,
+                        ),
+                        transition_inputs,
+                        active_count,
+                    )
+                )
         if not slots:
             raise ValueError("update requires at least one microbatch slot")
         return tuple(slots)
-
-    def _forward_context(self, device: Any):
-        if self.precision == "fp32":
-            return nullcontext()
-        import torch
-
-        dtype = torch.float16 if self.precision == "fp16" else torch.bfloat16
-        return torch.autocast(
-            device_type="cuda",
-            dtype=dtype,
-        )
 
     @staticmethod
     def _aligned_objective_views(
@@ -707,6 +732,7 @@ class UpdateEngine:
                 batch,
                 inputs,
                 self.update_microbatch_size,
+                self.transition_microbatch_size,
             ),
         )
         self._require_consistent_contract(
@@ -714,7 +740,11 @@ class UpdateEngine:
             phase="update.slot_contract",
             contract=(
                 batch.batch_size,
-                tuple(slot[0].batch_size for slot in slots),
+                batch.transition_count,
+                tuple(
+                    (slot[0].batch_size, slot[0].transition_count)
+                    for slot in slots
+                ),
             ),
         )
         local_active_count = sum(slot[2] for slot in slots)
@@ -743,11 +773,13 @@ class UpdateEngine:
                     ObjectiveOutput,
                     PolicyRecomputeStats,
                 ]:
-                    with self._forward_context(strategy.device):
-                        stats = strategy.recompute_policy_stats(
-                            micro_batch,
-                            require_reference=require_reference,
-                        )
+                    # Adapter parameters and inputs already own policy
+                    # precision.  A recompute-only autocast would make old
+                    # and new log-prob use different numerical paths.
+                    stats = strategy.recompute_policy_stats(
+                        micro_batch,
+                        require_reference=require_reference,
+                    )
                     if not isinstance(stats, PolicyRecomputeStats):
                         raise TypeError(
                             "Strategy recompute must return PolicyRecomputeStats"
