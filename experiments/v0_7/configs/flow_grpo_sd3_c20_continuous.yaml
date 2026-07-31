@@ -8,7 +8,6 @@ model:
   adapter_checkpoint: null
   params:
     checkpoint: ../../../checkpoints/stable-diffusion-3.5-medium
-    reference_repo: ../../../reference_code/TempFlow-GRPO-main
     lora_rank: 32
     lora_alpha: 64
     lora_target_modules:
@@ -26,6 +25,8 @@ model:
     max_sequence_length: 128
     local_files_only: true
     low_cpu_mem_usage: true
+    offload_frozen_modules_during_update: true
+    policy_forward_microbatch_size: 1
 
 dataset:
   path: ../../../data/prompts/geneval_rgb_train_36.txt
@@ -61,7 +62,7 @@ reward:
   execution:
     microbatch_size: 8
     max_retries: 0
-  cache_dir: ../../../reward_cache/flow-grpo-sd3
+  cache_dir: ../reward_cache/flow-grpo-sd3
 
 algorithm:
   name: grpo
@@ -87,8 +88,9 @@ optimizer:
 runtime:
   max_steps: 20
   batch_size: 1
-  precision: fp32
+  precision: bf16
   update_microbatch_size: 8
+  transition_microbatch_size: 1
   deterministic: true
   progress: true
   distributed:

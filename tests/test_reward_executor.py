@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import inspect
+import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -556,3 +557,45 @@ def test_image_reward_params_and_scores_use_one_batch_contract(
     vector = guarded.score(batch, context)
     assert vector.values.shape == (batch.batch_size,)
     assert vector.shared_metadata["margin_clip"] == 0.5
+
+
+def test_guarded_image_reward_is_finite_without_division_warnings(
+    tmp_path: Path,
+) -> None:
+    resolution = ResolutionContext(
+        config_path=(tmp_path / "config.yaml").resolve(),
+        config_dir=tmp_path.resolve(),
+    )
+    resolved = PromptColorGuardedRewardClient.resolve_params(
+        {
+            "default_color": "red",
+            "margin_clip": 0.5,
+            "saturation_max": 0.9,
+            "luminance_min": 0.1,
+            "luminance_max": 0.9,
+            "spatial_std_min": 0.05,
+            "spatial_std_max": 0.5,
+            "saturation_penalty_weight": 1.0,
+            "luminance_penalty_weight": 1.0,
+            "spatial_penalty_weight": 1.0,
+        },
+        resolution,
+    )
+    client = PromptColorGuardedRewardClient.from_config(
+        resolved,
+        _runtime_context(),
+    )
+    context = _context()
+    base = _batch(context)
+    media = torch.stack(
+        (
+            torch.zeros(3, 2, 2),
+            torch.ones(3, 2, 2),
+            torch.tensor([1.0, 0.0, 0.0])[:, None, None].expand(3, 2, 2),
+            torch.full((3, 2, 2), 1.0e-8),
+        )
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        vector = client.score(replace(base, media=media), context)
+    assert torch.isfinite(vector.values).all()

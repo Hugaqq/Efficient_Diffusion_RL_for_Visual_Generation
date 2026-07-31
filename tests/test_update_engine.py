@@ -43,7 +43,10 @@ class _Adapter:
         require_reference: bool = False,
     ) -> PolicyRecomputeStats:
         self.recompute_calls += 1
-        features = batch.recompute_payload["features"]
+        sample_weight = batch.recompute_payload["sample_weight"]
+        features = sample_weight * (
+            batch.timesteps.to(dtype=torch.float32) + 1.0
+        )
         new_log_probs = self.train_module.delta * features
         if not require_reference:
             return PolicyRecomputeStats(new_log_probs=new_log_probs)
@@ -125,11 +128,11 @@ def _batch(
         trajectory_step_index=None,
         transition_std_dev=None,
         recompute_payload={
-            "features": torch.arange(
+            "sample_weight": torch.arange(
                 1,
-                batch_size * transition_count + 1,
+                batch_size + 1,
                 dtype=torch.float32,
-            ).reshape(batch_size, transition_count)
+            ).reshape(batch_size, 1)
         },
         artifact_metadata={},
     )
@@ -151,6 +154,7 @@ def _rewards(batch: RolloutBatch) -> RewardBatch:
 def _plugin(
     *,
     microbatch_size: int,
+    transition_microbatch_size: int | None = None,
     beta: float = 0.0,
 ) -> AlgorithmOptimizerPlugin:
     return AlgorithmOptimizerPlugin(
@@ -164,6 +168,7 @@ def _plugin(
             output_dtype="float32",
         ),
         update_microbatch_size=microbatch_size,
+        transition_microbatch_size=transition_microbatch_size,
         precision="fp32",
         max_grad_norm=None,
         max_initial_logprob_delta=None,
@@ -189,10 +194,19 @@ def _optimizer(
     )
 
 
-def _run_once(*, microbatch_size: int, beta: float = 0.0):
+def _run_once(
+    *,
+    microbatch_size: int,
+    transition_microbatch_size: int | None = None,
+    beta: float = 0.0,
+):
     adapter = _Adapter()
     strategy = _strategy(adapter)
-    plugin = _plugin(microbatch_size=microbatch_size, beta=beta)
+    plugin = _plugin(
+        microbatch_size=microbatch_size,
+        transition_microbatch_size=transition_microbatch_size,
+        beta=beta,
+    )
     optimizer = _optimizer(plugin, adapter)
     batch = _batch()
     try:
@@ -239,6 +253,52 @@ def test_microbatch_and_full_batch_use_one_active_count_weighting() -> None:
     torch.testing.assert_close(split_gradient, full_gradient)
     assert full_forwards == 1
     assert split_forwards == 2
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.5])
+def test_transition_microbatch_preserves_the_one_objective_and_update(
+    beta: float,
+) -> None:
+    full = _run_once(
+        microbatch_size=4,
+        transition_microbatch_size=None,
+        beta=beta,
+    )
+    split = _run_once(
+        microbatch_size=4,
+        transition_microbatch_size=1,
+        beta=beta,
+    )
+    full_result, full_parameter, full_gradient, full_forwards, full_references = (
+        full
+    )
+    (
+        split_result,
+        split_parameter,
+        split_gradient,
+        split_forwards,
+        split_references,
+    ) = split
+
+    assert full_result.active_transition_count == 8
+    assert split_result.active_transition_count == 8
+    for name in (
+        "loss",
+        "policy_loss",
+        "reference_kl",
+        "approx_kl",
+        "clipfrac",
+    ):
+        assert getattr(split_result, name) == pytest.approx(
+            getattr(full_result, name),
+            abs=1e-7,
+        )
+    torch.testing.assert_close(split_parameter, full_parameter)
+    torch.testing.assert_close(split_gradient, full_gradient)
+    assert full_forwards == 1
+    assert split_forwards == 2
+    assert full_references == (1 if beta > 0.0 else 0)
+    assert split_references == (2 if beta > 0.0 else 0)
 
 
 def test_beta_zero_never_requests_reference_statistics() -> None:

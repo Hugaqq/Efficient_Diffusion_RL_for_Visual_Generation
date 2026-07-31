@@ -89,7 +89,7 @@ _BUILTIN_COMPONENTS: tuple[ComponentSpec, ...] = (
                 "conditioning.camera",
             }
         ),
-        dependencies=(*_DIFFUSERS_MODEL_DEPENDENCIES, "einops", "rp"),
+        dependencies=_DIFFUSERS_MODEL_DEPENDENCIES,
     ),
     ComponentSpec(
         kind="rollout",

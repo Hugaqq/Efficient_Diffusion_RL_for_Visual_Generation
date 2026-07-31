@@ -36,7 +36,11 @@ def _config(tmp_path: Path) -> SimpleNamespace:
             require_finite_gradients=True,
             require_nonzero_gradients=False,
         ),
-        runtime=SimpleNamespace(update_microbatch_size=4, precision="fp32"),
+        runtime=SimpleNamespace(
+            update_microbatch_size=4,
+            transition_microbatch_size=2,
+            precision="fp32",
+        ),
     )
 
 
@@ -133,6 +137,7 @@ def _install_runtime_fakes(
         def __new__(cls, **kwargs):
             assert kwargs["algorithm"].name == "algorithm"
             assert kwargs["update_microbatch_size"] == 4
+            assert kwargs["transition_microbatch_size"] == 2
             assert kwargs["precision"] == "fp32"
             assert kwargs["max_grad_norm"] == 1.0
             assert kwargs["max_initial_logprob_delta"] == 0.5

@@ -27,6 +27,7 @@ class _FakePeftTransformer(torch.nn.Module):
         self.adapter_disabled = False
         self.disable_calls = 0
         self.restore_calls = 0
+        self.training_modes: list[bool] = []
 
     def forward(
         self,
@@ -38,6 +39,7 @@ class _FakePeftTransformer(torch.nn.Module):
         return_dict,
     ):
         del timestep, encoder_hidden_states, pooled_projections, return_dict
+        self.training_modes.append(self.training)
         value = self.base
         if not self.adapter_disabled:
             value = value + self.delta
@@ -88,7 +90,6 @@ def _runtime_context(precision: str = "fp32") -> RuntimeBuildContext:
 def _adapter() -> tuple[SD3TempFlowAdapter, _FakePeftTransformer]:
     adapter = SD3TempFlowAdapter(
         checkpoint=Path("/checkpoint"),
-        reference_repo=Path("/reference"),
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q",),
@@ -169,6 +170,7 @@ def _batch() -> RolloutBatch:
 
 def test_sd3_beta_zero_path_performs_no_disabled_adapter_forward():
     adapter, transformer = _adapter()
+    transformer.train(True)
     batch = _batch()
     stats = adapter.recompute_policy_stats(
         batch,
@@ -177,6 +179,9 @@ def test_sd3_beta_zero_path_performs_no_disabled_adapter_forward():
     stats.validate_against(batch, require_reference=False)
     assert transformer.disable_calls == 0
     assert transformer.restore_calls == 0
+    assert transformer.training_modes
+    assert not any(transformer.training_modes)
+    assert transformer.training is True
     assert stats.current_transition_mean is None
     assert stats.transition_std is None
     assert stats.reference_transition_mean is None
@@ -185,7 +190,6 @@ def test_sd3_beta_zero_path_performs_no_disabled_adapter_forward():
 def test_sd3_prompt_payload_matches_policy_precision_before_latent_creation():
     adapter = SD3TempFlowAdapter(
         checkpoint=Path("/checkpoint"),
-        reference_repo=Path("/reference"),
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q",),
@@ -206,10 +210,12 @@ def test_sd3_prompt_payload_matches_policy_precision_before_latent_creation():
         tokenizer_3=object(),
     )
 
-    def encode(_encoders, _tokenizers, prompts, _max_sequence_length):
-        batch_size = len(prompts)
+    def encode(**kwargs):
+        batch_size = len(kwargs["prompt"])
         return (
             torch.zeros(batch_size, 2, 4, dtype=torch.float32),
+            torch.zeros(batch_size, 2, 4, dtype=torch.float32),
+            torch.zeros(batch_size, 4, dtype=torch.float32),
             torch.zeros(batch_size, 4, dtype=torch.float32),
         )
 
@@ -243,7 +249,6 @@ def test_sd3_scheduler_timesteps_preserve_fractional_values_for_recompute():
 def test_sd3_policy_dtype_guard_normalizes_reference_pipeline_latents():
     adapter = SD3TempFlowAdapter(
         checkpoint=Path("/checkpoint"),
-        reference_repo=Path("/reference"),
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q",),

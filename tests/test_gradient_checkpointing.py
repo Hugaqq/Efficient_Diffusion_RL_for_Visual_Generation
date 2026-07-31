@@ -48,7 +48,6 @@ class _CheckpointingTransformer(torch.nn.Module):
 def _raw_sd3_params(*, gradient_checkpointing: object) -> dict[str, object]:
     return {
         "checkpoint": "checkpoint",
-        "reference_repo": "reference",
         "lora_rank": 4,
         "lora_alpha": 8,
         "lora_target_modules": ["to_q", "to_v"],
@@ -164,7 +163,6 @@ def test_sd3_component_resolves_checks_and_constructs_one_canonical_bool(
     adapter = SD3TempFlowAdapter.from_config(resolved, _runtime_context())
     assert adapter.gradient_checkpointing is requested
     assert adapter.checkpoint == (tmp_path / "checkpoint").resolve()
-    assert adapter.reference_repo == (tmp_path / "reference").resolve()
 
 
 @pytest.mark.parametrize("invalid", [None, 0, 1, "true"])

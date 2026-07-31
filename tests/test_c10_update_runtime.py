@@ -101,6 +101,31 @@ def test_runner_scaler_matrix_has_no_plugin_or_engine_owner(monkeypatch) -> None
         assert "_get_grad_scaler" not in attributes
 
 
+def test_update_engine_does_not_add_a_recompute_only_autocast_context() -> None:
+    tree = ast.parse(
+        (ROOT / "visual_rl/optimizers/update_engine.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+        and node.func.attr == "autocast"
+    ]
+    assert len(calls) == 1
+    keywords = {item.arg: item.value for item in calls[0].keywords}
+    assert isinstance(keywords["enabled"], ast.Constant)
+    assert keywords["enabled"].value is False
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "_forward_context"
+        for node in ast.walk(tree)
+    )
+
+
 def test_runner_initial_seed_is_rank_local_from_the_one_validated_seed() -> None:
     tree = ast.parse(
         (ROOT / "visual_rl/runner.py").read_text(encoding="utf-8")

@@ -144,6 +144,27 @@ class PolicyLossInputs:
             active_mask=self.active_mask.index_select(0, tensor_index),
         )
 
+    def slice_transitions(self, start: int, stop: int) -> PolicyLossInputs:
+        """Select one non-empty contiguous transition interval."""
+
+        transition_count = int(self.base_advantage.shape[1])
+        for name, value in (("start", start), ("stop", stop)):
+            if type(value) is not int:
+                raise TypeError(f"transition {name} must be an integer")
+        if not 0 <= start < stop <= transition_count:
+            raise IndexError(
+                "transition interval must satisfy "
+                f"0 <= start < stop <= {transition_count}"
+            )
+        if start == 0 and stop == transition_count:
+            return self
+        return replace(
+            self,
+            base_advantage=self.base_advantage[:, start:stop],
+            algorithm_weight=self.algorithm_weight[:, start:stop],
+            active_mask=self.active_mask[:, start:stop],
+        )
+
     def validate_against(self, batch: RolloutBatch) -> None:
         """Require the algorithm tensors to match the canonical transition grid."""
 

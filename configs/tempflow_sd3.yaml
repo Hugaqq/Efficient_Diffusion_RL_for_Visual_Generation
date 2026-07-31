@@ -8,7 +8,6 @@ model:
   adapter_checkpoint: null
   params:
     checkpoint: ../checkpoints/stable-diffusion-3.5-medium
-    reference_repo: ../reference_code/TempFlow-GRPO-main
     lora_rank: 32
     lora_alpha: 64
     lora_target_modules: [to_q, to_k, to_v, to_out.0]
@@ -18,6 +17,11 @@ model:
     max_sequence_length: 128
     local_files_only: true
     low_cpu_mem_usage: true
+    offload_frozen_modules_during_update: true
+    # Rollout predicts one shared parent before expanding six branches.  Keep
+    # BF16 recompute at the same per-parent forward shape so PPO old/new
+    # log-prob parity does not drift from batch-shape-dependent kernels.
+    policy_forward_microbatch_size: 1
 
 dataset:
   path: ../data/prompts/geneval_rgb_train_36.txt
@@ -74,7 +78,8 @@ optimizer:
   max_initial_logprob_delta: 1.0e-4
   require_initial_clipfrac_zero: true
   require_finite_gradients: true
-  require_nonzero_gradients: true
+  # A valid branch group can produce an exactly cancelling policy gradient.
+  require_nonzero_gradients: false
 
 runtime:
   max_steps: 20

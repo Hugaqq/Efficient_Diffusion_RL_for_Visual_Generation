@@ -21,11 +21,22 @@ def test_wan_recompute_casts_model_input_without_rounding_sde_latents() -> None:
     class RecordingTransformer(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.anchor = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
+            # PEFT commonly enumerates its FP32 adapter before the frozen BF16
+            # Wan patch embedding. The first parameter must not determine the
+            # activation dtype.
+            self.lora_anchor = torch.nn.Parameter(
+                torch.zeros((), dtype=torch.float32)
+            )
+            self.patch_embedding = torch.nn.Conv3d(
+                1,
+                1,
+                kernel_size=1,
+                dtype=torch.bfloat16,
+            )
 
         def forward(self, *, hidden_states, **_kwargs):
             received["transformer_hidden_states"] = hidden_states.detach().clone()
-            return (hidden_states + self.anchor,)
+            return (hidden_states + self.lora_anchor.to(hidden_states.dtype),)
 
     def recording_sde_step(
         _scheduler,
@@ -50,7 +61,6 @@ def test_wan_recompute_casts_model_input_without_rounding_sde_latents() -> None:
     transformer = RecordingTransformer()
     adapter = WanFlashAdapter(
         checkpoint=Path("/offline/fake-wan"),
-        reference_repo=Path("/offline/fake-reference"),
         lora_rank=4,
         lora_alpha=8,
         lora_target_modules=("to_q",),
@@ -118,7 +128,7 @@ def test_wan_recompute_casts_model_input_without_rounding_sde_latents() -> None:
     hidden_states = received["transformer_hidden_states"]
     assert hidden_states.dtype is torch.bfloat16
     assert not torch.equal(hidden_states.float(), current[:, 0])
-    assert transformer.anchor.grad is not None
+    assert transformer.lora_anchor.grad is not None
 
     sde_current = received["sde_current_latent"]
     sde_next = received["sde_next_latent"]

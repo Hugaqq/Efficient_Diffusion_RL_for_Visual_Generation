@@ -20,6 +20,9 @@ from experiments.v0_7 import verify_evidence
 ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = ROOT / "experiments/v0_7"
 TEST_CANDIDATE = {"clean": True, "commit": "a" * 40, "tested": True}
+WORLD_R1_SERVER_REVISION = (
+    "world-r1-e156b02bc171"
+)
 
 
 def test_exact_role_table_and_thirty_full_yaml_configs_resolve() -> None:
@@ -41,16 +44,54 @@ def test_exact_role_table_and_thirty_full_yaml_configs_resolve() -> None:
         }
 
 
+def test_role_timeouts_cover_real_runs_without_restoring_a_global_timeout() -> None:
+    source = (EXPERIMENT_ROOT / "interrupt_resume.py").read_text(
+        encoding="utf-8"
+    )
+    assert "child.join(timeout=spec.run_timeout_s)" in source
+    assert "child.join(timeout=30.0)" not in source
+    assert "timeout_s=spec.run_timeout_s" in source
+    mg1_source = (EXPERIMENT_ROOT / "mg1_nccl.py").read_text(encoding="utf-8")
+    assert "timeout_s=spec.run_timeout_s" in mg1_source
+
+    for spec in interrupt_resume.ROLE_SPECS:
+        assert spec.run_timeout_s > 30.0
+        if spec.family in {
+            "flow_grpo_sd3",
+            "tempflow_sd3",
+            "flash_wan",
+            "world_r1_wan",
+        }:
+            expected = 86_400.0 if spec.phase == "q100" else 14_400.0
+            assert spec.run_timeout_s == expected
+
+
 def test_experiment_configs_freeze_bounded_storage_policy() -> None:
     no_preview_families = {"tiny_s100", "mg1_tiny_grpo"}
     for family in interrupt_resume.FAMILY_ORDER:
         expected_preview_count = 0 if family in no_preview_families else 2
+        family_cache_dirs = set()
         for config in interrupt_resume.assert_config_family(family).values():
             assert config.artifacts.preview_samples_per_event == (
                 expected_preview_count
             )
             assert config.artifacts.checkpoint_keep_last == 1
             assert not hasattr(config.runtime, "rollout_cache")
+            if family not in no_preview_families:
+                cache_dir = config.reward.cache_dir
+                assert cache_dir is not None
+                family_cache_dirs.add(cache_dir)
+                assert cache_dir.parent == EXPERIMENT_ROOT / "reward_cache"
+                output_dir = config.artifacts.output_dir
+                assert output_dir != cache_dir
+                assert output_dir not in cache_dir.parents
+                assert cache_dir not in output_dir.parents
+        if family not in no_preview_families:
+            # Continuous/interrupted/resume compare the same deterministic
+            # training lineage. Reusing the content-addressed reward result
+            # prevents a nondeterministic CUDA reward result from becoming an
+            # optimizer-state difference between those roles.
+            assert len(family_cache_dirs) == 1
 
 
 def test_four_real_families_freeze_batching_prompt_balance_and_q100_seeds() -> None:
@@ -62,8 +103,30 @@ def test_four_real_families_freeze_batching_prompt_balance_and_q100_seeds() -> N
     ):
         configs = interrupt_resume.assert_config_family(family)
         for name, config in configs.items():
+            assert "reference_repo" not in config.model.params
             assert config.runtime.batch_size == 1
             assert config.runtime.deterministic is True
+            if family == "flow_grpo_sd3":
+                assert config.runtime.precision == "bf16"
+                assert config.runtime.transition_microbatch_size == 1
+                assert config.model.params["policy_forward_microbatch_size"] == 1
+            if family == "tempflow_sd3":
+                # Branch rollout evaluates one shared parent and repeats its
+                # prediction.  BF16 recompute must retain that per-parent
+                # forward shape; a six-row forward can otherwise drift past
+                # TempFlow's deliberately narrow PPO clip range.
+                assert config.model.params["policy_forward_microbatch_size"] == 1
+                # Group-centred branch advantages can cancel exactly for a
+                # valid batch, so non-zero is evidence, not a per-step
+                # correctness invariant. Finite gradients remain mandatory.
+                assert config.optimizer.require_nonzero_gradients is False
+            if family == "world_r1_wan":
+                # Rollout evaluates the two-sample GRPO group together. Keep
+                # the initial BF16 policy recompute at that same batch shape;
+                # splitting it into single rows changes CUDA numerics enough
+                # to violate the pre-update log-prob parity gate.
+                assert config.rollout.params["samples_per_prompt"] == 2
+                assert config.runtime.update_microbatch_size == 2
             assert config.dataset.repeat_per_prompt == 1
             assert config.dataset.sampling_strategy == "sequential"
             interrupt_resume.assert_prompt_balance(config)
@@ -71,6 +134,30 @@ def test_four_real_families_freeze_batching_prompt_balance_and_q100_seeds() -> N
                 assert config.run.seed in {17, 29, 43}
                 assert config.runtime.max_steps == 100
                 assert config.resume.from_ is None
+
+
+def test_wan_reward_ports_and_world_camera_prompts_are_not_ambiguous() -> None:
+    from visual_rl.model_adapters.world_r1_camera import (
+        detect_camera_movements,
+    )
+
+    for family in ("flash_wan", "world_r1_wan"):
+        for config in interrupt_resume.assert_config_family(family).values():
+            endpoints = {
+                component.name: component.params["url"]
+                for component in config.reward.components
+            }
+            revisions = {
+                component.params["server_revision"]
+                for component in config.reward.components
+            }
+            assert revisions == {WORLD_R1_SERVER_REVISION}
+            assert endpoints["reward_general"] == "http://127.0.0.1:8090"
+            if family == "world_r1_wan":
+                assert endpoints["reward_3d"] == "http://127.0.0.1:8089"
+                prompts = config.dataset.prompts
+                assert prompts is not None
+                assert all(detect_camera_movements(prompt) for prompt in prompts)
 
 
 def test_prompt_window_formula_is_absolute_position_balanced() -> None:

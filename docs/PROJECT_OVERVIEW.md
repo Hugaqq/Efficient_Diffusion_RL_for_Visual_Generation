@@ -56,15 +56,19 @@ PromptDataset
 
 | 方向 | 组合 | 当前源码状态 | 真实实验状态 |
 |---|---|---|---|
-| Flow-GRPO | SD3.5 + full trajectory | 已接入统一 objective | `not_run` |
-| TempFlow-GRPO | SD3.5 + branching | 已接入统一 objective | `not_run` |
-| Flash-GRPO | Wan2.1 + single step | 已接入统一 objective | `not_run` |
-| World-R1 | Wan2.1 + strict reward service | 已接入统一主线 | `not_run` |
+| Flow-GRPO | SD3.5 + full trajectory | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
+| TempFlow-GRPO | SD3.5 + branching | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
+| Flash-GRPO | Wan2.1 + single step | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
+| World-R1 | Wan2.1 + strict reward service | 已接入统一主线 | BF16 operational C20 通过；正式 release gate 待运行 |
 | Tiny | CPU single/Gloo contract | 本地测试使用 | 不代表真实模型 |
 
 本地全仓自动化、Tiny single/Gloo API smoke 和基础 wheel 隔离安装已经通过。
-真实 C20/Q100、Flow native CUDA parity、MG1/NCCL、远端执行和上传尚未运行。
-源码准备、synthetic fixture、Gloo 或基础 wheel 测试不能替代这些真实结论。
+四条真实 C20 的 checkpoint、public audit、continuous/resume semantic parity
+和 32 GB 显存证据见
+[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)。这些证据来自
+dirty engineering candidate；Q100、Flow native CUDA parity、MG1/NCCL 和
+最终 clean-candidate envelope 尚未运行。源码准备、synthetic fixture、Gloo、
+基础 wheel 测试或单次 C20 都不能替代尚未获得的结论。
 
 完整范围与明确排除项见 [V0_7_SCOPE.md](V0_7_SCOPE.md)。
 
