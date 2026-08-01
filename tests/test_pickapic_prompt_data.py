@@ -40,16 +40,13 @@ PROVENANCE_V2_PATH = PROMPT_ROOT / "pickapic_sfw_provenance_v2.json"
 FINAL_TEST_V3_PATH = PROMPT_ROOT / FINAL_TEST_FILENAME
 PROVENANCE_V3_PATH = PROMPT_ROOT / PROVENANCE_FILENAME
 CONFIG_ROOT = ROOT / "experiments" / "flow_pickapic_20260801" / "configs"
+STAGED_QUALITY_GATE_PATH = (
+    ROOT / "experiments" / "flow_pickapic_20260801" / "staged_quality_gate_v1.json"
+)
 EXPECTED_V2_FROZEN_SHA256 = {
-    "q100_train": (
-        "bda5208d4f90465063861d52c401fca8b4adcf22f273b892efb5cb848279c3d7"
-    ),
-    "validation": (
-        "26cd082a5677d5de1bfeefa8ff0da2be3e7d21d9ea35091dc7df10aae788f68d"
-    ),
-    "provenance": (
-        "57f37eea53c2420a4355c88e2d3f86205bceb4c68d1553ed2be59dd3e6e0316b"
-    ),
+    "q100_train": ("bda5208d4f90465063861d52c401fca8b4adcf22f273b892efb5cb848279c3d7"),
+    "validation": ("26cd082a5677d5de1bfeefa8ff0da2be3e7d21d9ea35091dc7df10aae788f68d"),
+    "provenance": ("57f37eea53c2420a4355c88e2d3f86205bceb4c68d1553ed2be59dd3e6e0316b"),
 }
 EXPECTED_FINAL_TEST_V3_SHA256 = (
     "fe5def8d78ff1233a371cdb029cdc14cd30d4a20baa62714b4594973f6ad58d2"
@@ -173,9 +170,7 @@ def test_pickapic_v3_final_test_is_frozen_disjoint_and_sealed() -> None:
     }
     assert _sha256(TRAIN_V2_PATH) == EXPECTED_V2_FROZEN_SHA256["q100_train"]
     assert _sha256(HELDOUT_V2_PATH) == EXPECTED_V2_FROZEN_SHA256["validation"]
-    assert _sha256(PROVENANCE_V2_PATH) == (
-        EXPECTED_V2_FROZEN_SHA256["provenance"]
-    )
+    assert _sha256(PROVENANCE_V2_PATH) == (EXPECTED_V2_FROZEN_SHA256["provenance"])
     assert _sha256(FINAL_TEST_V3_PATH) == EXPECTED_FINAL_TEST_V3_SHA256
     assert _sha256(PROVENANCE_V3_PATH) == EXPECTED_PROVENANCE_V3_SHA256
 
@@ -279,10 +274,7 @@ def test_pickapic_v3_final_test_is_frozen_disjoint_and_sealed() -> None:
         "status": "not_used_for_c20_tuning",
     }
     assert splits["final_test"]["max_t5_tokens"] <= MAX_T5_TOKENS
-    assert (
-        splits["final_test"]["max_hps_clip_tokens"]
-        <= MAX_HPS_CLIP_TOKENS
-    )
+    assert splits["final_test"]["max_hps_clip_tokens"] <= MAX_HPS_CLIP_TOKENS
     assert manifest["v2_provenance"] == {
         "path": "pickapic_sfw_provenance_v2.json",
         "sha256": EXPECTED_V2_FROZEN_SHA256["provenance"],
@@ -375,9 +367,7 @@ def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
     assert {path.name for path in CONFIG_ROOT.glob("*.yaml")} == set(expected)
 
     for name, values in expected.items():
-        seed, steps, dataset_path, prompt_batch_size, group_size, learning_rate = (
-            values
-        )
+        seed, steps, dataset_path, prompt_batch_size, group_size, learning_rate = values
         config = vr.load(CONFIG_ROOT / name).resolve()
         assert config.run.seed == seed
         assert config.runtime.max_steps == steps
@@ -428,10 +418,13 @@ def test_pickapic_staged_seed17_configs_share_one_training_semantics() -> None:
     assert stage20.model == stable_c20.model
     assert stage20.dataset == stable_c20.dataset
     assert stage20.rollout == stable_c20.rollout
-    assert replace(
-        stage20.reward,
-        cache_dir=stable_c20.reward.cache_dir,
-    ) == stable_c20.reward
+    assert (
+        replace(
+            stage20.reward,
+            cache_dir=stable_c20.reward.cache_dir,
+        )
+        == stable_c20.reward
+    )
     assert stage20.algorithm == stable_c20.algorithm
     assert stage20.optimizer == stable_c20.optimizer
     assert stage20.runtime == stable_c20.runtime
@@ -462,3 +455,61 @@ def test_pickapic_staged_seed17_configs_share_one_training_semantics() -> None:
             resume=stage20.resume,
         )
         assert normalized == stage20
+
+
+def test_pickapic_staged_quality_gate_is_frozen_before_training() -> None:
+    gate = json.loads(STAGED_QUALITY_GATE_PATH.read_text(encoding="utf-8"))
+
+    assert gate["schema_version"] == 1
+    assert gate["protocol"] == "flow_pickapic_staged_quality_gate_v1"
+    assert gate["frozen_before_first_stage"] is True
+    assert gate["training_seed"] == 17
+    assert gate["stage_steps"] == [20, 40, 60, 80, 100]
+    assert gate["automatic_stage_promotion"] is False
+    assert gate["training_gate"] == {
+        "require_status_ok": True,
+        "require_audit_ok": True,
+        "require_complete_paired_grid": True,
+        "require_finite_metrics": True,
+        "require_zero_std_ratio_every_step": 0.0,
+        "maximum_reference_kl": 0.01,
+        "maximum_post_clip_gradient_norm": 1.0001,
+    }
+    assert gate["validation_hps_gate"]["role"] == "validation_only"
+    assert gate["validation_hps_gate"]["minimum_cluster_ci95_lower"] == 0.0
+    assert gate["validation_hps_gate"]["minimum_prompt_win_rate"] == 0.5
+    assert gate["validation_pickscore_gate"] == {
+        "scorer": "pickscore_v1_normalized_prompt_image_cosine",
+        "model_safetensors_sha256": (
+            "ef31ef6fc5ff4d9bb90dd232df4e145887ba62c5a03aa2841415f8c25f18d52e"
+        ),
+        "model_config_sha256": (
+            "bfa2a8243d3f82ad7c4746a0b62817e895f9f225926e6caecfc9dbb9171647ce"
+        ),
+        "tokenizer_json_sha256": (
+            "b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842"
+        ),
+        "processor_config_sha256": (
+            "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd"
+        ),
+        "repeat_passes": 2,
+        "maximum_repeat_abs_difference": 1e-6,
+        "minimum_cluster_ci95_lower": -0.001,
+        "minimum_prompt_win_rate": 0.45,
+        "interpretation": "noninferiority safety gate, not a positive quality claim",
+    }
+    assert gate["image_guard"] == {
+        "evaluator_protocol": "flow_pickapic_image_guard_v1",
+        "minimum_median_sharpness_ratio_to_base": 0.8,
+        "maximum_median_sharpness_ratio_to_base": 1.5,
+        "maximum_saturated_pixel_rate_increase": 0.05,
+        "maximum_black_white_or_near_constant_count": 0,
+        "scope": (
+            "deterministic CPU collapse guards only; no embedding-diversity claim"
+        ),
+    }
+    assert gate["stage_decision"].startswith("stop when any")
+    assert gate["final_claim_gate"]["requires_three_completed_seeds"] is True
+    assert gate["final_claim_gate"]["final_test_split"] == (
+        "pickapic_sfw_final_test_v3"
+    )

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "protocol": "flow_pickapic_staged_quality_gate_v1",
+  "frozen_before_first_stage": true,
+  "training_seed": 17,
+  "stage_steps": [20, 40, 60, 80, 100],
+  "automatic_stage_promotion": false,
+  "training_gate": {
+    "require_status_ok": true,
+    "require_audit_ok": true,
+    "require_complete_paired_grid": true,
+    "require_finite_metrics": true,
+    "require_zero_std_ratio_every_step": 0.0,
+    "maximum_reference_kl": 0.01,
+    "maximum_post_clip_gradient_norm": 1.0001
+  },
+  "validation_hps_gate": {
+    "prompt_split": "pickapic_sfw_heldout_eval_v2",
+    "role": "validation_only",
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 729,
+    "minimum_cluster_ci95_lower": 0.0,
+    "minimum_prompt_win_rate": 0.5
+  },
+  "validation_pickscore_gate": {
+    "scorer": "pickscore_v1_normalized_prompt_image_cosine",
+    "model_safetensors_sha256": "ef31ef6fc5ff4d9bb90dd232df4e145887ba62c5a03aa2841415f8c25f18d52e",
+    "model_config_sha256": "bfa2a8243d3f82ad7c4746a0b62817e895f9f225926e6caecfc9dbb9171647ce",
+    "tokenizer_json_sha256": "b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842",
+    "processor_config_sha256": "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd",
+    "repeat_passes": 2,
+    "maximum_repeat_abs_difference": 1e-6,
+    "minimum_cluster_ci95_lower": -0.001,
+    "minimum_prompt_win_rate": 0.45,
+    "interpretation": "noninferiority safety gate, not a positive quality claim"
+  },
+  "image_guard": {
+    "evaluator_protocol": "flow_pickapic_image_guard_v1",
+    "minimum_median_sharpness_ratio_to_base": 0.8,
+    "maximum_median_sharpness_ratio_to_base": 1.5,
+    "maximum_saturated_pixel_rate_increase": 0.05,
+    "maximum_black_white_or_near_constant_count": 0,
+    "scope": "deterministic CPU collapse guards only; no embedding-diversity claim"
+  },
+  "stage_decision": "stop when any training, HPS, PickScore, or image guard fails",
+  "final_claim_gate": {
+    "requires_three_completed_seeds": true,
+    "requires_every_seed_pickscore_mean_delta_positive": true,
+    "minimum_aggregate_pickscore_cluster_ci95_lower": 0.0,
+    "minimum_aggregate_pickscore_prompt_win_rate": 0.5,
+    "requires_all_image_guards": true,
+    "final_test_split": "pickapic_sfw_final_test_v3",
+    "open_final_test_only_after_checkpoints_and_analysis_are_frozen": true
+  }
+}

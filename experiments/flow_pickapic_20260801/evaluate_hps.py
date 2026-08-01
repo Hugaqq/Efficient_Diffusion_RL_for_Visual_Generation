@@ -24,6 +24,17 @@ EVAL_SEEDS = (1009, 2027)
 EVAL_BATCH_SIZE = 8
 BOOTSTRAP_SEED = 729
 BOOTSTRAP_REPLICATES = 10_000
+EVALUATION_PROTOCOL = "flow_pickapic_paired_hps_v1"
+_SHARED_MANIFEST_IDENTITY = (
+    "protocol",
+    "prompt_sha256",
+    "prompt_count",
+    "eval_seeds",
+    "batch_size",
+    "num_diffusion_steps",
+    "precision",
+    "config_sha256",
+)
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -49,8 +60,7 @@ def _checkpoint_identity(path: Path | None) -> dict[str, object] | None:
     children = {item.name for item in path.iterdir()}
     if children != expected:
         raise ValueError(
-            "adapter checkpoint must contain exactly adapter.json and "
-            "adapter_state.pt"
+            "adapter checkpoint must contain exactly adapter.json and adapter_state.pt"
         )
     return {
         "path": str(path),
@@ -76,6 +86,23 @@ def _write_json_atomic(path: Path, payload: object) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_json_exclusive(path: Path, payload: object) -> None:
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode()
+    with path.open("xb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _metadata(
@@ -163,9 +190,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
     prompts = _read_prompts(prompt_path)
     checkpoint_identity = _checkpoint_identity(checkpoint)
     condition = "base" if checkpoint is None else "trained"
+    reward_component = config.reward.components[0]
     manifest = {
         "schema_version": 1,
-        "protocol": "flow_pickapic_paired_hps_v1",
+        "protocol": EVALUATION_PROTOCOL,
         "condition": condition,
         "config_path": str(config_path),
         "config_sha256": _sha256_file(config_path),
@@ -177,6 +205,12 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "num_diffusion_steps": int(config.rollout.params["num_steps"]),
         "precision": config.runtime.precision,
         "adapter_checkpoint": checkpoint_identity,
+        "reward_general": {
+            "name": reward_component.name,
+            "params": {
+                "server_revision": reward_component.params["server_revision"],
+            },
+        },
     }
     _write_json_atomic(output_dir / "manifest.json", manifest)
 
@@ -305,6 +339,140 @@ def run_evaluation(args: argparse.Namespace) -> None:
     print(json.dumps({"completed_evaluation": summary}, sort_keys=True), flush=True)
 
 
+def _read_json_object(path: Path, *, label: str) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"evaluation {label} must be a JSON object")
+    return payload
+
+
+def _require_sha256(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"evaluation {field} must be a lowercase SHA-256")
+    return value
+
+
+def _reward_general_revision(manifest: dict[str, object]) -> str | None:
+    if "reward_general" not in manifest:
+        return None
+    reward = manifest["reward_general"]
+    if not isinstance(reward, dict):
+        raise TypeError("evaluation manifest reward_general must be an object")
+    if reward.get("name") != "reward_general":
+        raise ValueError(
+            "evaluation manifest reward_general.name must be 'reward_general'"
+        )
+    params = reward.get("params")
+    if not isinstance(params, dict):
+        raise TypeError("evaluation manifest reward_general.params must be an object")
+    revision = params.get("server_revision")
+    if not isinstance(revision, str) or not revision:
+        raise ValueError(
+            "evaluation manifest reward_general.params.server_revision must "
+            "be non-empty"
+        )
+    return revision
+
+
+def _load_manifest(
+    root: Path,
+    *,
+    expected_condition: str,
+) -> tuple[Path, dict[str, object]]:
+    if expected_condition not in {"base", "trained"}:
+        raise ValueError("expected_condition must be base or trained")
+    root = root.expanduser().resolve(strict=True)
+    manifest = _read_json_object(root / "manifest.json", label="manifest")
+    if manifest.get("schema_version") != 1:
+        raise ValueError("evaluation manifest schema_version must be 1")
+    if manifest.get("protocol") != EVALUATION_PROTOCOL:
+        raise ValueError(
+            f"evaluation manifest protocol must be {EVALUATION_PROTOCOL!r}"
+        )
+    if manifest.get("condition") != expected_condition:
+        raise ValueError(
+            f"evaluation manifest condition must be {expected_condition!r}"
+        )
+
+    _require_sha256(manifest.get("config_sha256"), field="config_sha256")
+    _require_sha256(manifest.get("prompt_sha256"), field="prompt_sha256")
+    if manifest.get("prompt_count") != 64:
+        raise ValueError("evaluation manifest prompt_count must be 64")
+    if manifest.get("eval_seeds") != list(EVAL_SEEDS):
+        raise ValueError("evaluation manifest eval_seeds do not match protocol")
+    if manifest.get("batch_size") != EVAL_BATCH_SIZE:
+        raise ValueError("evaluation manifest batch_size does not match protocol")
+    num_diffusion_steps = manifest.get("num_diffusion_steps")
+    if type(num_diffusion_steps) is not int or num_diffusion_steps <= 0:
+        raise ValueError(
+            "evaluation manifest num_diffusion_steps must be a positive integer"
+        )
+    precision = manifest.get("precision")
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError("evaluation manifest precision is invalid")
+
+    checkpoint = manifest.get("adapter_checkpoint")
+    if expected_condition == "base":
+        if checkpoint is not None:
+            raise ValueError("base evaluation manifest adapter_checkpoint must be null")
+    else:
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                "trained evaluation manifest adapter_checkpoint must be non-null"
+            )
+        _require_sha256(
+            checkpoint.get("adapter_json_sha256"),
+            field="adapter_checkpoint.adapter_json_sha256",
+        )
+        _require_sha256(
+            checkpoint.get("adapter_state_sha256"),
+            field="adapter_checkpoint.adapter_state_sha256",
+        )
+    _reward_general_revision(manifest)
+
+    summary = _read_json_object(root / "summary.json", label="summary")
+    if summary.get("schema_version") != 1:
+        raise ValueError("evaluation summary schema_version must be 1")
+    if summary.get("protocol") != manifest["protocol"]:
+        raise ValueError("evaluation summary protocol does not match manifest")
+    if summary.get("condition") != expected_condition:
+        raise ValueError("evaluation summary condition does not match manifest")
+    expected_sample_count = int(manifest["prompt_count"]) * len(EVAL_SEEDS)
+    if summary.get("sample_count") != expected_sample_count:
+        raise ValueError("evaluation summary sample_count does not match manifest")
+    recorded_scores_sha256 = _require_sha256(
+        summary.get("scores_sha256"),
+        field="summary.scores_sha256",
+    )
+    actual_scores_sha256 = _sha256_file(root / "scores.jsonl")
+    if recorded_scores_sha256 != actual_scores_sha256:
+        raise ValueError("evaluation scores SHA-256 does not match summary")
+    return root, manifest
+
+
+def _validate_manifest_pair(
+    base: dict[str, object],
+    trained: dict[str, object],
+) -> None:
+    for field in _SHARED_MANIFEST_IDENTITY:
+        if base[field] != trained[field]:
+            raise ValueError(
+                f"base and trained evaluation manifests differ for {field}"
+            )
+
+    base_revision = _reward_general_revision(base)
+    trained_revision = _reward_general_revision(trained)
+    if (base_revision is None) != (trained_revision is None):
+        raise ValueError("base and trained scorer identity availability differs")
+    if base_revision != trained_revision:
+        raise ValueError("base and trained reward_general server_revision differs")
+
+
 def _load_records(
     root: Path,
     *,
@@ -328,8 +496,7 @@ def _load_records(
         condition = row.get("condition")
         if condition != expected_condition:
             raise ValueError(
-                f"evaluation row {row_number} condition must be "
-                f"{expected_condition!r}"
+                f"evaluation row {row_number} condition must be {expected_condition!r}"
             )
         eval_seed = row.get("eval_seed")
         prompt_index = row.get("prompt_index")
@@ -344,9 +511,7 @@ def _load_records(
                 f"evaluation row {row_number} prompt_sha256 must be non-empty"
             )
         if not isinstance(sample_id, str) or not sample_id:
-            raise ValueError(
-                f"evaluation row {row_number} sample_id must be non-empty"
-            )
+            raise ValueError(f"evaluation row {row_number} sample_id must be non-empty")
         reward = row.get("reward")
         if (
             isinstance(reward, bool)
@@ -392,18 +557,23 @@ def _quantile(sorted_values: list[float], probability: float) -> float:
 
 
 def compare_evaluations(args: argparse.Namespace) -> None:
-    base_rows = _load_records(args.base_dir, expected_condition="base")
-    trained_rows = _load_records(
+    base_root, base_manifest = _load_manifest(
+        args.base_dir,
+        expected_condition="base",
+    )
+    trained_root, trained_manifest = _load_manifest(
         args.trained_dir,
         expected_condition="trained",
     )
-    base = {
-        (int(row["eval_seed"]), int(row["prompt_index"])): row
-        for row in base_rows
-    }
+    _validate_manifest_pair(base_manifest, trained_manifest)
+    base_rows = _load_records(base_root, expected_condition="base")
+    trained_rows = _load_records(
+        trained_root,
+        expected_condition="trained",
+    )
+    base = {(int(row["eval_seed"]), int(row["prompt_index"])): row for row in base_rows}
     trained = {
-        (int(row["eval_seed"]), int(row["prompt_index"])): row
-        for row in trained_rows
+        (int(row["eval_seed"]), int(row["prompt_index"])): row for row in trained_rows
     }
     if set(base) != set(trained):
         raise ValueError("base and trained evaluations have different paired keys")
@@ -435,7 +605,9 @@ def compare_evaluations(args: argparse.Namespace) -> None:
     prompt_ids = sorted(prompt_deltas)
     rng = random.Random(BOOTSTRAP_SEED)
     bootstrap = sorted(
-        statistics.fmean(prompt_deltas[index] for index in rng.choices(prompt_ids, k=64))
+        statistics.fmean(
+            prompt_deltas[index] for index in rng.choices(prompt_ids, k=64)
+        )
         for _ in range(BOOTSTRAP_REPLICATES)
     )
     mean_delta = statistics.fmean(prompt_deltas.values())
@@ -466,7 +638,7 @@ def compare_evaluations(args: argparse.Namespace) -> None:
     }
     output = args.output.expanduser().resolve(strict=False)
     output.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(output, result)
+    _write_json_exclusive(output, result)
     print(json.dumps({"comparison": result["acceptance"]}, sort_keys=True))
 
 
