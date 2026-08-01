@@ -64,6 +64,37 @@ the frozen one-shot tensor, gradient, parameter-update, and fresh-resume
 contracts against the native reference. It does not prove BF16 long-horizon
 quality improvement or the final all-gate candidate identity.
 
+## Flow held-out HPS C20 promotion gate
+
+The stabilized Flow/Pick-a-Pic C20 configuration also completed from a clean
+source archive and isolated wheel installation:
+
+- source commit: `b75854029318ea2a0e79ec50d0ab0cc1124623e0`;
+- installed wheel SHA-256:
+  `90065e1f5dfdc8ae8252bddd8ec70bc42418ca0744a501d49dcbefa00c576c22`;
+- run ID: `run-ed19f0fb38ab456ba8f9f1acf606aae2`;
+- 20 / 20 committed steps, four checked commit markers, public status/audit
+  both pass;
+- two prompt groups of four samples per step, with non-zero reward standard
+  deviation at every step;
+- mean / maximum sampled frozen-reference KL:
+  `0.0024303291 / 0.0034658060`;
+- monitored trainer peak: 24,873 MiB on one RTX 5090; a second RTX 5090 ran
+  the HPS service.
+
+The frozen 64-prompt, two-seed paired evaluation contained 128 observations.
+Mean HPS changed from `0.2895917892` to `0.2915687561`; the paired delta was
+`+0.0019769669`, the prompt-cluster bootstrap 95% CI was
+`[+0.0003795385, +0.0036850214]`, and 56.25% of prompts improved. Both
+pre-registered C20 acceptance conditions passed.
+
+The machine-readable summary is
+[`../experiments/flow_pickapic_20260801/evidence/flow_pickapic_c20_stable_v2_seed17.json`](../experiments/flow_pickapic_20260801/evidence/flow_pickapic_c20_stable_v2_seed17.json).
+The durable archive SHA-256 is
+`8bc4a55e1354ada7938d34fbe1763821f0abcc2ef9746d99296b1a0cdf64f2b7`.
+This result proves only the bounded single-seed HPS promotion gate. It does not
+upgrade the experiment to a multi-seed Q100 or general visual-quality claim.
+
 ## Completed recipes
 
 | Recipe | Continuous/resume | Public audit | Checkpoint tree SHA-256 | Semantic projection SHA-256 | Manifest / metrics | Peak GPU memory |
@@ -187,6 +218,6 @@ clipped-surrogate objective and authoritative commit lifecycle.
 The following remain incomplete and must not be inferred from the operational
 C20 rows or the standalone native oracle:
 
-- Q100 runs and multi-seed reward-improvement verdicts;
+- stabilized Q100 runs and their multi-seed reward-improvement verdict;
 - MG1 real NCCL evidence;
 - the final same-commit release evidence envelope.

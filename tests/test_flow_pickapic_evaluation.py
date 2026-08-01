@@ -18,6 +18,7 @@ def _write_scores(
     root: Path,
     *,
     reward_offset: float,
+    condition: str,
     mismatched_sample: bool = False,
 ) -> None:
     root.mkdir()
@@ -29,6 +30,7 @@ def _write_scores(
                 sample_id += "-wrong"
             rows.append(
                 {
+                    "condition": condition,
                     "eval_seed": eval_seed,
                     "prompt_index": prompt_index,
                     "prompt_sha256": f"prompt-{prompt_index}",
@@ -46,8 +48,8 @@ def test_paired_hps_comparison_uses_prompt_cluster_acceptance(tmp_path: Path) ->
     base = tmp_path / "base"
     trained = tmp_path / "trained"
     output = tmp_path / "comparison.json"
-    _write_scores(base, reward_offset=0.0)
-    _write_scores(trained, reward_offset=0.01)
+    _write_scores(base, reward_offset=0.0, condition="base")
+    _write_scores(trained, reward_offset=0.01, condition="trained")
 
     compare_evaluations(
         Namespace(base_dir=base, trained_dir=trained, output=output)
@@ -69,10 +71,81 @@ def test_paired_hps_comparison_uses_prompt_cluster_acceptance(tmp_path: Path) ->
 def test_paired_hps_comparison_rejects_identity_mismatch(tmp_path: Path) -> None:
     base = tmp_path / "base"
     trained = tmp_path / "trained"
-    _write_scores(base, reward_offset=0.0)
-    _write_scores(trained, reward_offset=0.01, mismatched_sample=True)
+    _write_scores(base, reward_offset=0.0, condition="base")
+    _write_scores(
+        trained,
+        reward_offset=0.01,
+        condition="trained",
+        mismatched_sample=True,
+    )
 
     with pytest.raises(ValueError, match="sample_id"):
+        compare_evaluations(
+            Namespace(
+                base_dir=base,
+                trained_dir=trained,
+                output=tmp_path / "comparison.json",
+            )
+        )
+
+
+def test_paired_hps_comparison_rejects_wrong_condition(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    trained = tmp_path / "trained"
+    _write_scores(base, reward_offset=0.0, condition="trained")
+    _write_scores(trained, reward_offset=0.01, condition="trained")
+
+    with pytest.raises(ValueError, match="condition must be 'base'"):
+        compare_evaluations(
+            Namespace(
+                base_dir=base,
+                trained_dir=trained,
+                output=tmp_path / "comparison.json",
+            )
+        )
+
+
+def test_paired_hps_comparison_rejects_noncanonical_grid(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    trained = tmp_path / "trained"
+    _write_scores(base, reward_offset=0.0, condition="base")
+    _write_scores(trained, reward_offset=0.01, condition="trained")
+    rows = [
+        json.loads(line)
+        for line in (trained / "scores.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows[-1]["eval_seed"] = 9999
+    (trained / "scores.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="frozen seed/prompt grid"):
+        compare_evaluations(
+            Namespace(
+                base_dir=base,
+                trained_dir=trained,
+                output=tmp_path / "comparison.json",
+            )
+        )
+
+
+def test_paired_hps_comparison_rejects_nonfinite_reward(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    trained = tmp_path / "trained"
+    _write_scores(base, reward_offset=0.0, condition="base")
+    _write_scores(trained, reward_offset=0.01, condition="trained")
+    rows = [
+        json.loads(line)
+        for line in (trained / "scores.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    rows[0]["reward"] = float("nan")
+    (trained / "scores.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reward must be finite numeric"):
         compare_evaluations(
             Namespace(
                 base_dir=base,

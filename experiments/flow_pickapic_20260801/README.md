@@ -35,6 +35,27 @@ advantages. It also lowers the learning rate to `1e-4`. All other important
 Flow objective and inference settings remain unchanged. This is a new run,
 not a mutation or continuation of the failed Q100.
 
+The replacement C20 completed from candidate `b75854029318` on 2026-08-01.
+All 20 steps committed, `inspect_run()` and `audit_run()` passed, every step
+retained two non-degenerate reward groups, and the maximum sampled frozen-
+reference KL was `0.00346581`. The frozen paired evaluation then produced:
+
+- base mean HPS: `0.2895917892`;
+- trained mean HPS: `0.2915687561`;
+- mean paired delta: `+0.0019769669`;
+- prompt-cluster bootstrap 95% CI:
+  `[+0.0003795385, +0.0036850214]`;
+- prompt win rate: `56.25%`;
+- pre-registered C20 acceptance: pass.
+
+The machine-readable result is
+[`evidence/flow_pickapic_c20_stable_v2_seed17.json`](evidence/flow_pickapic_c20_stable_v2_seed17.json).
+The complete run, immutable score matrices, paired comparison, runtime logs,
+GPU monitor, source archive and installed wheel are retained in the durable
+archive named there. This is a bounded single-seed promotion result; it does
+not replace the three-seed Q100 requirement or prove general perceptual
+quality.
+
 Promotion beyond this C20 requires all of the following:
 
 - twenty authoritative commits and passing status/audit;

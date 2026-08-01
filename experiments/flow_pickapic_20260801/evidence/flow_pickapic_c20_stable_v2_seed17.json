@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-01",
+  "candidate": {
+    "commit": "b75854029318ea2a0e79ec50d0ab0cc1124623e0",
+    "source_archive_sha256": "9671ee274107f6f4026333a83876e4d8418fd4fb408c58c64b7850d0fdb248fa",
+    "wheel_sha256": "90065e1f5dfdc8ae8252bddd8ec70bc42418ca0744a501d49dcbefa00c576c22"
+  },
+  "training": {
+    "config": "experiments/flow_pickapic_20260801/configs/flow_pickapic_c20_stable_v2_seed17.yaml",
+    "run_id": "run-ed19f0fb38ab456ba8f9f1acf606aae2",
+    "committed_steps": 20,
+    "checked_commit_count": 4,
+    "status_ok": true,
+    "audit_ok": true,
+    "sample_count_per_step": 8,
+    "trained_prompt_count_per_step": 2,
+    "group_size": 4,
+    "reward_mean_all_steps": 0.2832328796386719,
+    "reward_std_mean_all_steps": 0.029164756635676727,
+    "reference_kl_mean_all_steps": 0.0024303291218326704,
+    "reference_kl_max": 0.0034658060156573358,
+    "gpu_peak_used_mib": 24873,
+    "precision": "bf16"
+  },
+  "paired_evaluation": {
+    "protocol": "flow_pickapic_paired_hps_v1",
+    "prompt_count": 64,
+    "pair_count": 128,
+    "eval_seeds": [
+      1009,
+      2027
+    ],
+    "base_reward_mean": 0.28959178924560547,
+    "trained_reward_mean": 0.2915687561035156,
+    "mean_paired_delta": 0.0019769668579101562,
+    "median_prompt_delta": 0.00177001953125,
+    "prompt_win_rate": 0.5625,
+    "cluster_bootstrap_95_ci": [
+      0.00037953853607177737,
+      0.00368502140045166
+    ],
+    "bootstrap_seed": 729,
+    "bootstrap_replicates": 10000,
+    "passed": true,
+    "base_scores_sha256": "b7dfe3463dbb3390b9102be0c69337bd18f495b45773073d92d25d9ac51d699c",
+    "trained_scores_sha256": "7a7e238f74cc83b0b0b55d910044046ce2c61c78336fb9c8487b160b8c844c6b",
+    "comparison_sha256": "9b3bdbfd0734b05f6ed3c92f95b3f32a7d928a1c5b2cc960270c301cee8d3518"
+  },
+  "resources": {
+    "gpu_count": 2,
+    "trainer_gpu_index": 2,
+    "reward_gpu_index": 3,
+    "gpu_model": "NVIDIA GeForce RTX 5090"
+  },
+  "archive": {
+    "path": "/mnt/data/v-qiaoqifan/visual_rl_runs/flow_pickapic_20260801/archives/flow_pickapic_c20_stable_v2_seed17_b758540_20260801.tar.gz",
+    "sha256": "8bc4a55e1354ada7938d34fbe1763821f0abcc2ef9746d99296b1a0cdf64f2b7"
+  },
+  "claim_boundary": "This is a bounded single-seed C20 promotion result for held-out HPS alignment, not a multi-seed Q100 or general visual-quality claim."
+}
