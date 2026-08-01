@@ -185,7 +185,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         local_rank=0,
         world_size=1,
         backend=None,
-        device=torch.device("cuda"),
+        device=torch.device("cuda", 0),
         precision=config.runtime.precision,
     )
     torch.cuda.set_device(runtime_context.device)
