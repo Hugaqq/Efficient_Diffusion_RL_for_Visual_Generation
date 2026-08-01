@@ -114,6 +114,14 @@ def _configure_cuda_determinism(torch_module: Any) -> None:
     torch_module.backends.cudnn.allow_tf32 = False
 
 
+def _seed_native_case(seed: int) -> None:
+    """Seed every model-construction RNG from the frozen case."""
+
+    from visual_rl.core.seed import seed_everything
+
+    seed_everything(seed)
+
+
 @dataclass(frozen=True)
 class _NativeComputeLogProbView:
     """The exact config attributes read by native ``compute_log_prob()``."""
@@ -2070,7 +2078,9 @@ def _run_real_parity(
     def build_adapter() -> Any:
         return SD3TempFlowAdapter.from_config(config.model.params, context)
 
+    _seed_native_case(int(case["seed"]))
     visual_adapter = build_adapter()
+    _seed_native_case(int(case["seed"]))
     native_adapter = build_adapter()
     _set_policy_residency(native_adapter, active=False)
     native_closed = False
