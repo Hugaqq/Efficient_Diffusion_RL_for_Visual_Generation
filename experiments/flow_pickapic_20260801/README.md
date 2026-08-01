@@ -27,6 +27,24 @@ The Q100 configurations are frozen before their first launch. A final quality
 claim additionally requires all three seeds and a paired step-0/final
 evaluation on the held-out prompts. Training reward alone is not sufficient.
 
+The paired evaluation protocol is frozen as
+`flow_pickapic_paired_hps_v1`:
+
+- all 64 v2 held-out prompts;
+- inference seeds 1009 and 2027, for 128 paired observations;
+- 20 diffusion steps, BF16, 512 px, guidance scale 4.5;
+- identical prompt order, batch size 8, and noise seed for base/final;
+- no optimizer, backward pass, or training-run mutation;
+- primary statistic: mean final-minus-base HPS delta;
+- uncertainty: 10,000-replicate prompt-cluster bootstrap, seed 729;
+- a seed passes only when the 95% CI lower bound is above zero and more than
+  half of held-out prompts improve after averaging their two inference seeds.
+
+This supports only the claim that held-out HPS alignment improved. Because HPS
+is also the training reward, it does not by itself establish general human
+preference or visual-quality improvement. Saved paired images remain available
+for an independent scorer or blinded review.
+
 Expected allocation is exactly two RTX 5090 GPUs:
 
 - one physical GPU for the SD3 trainer;
@@ -37,4 +55,28 @@ Run one configuration after starting the local reward service:
 ```text
 python experiments/flow_pickapic_20260801/run_with_api.py \
   experiments/flow_pickapic_20260801/configs/flow_pickapic_c20_seed17.yaml
+```
+
+Run the frozen read-only baseline evaluation before Q100:
+
+```text
+python experiments/flow_pickapic_20260801/evaluate_hps.py run \
+  --config experiments/flow_pickapic_20260801/configs/flow_pickapic_q100_seed17.yaml \
+  --prompts data/prompts/pickapic_sfw_heldout_eval_v2.txt \
+  --output-dir experiments/flow_pickapic_20260801/evaluations/base
+```
+
+For a final checkpoint, add:
+
+```text
+--adapter-checkpoint <run>/checkpoint_000100/adapter
+```
+
+Then compare the two immutable score matrices:
+
+```text
+python experiments/flow_pickapic_20260801/evaluate_hps.py compare \
+  --base-dir experiments/flow_pickapic_20260801/evaluations/base \
+  --trained-dir experiments/flow_pickapic_20260801/evaluations/seed17_final \
+  --output experiments/flow_pickapic_20260801/evaluations/seed17_comparison.json
 ```
