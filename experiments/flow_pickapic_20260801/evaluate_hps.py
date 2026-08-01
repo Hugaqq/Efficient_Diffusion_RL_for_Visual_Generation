@@ -305,7 +305,11 @@ def run_evaluation(args: argparse.Namespace) -> None:
     print(json.dumps({"completed_evaluation": summary}, sort_keys=True), flush=True)
 
 
-def _load_records(root: Path) -> tuple[dict[str, object], ...]:
+def _load_records(
+    root: Path,
+    *,
+    expected_condition: str,
+) -> tuple[dict[str, object], ...]:
     root = root.expanduser().resolve(strict=True)
     rows = tuple(
         json.loads(line)
@@ -313,9 +317,65 @@ def _load_records(root: Path) -> tuple[dict[str, object], ...]:
     )
     if len(rows) != 64 * len(EVAL_SEEDS):
         raise ValueError("evaluation must contain exactly 128 score rows")
-    keys = tuple((int(row["eval_seed"]), int(row["prompt_index"])) for row in rows)
-    if len(set(keys)) != len(keys):
+    if expected_condition not in {"base", "trained"}:
+        raise ValueError("expected_condition must be base or trained")
+
+    keys: list[tuple[int, int]] = []
+    prompt_hashes: dict[int, str] = {}
+    for row_number, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise TypeError(f"evaluation row {row_number} must be a JSON object")
+        condition = row.get("condition")
+        if condition != expected_condition:
+            raise ValueError(
+                f"evaluation row {row_number} condition must be "
+                f"{expected_condition!r}"
+            )
+        eval_seed = row.get("eval_seed")
+        prompt_index = row.get("prompt_index")
+        if type(eval_seed) is not int or type(prompt_index) is not int:
+            raise ValueError(
+                f"evaluation row {row_number} paired key must contain integers"
+            )
+        prompt_sha256 = row.get("prompt_sha256")
+        sample_id = row.get("sample_id")
+        if not isinstance(prompt_sha256, str) or not prompt_sha256:
+            raise ValueError(
+                f"evaluation row {row_number} prompt_sha256 must be non-empty"
+            )
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError(
+                f"evaluation row {row_number} sample_id must be non-empty"
+            )
+        reward = row.get("reward")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(float(reward))
+        ):
+            raise ValueError(
+                f"evaluation row {row_number} reward must be finite numeric"
+            )
+        previous_hash = prompt_hashes.setdefault(prompt_index, prompt_sha256)
+        if previous_hash != prompt_sha256:
+            raise ValueError(
+                "evaluation prompt_sha256 differs across seeds for prompt "
+                f"{prompt_index}"
+            )
+        keys.append((eval_seed, prompt_index))
+
+    actual_keys = set(keys)
+    if len(actual_keys) != len(keys):
         raise ValueError("evaluation contains duplicate paired keys")
+    expected_keys = {
+        (eval_seed, prompt_index)
+        for eval_seed in EVAL_SEEDS
+        for prompt_index in range(64)
+    }
+    if actual_keys != expected_keys:
+        raise ValueError(
+            "evaluation paired keys do not match the frozen seed/prompt grid"
+        )
     return rows
 
 
@@ -332,8 +392,11 @@ def _quantile(sorted_values: list[float], probability: float) -> float:
 
 
 def compare_evaluations(args: argparse.Namespace) -> None:
-    base_rows = _load_records(args.base_dir)
-    trained_rows = _load_records(args.trained_dir)
+    base_rows = _load_records(args.base_dir, expected_condition="base")
+    trained_rows = _load_records(
+        args.trained_dir,
+        expected_condition="trained",
+    )
     base = {
         (int(row["eval_seed"]), int(row["prompt_index"])): row
         for row in base_rows
