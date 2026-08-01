@@ -246,6 +246,76 @@ def test_sd3_scheduler_timesteps_preserve_fractional_values_for_recompute():
     assert torch.equal(values[1], scheduler.timesteps)
 
 
+def test_sd3_scheduler_recompute_payload_restores_fresh_scheduler_state():
+    sampled = SimpleNamespace(
+        timesteps=torch.tensor([999.0, 833.3333, 0.25], dtype=torch.float32),
+        sigmas=torch.tensor([0.999, 0.8333333, 0.00025, 0.0]),
+    )
+    payload = sd3_module._scheduler_recompute_payload(
+        sampled,
+        batch_size=2,
+        expected=3,
+        device=torch.device("cpu"),
+    )
+    assert set(payload) == {
+        "sd3_scheduler_timesteps",
+        "sd3_scheduler_sigmas",
+    }
+    assert tuple(payload["sd3_scheduler_timesteps"].shape) == (2, 3)
+    assert tuple(payload["sd3_scheduler_sigmas"].shape) == (2, 4)
+
+    fresh = SimpleNamespace(
+        timesteps=torch.tensor([1.0]),
+        sigmas=torch.tensor([1.0, 0.0]),
+        _step_index=7,
+        _begin_index=4,
+    )
+    single_row = {name: value[:1] for name, value in payload.items()}
+    sd3_module._restore_scheduler_from_recompute_payload(
+        fresh,
+        single_row,
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(fresh.timesteps, sampled.timesteps)
+    assert torch.equal(fresh.sigmas, sampled.sigmas)
+    assert fresh._step_index is None
+    assert fresh._begin_index is None
+
+
+def test_sd3_scheduler_recompute_payload_rejects_incomplete_or_row_drift():
+    scheduler = SimpleNamespace(
+        timesteps=torch.tensor([9.0, 4.0]),
+        sigmas=torch.tensor([0.9, 0.4, 0.0]),
+    )
+    payload = sd3_module._scheduler_recompute_payload(
+        scheduler,
+        batch_size=2,
+        expected=2,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(RunError, match="incomplete scheduler state"):
+        sd3_module._restore_scheduler_from_recompute_payload(
+            scheduler,
+            {"sd3_scheduler_timesteps": payload["sd3_scheduler_timesteps"]},
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+
+    drifted = dict(payload)
+    drifted["sd3_scheduler_sigmas"] = payload[
+        "sd3_scheduler_sigmas"
+    ].clone()
+    drifted["sd3_scheduler_sigmas"][1, 1] += 0.1
+    with pytest.raises(RunError, match="rows must share"):
+        sd3_module._restore_scheduler_from_recompute_payload(
+            scheduler,
+            drifted,
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+
+
 def test_sd3_policy_dtype_guard_normalizes_reference_pipeline_latents():
     adapter = SD3TempFlowAdapter(
         checkpoint=Path("/checkpoint"),

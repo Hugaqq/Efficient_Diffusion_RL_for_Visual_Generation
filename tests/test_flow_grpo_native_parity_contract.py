@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -515,6 +515,41 @@ def test_explicit_to_default_rng_bridge_is_exact_and_restores_caller():
     assert harness._RngSnapshot.capture().exactly_equal(outer)
 
 
+@pytest.mark.parametrize(
+    "kernel_name",
+    ("sde_step_with_logprob", "sd3_sde_step_with_logprob"),
+)
+def test_sde_trace_supports_reference_and_internal_kernel_names(kernel_name):
+    harness = _load_harness()
+
+    def kernel(_scheduler, _model, _timestep, sample, **_kwargs):
+        mean = sample + 1.0
+        std = torch.ones_like(sample)
+        next_sample = mean + 2.0 * std
+        return next_sample, torch.zeros(sample.shape[0]), mean, std
+
+    def reference_template():
+        sample = torch.zeros(2, 1)
+        return sde_step_with_logprob(None, None, None, sample)  # noqa: F821
+
+    def internal_template():
+        sample = torch.zeros(2, 1)
+        return sd3_sde_step_with_logprob(None, None, None, sample)  # noqa: F821
+
+    namespace = {"torch": torch, kernel_name: kernel}
+    template = (
+        reference_template
+        if kernel_name == "sde_step_with_logprob"
+        else internal_template
+    )
+    pipeline = FunctionType(template.__code__, namespace)
+    with harness._trace_sde_draws(pipeline) as draws:
+        pipeline()
+    assert namespace[kernel_name] is kernel
+    assert len(draws) == 1
+    torch.testing.assert_close(draws[0], torch.full((2, 1), 2.0))
+
+
 def test_update_rng_isolation_is_order_independent_and_detects_extra_draw():
     harness = _load_harness()
     random.seed(410)
@@ -734,6 +769,301 @@ def _exercise_k_slot_update_rng_isolation(device_name):
 
 def test_k_slot_update_rng_isolation_cpu():
     _exercise_k_slot_update_rng_isolation("cpu")
+
+
+def test_update_trace_difference_summary_separates_roundoff_from_failure():
+    harness = _load_harness()
+    rng = harness._RngSnapshot.capture()
+    value = torch.tensor([1.0], dtype=torch.float32)
+    trace = harness._UpdateTrace(
+        current_log_prob=value.clone(),
+        current_mean=value.clone(),
+        reference_mean=value.clone(),
+        transition_std=value.clone(),
+        policy_loss=value.clone(),
+        reference_kl=value.clone(),
+        total_loss=value.clone(),
+        pre_clip_gradients={"weight": value.clone()},
+        post_clip_gradients={"weight": value.clone()},
+        parameter_delta={"weight": value.clone()},
+        slot_rng_before=(rng,),
+        slot_rng_after=(rng,),
+        backward_count=1,
+        clip_count=1,
+        step_count=1,
+        zero_grad_count=2,
+    )
+
+    identical = harness._update_trace_difference_summary(trace, trace)
+    assert identical == {
+        "exact": True,
+        "within_cuda_tolerance": True,
+        "changed_tensor_count": 0,
+        "failed_tolerance_count": 0,
+        "counters_equal": True,
+        "rng_equal": True,
+        "groups": {},
+        "largest_differences": [],
+    }
+
+    roundoff = dataclasses.replace(
+        trace,
+        current_log_prob=trace.current_log_prob + 5.0e-7,
+    )
+    roundoff_summary = harness._update_trace_difference_summary(
+        trace,
+        roundoff,
+    )
+    assert roundoff_summary["exact"] is False
+    assert roundoff_summary["within_cuda_tolerance"] is True
+    assert roundoff_summary["changed_tensor_count"] == 1
+    assert roundoff_summary["failed_tolerance_count"] == 0
+    assert roundoff_summary["groups"]["current_log_prob"] == {
+        "changed_tensor_count": 1,
+        "failed_tolerance_count": 0,
+        "max_abs_error": pytest.approx(4.76837158203125e-7),
+        "max_rel_error": pytest.approx(4.7683693082944956e-7),
+    }
+    assert roundoff_summary["largest_differences"][0]["tensor_name"] == (
+        "current_log_prob"
+    )
+
+    mismatch = dataclasses.replace(
+        trace,
+        current_log_prob=trace.current_log_prob + 1.0e-3,
+    )
+    mismatch_summary = harness._update_trace_difference_summary(
+        trace,
+        mismatch,
+    )
+    assert mismatch_summary["within_cuda_tolerance"] is False
+    assert mismatch_summary["failed_tolerance_count"] == 1
+
+
+def test_cuda_determinism_configuration_is_fixed_and_rejects_drift(monkeypatch):
+    harness = _load_harness()
+    calls = []
+    fake = SimpleNamespace(
+        use_deterministic_algorithms=lambda enabled: calls.append(enabled),
+        backends=SimpleNamespace(
+            cudnn=SimpleNamespace(
+                benchmark=True,
+                deterministic=False,
+                allow_tf32=True,
+            ),
+            cuda=SimpleNamespace(
+                matmul=SimpleNamespace(allow_tf32=True),
+            ),
+        ),
+    )
+    monkeypatch.setenv(
+        "CUBLAS_WORKSPACE_CONFIG",
+        harness._CUBLAS_WORKSPACE_CONFIG,
+    )
+    harness._configure_cuda_determinism(fake)
+    assert calls == [True]
+    assert fake.backends.cudnn.benchmark is False
+    assert fake.backends.cudnn.deterministic is True
+    assert fake.backends.cuda.matmul.allow_tf32 is False
+    assert fake.backends.cudnn.allow_tf32 is False
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with pytest.raises(RuntimeError, match="requires CUBLAS_WORKSPACE_CONFIG"):
+        harness._configure_cuda_determinism(fake)
+
+
+def test_resume_stage_preserves_result_and_identifies_failure():
+    harness = _load_harness()
+    assert harness._resume_stage("read", lambda: 17) == 17
+
+    def fail():
+        raise ValueError("mixed device")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "checkpoint/resume stage resumed_update failed: "
+            "ValueError: mixed device"
+        ),
+    ) as captured:
+        harness._resume_stage("resumed_update", fail)
+    assert isinstance(captured.value.__cause__, ValueError)
+
+
+def test_native_parity_policy_residency_is_exclusive_and_idempotent(monkeypatch):
+    harness = _load_harness()
+    calls = []
+
+    class TrainModule:
+        def to(self, device):
+            calls.append(("to", device))
+            return self
+
+    class Adapter:
+        device = "cuda:0"
+        train_module = TrainModule()
+        _policy_active = True
+        _text_encoders_active = False
+        _vae_active = False
+
+        def _activate_policy_module(self):
+            if not self._policy_active:
+                calls.append(("activate", self.device))
+                self._policy_active = True
+
+    adapter = Adapter()
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(("empty",)))
+
+    harness._set_policy_residency(adapter, active=False)
+    harness._set_policy_residency(adapter, active=False)
+    assert adapter._policy_active is False
+    assert calls == [("to", "cpu"), ("empty",)]
+
+    harness._set_policy_residency(adapter, active=True)
+    harness._set_policy_residency(adapter, active=True)
+    assert adapter._policy_active is True
+    assert calls[-1] == ("activate", "cuda:0")
+
+
+def test_exclusive_policy_recycles_both_branches_before_activation(monkeypatch):
+    harness = _load_harness()
+    calls = []
+
+    class TrainModule:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, device):
+            calls.append((self.name, "to", device))
+            return self
+
+    class Adapter:
+        device = "cuda:0"
+        _text_encoders_active = False
+        _vae_active = False
+
+        def __init__(self, name):
+            self.name = name
+            self.train_module = TrainModule(name)
+            self._policy_active = True
+
+        def _activate_policy_module(self):
+            if not self._policy_active:
+                calls.append((self.name, "activate", self.device))
+                self._policy_active = True
+
+    active = Adapter("active")
+    inactive = Adapter("inactive")
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    harness._activate_exclusive_policy(active, inactive)
+    assert calls == [
+        ("inactive", "to", "cpu"),
+        ("active", "to", "cpu"),
+        ("active", "activate", "cuda:0"),
+    ]
+    assert active._policy_active is True
+    assert inactive._policy_active is False
+
+
+def test_native_prompt_payload_uses_the_adapter_offload_lifecycle():
+    harness = _load_harness()
+    calls = []
+    pipeline = SimpleNamespace(
+        text_encoder=object(),
+        text_encoder_2=object(),
+        text_encoder_3=object(),
+        tokenizer=object(),
+        tokenizer_2=object(),
+        tokenizer_3=object(),
+    )
+
+    class Adapter:
+        device = "cuda:0"
+        max_sequence_length = 128
+        _text_encoders_active = False
+        _policy_active = True
+
+        def __init__(self):
+            self.pipeline = pipeline
+
+        def _activate_text_encoders_for_prompt(self):
+            calls.append("activate_text")
+            self._text_encoders_active = True
+            self._policy_active = False
+
+        def _offload_text_encoders(self):
+            calls.append("offload_text")
+            self._text_encoders_active = False
+
+        def _activate_policy_module(self):
+            calls.append("activate_policy")
+            self._policy_active = True
+
+    adapter = Adapter()
+
+    def compute(prompts, encoders, tokenizers, max_length, device):
+        assert adapter._text_encoders_active is True
+        assert len(encoders) == len(tokenizers) == 3
+        assert max_length == 128
+        assert device == "cuda:0"
+        value = 1.0 if prompts[0] else 0.0
+        return torch.tensor([value]), torch.tensor([value + 1.0])
+
+    payload = harness._prompt_payload_native(
+        SimpleNamespace(compute_text_embeddings=compute),
+        adapter,
+        ("prompt",),
+    )
+    assert tuple(payload) == (
+        "prompt_embeds",
+        "pooled_prompt_embeds",
+        "negative_prompt_embeds",
+        "negative_pooled_prompt_embeds",
+    )
+    assert calls == ["activate_text", "offload_text", "activate_policy"]
+    assert adapter._text_encoders_active is False
+    assert adapter._policy_active is True
+
+
+def test_native_pipeline_proxy_pins_cuda_and_decodes_through_offload_lifecycle():
+    harness = _load_harness()
+    calls = []
+
+    class Vae:
+        dtype = torch.float32
+        config = SimpleNamespace(scaling_factor=1.0, shift_factor=0.0)
+
+        def decode(self, value, return_dict=False):
+            assert return_dict is False
+            assert adapter.vae_active is True
+            calls.append("decode")
+            return (value + 1.0,)
+
+    class Adapter:
+        device = torch.device("cuda:0")
+        vae_active = False
+
+        def __init__(self):
+            self.pipeline = SimpleNamespace(vae=Vae(), marker="original")
+
+        def _activate_vae_for_decode(self):
+            calls.append("activate_vae")
+            self.vae_active = True
+
+        def _offload_vae_after_decode(self):
+            calls.append("offload_vae")
+            self.vae_active = False
+
+    adapter = Adapter()
+    proxy = harness._NativePipelineProxy(adapter)
+    assert proxy._execution_device == torch.device("cuda:0")
+    assert proxy.marker == "original"
+    proxy.marker = "updated"
+    assert adapter.pipeline.marker == "updated"
+    decoded = proxy.vae.decode(torch.tensor([2.0]), return_dict=False)
+    torch.testing.assert_close(decoded[0], torch.tensor([3.0]))
+    assert calls == ["activate_vae", "decode", "offload_vae"]
+    assert adapter.vae_active is False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -990,6 +1320,7 @@ def test_native_harness_is_test_only_and_has_no_production_import_path():
     source = HARNESS_PATH.read_text(encoding="utf-8")
     assert "real CUDA native parity is not run" not in source
     assert "_run_real_parity(" in source
+    assert "_pipeline_full" not in source
     assert "raise RuntimeError(\n            \"real CUDA" not in source
 
     for source_path in (ROOT / "visual_rl").rglob("*.py"):

@@ -16,6 +16,7 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -94,6 +95,23 @@ _COMPARISON_KEYS = frozenset(
 )
 _CUDA_RTOL = 1.0e-5
 _CUDA_ATOL = 1.0e-6
+_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+
+
+def _configure_cuda_determinism(torch_module: Any) -> None:
+    """Freeze CUDA math choices for this standalone FP32 parity process."""
+
+    configured = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if configured != _CUBLAS_WORKSPACE_CONFIG:
+        raise RuntimeError(
+            "native parity requires CUBLAS_WORKSPACE_CONFIG="
+            f"{_CUBLAS_WORKSPACE_CONFIG}, got {configured!r}"
+        )
+    torch_module.use_deterministic_algorithms(True)
+    torch_module.backends.cudnn.benchmark = False
+    torch_module.backends.cudnn.deterministic = True
+    torch_module.backends.cuda.matmul.allow_tf32 = False
+    torch_module.backends.cudnn.allow_tf32 = False
 
 
 @dataclass(frozen=True)
@@ -191,6 +209,45 @@ class _NativeHelpers:
     compute_log_prob: Callable[..., Any]
     pipeline_with_logprob: Callable[..., Any]
     tracker_type: type[Any]
+
+
+class _NativeVaeProxy:
+    """Decode through the Adapter's existing frozen-module lifecycle."""
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter.pipeline.vae, name)
+
+    def decode(self, *args: Any, **kwargs: Any) -> Any:
+        self._adapter._activate_vae_for_decode()
+        try:
+            return self._adapter.pipeline.vae.decode(*args, **kwargs)
+        finally:
+            self._adapter._offload_vae_after_decode()
+
+
+class _NativePipelineProxy:
+    """Expose the training CUDA device while frozen modules remain offloaded."""
+
+    def __init__(self, adapter: Any) -> None:
+        object.__setattr__(self, "_adapter", adapter)
+        object.__setattr__(self, "_vae_proxy", _NativeVaeProxy(adapter))
+
+    @property
+    def _execution_device(self) -> Any:
+        return self._adapter.device
+
+    @property
+    def vae(self) -> _NativeVaeProxy:
+        return self._vae_proxy
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._adapter.pipeline, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._adapter.pipeline, name, value)
 
 
 @dataclass(frozen=True)
@@ -769,6 +826,36 @@ def _loss_input_slice(inputs: Any, rows: Sequence[int], step: int):
     )
 
 
+def _set_policy_residency(adapter: Any, *, active: bool) -> None:
+    """Keep only the parity branch being evaluated resident on CUDA."""
+
+    import torch
+
+    if torch.device(adapter.device).type != "cuda":
+        raise RuntimeError("native parity policy swapping requires CUDA")
+    if active:
+        adapter._activate_policy_module()
+        if not adapter._policy_active:
+            raise RuntimeError("native parity policy activation did not complete")
+        return
+    if adapter._text_encoders_active or adapter._vae_active:
+        raise RuntimeError("cannot offload parity policy during a frozen-module phase")
+    if adapter._policy_active:
+        adapter.train_module.to("cpu")
+        adapter._policy_active = False
+        torch.cuda.empty_cache()
+    if adapter._policy_active:
+        raise RuntimeError("native parity policy offload did not complete")
+
+
+def _activate_exclusive_policy(active: Any, inactive: Any) -> None:
+    """Rebuild the same single-policy CUDA residency for every branch."""
+
+    _set_policy_residency(inactive, active=False)
+    _set_policy_residency(active, active=False)
+    _set_policy_residency(active, active=True)
+
+
 def _clone_named_parameters(
     source: Sequence[tuple[str, Any]],
     target: Sequence[tuple[str, Any]],
@@ -995,30 +1082,35 @@ def _prompt_payload_native(
     adapter: Any,
     prompts: tuple[str, ...],
 ) -> dict[str, Any]:
-    encoders = [
-        adapter.pipeline.text_encoder,
-        adapter.pipeline.text_encoder_2,
-        adapter.pipeline.text_encoder_3,
-    ]
-    tokenizers = [
-        adapter.pipeline.tokenizer,
-        adapter.pipeline.tokenizer_2,
-        adapter.pipeline.tokenizer_3,
-    ]
-    positive, pooled = helpers.compute_text_embeddings(
-        list(prompts),
-        encoders,
-        tokenizers,
-        adapter.max_sequence_length,
-        adapter.device,
-    )
-    negative, negative_pooled = helpers.compute_text_embeddings(
-        [""] * len(prompts),
-        encoders,
-        tokenizers,
-        adapter.max_sequence_length,
-        adapter.device,
-    )
+    adapter._activate_text_encoders_for_prompt()
+    try:
+        encoders = [
+            adapter.pipeline.text_encoder,
+            adapter.pipeline.text_encoder_2,
+            adapter.pipeline.text_encoder_3,
+        ]
+        tokenizers = [
+            adapter.pipeline.tokenizer,
+            adapter.pipeline.tokenizer_2,
+            adapter.pipeline.tokenizer_3,
+        ]
+        positive, pooled = helpers.compute_text_embeddings(
+            list(prompts),
+            encoders,
+            tokenizers,
+            adapter.max_sequence_length,
+            adapter.device,
+        )
+        negative, negative_pooled = helpers.compute_text_embeddings(
+            [""] * len(prompts),
+            encoders,
+            tokenizers,
+            adapter.max_sequence_length,
+            adapter.device,
+        )
+    finally:
+        adapter._offload_text_encoders()
+        adapter._activate_policy_module()
     return {
         "prompt_embeds": positive,
         "pooled_prompt_embeds": pooled,
@@ -1104,20 +1196,19 @@ def _run_with_default_torch_rng(
     return value, post
 
 
-def _pipeline_sde_globals(pipeline_function: Any) -> dict[str, Any]:
+def _pipeline_sde_globals(pipeline_function: Any) -> tuple[dict[str, Any], str]:
     seen: set[int] = set()
     current = pipeline_function
     while callable(current) and id(current) not in seen:
         seen.add(id(current))
-        namespace = current.__globals__
-        if (
-            isinstance(namespace, dict)
-            and "sde_step_with_logprob" in namespace
-            and callable(namespace["sde_step_with_logprob"])
-        ):
-            return namespace
+        function = getattr(current, "__func__", current)
+        namespace = getattr(function, "__globals__", None)
+        if isinstance(namespace, dict):
+            for key in ("sde_step_with_logprob", "sd3_sde_step_with_logprob"):
+                if key in namespace and callable(namespace[key]):
+                    return namespace, key
         try:
-            current = current.__wrapped__
+            current = function.__wrapped__
         except AttributeError:
             break
     raise RuntimeError("native pipeline does not expose its SDE helper globals")
@@ -1131,12 +1222,14 @@ def _trace_sde_draws(
 
     import torch
 
-    namespace = _pipeline_sde_globals(pipeline_function)
-    original = namespace["sde_step_with_logprob"]
+    namespace, key = _pipeline_sde_globals(pipeline_function)
+    original = namespace[key]
     draws: list[Any] = []
 
     def traced(*args: Any, **kwargs: Any):
-        deterministic = bool(kwargs.get("determistic", False))
+        deterministic = bool(
+            kwargs.get("deterministic", kwargs.get("determistic", False))
+        )
         previous = (
             args[4] if len(args) >= 5 else kwargs.get("prev_sample")
         )
@@ -1153,12 +1246,12 @@ def _trace_sde_draws(
             draws.append(draw.detach().cpu().contiguous().clone())
         return output
 
-    namespace["sde_step_with_logprob"] = traced
+    namespace[key] = traced
     try:
         yield draws
     finally:
-        if namespace["sde_step_with_logprob"] is traced:
-            namespace["sde_step_with_logprob"] = original
+        if namespace[key] is traced:
+            namespace[key] = original
 
 
 def _rollout_visual(
@@ -1172,26 +1265,38 @@ def _rollout_visual(
 ) -> tuple[Any, Any, tuple[Any, ...]]:
     """Use the real RolloutEngine while injecting the frozen latent/stream."""
 
-    original = adapter._pipeline_full
+    import torch
+
+    original_prepare = adapter._prepare_native_sd3_rollout
+    original_run = adapter._run_full_pipeline
     generator_post_state: list[Any] = []
 
-    def fixed_pipeline(pipeline: Any, **kwargs: Any):
+    def fixed_prepare(*, prompt_embeds: Any, num_steps: int, generator: Any):
+        if generator is None:
+            raise RuntimeError("VisualRL SD3 rollout did not provide a generator")
+        timesteps, prepared = original_prepare(
+            prompt_embeds=prompt_embeds,
+            num_steps=num_steps,
+            generator=generator,
+        )
+        if not torch.equal(generator.get_state(), transition_rng_state):
+            raise RuntimeError("VisualRL initial-latent RNG state drifted")
+        if not torch.equal(prepared, canonical_latent):
+            raise RuntimeError("VisualRL rollout initial latent drifted")
+        return timesteps, canonical_latent.clone()
+
+    def fixed_run(**kwargs: Any):
         generator = kwargs.get("generator")
         if generator is None:
             raise RuntimeError("VisualRL SD3 rollout did not provide a generator")
-        generator.set_state(transition_rng_state.clone())
-        kwargs["latents"] = canonical_latent.clone()
-        output = original(pipeline, **kwargs)
+        output = original_run(**kwargs)
         generator_post_state.append(generator.get_state().clone())
         return output
 
-    # SD3TempFlowAdapter._bind_sde_generator follows __wrapped__ to the actual
-    # reference pipeline globals and injects this same explicit generator into
-    # every stochastic SDE step.
-    fixed_pipeline.__wrapped__ = original  # type: ignore[attr-defined]
-    adapter._pipeline_full = fixed_pipeline
+    adapter._prepare_native_sd3_rollout = fixed_prepare
+    adapter._run_full_pipeline = fixed_run
     try:
-        with _trace_sde_draws(original) as draws:
+        with _trace_sde_draws(original_run) as draws:
             batch = rollout.sample(
                 adapter=adapter,
                 prompts=(prompt,),
@@ -1206,7 +1311,8 @@ def _rollout_visual(
                 context=context,
             )
     finally:
-        adapter._pipeline_full = original
+        adapter._prepare_native_sd3_rollout = original_prepare
+        adapter._run_full_pipeline = original_run
     if len(generator_post_state) != 1:
         raise RuntimeError("VisualRL rollout did not expose one generator post-state")
     return batch, generator_post_state[0], tuple(draws)
@@ -1228,11 +1334,12 @@ def _rollout_native(
     import torch
 
     adapter.train_module.eval()
+    pipeline = _NativePipelineProxy(adapter)
 
     def run():
         with torch.no_grad():
             return helpers.pipeline_with_logprob(
-                adapter.pipeline,
+                pipeline,
                 prompt_embeds=payload["prompt_embeds"],
                 pooled_prompt_embeds=payload["pooled_prompt_embeds"],
                 negative_prompt_embeds=payload["negative_prompt_embeds"],
@@ -1547,6 +1654,119 @@ def _update_traces_exactly_equal(
     return scalar_and_tensor_fields_equal and rng_fields_equal
 
 
+def _update_trace_difference_summary(
+    left: _UpdateTrace,
+    right: _UpdateTrace,
+    *,
+    limit: int = 12,
+) -> dict[str, Any]:
+    """Summarize order sensitivity without discarding numerical magnitude."""
+
+    if limit < 1:
+        raise ValueError("update trace summary limit must be positive")
+    tensor_values: list[dict[str, Any]] = []
+    for field in (
+        "current_log_prob",
+        "current_mean",
+        "reference_mean",
+        "transition_std",
+        "policy_loss",
+        "reference_kl",
+        "total_loss",
+    ):
+        tensor_values.append(
+            _comparison(field, getattr(left, field), getattr(right, field))
+        )
+    for field in (
+        "pre_clip_gradients",
+        "post_clip_gradients",
+        "parameter_delta",
+    ):
+        comparison = _comparison_item(
+            {
+                f"{field}/{name}": value
+                for name, value in getattr(left, field).items()
+            },
+            {
+                f"{field}/{name}": value
+                for name, value in getattr(right, field).items()
+            },
+        )
+        tensor_values.extend(comparison["comparisons"])
+
+    changed = [
+        item
+        for item in tensor_values
+        if item["max_abs_error"] != 0.0 or not item["passed"]
+    ]
+    changed.sort(
+        key=lambda item: (
+            not item["passed"],
+            item["max_abs_error"],
+            item["max_rel_error"],
+            item["tensor_name"],
+        ),
+        reverse=True,
+    )
+    groups: dict[str, dict[str, Any]] = {}
+    for item in changed:
+        group = item["tensor_name"].split("/", 1)[0]
+        summary = groups.setdefault(
+            group,
+            {
+                "changed_tensor_count": 0,
+                "failed_tolerance_count": 0,
+                "max_abs_error": 0.0,
+                "max_rel_error": 0.0,
+            },
+        )
+        summary["changed_tensor_count"] += 1
+        summary["failed_tolerance_count"] += int(not item["passed"])
+        summary["max_abs_error"] = max(
+            summary["max_abs_error"],
+            item["max_abs_error"],
+        )
+        summary["max_rel_error"] = max(
+            summary["max_rel_error"],
+            item["max_rel_error"],
+        )
+    counter_fields = (
+        "backward_count",
+        "clip_count",
+        "step_count",
+        "zero_grad_count",
+    )
+    counters_equal = all(
+        getattr(left, field) == getattr(right, field)
+        for field in counter_fields
+    )
+    rng_equal = all(
+        len(getattr(left, field)) == len(getattr(right, field))
+        and all(
+            a.exactly_equal(b)
+            for a, b in zip(
+                getattr(left, field),
+                getattr(right, field),
+                strict=True,
+            )
+        )
+        for field in ("slot_rng_before", "slot_rng_after")
+    )
+    return {
+        "exact": _update_traces_exactly_equal(left, right),
+        "within_cuda_tolerance": bool(tensor_values)
+        and all(item["passed"] for item in tensor_values)
+        and counters_equal
+        and rng_equal,
+        "changed_tensor_count": len(changed),
+        "failed_tolerance_count": sum(not item["passed"] for item in tensor_values),
+        "counters_equal": counters_equal,
+        "rng_equal": rng_equal,
+        "groups": groups,
+        "largest_differences": changed[:limit],
+    }
+
+
 def _rank_state_from_current_rng(device: Any):
     import numpy as np
     import torch
@@ -1621,6 +1841,18 @@ def _compare_resume_projections(
     }
 
 
+def _resume_stage(label: str, callback: Callable[[], Any]) -> Any:
+    """Attach one stable checkpoint/resume stage to low-level failures."""
+
+    try:
+        return callback()
+    except BaseException as exc:
+        raise RuntimeError(
+            f"checkpoint/resume stage {label} failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _resume_comparison(
     *,
     config: Any,
@@ -1692,28 +1924,35 @@ def _resume_comparison(
         continuous_global_step = continuous_start_step + 1
         continuous_scaler_state = None
 
-        fresh = build_fresh_adapter()
+        _set_policy_residency(adapter, active=False)
+        fresh = _resume_stage("build_fresh_adapter", build_fresh_adapter)
         try:
             fresh_optimizer = _build_adamw(
                 fresh.named_parameters(),
                 config.optimizer,
             )
-            validated = read_and_validate_training_state(
-                checkpoint,
-                adapter=fresh,
-                optimizer=fresh_optimizer,
-                scaler=None,
-                expected_global_step=1,
-                expected_world_size=1,
-                expected_training_contract=contract,
+            validated = _resume_stage(
+                "read_and_validate_training_state",
+                lambda: read_and_validate_training_state(
+                    checkpoint,
+                    adapter=fresh,
+                    optimizer=fresh_optimizer,
+                    scaler=None,
+                    expected_global_step=1,
+                    expected_world_size=1,
+                    expected_training_contract=contract,
+                ),
             )
-            apply_training_state(
-                validated,
-                adapter=fresh,
-                optimizer=fresh_optimizer,
-                scaler=None,
-                optimizer_config=config.optimizer,
-                rank=0,
+            _resume_stage(
+                "apply_training_state",
+                lambda: apply_training_state(
+                    validated,
+                    adapter=fresh,
+                    optimizer=fresh_optimizer,
+                    scaler=None,
+                    optimizer_config=config.optimizer,
+                    rank=0,
+                ),
             )
             resumed_start_rng = _RngSnapshot.capture()
             resumed_next_inputs = _next_step_input_projection(
@@ -1722,20 +1961,23 @@ def _resume_comparison(
             )
             resumed_start_step = validated.global_step
             resumed_initial = _named_tensor_snapshot(fresh.named_parameters())
-            resumed_trace = _run_update_window(
-                named_parameters=fresh.named_parameters(),
-                optimizer=fresh_optimizer,
-                initial_parameters=resumed_initial,
-                slots=slots,
-                evaluate_slot=lambda rows, step: _aligned_visual_objective(
-                    adapter=fresh,
-                    objective=objective,
-                    batch=_transition_slice(rollout_batch, rows, step),
-                    inputs=_loss_input_slice(loss_inputs, rows, step),
+            resumed_trace = _resume_stage(
+                "resumed_update",
+                lambda: _run_update_window(
+                    named_parameters=fresh.named_parameters(),
+                    optimizer=fresh_optimizer,
+                    initial_parameters=resumed_initial,
+                    slots=slots,
+                    evaluate_slot=lambda rows, step: _aligned_visual_objective(
+                        adapter=fresh,
+                        objective=objective,
+                        batch=_transition_slice(rollout_batch, rows, step),
+                        inputs=_loss_input_slice(loss_inputs, rows, step),
+                    ),
+                    batch_size=rollout_batch.batch_size,
+                    transition_count=rollout_batch.transition_count,
+                    max_grad_norm=float(config.optimizer.max_grad_norm),
                 ),
-                batch_size=rollout_batch.batch_size,
-                transition_count=rollout_batch.transition_count,
-                max_grad_norm=float(config.optimizer.max_grad_norm),
             )
             resumed_parameters = _named_tensor_snapshot(fresh.named_parameters())
             resumed_optimizer = deepcopy(fresh_optimizer.state_dict())
@@ -1801,6 +2043,7 @@ def _run_real_parity(
     from visual_rl.optimizers.objective import PolicyObjective
     from visual_rl.rollout.full_trajectory import FullTrajectoryRollout
 
+    _configure_cuda_determinism(torch)
     if not torch.cuda.is_available():
         raise RuntimeError("real native parity requires an available CUDA device")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1829,6 +2072,7 @@ def _run_real_parity(
 
     visual_adapter = build_adapter()
     native_adapter = build_adapter()
+    _set_policy_residency(native_adapter, active=False)
     native_closed = False
     try:
         visual_named = visual_adapter.named_parameters()
@@ -1852,11 +2096,13 @@ def _run_real_parity(
                     strict=True,
                 )
             }
+            _set_policy_residency(visual_adapter, active=False)
             native_prompt = _prompt_payload_native(
                 helpers,
                 native_adapter,
                 prompts,
             )
+            _set_policy_residency(native_adapter, active=False)
             prompt_item = _comparison_item(visual_prompt, native_prompt)
 
             (
@@ -1896,6 +2142,7 @@ def _run_real_parity(
                 world_size=1,
             )
             construction_rng.restore()
+            _activate_exclusive_policy(visual_adapter, native_adapter)
             (
                 visual_batch,
                 visual_rollout_post,
@@ -1911,6 +2158,7 @@ def _run_real_parity(
             visual_global_post = _RngSnapshot.capture()
 
             construction_rng.restore()
+            _activate_exclusive_policy(native_adapter, visual_adapter)
             (
                 native_data,
                 native_rollout_post,
@@ -2053,6 +2301,7 @@ def _run_real_parity(
             update_rng = _RngSnapshot.capture()
 
             def visual_update(optimizer: Any) -> _UpdateTrace:
+                _activate_exclusive_policy(visual_adapter, native_adapter)
                 visual_adapter.train_module.train(True)
                 return _run_update_window(
                     named_parameters=visual_named,
@@ -2075,6 +2324,7 @@ def _run_real_parity(
                 )
 
             def native_update(optimizer: Any) -> _UpdateTrace:
+                _activate_exclusive_policy(native_adapter, visual_adapter)
                 native_adapter.train_module.train(True)
                 return _run_update_window(
                     named_parameters=native_named,
@@ -2138,21 +2388,41 @@ def _run_real_parity(
             visual_trace = visual_update(visual_optimizer)
             visual_post_reverse = _RngSnapshot.capture()
 
-            if not (
-                visual_post_forward.exactly_equal(native_post_forward)
-                and visual_post_forward.exactly_equal(native_post_reverse)
-                and visual_post_forward.exactly_equal(visual_post_reverse)
-                and _update_traces_exactly_equal(
+            order_flags = {
+                "forward_branch_rng": visual_post_forward.exactly_equal(
+                    native_post_forward
+                ),
+                "native_forward_reverse_rng": visual_post_forward.exactly_equal(
+                    native_post_reverse
+                ),
+                "visual_forward_reverse_rng": visual_post_forward.exactly_equal(
+                    visual_post_reverse
+                ),
+                "visual_forward_reverse_trace": _update_traces_exactly_equal(
                     visual_trace_forward,
                     visual_trace,
-                )
-                and _update_traces_exactly_equal(
+                ),
+                "native_forward_reverse_trace": _update_traces_exactly_equal(
                     native_trace_forward,
                     native_trace,
+                ),
+            }
+            if not all(order_flags.values()):
+                order_flags["visual_forward_reverse_difference"] = (
+                    _update_trace_difference_summary(
+                        visual_trace_forward,
+                        visual_trace,
+                    )
                 )
-            ):
+                order_flags["native_forward_reverse_difference"] = (
+                    _update_trace_difference_summary(
+                        native_trace_forward,
+                        native_trace,
+                    )
+                )
                 raise RuntimeError(
-                    "update result depends on VisualRL/native branch order"
+                    "update result depends on VisualRL/native branch order: "
+                    + json.dumps(order_flags, sort_keys=True)
                 )
 
             items = {
@@ -2204,6 +2474,9 @@ def _run_real_parity(
 
 
 def main() -> int:
+    # This is a fixed test process setting, not a user-configurable input.  It
+    # must be installed before visual_rl imports torch and initializes cuBLAS.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = _CUBLAS_WORKSPACE_CONFIG
     repo_root = Path(__file__).resolve().parents[2]
     case_path = (
         repo_root
