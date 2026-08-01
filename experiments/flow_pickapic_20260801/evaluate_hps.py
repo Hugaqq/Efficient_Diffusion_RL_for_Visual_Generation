@@ -111,7 +111,7 @@ def _save_image(tensor: Any, path: Path) -> str:
         .to(dtype=torch.uint8)
         .numpy()
     )
-    payload = Image.fromarray(np.asarray(image), mode="RGB")
+    payload = Image.fromarray(np.asarray(image))
     payload.save(path, format="PNG", optimize=False)
     return _sha256_file(path)
 
