@@ -257,7 +257,10 @@ def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
                 approx_kl=0.0,
                 clipfrac=0.0,
                 active_transition_count=2,
-                diagnostics={},
+                diagnostics={
+                    "update/gradient_norm_pre_clip": 1.25,
+                    "update/gradient_norm_post_clip": 1.0,
+                },
             )
 
     class Coordinator:
@@ -303,6 +306,8 @@ def test_execute_step_preserves_one_step_context_object_end_to_end() -> None:
     ]
     assert result.metrics.sample_count == 2
     assert result.metrics.active_transition_count == 2
+    assert result.metrics.values["update/gradient_norm_pre_clip"] == 1.25
+    assert result.metrics.values["update/gradient_norm_post_clip"] == 1.0
     assert len(result.artifacts.local_records) == 2
     assert result.artifacts.local_records[0].media_path is not None
     assert result.artifacts.local_records[1].media_path is None

@@ -646,6 +646,10 @@ def test_gloo_fixed_batch_matches_single_process() -> None:
     assert all(isinstance(rows[rank], dict) for rank in range(2)), rows
 
     expected = _single_global_case()
+    assert {
+        "update/gradient_norm_pre_clip",
+        "update/gradient_norm_post_clip",
+    }.issubset(expected["diagnostics"])
     for payload in rows.values():
         assert payload["active_transition_count"] == 5
         for name in (

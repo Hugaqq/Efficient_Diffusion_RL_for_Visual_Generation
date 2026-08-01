@@ -21,7 +21,13 @@ from visual_rl.optimizers.advantages import AdvantageComputer
 from visual_rl.optimizers.algorithm_plugin import AlgorithmOptimizerPlugin
 from visual_rl.optimizers.base import OptimizerPlugin
 from visual_rl.optimizers.grpo import GRPOAlgorithm
-from visual_rl.optimizers.update_engine import UpdateResult
+from visual_rl.optimizers.update_engine import UpdateEngine, UpdateResult
+
+
+_GRADIENT_NORM_FIELDS = (
+    "update/gradient_norm_pre_clip",
+    "update/gradient_norm_post_clip",
+)
 
 
 class _TrainModule(torch.nn.Module):
@@ -156,6 +162,7 @@ def _plugin(
     microbatch_size: int,
     transition_microbatch_size: int | None = None,
     beta: float = 0.0,
+    max_grad_norm: float | None = None,
 ) -> AlgorithmOptimizerPlugin:
     return AlgorithmOptimizerPlugin(
         algorithm=GRPOAlgorithm(
@@ -170,7 +177,7 @@ def _plugin(
         update_microbatch_size=microbatch_size,
         transition_microbatch_size=transition_microbatch_size,
         precision="fp32",
-        max_grad_norm=None,
+        max_grad_norm=max_grad_norm,
         max_initial_logprob_delta=None,
         require_initial_clipfrac_zero=False,
         require_finite_gradients=True,
@@ -199,6 +206,7 @@ def _run_once(
     microbatch_size: int,
     transition_microbatch_size: int | None = None,
     beta: float = 0.0,
+    max_grad_norm: float | None = None,
 ):
     adapter = _Adapter()
     strategy = _strategy(adapter)
@@ -206,6 +214,7 @@ def _run_once(
         microbatch_size=microbatch_size,
         transition_microbatch_size=transition_microbatch_size,
         beta=beta,
+        max_grad_norm=max_grad_norm,
     )
     optimizer = _optimizer(plugin, adapter)
     batch = _batch()
@@ -249,6 +258,11 @@ def test_microbatch_and_full_batch_use_one_active_count_weighting() -> None:
             getattr(full_result, name),
             abs=1e-7,
         )
+    assert tuple(full_result.diagnostics)[-2:] == _GRADIENT_NORM_FIELDS
+    assert split_result.diagnostics == pytest.approx(
+        full_result.diagnostics,
+        abs=5e-7,
+    )
     torch.testing.assert_close(split_parameter, full_parameter)
     torch.testing.assert_close(split_gradient, full_gradient)
     assert full_forwards == 1
@@ -293,6 +307,10 @@ def test_transition_microbatch_preserves_the_one_objective_and_update(
             getattr(full_result, name),
             abs=1e-7,
         )
+    assert split_result.diagnostics == pytest.approx(
+        full_result.diagnostics,
+        abs=5e-7,
+    )
     torch.testing.assert_close(split_parameter, full_parameter)
     torch.testing.assert_close(split_gradient, full_gradient)
     assert full_forwards == 1
@@ -322,6 +340,92 @@ def test_beta_positive_adds_differentiable_reference_loss() -> None:
         active_result.policy_loss + 0.5 * active_result.reference_kl
     )
     assert not torch.equal(active_gradient, control[2])
+
+
+def test_gradient_norm_diagnostics_report_actual_clipping() -> None:
+    max_grad_norm = 0.01
+    unclipped = _run_once(microbatch_size=4, max_grad_norm=None)
+    result, _parameter, gradient, _forwards, _references = _run_once(
+        microbatch_size=4,
+        max_grad_norm=max_grad_norm,
+    )
+
+    pre_clip = result.diagnostics["update/gradient_norm_pre_clip"]
+    post_clip = result.diagnostics["update/gradient_norm_post_clip"]
+    assert pre_clip == pytest.approx(float(unclipped[2].abs()), abs=1e-8)
+    assert post_clip == pytest.approx(float(gradient.abs()), abs=1e-8)
+    assert post_clip == pytest.approx(max_grad_norm, rel=1e-4)
+
+
+def test_no_clip_norm_diagnostic_does_not_write_gradients() -> None:
+    first = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    second = torch.nn.Parameter(torch.tensor([3.0]))
+    first.grad = torch.tensor([3.0, 4.0])
+    second.grad = torch.tensor([12.0])
+    parameters = (first, second)
+    before = tuple(parameter.grad.detach().clone() for parameter in parameters)
+
+    pre_clip, post_clip = UpdateEngine._gradient_gate_and_clip(
+        parameters,
+        require_finite=True,
+        require_nonzero=True,
+        max_grad_norm=None,
+    )
+
+    assert float(pre_clip) == pytest.approx(13.0)
+    assert float(post_clip) == pytest.approx(13.0)
+    for parameter, expected in zip(parameters, before, strict=True):
+        torch.testing.assert_close(
+            parameter.grad,
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_no_clip_diagnostic_preserves_disabled_finite_gate() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.tensor([float("inf")])
+
+    pre_clip, post_clip = UpdateEngine._gradient_gate_and_clip(
+        (parameter,),
+        require_finite=False,
+        require_nonzero=False,
+        max_grad_norm=None,
+    )
+
+    assert pre_clip is None
+    assert post_clip is None
+    assert torch.isinf(parameter.grad).all()
+    assert UpdateEngine._gradient_norm_contributions(
+        pre_clip,
+        post_clip,
+        device="cpu",
+    ) == {}
+
+
+def test_update_result_accepts_only_declared_diagnostic_namespaces() -> None:
+    accepted = UpdateResult(
+        loss=0.0,
+        policy_loss=0.0,
+        reference_kl=0.0,
+        approx_kl=0.0,
+        clipfrac=0.0,
+        active_transition_count=1,
+        diagnostics={"update/gradient_norm_pre_clip": 1.0},
+    )
+    assert accepted.diagnostics["update/gradient_norm_pre_clip"] == 1.0
+
+    with pytest.raises(ValueError, match="diagnostics keys"):
+        UpdateResult(
+            loss=0.0,
+            policy_loss=0.0,
+            reference_kl=0.0,
+            approx_kl=0.0,
+            clipfrac=0.0,
+            active_transition_count=1,
+            diagnostics={"optimizer/gradient_norm": 1.0},
+        )
 
 
 def test_context_identity_failure_precedes_forward_and_mutation() -> None:
