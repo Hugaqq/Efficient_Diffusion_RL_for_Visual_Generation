@@ -149,6 +149,26 @@ Do not load checkpoint tensors to decide whether a run succeeded. The
 authoritative commit chain, status, and audit establish completion and
 resumability.
 
+Each committed metrics row includes the objective statistics `approx_kl`,
+`clipfrac`, and `reference_kl`. Their meanings are deliberately different:
+
+- `approx_kl` and `clipfrac` compare the recomputed policy with the policy that
+  collected the current rollout. In a strictly on-policy, one-rollout/one-
+  update run they are expected to be zero before the optimizer step; they do
+  not measure drift accumulated across training steps.
+- `reference_kl` compares the current policy with the frozen reference policy
+  and is the long-horizon drift signal used by the configured KL penalty.
+- `update/gradient_norm_pre_clip` and
+  `update/gradient_norm_post_clip` report the actual unscaled gradient norm
+  immediately before the optimizer step. When `max_grad_norm` is disabled the
+  two values are equal and are read without mutating gradients. When clipping
+  is enabled, the first value is the norm returned by `clip_grad_norm_` and the
+  second is measured after clipping.
+
+The gradient metrics are diagnostics only. They use the same single/DDP
+metric-reduction path as the other update diagnostics and do not create a
+second optimizer or update lifecycle.
+
 Q100 quality aggregation first performs these two public checks on exactly the
 twelve paths listed in
 [`q100_inputs.json`](../experiments/v0_7/evidence/q100_inputs.json), then reads

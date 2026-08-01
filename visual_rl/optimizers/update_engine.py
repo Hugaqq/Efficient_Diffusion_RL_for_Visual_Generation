@@ -31,6 +31,9 @@ _CORE_FIELDS = (
     "approx_kl",
     "clipfrac",
 )
+_GRADIENT_NORM_PRE_CLIP = "update/gradient_norm_pre_clip"
+_GRADIENT_NORM_POST_CLIP = "update/gradient_norm_post_clip"
+_DIAGNOSTIC_PREFIXES = ("advantage/", "algorithm/", "update/")
 
 
 @dataclass(frozen=True)
@@ -63,12 +66,11 @@ class UpdateResult:
             raise TypeError("diagnostics must be a mapping")
         frozen: dict[str, float] = {}
         for name, value in self.diagnostics.items():
-            if (
-                not isinstance(name, str)
-                or not name.startswith(("advantage/", "algorithm/"))
+            if not isinstance(name, str) or not name.startswith(
+                _DIAGNOSTIC_PREFIXES
             ):
                 raise ValueError(
-                    "diagnostics keys must use advantage/ or algorithm/"
+                    "diagnostics keys must use advantage/, algorithm/, or update/"
                 )
             if name in _CORE_FIELDS:
                 raise ValueError("diagnostics cannot replace core update fields")
@@ -557,21 +559,35 @@ class UpdateEngine:
         )
 
     @staticmethod
+    def _gradient_total_norm(gradients: tuple[Any, ...]) -> Any:
+        import torch
+
+        if not gradients:
+            return torch.zeros((), dtype=torch.float32)
+        first_device = gradients[0].device
+        per_gradient = tuple(
+            torch.linalg.vector_norm(gradient.detach(), ord=2) for gradient in gradients
+        )
+        return torch.linalg.vector_norm(
+            torch.stack(tuple(norm.to(device=first_device) for norm in per_gradient)),
+            ord=2,
+        )
+
+    @staticmethod
     def _gradient_gate_and_clip(
         parameters: tuple[Any, ...],
         *,
         require_finite: bool,
         require_nonzero: bool,
         max_grad_norm: float | None,
-    ) -> None:
+    ) -> tuple[Any, Any]:
         import torch
 
         gradients = tuple(
             parameter.grad for parameter in parameters if parameter.grad is not None
         )
         finite = all(
-            bool(torch.isfinite(gradient.detach()).all())
-            for gradient in gradients
+            bool(torch.isfinite(gradient.detach()).all()) for gradient in gradients
         )
         nonzero = any(
             bool(torch.count_nonzero(gradient.detach()))
@@ -582,16 +598,53 @@ class UpdateEngine:
         if require_nonzero and not nonzero:
             raise RuntimeError("Gradient gate failed: all gradients are zero")
         if max_grad_norm is not None:
-            norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
-            if not bool(torch.isfinite(torch.as_tensor(norm))):
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(
+                parameters,
+                max_grad_norm,
+            )
+            post_clip_norm = UpdateEngine._gradient_total_norm(gradients)
+            if not bool(torch.isfinite(torch.as_tensor(pre_clip_norm))):
                 raise RuntimeError("Gradient clipping produced a non-finite norm")
-            if require_finite and not all(
-                bool(torch.isfinite(gradient.detach()).all())
-                for gradient in gradients
-            ):
+            if not bool(torch.isfinite(torch.as_tensor(post_clip_norm))):
                 raise RuntimeError(
-                    "Gradient gate failed after gradient clipping"
+                    "Gradient clipping produced a non-finite post-clip norm"
                 )
+            if require_finite and not all(
+                bool(torch.isfinite(gradient.detach()).all()) for gradient in gradients
+            ):
+                raise RuntimeError("Gradient gate failed after gradient clipping")
+            return pre_clip_norm.detach(), post_clip_norm.detach()
+
+        gradient_norm = UpdateEngine._gradient_total_norm(gradients)
+        if not bool(torch.isfinite(torch.as_tensor(gradient_norm))):
+            # ``require_finite=False`` historically allowed a no-clip update
+            # to proceed.  A read-only diagnostic must not strengthen that
+            # gate, and UpdateResult cannot publish non-finite metrics.
+            return None, None
+        gradient_norm = gradient_norm.detach()
+        return gradient_norm, gradient_norm
+
+    @staticmethod
+    def _gradient_norm_contributions(
+        pre_clip_norm: Any,
+        post_clip_norm: Any,
+        *,
+        device: Any,
+    ) -> dict[str, MetricContribution]:
+        import torch
+
+        if pre_clip_norm is None or post_clip_norm is None:
+            return {}
+        return {
+            _GRADIENT_NORM_PRE_CLIP: MetricContribution(
+                numerator=pre_clip_norm.to(device=device, dtype=torch.float64),
+                denominator=1,
+            ),
+            _GRADIENT_NORM_POST_CLIP: MetricContribution(
+                numerator=post_clip_norm.to(device=device, dtype=torch.float64),
+                denominator=1,
+            ),
+        }
 
     @staticmethod
     def _validated_reduced_metrics(
@@ -873,7 +926,10 @@ class UpdateEngine:
                 lambda: scaler.unscale_(optimizer),
             )
 
-        def validate_gradients_and_initial_update() -> None:
+        def validate_gradients_and_initial_update() -> dict[
+            str,
+            MetricContribution,
+        ]:
             if context.step == 0:
                 if (
                     self.max_initial_logprob_delta is not None
@@ -895,18 +951,24 @@ class UpdateEngine:
                         "Pre-update clipfrac gate failed: "
                         f"expected 0, got {local_clipfrac:.6g}"
                     )
-            self._gradient_gate_and_clip(
+            pre_clip_norm, post_clip_norm = self._gradient_gate_and_clip(
                 parameters,
                 require_finite=self.require_finite_gradients,
                 require_nonzero=self.require_nonzero_gradients,
                 max_grad_norm=self.max_grad_norm,
             )
+            return self._gradient_norm_contributions(
+                pre_clip_norm,
+                post_clip_norm,
+                device=strategy.device,
+            )
 
-        self._local_then_gate(
+        gradient_diagnostics = self._local_then_gate(
             strategy,
             "update.gradient_gate",
             validate_gradients_and_initial_update,
         )
+        diagnostics = {**diagnostics, **gradient_diagnostics}
         contributions = dict(diagnostics)
         contributions.update(
             {
