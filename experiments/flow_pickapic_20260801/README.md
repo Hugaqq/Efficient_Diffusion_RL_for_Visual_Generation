@@ -128,6 +128,11 @@ runaway frozen-reference KL. The v2 validation protocol is then evaluated as a
 safety gate. The v3 final test remains unopened until the selected multi-seed
 checkpoints and final analysis rule are frozen.
 
+The exact promotion thresholds, PickScore weight identities, image guards and
+final-claim boundary are frozen in
+[`staged_quality_gate_v1.json`](staged_quality_gate_v1.json). A stage that fails
+any one of those gates is retained as evidence and is not resumed.
+
 Expected allocation is exactly two RTX 5090 GPUs:
 
 - one physical GPU for the SD3 trainer;
@@ -151,16 +156,23 @@ Run the frozen read-only baseline evaluation before Q100:
 
 ```text
 python experiments/flow_pickapic_20260801/evaluate_hps.py run \
-  --config experiments/flow_pickapic_20260801/configs/flow_pickapic_q100_seed17.yaml \
+  --config experiments/flow_pickapic_20260801/configs/flow_pickapic_q100_stable_v2_seed17_s20.yaml \
   --prompts data/prompts/pickapic_sfw_heldout_eval_v2.txt \
   --output-dir experiments/flow_pickapic_20260801/evaluations/base
 ```
 
-For a final checkpoint, add:
+Use that same `s20` configuration for every trained evaluation and add the
+stage checkpoint explicitly:
 
 ```text
---adapter-checkpoint <run>/checkpoint_000100/adapter
+--adapter-checkpoint <run>/checkpoint_000020/adapter
 ```
+
+The evaluator compares the full inference identity, including the
+configuration digest. Reusing the same inference-only `s20` configuration for
+base and trained images prevents a later resume path or `max_steps` change from
+being mistaken for a generation change; the explicit adapter checkpoint is the
+only intended difference.
 
 Then compare the two immutable score matrices:
 
@@ -170,3 +182,51 @@ python experiments/flow_pickapic_20260801/evaluate_hps.py compare \
   --trained-dir experiments/flow_pickapic_20260801/evaluations/seed17_final \
   --output experiments/flow_pickapic_20260801/evaluations/seed17_comparison.json
 ```
+
+Score each saved HPS image matrix with the frozen, local-only PickScore model.
+The command performs two complete scoring passes and refuses to publish output
+if their maximum absolute difference exceeds `1e-6`:
+
+```text
+python experiments/flow_pickapic_20260801/evaluate_pickscore.py score \
+  --source-dir experiments/flow_pickapic_20260801/evaluations/base \
+  --prompts data/prompts/pickapic_sfw_heldout_eval_v2.txt \
+  --output-dir experiments/flow_pickapic_20260801/evaluations/base_pickscore \
+  --model-path <local-pickscore-model> \
+  --processor-path <local-pickscore-processor> \
+  --expected-model-weight-sha256 ef31ef6fc5ff4d9bb90dd232df4e145887ba62c5a03aa2841415f8c25f18d52e \
+  --expected-model-config-sha256 bfa2a8243d3f82ad7c4746a0b62817e895f9f225926e6caecfc9dbb9171647ce \
+  --expected-tokenizer-sha256 b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842 \
+  --expected-processor-config-sha256 910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd \
+  --device cuda:0 \
+  --dtype float16
+```
+
+After scoring the corresponding trained matrix with the same command and
+asset paths, apply the pre-registered stage noninferiority gate:
+
+```text
+python experiments/flow_pickapic_20260801/evaluate_pickscore.py compare \
+  --base-dir experiments/flow_pickapic_20260801/evaluations/base_pickscore \
+  --trained-dir experiments/flow_pickapic_20260801/evaluations/seed17_s20_pickscore \
+  --output experiments/flow_pickapic_20260801/evaluations/seed17_s20_pickscore_comparison.json
+```
+
+Passing that stage gate only says the independent score did not materially
+regress (`CI lower >= -0.001`, prompt win rate `>= 0.45`). A positive final
+quality claim still requires the separate three-seed v3 final-test rule.
+
+Finally, run the deterministic CPU-only collapse guards over the same paired
+image matrices:
+
+```text
+python experiments/flow_pickapic_20260801/evaluate_image_guards.py \
+  --base-dir experiments/flow_pickapic_20260801/evaluations/base \
+  --trained-dir experiments/flow_pickapic_20260801/evaluations/seed17_s20 \
+  --prompts data/prompts/pickapic_sfw_heldout_eval_v2.txt \
+  --output-dir experiments/flow_pickapic_20260801/evaluations/seed17_s20_image_guards
+```
+
+These guards only detect obvious sharpness, extreme-saturation, black/white,
+or near-constant collapse. They are not a perceptual score and make no
+embedding-diversity claim.
