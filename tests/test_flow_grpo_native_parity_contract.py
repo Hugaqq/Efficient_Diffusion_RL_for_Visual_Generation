@@ -872,6 +872,23 @@ def test_cuda_determinism_configuration_is_fixed_and_rejects_drift(monkeypatch):
         harness._configure_cuda_determinism(fake)
 
 
+def test_native_case_seed_freezes_all_model_construction_rngs():
+    harness = _load_harness()
+
+    def draw():
+        return (
+            random.random(),
+            float(np.random.random()),
+            torch.rand(4),
+        )
+
+    harness._seed_native_case(41)
+    first = draw()
+    harness._seed_native_case(41)
+    second = draw()
+    assert harness._deep_equal(first, second)
+
+
 def test_resume_stage_preserves_result_and_identifies_failure():
     harness = _load_harness()
     assert harness._resume_stage("read", lambda: 17) == 17
