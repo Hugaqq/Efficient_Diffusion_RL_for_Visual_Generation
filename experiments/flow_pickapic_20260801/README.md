@@ -104,6 +104,30 @@ single update use the same policy. Those fields therefore cannot be used as a
 cross-step stability claim; the staged run must monitor gradient norms,
 frozen-reference KL, validation HPS, and an independent quality score.
 
+The stabilized seed-17 long run is frozen as five complete configurations:
+
+```text
+flow_pickapic_q100_stable_v2_seed17_s20.yaml
+flow_pickapic_q100_stable_v2_seed17_s40.yaml
+flow_pickapic_q100_stable_v2_seed17_s60.yaml
+flow_pickapic_q100_stable_v2_seed17_s80.yaml
+flow_pickapic_q100_stable_v2_seed17_s100.yaml
+```
+
+They share one output directory and one reward cache. The first configuration
+starts a fresh run; each later configuration resumes the same authoritative
+run and only raises `runtime.max_steps`. All training semantics are identical
+to the successful stable C20: two prompt groups per update, four samples per
+group, learning rate `1e-4`, beta `0.004`, BF16, and frozen-module CPU offload.
+Checkpoints are committed every 20 steps and the latest two are retained.
+
+No later stage starts automatically. At each boundary the run must pass public
+status/audit, publish finite gradient norms, keep the post-clip norm within the
+configured `1.0` limit, keep all reward groups non-degenerate, and avoid a
+runaway frozen-reference KL. The v2 validation protocol is then evaluated as a
+safety gate. The v3 final test remains unopened until the selected multi-seed
+checkpoints and final analysis rule are frozen.
+
 Expected allocation is exactly two RTX 5090 GPUs:
 
 - one physical GPU for the SD3 trainer;

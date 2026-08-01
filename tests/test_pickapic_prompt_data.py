@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import visual_rl as vr
@@ -330,6 +331,46 @@ def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
             8,
             3.0e-4,
         ),
+        "flow_pickapic_q100_stable_v2_seed17_s20.yaml": (
+            17,
+            20,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
+        "flow_pickapic_q100_stable_v2_seed17_s40.yaml": (
+            17,
+            40,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
+        "flow_pickapic_q100_stable_v2_seed17_s60.yaml": (
+            17,
+            60,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
+        "flow_pickapic_q100_stable_v2_seed17_s80.yaml": (
+            17,
+            80,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
+        "flow_pickapic_q100_stable_v2_seed17_s100.yaml": (
+            17,
+            100,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
     }
     assert {path.name for path in CONFIG_ROOT.glob("*.yaml")} == set(expected)
 
@@ -364,3 +405,60 @@ def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
         assert config.reward.cache_dir.is_relative_to(
             CONFIG_ROOT.parent / "reward_cache"
         )
+
+
+def test_pickapic_staged_seed17_configs_share_one_training_semantics() -> None:
+    stage_names = {
+        20: "flow_pickapic_q100_stable_v2_seed17_s20.yaml",
+        40: "flow_pickapic_q100_stable_v2_seed17_s40.yaml",
+        60: "flow_pickapic_q100_stable_v2_seed17_s60.yaml",
+        80: "flow_pickapic_q100_stable_v2_seed17_s80.yaml",
+        100: "flow_pickapic_q100_stable_v2_seed17_s100.yaml",
+    }
+    stages = {
+        step: vr.load(CONFIG_ROOT / name).resolve()
+        for step, name in stage_names.items()
+    }
+    stage20 = stages[20]
+    stable_c20 = vr.load(
+        CONFIG_ROOT / "flow_pickapic_c20_stable_v2_seed17.yaml"
+    ).resolve()
+
+    assert stage20.run == stable_c20.run
+    assert stage20.model == stable_c20.model
+    assert stage20.dataset == stable_c20.dataset
+    assert stage20.rollout == stable_c20.rollout
+    assert replace(
+        stage20.reward,
+        cache_dir=stable_c20.reward.cache_dir,
+    ) == stable_c20.reward
+    assert stage20.algorithm == stable_c20.algorithm
+    assert stage20.optimizer == stable_c20.optimizer
+    assert stage20.runtime == stable_c20.runtime
+    assert stage20.artifacts.preview_samples_per_event == (
+        stable_c20.artifacts.preview_samples_per_event
+    )
+
+    shared_output_dir = stage20.artifacts.output_dir
+    shared_cache_dir = stage20.reward.cache_dir
+    assert stage20.resume.from_ is None
+    assert stage20.artifacts.checkpoint_every == 20
+    assert stage20.artifacts.checkpoint_keep_last == 2
+
+    for step, config in stages.items():
+        assert config.runtime.max_steps == step
+        assert config.artifacts.output_dir == shared_output_dir
+        assert config.reward.cache_dir == shared_cache_dir
+        assert config.artifacts.checkpoint_every == 20
+        assert config.artifacts.checkpoint_keep_last == 2
+        if step == 20:
+            assert config.resume.from_ is None
+        else:
+            assert config.resume.from_ == shared_output_dir
+
+        normalized = replace(
+            config,
+            runtime=replace(config.runtime, max_steps=20),
+            resume=stage20.resume,
+        )
+        assert normalized == stage20
