@@ -57,5 +57,5 @@
     "path": "/mnt/data/v-qiaoqifan/visual_rl_runs/flow_pickapic_20260801/archives/flow_pickapic_c20_stable_v2_seed17_b758540_20260801.tar.gz",
     "sha256": "8bc4a55e1354ada7938d34fbe1763821f0abcc2ef9746d99296b1a0cdf64f2b7"
   },
-  "claim_boundary": "This is a bounded single-seed C20 promotion result for held-out HPS alignment, not a multi-seed Q100 or general visual-quality claim."
+  "claim_boundary": "This is a bounded single-seed C20 promotion result on the v2 validation HPS protocol, not an untouched final-test, multi-seed Q100, or general visual-quality claim."
 }
