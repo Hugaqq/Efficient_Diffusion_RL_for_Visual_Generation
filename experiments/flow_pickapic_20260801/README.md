@@ -6,10 +6,17 @@ v2.1 general reward on realistic prompts. It uses the public Python API only;
 
 The frozen prompt sources are:
 
-- training: `data/prompts/pickapic_sfw_q100_train_v1.txt` (100 prompts);
-- held-out evaluation: `data/prompts/pickapic_sfw_heldout_eval_v1.txt`
+- C20 diagnostic training: `data/prompts/pickapic_sfw_q100_train_v1.txt`
+  (100 prompts, preserved unchanged with the C20 evidence);
+- Q100 training: `data/prompts/pickapic_sfw_q100_train_v2.txt`
+  (100 prompts);
+- held-out evaluation: `data/prompts/pickapic_sfw_heldout_eval_v2.txt`
   (64 prompts);
-- provenance: `data/prompts/pickapic_sfw_provenance_v1.json`.
+- Q100/evaluation provenance: `data/prompts/pickapic_sfw_provenance_v2.json`.
+
+The v2 selection enforces both conditioning budgets before Q100 starts: at
+most 128 SD3/T5 tokens and at most 77 HPS/OpenCLIP tokens. This prevents the
+reward model from silently evaluating only a prefix of a longer SD3 prompt.
 
 The bounded C20 run is an engineering and learning-signal gate. It validates
 that BCHW SD3 images reach HPS, rewards are finite and non-constant within a
