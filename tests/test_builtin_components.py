@@ -78,7 +78,7 @@ GOLDEN_MATRIX = {
     ("reward", "prompt_color_guarded"): (set(), {"media.image"}, ("numpy",)),
     ("reward", "reward_general"): (
         set(),
-        {"media.video"},
+        set(),
         ("numpy", "PIL", "requests"),
     ),
     ("reward", "reward_3d"): (

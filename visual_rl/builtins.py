@@ -146,7 +146,6 @@ _BUILTIN_COMPONENTS: tuple[ComponentSpec, ...] = (
         kind="reward",
         name="reward_general",
         factory=WorldR1RewardGeneralClient,
-        requires=frozenset({"media.video"}),
         dependencies=("numpy", "PIL", "requests"),
     ),
     ComponentSpec(
