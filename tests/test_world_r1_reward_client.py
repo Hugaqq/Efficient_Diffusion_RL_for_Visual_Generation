@@ -151,6 +151,15 @@ def _batch(
     )
 
 
+def _image_batch(context: StepContext) -> RolloutBatch:
+    batch = _batch(context, frames=1, camera=False)
+    return replace(
+        batch,
+        media=batch.media[:, 0].contiguous(),
+        media_layout="BCHW",
+    )
+
+
 def _params(tmp_path: Path | None = None) -> dict[str, object]:
     return {
         "url": "http://127.0.0.1:8090/",
@@ -319,7 +328,9 @@ def test_general_score_uses_exact_json_middle_frame_and_no_camera() -> None:
     }
     assert request["sample_id"] == list(batch.sample_id)
     assert len(request["images"]) == batch.batch_size
-    assert all(base64.b64decode(item).startswith(b"\xff\xd8") for item in request["images"])
+    assert all(
+        base64.b64decode(item).startswith(b"\xff\xd8") for item in request["images"]
+    )
     assert result.sample_metadata[0]["selected_frame_index"] == 1
     assert session.posts[0][0] == "http://127.0.0.1:8090/v2/reward"
     assert session.posts[0][1]["allow_redirects"] is False
@@ -333,6 +344,27 @@ def test_general_score_uses_exact_json_middle_frame_and_no_camera() -> None:
     second = _Session(score_payload=_score_payload())
     _client(WorldR1RewardGeneralClient, second).score(changed_camera, context)
     assert _request_json(second)["images"] == request["images"]
+
+
+def test_general_score_accepts_sd3_bchw_image_media() -> None:
+    context = _context()
+    batch = _image_batch(context)
+    session = _Session(score_payload=_score_payload())
+
+    result = _client(WorldR1RewardGeneralClient, session).score(batch, context)
+    request = _request_json(session)
+
+    assert result.values.tolist() == [0.25, 0.75]
+    assert request["sample_id"] == list(batch.sample_id)
+    assert request["prompts"] == list(batch.prompts)
+    assert len(request["images"]) == batch.batch_size
+    assert all(
+        base64.b64decode(item).startswith(b"\xff\xd8") for item in request["images"]
+    )
+    assert result.sample_metadata == (
+        {"source_frame_count": 1, "selected_frame_index": 0},
+        {"source_frame_count": 1, "selected_frame_index": 0},
+    )
 
 
 def test_reward_3d_uses_all_frames_and_only_typed_camera() -> None:

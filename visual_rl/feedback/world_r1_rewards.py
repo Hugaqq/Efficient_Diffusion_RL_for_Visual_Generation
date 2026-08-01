@@ -330,12 +330,16 @@ class WorldR1RewardGeneralClient(_WorldR1RewardClient):
         self,
         batch: RolloutBatch,
     ) -> tuple[dict[str, object], tuple[Mapping[str, object], ...]]:
-        videos = _video_batch(batch)
-        frame_index = int(videos.shape[1] // 2)
-        images = [
-            _jpeg_base64(videos[row, frame_index])
-            for row in range(batch.batch_size)
-        ]
+        if batch.media_layout == "BCHW":
+            image_batch = _image_batch(batch)
+            frame_count = 1
+            frame_index = 0
+        else:
+            videos = _video_batch(batch)
+            frame_count = int(videos.shape[1])
+            frame_index = int(frame_count // 2)
+            image_batch = videos[:, frame_index]
+        images = [_jpeg_base64(image_batch[row]) for row in range(batch.batch_size)]
         payload: dict[str, object] = {
             "protocol_version": PROTOCOL_VERSION,
             "server_revision": self.server_revision,
@@ -345,7 +349,7 @@ class WorldR1RewardGeneralClient(_WorldR1RewardClient):
         }
         records = tuple(
             {
-                "source_frame_count": int(videos.shape[1]),
+                "source_frame_count": frame_count,
                 "selected_frame_index": frame_index,
             }
             for _ in batch.sample_id
@@ -647,6 +651,36 @@ def _video_batch(batch: RolloutBatch) -> np.ndarray:
         raise ValueError("World-R1 media must be finite")
     if array.size and (float(array.min()) < 0.0 or float(array.max()) > 1.0):
         raise ValueError("floating World-R1 media must be in [0, 1]")
+    return np.ascontiguousarray(np.rint(array * 255.0).astype(np.uint8))
+
+
+def _image_batch(batch: RolloutBatch) -> np.ndarray:
+    if batch.media_layout != "BCHW":
+        raise ValueError("general image reward requires BCHW image media")
+    media = batch.media
+    try:
+        import torch
+
+        if isinstance(media, torch.Tensor):
+            media = media.detach().to(device="cpu").numpy()
+    except ModuleNotFoundError:  # pragma: no cover - RolloutBatch requires torch
+        pass
+    array = np.asarray(media)
+    if array.ndim != 4 or array.shape[0] != batch.batch_size:
+        raise ValueError("general image reward media must have shape [B, C, H, W]")
+    if array.shape[1] != 3:
+        raise ValueError("BCHW general image reward media must have three RGB channels")
+    if array.shape[2] < 1 or array.shape[3] < 1:
+        raise ValueError("general image reward dimensions must be positive")
+    array = np.moveaxis(array, 1, -1)
+    if array.dtype == np.uint8:
+        return np.ascontiguousarray(array)
+    if not np.issubdtype(array.dtype, np.floating):
+        raise TypeError("general image reward media must be uint8 or floating point")
+    if not np.isfinite(array).all():
+        raise ValueError("general image reward media must be finite")
+    if array.size and (float(array.min()) < 0.0 or float(array.max()) > 1.0):
+        raise ValueError("floating general image reward media must be in [0, 1]")
     return np.ascontiguousarray(np.rint(array * 255.0).astype(np.uint8))
 
 
