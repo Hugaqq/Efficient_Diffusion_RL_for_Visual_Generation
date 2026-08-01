@@ -23,6 +23,29 @@ that BCHW SD3 images reach HPS, rewards are finite and non-constant within a
 group, gradients are finite/non-zero, twenty steps commit, and the final public
 status/audit pass. It is not evidence of a quality improvement.
 
+The original seed-17 Q100 is retained as failed evidence. It used one prompt
+group of eight samples per optimizer step at learning rate `3e-4`; its held-out
+HPS delta was `-0.20302` and its prompt win rate was zero. Do not resume it or
+launch the frozen seed-29/43 copies.
+
+`flow_pickapic_c20_stable_v2_seed17.yaml` is the replacement stability gate.
+It keeps eight generated samples per optimizer step, but divides them into two
+independent prompt groups of four so the update averages two prompt-specific
+advantages. It also lowers the learning rate to `1e-4`. All other important
+Flow objective and inference settings remain unchanged. This is a new run,
+not a mutation or continuation of the failed Q100.
+
+Promotion beyond this C20 requires all of the following:
+
+- twenty authoritative commits and passing status/audit;
+- finite, non-zero within-group reward standard deviation and gradients;
+- no late-window reward collapse or runaway frozen-reference KL;
+- paired held-out HPS point delta above zero using the frozen protocol below.
+
+The C20 result is only a tuning/promotion decision. A held-out quality claim
+still requires the pre-registered Q100 multi-seed gates; those gates are not
+relaxed by this stability run.
+
 The Q100 configurations are frozen before their first launch. A final quality
 claim additionally requires all three seeds and a paired step-0/final
 evaluation on the held-out prompts. Training reward alone is not sufficient.
@@ -55,6 +78,13 @@ Run one configuration after starting the local reward service:
 ```text
 python experiments/flow_pickapic_20260801/run_with_api.py \
   experiments/flow_pickapic_20260801/configs/flow_pickapic_c20_seed17.yaml
+```
+
+Run the replacement stability configuration with:
+
+```text
+python experiments/flow_pickapic_20260801/run_with_api.py \
+  experiments/flow_pickapic_20260801/configs/flow_pickapic_c20_stable_v2_seed17.yaml
 ```
 
 Run the frozen read-only baseline evaluation before Q100:

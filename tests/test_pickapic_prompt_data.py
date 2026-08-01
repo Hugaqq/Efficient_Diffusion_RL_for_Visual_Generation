@@ -134,17 +134,57 @@ def test_pickapic_v2_subsets_fit_sd3_and_hps_token_budgets() -> None:
 
 def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
     expected = {
-        "flow_pickapic_c20_seed17.yaml": (17, 20, TRAIN_PATH),
-        "flow_pickapic_q100_seed17.yaml": (17, 100, TRAIN_V2_PATH),
-        "flow_pickapic_q100_seed29.yaml": (29, 100, TRAIN_V2_PATH),
-        "flow_pickapic_q100_seed43.yaml": (43, 100, TRAIN_V2_PATH),
+        "flow_pickapic_c20_seed17.yaml": (
+            17,
+            20,
+            TRAIN_PATH,
+            1,
+            8,
+            3.0e-4,
+        ),
+        "flow_pickapic_c20_stable_v2_seed17.yaml": (
+            17,
+            20,
+            TRAIN_V2_PATH,
+            2,
+            4,
+            1.0e-4,
+        ),
+        "flow_pickapic_q100_seed17.yaml": (
+            17,
+            100,
+            TRAIN_V2_PATH,
+            1,
+            8,
+            3.0e-4,
+        ),
+        "flow_pickapic_q100_seed29.yaml": (
+            29,
+            100,
+            TRAIN_V2_PATH,
+            1,
+            8,
+            3.0e-4,
+        ),
+        "flow_pickapic_q100_seed43.yaml": (
+            43,
+            100,
+            TRAIN_V2_PATH,
+            1,
+            8,
+            3.0e-4,
+        ),
     }
     assert {path.name for path in CONFIG_ROOT.glob("*.yaml")} == set(expected)
 
-    for name, (seed, steps, dataset_path) in expected.items():
+    for name, values in expected.items():
+        seed, steps, dataset_path, prompt_batch_size, group_size, learning_rate = (
+            values
+        )
         config = vr.load(CONFIG_ROOT / name).resolve()
         assert config.run.seed == seed
         assert config.runtime.max_steps == steps
+        assert config.runtime.batch_size == prompt_batch_size
         assert config.runtime.precision == "bf16"
         assert config.runtime.distributed.mode == "single"
         assert config.model.name == "sd3_tempflow"
@@ -153,13 +193,15 @@ def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
         assert config.dataset.sampling_seed == seed
         assert config.rollout.name == "full_trajectory"
         assert config.rollout.params["num_steps"] == 20
-        assert config.rollout.params["samples_per_prompt"] == 8
+        assert config.rollout.params["samples_per_prompt"] == group_size
+        assert prompt_batch_size * group_size == 8
         assert [item.name for item in config.reward.components] == ["reward_general"]
         assert config.reward.components[0].params["server_revision"] == (
             "world-r1-e156b02bc171"
         )
         assert config.algorithm.name == "grpo"
         assert config.algorithm.params["beta"] == 0.004
+        assert config.optimizer.learning_rate == learning_rate
         targets = config.model.params["lora_target_modules"]
         assert len(targets) == len(set(targets)) == 8
         assert config.artifacts.output_dir.is_relative_to(CONFIG_ROOT.parent / "runs")
