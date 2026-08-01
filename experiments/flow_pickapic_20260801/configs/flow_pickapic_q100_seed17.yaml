@@ -29,7 +29,7 @@ model:
     policy_forward_microbatch_size: 1
 
 dataset:
-  path: ../../../data/prompts/pickapic_sfw_q100_train_v1.txt
+  path: ../../../data/prompts/pickapic_sfw_q100_train_v2.txt
   prompts: null
   split: train
   repeat_per_prompt: 1

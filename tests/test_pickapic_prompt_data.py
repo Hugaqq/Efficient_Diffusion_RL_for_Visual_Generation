@@ -9,7 +9,9 @@ from pathlib import Path
 import visual_rl as vr
 from experiments.v0_7.prepare_pickapic_sfw import (
     EVAL_BIN_COUNTS,
+    MAX_HPS_CLIP_TOKENS,
     MAX_T5_TOKENS,
+    OUTPUT_VERSION,
     SELECTION_SEED,
     SOURCE_COMMIT,
     SOURCE_REPOSITORY,
@@ -18,12 +20,14 @@ from experiments.v0_7.prepare_pickapic_sfw import (
     _length_bin,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_ROOT = ROOT / "data" / "prompts"
 TRAIN_PATH = PROMPT_ROOT / "pickapic_sfw_q100_train_v1.txt"
 HELDOUT_PATH = PROMPT_ROOT / "pickapic_sfw_heldout_eval_v1.txt"
 PROVENANCE_PATH = PROMPT_ROOT / "pickapic_sfw_provenance_v1.json"
+TRAIN_V2_PATH = PROMPT_ROOT / "pickapic_sfw_q100_train_v2.txt"
+HELDOUT_V2_PATH = PROMPT_ROOT / "pickapic_sfw_heldout_eval_v2.txt"
+PROVENANCE_V2_PATH = PROMPT_ROOT / "pickapic_sfw_provenance_v2.json"
 CONFIG_ROOT = ROOT / "experiments" / "flow_pickapic_20260801" / "configs"
 
 
@@ -81,16 +85,63 @@ def test_pickapic_prompt_subsets_match_frozen_provenance() -> None:
     }
 
 
+def test_pickapic_v2_subsets_fit_sd3_and_hps_token_budgets() -> None:
+    manifest = json.loads(PROVENANCE_V2_PATH.read_text(encoding="utf-8"))
+    train = _prompts(TRAIN_V2_PATH)
+    heldout = _prompts(HELDOUT_V2_PATH)
+
+    assert len(train) == len(set(train)) == 100
+    assert len(heldout) == len(set(heldout)) == 64
+    assert not set(train).intersection(heldout)
+    assert all(prompt and len(prompt.split()) >= 6 for prompt in train + heldout)
+    assert _bin_counts(train) == TRAIN_BIN_COUNTS
+    assert _bin_counts(heldout) == EVAL_BIN_COUNTS
+
+    assert manifest["schema_version"] == OUTPUT_VERSION == 2
+    assert manifest["source"] == {
+        "repository": SOURCE_REPOSITORY,
+        "commit": SOURCE_COMMIT,
+        "train_rows": 15486,
+        "train_sha256": SOURCE_SHA256["train"],
+        "test_rows": 1024,
+        "test_sha256": SOURCE_SHA256["test"],
+    }
+    selection = manifest["selection"]
+    assert selection["seed"] == SELECTION_SEED
+    assert selection["maximum_t5_tokens"] == MAX_T5_TOKENS
+    assert selection["maximum_hps_clip_tokens"] == MAX_HPS_CLIP_TOKENS
+    assert selection["t5_tokenizer_class"] == "T5Tokenizer"
+    assert selection["hps_clip_tokenizer_class"] == "CLIPTokenizer"
+    assert manifest["outputs"]["q100_train"] == {
+        "count": 100,
+        "length_bins": TRAIN_BIN_COUNTS,
+        "max_t5_tokens": 89,
+        "min_t5_tokens": 8,
+        "max_hps_clip_tokens": 72,
+        "min_hps_clip_tokens": 8,
+        "sha256": _sha256(TRAIN_V2_PATH),
+    }
+    assert manifest["outputs"]["heldout_eval"] == {
+        "count": 64,
+        "length_bins": EVAL_BIN_COUNTS,
+        "max_t5_tokens": 100,
+        "min_t5_tokens": 9,
+        "max_hps_clip_tokens": 75,
+        "min_hps_clip_tokens": 8,
+        "sha256": _sha256(HELDOUT_V2_PATH),
+    }
+
+
 def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
     expected = {
-        "flow_pickapic_c20_seed17.yaml": (17, 20),
-        "flow_pickapic_q100_seed17.yaml": (17, 100),
-        "flow_pickapic_q100_seed29.yaml": (29, 100),
-        "flow_pickapic_q100_seed43.yaml": (43, 100),
+        "flow_pickapic_c20_seed17.yaml": (17, 20, TRAIN_PATH),
+        "flow_pickapic_q100_seed17.yaml": (17, 100, TRAIN_V2_PATH),
+        "flow_pickapic_q100_seed29.yaml": (29, 100, TRAIN_V2_PATH),
+        "flow_pickapic_q100_seed43.yaml": (43, 100, TRAIN_V2_PATH),
     }
     assert {path.name for path in CONFIG_ROOT.glob("*.yaml")} == set(expected)
 
-    for name, (seed, steps) in expected.items():
+    for name, (seed, steps, dataset_path) in expected.items():
         config = vr.load(CONFIG_ROOT / name).resolve()
         assert config.run.seed == seed
         assert config.runtime.max_steps == steps
@@ -98,7 +149,7 @@ def test_pickapic_flow_configs_resolve_to_one_training_contract() -> None:
         assert config.runtime.distributed.mode == "single"
         assert config.model.name == "sd3_tempflow"
         assert config.model.params["offload_frozen_modules_during_update"] is True
-        assert config.dataset.path == TRAIN_PATH.resolve()
+        assert config.dataset.path == dataset_path.resolve()
         assert config.dataset.sampling_seed == seed
         assert config.rollout.name == "full_trajectory"
         assert config.rollout.params["num_steps"] == 20

@@ -1,4 +1,10 @@
-"""Freeze deterministic prompt-only Pick-a-Pic subsets for Flow-GRPO runs."""
+"""Freeze deterministic prompt-only Pick-a-Pic subsets for Flow-GRPO runs.
+
+Version 2 keeps every prompt within both conditioning token budgets used by
+the experiment: SD3's T5 encoder (128 tokens) and the HPS/OpenCLIP reward
+encoder (77 tokens).  The earlier v1 files remain immutable evidence for the
+bounded C20 diagnostic and are not overwritten by this script.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,6 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
-
 
 SOURCE_REPOSITORY = "https://github.com/yifan123/flow_grpo"
 SOURCE_COMMIT = "879042cf5707f8b90daa98d147d7deac2317c5da"
@@ -19,6 +24,8 @@ TRAIN_BIN_COUNTS = {"medium": 30, "long": 40, "very_long": 30}
 EVAL_BIN_COUNTS = {"medium": 20, "long": 24, "very_long": 20}
 SELECTION_SEED = 729
 MAX_T5_TOKENS = 128
+MAX_HPS_CLIP_TOKENS = 77
+OUTPUT_VERSION = 2
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -58,40 +65,57 @@ def _length_bin(prompt: str) -> str:
 
 
 def _rank(prompt: str, *, split: str) -> str:
-    return _sha256_bytes(f"{SELECTION_SEED}:{split}:{prompt}".encode("utf-8"))
+    return _sha256_bytes(f"{SELECTION_SEED}:{split}:{prompt}".encode())
 
 
 def _eligible(
     prompts: tuple[str, ...],
     *,
-    tokenizer: Any,
+    t5_tokenizer: Any,
+    hps_clip_tokenizer: Any,
     excluded: frozenset[str],
-) -> tuple[tuple[str, int, str], ...]:
-    rows: list[tuple[str, int, str]] = []
+) -> tuple[tuple[str, int, int, str], ...]:
+    rows: list[tuple[str, int, int, str]] = []
     for prompt in prompts:
         if prompt in excluded or len(prompt.split()) < 6:
             continue
-        token_ids = tokenizer(
+        t5_token_ids = t5_tokenizer(
             prompt,
             add_special_tokens=True,
             truncation=False,
         )["input_ids"]
-        token_count = len(token_ids)
-        if token_count <= MAX_T5_TOKENS:
-            rows.append((prompt, token_count, _length_bin(prompt)))
+        hps_clip_token_ids = hps_clip_tokenizer(
+            prompt,
+            add_special_tokens=True,
+            truncation=False,
+        )["input_ids"]
+        t5_token_count = len(t5_token_ids)
+        hps_clip_token_count = len(hps_clip_token_ids)
+        if (
+            t5_token_count <= MAX_T5_TOKENS
+            and hps_clip_token_count <= MAX_HPS_CLIP_TOKENS
+        ):
+            rows.append(
+                (
+                    prompt,
+                    t5_token_count,
+                    hps_clip_token_count,
+                    _length_bin(prompt),
+                )
+            )
     return tuple(rows)
 
 
 def _select(
-    rows: tuple[tuple[str, int, str], ...],
+    rows: tuple[tuple[str, int, int, str], ...],
     *,
     split: str,
     counts: dict[str, int],
-) -> tuple[tuple[str, int, str], ...]:
-    selected: list[tuple[str, int, str]] = []
+) -> tuple[tuple[str, int, int, str], ...]:
+    selected: list[tuple[str, int, int, str]] = []
     for length_bin, count in counts.items():
         candidates = sorted(
-            (row for row in rows if row[2] == length_bin),
+            (row for row in rows if row[3] == length_bin),
             key=lambda row: _rank(row[0], split=split),
         )
         if len(candidates) < count:
@@ -103,27 +127,39 @@ def _select(
     return tuple(sorted(selected, key=lambda row: _rank(row[0], split=split)))
 
 
-def _write_prompts(path: Path, rows: tuple[tuple[str, int, str], ...]) -> str:
-    payload = "".join(f"{prompt}\n" for prompt, _tokens, _bin in rows).encode("utf-8")
+def _write_prompts(
+    path: Path,
+    rows: tuple[tuple[str, int, int, str], ...],
+) -> str:
+    payload = "".join(
+        f"{prompt}\n"
+        for prompt, _t5_tokens, _hps_tokens, _bin in rows
+    ).encode("utf-8")
     path.write_bytes(payload)
     return _sha256_bytes(payload)
 
 
 def _summary(
-    rows: tuple[tuple[str, int, str], ...],
+    rows: tuple[tuple[str, int, int, str], ...],
     *,
     sha256: str,
 ) -> dict[str, object]:
     bins = {
-        name: sum(length_bin == name for _prompt, _tokens, length_bin in rows)
+        name: sum(
+            length_bin == name
+            for _prompt, _t5_tokens, _hps_tokens, length_bin in rows
+        )
         for name in ("medium", "long", "very_long")
     }
-    token_counts = [tokens for _prompt, tokens, _bin in rows]
+    t5_token_counts = [tokens for _prompt, tokens, _hps, _bin in rows]
+    hps_token_counts = [tokens for _prompt, _t5, tokens, _bin in rows]
     return {
         "count": len(rows),
         "length_bins": bins,
-        "max_t5_tokens": max(token_counts),
-        "min_t5_tokens": min(token_counts),
+        "max_t5_tokens": max(t5_token_counts),
+        "min_t5_tokens": min(t5_token_counts),
+        "max_hps_clip_tokens": max(hps_token_counts),
+        "min_hps_clip_tokens": min(hps_token_counts),
         "sha256": sha256,
     }
 
@@ -145,13 +181,25 @@ def prepare(
         source_test,
         expected_sha256=SOURCE_SHA256["test"],
     )
-    tokenizer = AutoTokenizer.from_pretrained(
+    t5_tokenizer = AutoTokenizer.from_pretrained(
         model_checkpoint / "tokenizer_3",
         local_files_only=True,
     )
-    tokenizer_fingerprint = _sha256_bytes(
+    hps_clip_tokenizer = AutoTokenizer.from_pretrained(
+        model_checkpoint / "tokenizer",
+        local_files_only=True,
+    )
+    t5_tokenizer_fingerprint = _sha256_bytes(
         json.dumps(
-            tokenizer.get_vocab(),
+            t5_tokenizer.get_vocab(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    hps_clip_tokenizer_fingerprint = _sha256_bytes(
+        json.dumps(
+            hps_clip_tokenizer.get_vocab(),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -159,13 +207,18 @@ def prepare(
     )
     train_eligible = _eligible(
         train_source,
-        tokenizer=tokenizer,
+        t5_tokenizer=t5_tokenizer,
+        hps_clip_tokenizer=hps_clip_tokenizer,
         excluded=frozenset(),
     )
     test_eligible = _eligible(
         test_source,
-        tokenizer=tokenizer,
-        excluded=frozenset(prompt for prompt, _tokens, _bin in train_eligible),
+        t5_tokenizer=t5_tokenizer,
+        hps_clip_tokenizer=hps_clip_tokenizer,
+        excluded=frozenset(
+            prompt
+            for prompt, _t5_tokens, _hps_tokens, _bin in train_eligible
+        ),
     )
     train_rows = _select(
         train_eligible,
@@ -181,12 +234,12 @@ def prepare(
         raise RuntimeError("train and heldout prompt selections overlap")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_path = output_dir / "pickapic_sfw_q100_train_v1.txt"
-    eval_path = output_dir / "pickapic_sfw_heldout_eval_v1.txt"
+    train_path = output_dir / "pickapic_sfw_q100_train_v2.txt"
+    eval_path = output_dir / "pickapic_sfw_heldout_eval_v2.txt"
     train_sha256 = _write_prompts(train_path, train_rows)
     eval_sha256 = _write_prompts(eval_path, eval_rows)
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": OUTPUT_VERSION,
         "source": {
             "repository": SOURCE_REPOSITORY,
             "commit": SOURCE_COMMIT,
@@ -199,15 +252,20 @@ def prepare(
             "seed": SELECTION_SEED,
             "minimum_words": 6,
             "maximum_t5_tokens": MAX_T5_TOKENS,
-            "tokenizer_class": type(tokenizer).__name__,
-            "tokenizer_vocab_sha256": tokenizer_fingerprint,
+            "maximum_hps_clip_tokens": MAX_HPS_CLIP_TOKENS,
+            "t5_tokenizer_class": type(t5_tokenizer).__name__,
+            "t5_tokenizer_vocab_sha256": t5_tokenizer_fingerprint,
+            "hps_clip_tokenizer_class": type(hps_clip_tokenizer).__name__,
+            "hps_clip_tokenizer_vocab_sha256": (
+                hps_clip_tokenizer_fingerprint
+            ),
         },
         "outputs": {
             "q100_train": _summary(train_rows, sha256=train_sha256),
             "heldout_eval": _summary(eval_rows, sha256=eval_sha256),
         },
     }
-    manifest_path = output_dir / "pickapic_sfw_provenance_v1.json"
+    manifest_path = output_dir / "pickapic_sfw_provenance_v2.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
