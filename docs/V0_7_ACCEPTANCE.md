@@ -1,6 +1,6 @@
 # VisualRL v0.7 acceptance
 
-Updated: 2026-07-31
+Updated: 2026-08-01
 
 This document separates source readiness from real execution evidence. `not_run`
 is not a pass, a skip interpreted as success, or a quality claim.
@@ -13,7 +13,7 @@ is not a pass, a skip interpreted as success, or a quality claim.
 | Q100 offline tooling | 3,600-row synthetic fixture, fixed generator, boundary/non-finite/missing-step/sample-count/prompt-balance/isolation/byte-stability tests | `verified locally` |
 | Wheel checker source | standard-library synthetic archive/metadata/RECORD tests | `verified locally` |
 | Real Flow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
-| Real Flow native parity | W04 14-item CUDA one-shot numerical result | `not_run` |
+| Real Flow native parity | W04 14-item CUDA one-shot numerical result | `pass` on clean wheel from `67e7b1704c8fea732bba89f946d60913ea877b9b`; final all-gate candidate identity still pending |
 | Real TempFlow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
 | Real Flash-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
 | Real World-R1 C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
@@ -29,6 +29,11 @@ The engineering-wheel results above are independently recorded in
 bounded runtime statements listed there, but their dirty-candidate identity
 cannot satisfy the final evidence identity below and cannot advance Q100 or
 release gates.
+
+The Flow native result is a separate clean-wheel oracle run. It closes the
+standalone numerical gate, but it does not by itself satisfy the final
+same-commit envelope, which still requires every other real gate to bind to
+one final candidate.
 
 ## Frozen correctness order
 

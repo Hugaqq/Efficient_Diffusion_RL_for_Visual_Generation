@@ -1,14 +1,16 @@
 # VisualRL v0.7 operational C20 evidence
 
-Updated: 2026-07-31
+Updated: 2026-08-01
 
 This document records bounded, real-model engineering evidence for the four
 v0.7 recipes. It is intentionally separate from the clean-candidate release
 envelope in [V0_7_ACCEPTANCE.md](V0_7_ACCEPTANCE.md).
 
-The runs below prove only the stated operational properties. They do not count
-as the still-pending Flow FP32 native-parity gate, Q100 reward-improvement
-evidence, MG1/NCCL evidence, or the final clean-commit release gate.
+The runs below prove only the stated operational properties. The later
+clean-wheel Flow FP32 native-parity result is recorded separately and does not
+upgrade these dirty-candidate C20 runs into final release evidence. Q100
+reward-improvement evidence, MG1/NCCL evidence, and the final same-commit
+release envelope remain incomplete.
 
 ## Candidate and environment
 
@@ -28,6 +30,39 @@ All four C20 configurations enable gradient checkpointing and
 enable VAE tiling. Frozen text encoders and the VAE move to CPU before
 policy recompute/backward; the trainable transformer/LoRA remains on the
 training GPU.
+
+## Flow native FP32 parity
+
+The standalone Flow-GRPO native oracle passed from a clean committed source and
+an isolated wheel installation:
+
+- source commit: `67e7b1704c8fea732bba89f946d60913ea877b9b`;
+- source archive SHA-256:
+  `abcb604a268036ae2a61ea41a6e70dea8aad4d37b246da3aa5a4b6c9e95fd914`;
+- installed wheel SHA-256:
+  `2ca088fc955c717c551055e22077ac766879bcc6440debfb1ba976119418e29a`;
+- frozen native reference commit:
+  `63e4def7159940ba7d60e4e6250eee868342388c`;
+- report SHA-256:
+  `4b27527de8f5ccd0d4cbbe15bc0e77fd7cda1de5c39004ec6a983170fbbaae4c`;
+- precision: FP32; result: 14 / 14 items passed;
+- gradient tensors: 764 / 764 passed;
+- parameter deltas: 382 / 382 passed, maximum absolute delta
+  `6.811126240791054e-07`;
+- checkpoint/resume invariants: 7 / 7 passed;
+- peak GPU memory: 24,821 MiB; monitored duration: 719 seconds.
+
+The durable canonical report is:
+
+```text
+/mnt/data/v-qiaoqifan/visual_rl_runs/flow_pickapic_20260801/
+native_parity/67e7b17-clean-wheel/report.json
+```
+
+No `PYTHONPATH` or source-tree import was used for the formal run. This proves
+the frozen one-shot tensor, gradient, parameter-update, and fresh-resume
+contracts against the native reference. It does not prove BF16 long-horizon
+quality improvement or the final all-gate candidate identity.
 
 ## Completed recipes
 
@@ -145,14 +180,13 @@ clipped-surrogate objective and authoritative commit lifecycle.
 | Flash C20 and resume parity | 20-step public audit, matching checkpoint/projection digest, non-zero optimizer moments | pass |
 | World-R1 C20 and resume parity | 20-step public audit, byte-identical checkpoint state and matching projection digest | pass |
 | Wheel-only World-R1 service startup | non-source cwd, no `PYTHONPATH`, installed-wheel module origin, health plus real finite 3D score | pass |
-| Current local package gate | 658 passed / 7 environment skips; Ruff `E4,E7,E9,F`, compileall, wheel contract, isolated install, `pip check`, outside-repository import | pass |
+| Current local package gate | 676 passed / 7 environment skips; Ruff `E4,E7,E9,F`, compileall, wheel contract, isolated install, `pip check`, outside-repository import | pass |
 
 ## Remaining evidence
 
 The following remain incomplete and must not be inferred from the operational
-C20 rows:
+C20 rows or the standalone native oracle:
 
-- Flow-GRPO 14-item FP32 native CUDA parity;
 - Q100 runs and multi-seed reward-improvement verdicts;
 - MG1 real NCCL evidence;
-- a clean-commit wheel and final release evidence envelope.
+- the final same-commit release evidence envelope.

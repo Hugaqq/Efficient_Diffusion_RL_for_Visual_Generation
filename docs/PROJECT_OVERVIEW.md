@@ -56,7 +56,7 @@ PromptDataset
 
 | 方向 | 组合 | 当前源码状态 | 真实实验状态 |
 |---|---|---|---|
-| Flow-GRPO | SD3.5 + full trajectory | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
+| Flow-GRPO | SD3.5 + full trajectory | 已接入统一 objective | BF16 operational C20 与 clean-wheel FP32 14-item native parity 通过；质量与最终 release gate 待完成 |
 | TempFlow-GRPO | SD3.5 + branching | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
 | Flash-GRPO | Wan2.1 + single step | 已接入统一 objective | BF16 operational C20 通过；正式 release gate 待运行 |
 | World-R1 | Wan2.1 + strict reward service | 已接入统一主线 | BF16 operational C20 通过；正式 release gate 待运行 |
@@ -65,10 +65,11 @@ PromptDataset
 本地全仓自动化、Tiny single/Gloo API smoke 和基础 wheel 隔离安装已经通过。
 四条真实 C20 的 checkpoint、public audit、continuous/resume semantic parity
 和 32 GB 显存证据见
-[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)。这些证据来自
-dirty engineering candidate；Q100、Flow native CUDA parity、MG1/NCCL 和
-最终 clean-candidate envelope 尚未运行。源码准备、synthetic fixture、Gloo、
-基础 wheel 测试或单次 C20 都不能替代尚未获得的结论。
+[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)。四条 C20
+证据来自 dirty engineering candidate；Flow native CUDA parity 已经由独立
+clean wheel 通过，但 Q100 多 seed、MG1/NCCL 和最终 same-commit envelope
+尚未完成。源码准备、synthetic fixture、Gloo、基础 wheel 测试、单次 C20
+或独立 native oracle 都不能替代尚未获得的结论。
 
 完整范围与明确排除项见 [V0_7_SCOPE.md](V0_7_SCOPE.md)。
 

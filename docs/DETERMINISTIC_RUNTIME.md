@@ -52,8 +52,8 @@ W04 已对 Tiny/SD3 reference statistics 和数值合同完成本地测试。Flo
 TempFlow、Flash 和 World-R1 的 BF16 operational C20 已在真实 RTX 5090
 上完成 continuous/interrupted-resume semantic parity，详见
 [V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)。Flow native
-FP32 CUDA、Q100、MG1/NCCL 和 clean-candidate release evidence 仍是
-`not_run`，因此不能把 operational C20 外推成逐 tensor native parity 或完整
-设备确定性结论。
+FP32 CUDA 的 clean-wheel 14-item oracle 已通过；Q100 多 seed、MG1/NCCL 和
+最终 same-commit release evidence 仍未完成。因此不能把一次 native oracle
+或 operational C20 外推成 BF16 长训练质量、完整设备确定性或最终发布结论。
 
 实验与发布状态见 [v0.7 acceptance](V0_7_ACCEPTANCE.md)。
