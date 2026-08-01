@@ -64,7 +64,7 @@ the frozen one-shot tensor, gradient, parameter-update, and fresh-resume
 contracts against the native reference. It does not prove BF16 long-horizon
 quality improvement or the final all-gate candidate identity.
 
-## Flow held-out HPS C20 promotion gate
+## Flow validation HPS C20 promotion gate
 
 The stabilized Flow/Pick-a-Pic C20 configuration also completed from a clean
 source archive and isolated wheel installation:
@@ -82,7 +82,7 @@ source archive and isolated wheel installation:
 - monitored trainer peak: 24,873 MiB on one RTX 5090; a second RTX 5090 ran
   the HPS service.
 
-The frozen 64-prompt, two-seed paired evaluation contained 128 observations.
+The frozen 64-prompt, two-seed paired validation contained 128 observations.
 Mean HPS changed from `0.2895917892` to `0.2915687561`; the paired delta was
 `+0.0019769669`, the prompt-cluster bootstrap 95% CI was
 `[+0.0003795385, +0.0036850214]`, and 56.25% of prompts improved. Both
@@ -92,8 +92,10 @@ The machine-readable summary is
 [`../experiments/flow_pickapic_20260801/evidence/flow_pickapic_c20_stable_v2_seed17.json`](../experiments/flow_pickapic_20260801/evidence/flow_pickapic_c20_stable_v2_seed17.json).
 The durable archive SHA-256 is
 `8bc4a55e1354ada7938d34fbe1763821f0abcc2ef9746d99296b1a0cdf64f2b7`.
-This result proves only the bounded single-seed HPS promotion gate. It does not
-upgrade the experiment to a multi-seed Q100 or general visual-quality claim.
+This result proves only the bounded single-seed HPS promotion gate. The same
+v2 prompts participated in the promotion decision and are therefore validation,
+not the untouched final test. The result does not upgrade the experiment to a
+multi-seed Q100 or general visual-quality claim.
 
 ## Completed recipes
 
