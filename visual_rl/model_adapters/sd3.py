@@ -58,6 +58,8 @@ _PROMPT_PAYLOAD_KEYS = (
     "negative_prompt_embeds",
     "negative_pooled_prompt_embeds",
 )
+_SCHEDULER_TIMESTEPS_KEY = "sd3_scheduler_timesteps"
+_SCHEDULER_SIGMAS_KEY = "sd3_scheduler_sigmas"
 
 
 class SD3TempFlowAdapter(ModelAdapter):
@@ -381,6 +383,14 @@ class SD3TempFlowAdapter(ModelAdapter):
                 strict=True,
             )
         }
+        payload.update(
+            _scheduler_recompute_payload(
+                self.pipeline.scheduler,
+                batch_size=len(request.prompts),
+                expected=request.num_steps,
+                device=log_probs.device,
+            )
+        )
         return RolloutBatch(
             prompts=request.prompts,
             metadata=request.metadata,
@@ -535,6 +545,14 @@ class SD3TempFlowAdapter(ModelAdapter):
                 ).detach()
             ),
         }
+        payload.update(
+            _scheduler_recompute_payload(
+                self.pipeline.scheduler,
+                batch_size=len(request.prompts),
+                expected=request.num_steps,
+                device=log_tensor.device,
+            )
+        )
         branch_tensor = torch.tensor(
             request.branch_step_index,
             dtype=torch.int64,
@@ -577,6 +595,12 @@ class SD3TempFlowAdapter(ModelAdapter):
         self._ensure_loaded()
         self._offload_frozen_modules_for_update()
         self._activate_policy_module()
+        _restore_scheduler_from_recompute_payload(
+            self.pipeline.scheduler,
+            batch.recompute_payload,
+            batch_size=batch.batch_size,
+            device=self.device,
+        )
         payload = []
         for key in _PROMPT_PAYLOAD_KEYS:
             value = batch.recompute_payload.get(key)
@@ -1383,6 +1407,95 @@ def _scheduler_timesteps(
         batch_size,
         expected,
     ).clone()
+
+
+def _scheduler_recompute_payload(
+    scheduler: object,
+    *,
+    batch_size: int,
+    expected: int,
+    device: object,
+) -> dict[str, Any]:
+    """Freeze the inference schedule needed by stateless policy recompute."""
+
+    import torch
+
+    timesteps = _scheduler_values(scheduler, expected=expected).to(device=device)
+    sigmas = torch.as_tensor(getattr(scheduler, "sigmas", None)).reshape(-1)
+    if sigmas.numel() != expected + 1:
+        raise RunError(f"SD3 scheduler must expose {expected + 1} sigmas")
+    if not bool(torch.isfinite(timesteps).all()) or not bool(
+        torch.isfinite(sigmas).all()
+    ):
+        raise RunError("SD3 scheduler recompute state must be finite")
+    return {
+        _SCHEDULER_TIMESTEPS_KEY: timesteps[None, :]
+        .expand(batch_size, expected)
+        .clone()
+        .detach(),
+        _SCHEDULER_SIGMAS_KEY: sigmas.to(device=device)[None, :]
+        .expand(batch_size, expected + 1)
+        .clone()
+        .detach(),
+    }
+
+
+def _restore_scheduler_from_recompute_payload(
+    scheduler: object,
+    payload: Mapping[str, Any],
+    *,
+    batch_size: int,
+    device: object,
+) -> None:
+    """Restore one shared SD3 schedule when recomputing on a fresh adapter."""
+
+    import torch
+
+    has_timesteps = _SCHEDULER_TIMESTEPS_KEY in payload
+    has_sigmas = _SCHEDULER_SIGMAS_KEY in payload
+    if not has_timesteps and not has_sigmas:
+        # Backward-compatible batches may rely on the adapter that sampled
+        # them.  All newly produced SD3 batches carry the explicit schedule.
+        return
+    if has_timesteps != has_sigmas:
+        raise RunError("SD3 recompute payload has an incomplete scheduler state")
+    timesteps = payload[_SCHEDULER_TIMESTEPS_KEY]
+    sigmas = payload[_SCHEDULER_SIGMAS_KEY]
+    if (
+        not isinstance(timesteps, torch.Tensor)
+        or not isinstance(sigmas, torch.Tensor)
+        or timesteps.ndim != 2
+        or sigmas.ndim != 2
+        or timesteps.shape[0] != batch_size
+        or sigmas.shape[0] != batch_size
+        or timesteps.shape[1] < 1
+        or sigmas.shape[1] != timesteps.shape[1] + 1
+    ):
+        raise RunError("SD3 recompute scheduler state has invalid shape")
+    canonical_timesteps = timesteps[:1].expand_as(timesteps)
+    canonical_sigmas = sigmas[:1].expand_as(sigmas)
+    if not torch.equal(timesteps, canonical_timesteps) or not torch.equal(
+        sigmas,
+        canonical_sigmas,
+    ):
+        raise RunError("SD3 recompute rows must share one scheduler state")
+    if not bool(torch.isfinite(timesteps).all()) or not bool(
+        torch.isfinite(sigmas).all()
+    ):
+        raise RunError("SD3 recompute scheduler state must be finite")
+
+    existing_sigmas = torch.as_tensor(getattr(scheduler, "sigmas", None))
+    sigma_device = existing_sigmas.device
+    sigma_dtype = existing_sigmas.dtype
+    scheduler.timesteps = timesteps[0].to(device=device).contiguous()
+    scheduler.sigmas = sigmas[0].to(
+        device=sigma_device,
+        dtype=sigma_dtype,
+    ).contiguous()
+    if hasattr(scheduler, "_step_index"):
+        scheduler._step_index = None
+    if hasattr(scheduler, "_begin_index"):
+        scheduler._begin_index = None
 
 
 def _group_layout(
