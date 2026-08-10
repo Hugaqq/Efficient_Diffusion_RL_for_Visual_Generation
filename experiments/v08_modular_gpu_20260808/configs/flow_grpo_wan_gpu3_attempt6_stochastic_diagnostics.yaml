@@ -1,0 +1,89 @@
+schema_version: 2
+recipe: flow_grpo_v1
+
+# One-step engineering diagnostic for the explicit stochastic Wan Dynamics
+# binding. This run is isolated from the earlier deterministic-action failures
+# and is not frozen 20-step evidence.
+overrides:
+  algorithm:
+    params:
+      beta: 0.0
+      advantage_epsilon: 1.0e-4
+      advantage_std_domain: group
+      clip_range: 1.0e-3
+  model:
+    id: wan-t2v
+    params:
+      artifact_ref: main
+      max_sequence_length: 512
+  rewards:
+    reward_quality:
+      id: video-general
+      params:
+        resource:
+          schema_version: 1
+          factory_class: reward_general
+          artifact_ref: reward_general
+          protocol: world_r1_json
+          protocol_version: strict_v2
+          semantic_factory_config:
+            server_revision_expectation: world-r1-8e46b1b63498
+            input_selection_policy:
+              schema_version: 1
+              domain: video_frame
+              candidate_indices: all
+              selection: keyed_uniform
+              sharing: batch
+              seed_derivation_schema: sha256_rejection_v1
+          allowed_runtime_policy:
+            allowed_devices: [cpu]
+            allowed_dtypes: [fp32]
+            allowed_worker_domains: [remote]
+  sources:
+    main:
+      selector: prompt-video
+      artifact_ref: main
+      artifact_kind: file
+      format: text
+  training:
+    seed: 43
+    global_prompt_batch_size: 1
+    max_optimizer_steps: 1
+    gradient_accumulation_steps: 1
+    policy_recompute:
+      row_microbatch_size: 1
+      transition_window_size: 1
+    adamw:
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-4
+    lr_schedule:
+      warmup_steps: 0
+  execution:
+    precision: bf16
+    distribution_mode: single
+    group_size: 4
+    rollout:
+      forward_microbatch_size: 1
+      decode_microbatch_size: 1
+      trajectory_storage_device: cpu
+
+launch:
+  output_dir: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/runs/flow-wan-gpu3-attempt6-stochastic-diagnostics
+  resume_from: null
+  checkpoint_every_optimizer_steps: 1
+  reward_runtime_bindings:
+    reward_general:
+      execution_domain: remote
+      device: cpu
+      dtype: fp32
+      endpoint: http://127.0.0.1:8093
+      timeout_s: 1830.0
+      trusted_hosts: [127.0.0.1]
+      ca_bundle: null
+      max_response_bytes: 8388608
+  artifacts:
+    model: /dev/shm/v-qiaoqifan/visualrl-v08-models/Wan2.1-T2V-1.3B-Diffusers
+    datasets:
+      main: /dev/shm/v-qiaoqifan/visualrl-v08-wan-stochastic-20260808-1815-source/data/prompts/geneval_rgb_train_36.txt
+    rewards:
+      reward_general: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/reward_receipts/general-8e46b1b63498-diagnostic

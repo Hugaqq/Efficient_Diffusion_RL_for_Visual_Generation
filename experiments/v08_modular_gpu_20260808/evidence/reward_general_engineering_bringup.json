@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "world_r1_engineering_bringup_reward_evidence",
+  "evidence_class": "engineering_bringup_not_release",
+  "reward": "reward_general",
+  "deployment": {
+    "kind": "source_tree",
+    "server_revision": "world-r1-2173e1e166a3",
+    "service_implementation_sha256": "2173e1e166a36d561a31ce71529630944209ba9f4e95dab41e0c0e9a0a55e696"
+  },
+  "resource": {
+    "kind": "hps_checkpoint",
+    "byte_count": 1972490005,
+    "content_sha256": "c57a38fb4a2f7e7c15bf00da2ea377cdf165448b4dd1052a484c215a998c9837"
+  },
+  "receipts": {
+    "health": {
+      "filename": "health.json",
+      "sha256": "b45e9d00bbbb84df935b89786b8eb1d57eda0b12bf6c457d7786805f4a248016"
+    },
+    "score": {
+      "filename": "score.json",
+      "sha256": "c4eeeeffc46ce77ec6692cdee9217b3ae4517dfb66e14216ed85db11bac67ead"
+    }
+  }
+}

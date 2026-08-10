@@ -8,7 +8,6 @@ model:
   adapter_checkpoint: null
   params:
     checkpoint: ../checkpoints/Wan2.1-T2V-1.3B-Diffusers
-    reference_repo: ../reference_code/World-R1-main
     lora_rank: 32
     lora_alpha: 64
     lora_target_modules: [to_q, to_k, to_v, to_out.0]
@@ -16,9 +15,11 @@ model:
     guidance_scale: 5.0
     height: 480
     width: 832
-    max_sequence_length: 226
+    max_sequence_length: 512
     local_files_only: true
     low_cpu_mem_usage: true
+    offload_frozen_modules_during_update: true
+    vae_tiling: true
 
 dataset:
   path: ../data/prompts/world_r1_camera_v1.txt
@@ -41,12 +42,12 @@ reward:
     - name: reward_general
       weight: 1.0
       params:
-        url: http://127.0.0.1:8089
+        url: http://127.0.0.1:8090
         timeout_s: 1830.0
         trusted_hosts: [127.0.0.1]
         ca_bundle: null
         max_response_bytes: 8388608
-        server_revision: world-r1-0123456789ab
+        server_revision: world-r1-e156b02bc171
     - name: reward_3d
       weight: 1.0
       params:
@@ -55,7 +56,7 @@ reward:
         trusted_hosts: [127.0.0.1]
         ca_bundle: null
         max_response_bytes: 8388608
-        server_revision: world-r1-0123456789ab
+        server_revision: world-r1-e156b02bc171
   execution:
     microbatch_size: 2
     max_retries: 1
@@ -87,6 +88,7 @@ runtime:
   batch_size: 2
   precision: bf16
   update_microbatch_size: 2
+  transition_microbatch_size: 1
   deterministic: true
   progress: true
   distributed:

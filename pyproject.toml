@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-rl"
-version = "0.7.0"
+version = "0.8.0"
 description = "Unified Diffusion RL infrastructure for visual generation."
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
@@ -35,11 +35,48 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["visual_rl*"]
+include = ["visual_rl*", "services.world_r1_strict*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"services.world_r1_strict" = [
+  "README.md",
+  "requirements-service.txt",
+  "licenses/*",
+  "native/assets/*",
+  "native/depth_anything_3/configs/*.yaml",
+]
+
+[tool.setuptools.data-files]
+"share/doc/visual-rl" = ["THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["reference_code", "third_party", ".git", ".venv", "runs"]
 markers = [
   "distributed: tests requiring local multi-process torch.distributed loopback sockets",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve the bundled, revision-pinned upstream service source byte-for-byte.
+"services/world_r1_strict/native/depth_anything_3/model/dinov2/vision_transformer.py" = ["F401"]
+"services/world_r1_strict/native/depth_anything_3/utils/api_helpers.py" = ["E741"]
+"services/world_r1_strict/native/depth_anything_3/utils/export/colmap.py" = ["F401"]
+"services/world_r1_strict/native/depth_anything_3/utils/parallel_utils.py" = ["E731"]
+"services/world_r1_strict/native/reward_3d.py" = ["E722"]
+"services/world_r1_strict/native/reward_3d_backend.py" = ["F401"]
+# Preserve the bundled World-R1-derived numerical source without stylistic rewrites.
+"visual_rl/algorithms/conditioning/camera_math.py" = [
+  "B006",
+  "B018",
+  "C408",
+  "F841",
+  "I001",
+  "RUF046",
+  "RUF059",
+  "SIM114",
+  "UP006",
+  "UP007",
+  "UP035",
+  "UP045",
 ]

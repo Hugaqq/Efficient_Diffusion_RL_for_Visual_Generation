@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
 import hashlib
 import json
+import math
 import multiprocessing
 import os
-from pathlib import Path, PurePosixPath
 import secrets
 import signal
 import socket
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
+from pathlib import Path, PurePosixPath
 
 import visual_rl as vr
 
@@ -60,6 +61,7 @@ class RoleSpec:
     expected_exit: int
     lineage_head: str
     world_size: int
+    run_timeout_s: float
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,19 @@ def _role(
     expected_exit: int = 0,
     lineage_head: str | None = None,
     world_size: int = 1,
+    run_timeout_s: float | None = None,
 ) -> RoleSpec:
+    if run_timeout_s is None:
+        if family == "tiny_s100":
+            run_timeout_s = 600.0
+        elif family == "mg1_tiny_grpo":
+            run_timeout_s = 900.0
+        elif phase == "q100":
+            run_timeout_s = 86_400.0
+        else:
+            run_timeout_s = 14_400.0
+    if not math.isfinite(run_timeout_s) or run_timeout_s <= 0.0:
+        raise ValueError("run_timeout_s must be finite and positive")
     return RoleSpec(
         name=name,
         family=family,
@@ -111,6 +125,7 @@ def _role(
         expected_exit=expected_exit,
         lineage_head=lineage_head or name,
         world_size=world_size,
+        run_timeout_s=run_timeout_s,
     )
 
 
@@ -412,10 +427,18 @@ def _run_role(
                 )
 
                 if spec.phase == "interrupted":
-                    _interrupt_at_marker(identity, output_dir, spec.target_steps)
-                child.join(timeout=30.0)
+                    _interrupt_at_marker(
+                        identity,
+                        output_dir,
+                        spec.target_steps,
+                        timeout_s=spec.run_timeout_s,
+                    )
+                child.join(timeout=spec.run_timeout_s)
                 if child.is_alive():
-                    raise TimeoutError(f"{spec.name} did not exit after its run")
+                    raise TimeoutError(
+                        f"{spec.name} did not exit within "
+                        f"{spec.run_timeout_s:.0f} seconds"
+                    )
                 exit_code = int(
                     child.exitcode if child.exitcode is not None else 1
                 )

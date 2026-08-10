@@ -1,6 +1,6 @@
 # VisualRL v0.7 acceptance
 
-Updated: 2026-07-29
+Updated: 2026-08-01
 
 This document separates source readiness from real execution evidence. `not_run`
 is not a pass, a skip interpreted as success, or a quality claim.
@@ -12,17 +12,28 @@ is not a pass, a skip interpreted as success, or a quality claim.
 | W06 source/config/controller | 30 resolving full YAML files, sole API callsite, exact readiness schemas, fail-closed gates/evidence writers, process cleanup tests | `verified locally` |
 | Q100 offline tooling | 3,600-row synthetic fixture, fixed generator, boundary/non-finite/missing-step/sample-count/prompt-balance/isolation/byte-stability tests | `verified locally` |
 | Wheel checker source | standard-library synthetic archive/metadata/RECORD tests | `verified locally` |
-| Real Flow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `not_run` |
-| Real Flow native parity | W04 14-item CUDA one-shot numerical result | `not_run` |
-| Real TempFlow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `not_run` |
-| Real Flash-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `not_run` |
-| Real World-R1 C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `not_run` |
+| Real Flow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
+| Real Flow native parity | W04 14-item CUDA one-shot numerical result | `pass` on clean wheel from `67e7b1704c8fea732bba89f946d60913ea877b9b`; final all-gate candidate identity still pending |
+| Real TempFlow-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
+| Real Flash-GRPO C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
+| Real World-R1 C20 correctness | continuous, interrupted, fresh resume, public audit and semantic parity | `operational pass on engineering wheel`; clean-candidate evidence pending |
 | Q100 evidence completeness | four algorithms x seeds 17/29/43, 100 committed audited steps | `not_run` |
 | Q100 reward improvement | preregistered pooled/seed/Theil-Sen gates after evidence completeness | `not_run` |
 | MG1 internal NCCL | three fixed two-rank NCCL failure/correctness tests | `not_run` |
 | MG1 Tiny C20 | two-GPU continuous, interrupted, fresh resume | `not_run` |
 | Candidate wheel build/install | unique wheel, checker pass, clean install, outside-repository import; Tiny single/resume/Gloo public API smoke | `verified locally` |
-| Remote execution/upload | authorized clean-commit execution and curated evidence transfer | `not_run` |
+| Remote execution/upload | authorized clean-commit execution and curated evidence transfer | engineering execution/partial durable transfer complete; clean-commit envelope `not_run` |
+
+The engineering-wheel results above are independently recorded in
+[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md). They prove the
+bounded runtime statements listed there, but their dirty-candidate identity
+cannot satisfy the final evidence identity below and cannot advance Q100 or
+release gates.
+
+The Flow native result is a separate clean-wheel oracle run. It closes the
+standalone numerical gate, but it does not by itself satisfy the final
+same-commit envelope, which still requires every other real gate to bind to
+one final candidate.
 
 ## Frozen correctness order
 
@@ -83,7 +94,8 @@ conda run -n visual-rl python -m pytest -q \
   tests/test_v0_7_offline_aggregate.py \
   tests/test_wheel_contract.py
 
-conda run -n visual-rl ruff check experiments/v0_7 \
+conda run -n visual-rl ruff check --select E4,E7,E9,F \
+  experiments/v0_7 \
   scripts/verify_wheel_contract.py \
   tests/test_v0_7_experiment_tools.py \
   tests/test_v0_7_offline_aggregate.py \
@@ -105,7 +117,7 @@ The final candidate is accepted locally only when this whole sequence passes on
 one clean commit:
 
 ```text
-compileall + Ruff + git diff --check
+compileall + Ruff `E4,E7,E9,F` + git diff --check
 full pytest excluding the dedicated API smoke
 dedicated Tiny single/resume/Gloo API smoke
 python -m build
@@ -115,5 +127,6 @@ outside-repository python -I import
 ```
 
 This verifies local orchestration and base-package installation only. It does
-not change any real GPU/NCCL, C20/Q100, reward-improvement, remote-execution, or
-upload row above from `not_run`.
+not upgrade an operational engineering run to clean-candidate evidence and
+does not change any pending GPU/NCCL, Q100, reward-improvement or final upload
+gate.

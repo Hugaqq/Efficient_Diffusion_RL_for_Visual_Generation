@@ -1,0 +1,61 @@
+# Bounded 20-step A7 candidate. The separate phase gate retains 150 steps.
+schema_version: 2
+recipe: world_r1_release_surrogate_v1
+
+overrides:
+  model:
+    params:
+      max_sequence_length: 512
+  training:
+    seed: 31
+    global_prompt_batch_size: 2
+    max_optimizer_steps: 20
+    gradient_accumulation_steps: 1
+    policy_recompute:
+      row_microbatch_size: 1
+      transition_window_size: 1
+    adamw:
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-4
+    lr_schedule:
+      warmup_steps: 0
+  execution:
+    precision: bf16
+    distribution_mode: single
+    group_size: 4
+    rollout:
+      forward_microbatch_size: 1
+      decode_microbatch_size: 1
+      trajectory_storage_device: cpu
+
+launch:
+  output_dir: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/runs/a7-candidate-56507f-world-r1-release-surrogate-wan
+  resume_from: null
+  checkpoint_every_optimizer_steps: 10
+  reward_runtime_bindings:
+    reward_3d:
+      execution_domain: remote
+      device: cpu
+      dtype: fp32
+      endpoint: http://127.0.0.1:8092
+      timeout_s: 1830.0
+      trusted_hosts: [127.0.0.1]
+      ca_bundle: null
+      max_response_bytes: 8388608
+    reward_general:
+      execution_domain: remote
+      device: cpu
+      dtype: fp32
+      endpoint: http://127.0.0.1:8093
+      timeout_s: 1830.0
+      trusted_hosts: [127.0.0.1]
+      ca_bundle: null
+      max_response_bytes: 8388608
+  artifacts:
+    model: /dev/shm/v-qiaoqifan/visualrl-v08-models/Wan2.1-T2V-1.3B-Diffusers
+    datasets:
+      dynamic: /dev/shm/v-qiaoqifan/visualrl-v08-candidate-56507f6e-source/data/prompts/world_r1_dynamic_v1.txt
+      main: /dev/shm/v-qiaoqifan/visualrl-v08-candidate-56507f6e-source/data/prompts/world_r1_camera_v1.txt
+    rewards:
+      reward_3d: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/reward_receipts/3d-8e46b1b63498-diagnostic
+      reward_general: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/reward_receipts/general-8e46b1b63498-diagnostic

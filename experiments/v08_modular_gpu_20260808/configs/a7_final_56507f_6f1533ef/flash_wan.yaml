@@ -1,0 +1,55 @@
+# Bounded A7 candidate for code identity 56507f6e. Not final until promoted.
+schema_version: 2
+recipe: flash_grpo_v1
+
+overrides:
+  algorithm:
+    params:
+      candidate_timestep_window: [0, 10]
+      selection_key: prompt
+      selection_domain: single_process
+  model:
+    params:
+      max_sequence_length: 512
+  training:
+    seed: 29
+    global_prompt_batch_size: 2
+    max_optimizer_steps: 20
+    gradient_accumulation_steps: 1
+    policy_recompute:
+      row_microbatch_size: 1
+      transition_window_size: 1
+    adamw:
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-4
+    lr_schedule:
+      warmup_steps: 0
+  execution:
+    precision: bf16
+    distribution_mode: single
+    group_size: 4
+    rollout:
+      forward_microbatch_size: 1
+      decode_microbatch_size: 1
+      trajectory_storage_device: cpu
+
+launch:
+  output_dir: /dev/shm/v-qiaoqifan/visualrl-v08-a7-final-56507f-6f1533ef/runs/flash-wan
+  resume_from: null
+  checkpoint_every_optimizer_steps: 10
+  reward_runtime_bindings:
+    reward_general:
+      execution_domain: remote
+      device: cpu
+      dtype: fp32
+      endpoint: http://127.0.0.1:8093
+      timeout_s: 1830.0
+      trusted_hosts: [127.0.0.1]
+      ca_bundle: null
+      max_response_bytes: 8388608
+  artifacts:
+    model: /dev/shm/v-qiaoqifan/visualrl-v08-models/Wan2.1-T2V-1.3B-Diffusers
+    datasets:
+      main: /dev/shm/v-qiaoqifan/visualrl-v08-candidate-56507f6e-source/data/prompts/geneval_rgb_train_36.txt
+    rewards:
+      reward_general: /mnt/data/v-qiaoqifan/visual_rl_runs/v08_modular_gpu_20260808/reward_artifacts/world-r1-general-8e46b1b63498-wheel-6f1533ef

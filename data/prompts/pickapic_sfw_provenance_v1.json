@@ -1,0 +1,42 @@
+{
+  "outputs": {
+    "heldout_eval": {
+      "count": 64,
+      "length_bins": {
+        "long": 24,
+        "medium": 20,
+        "very_long": 20
+      },
+      "max_t5_tokens": 125,
+      "min_t5_tokens": 9,
+      "sha256": "6aa8a006cfd220d5137f0907b74984d931031772fbf700bc36c9cc7f44b17f20"
+    },
+    "q100_train": {
+      "count": 100,
+      "length_bins": {
+        "long": 40,
+        "medium": 30,
+        "very_long": 30
+      },
+      "max_t5_tokens": 123,
+      "min_t5_tokens": 8,
+      "sha256": "5cd021b179bd9881cf6c054d8f334af5bcbdcaeeddaee563135b35969718d9d1"
+    }
+  },
+  "schema_version": 1,
+  "selection": {
+    "maximum_t5_tokens": 128,
+    "minimum_words": 6,
+    "seed": 729,
+    "tokenizer_class": "T5Tokenizer",
+    "tokenizer_vocab_sha256": "3e4dac4c480136f1337a43a23a00b56e92b10e1e65483bb718ceb971eef2aa14"
+  },
+  "source": {
+    "commit": "879042cf5707f8b90daa98d147d7deac2317c5da",
+    "repository": "https://github.com/yifan123/flow_grpo",
+    "test_rows": 1024,
+    "test_sha256": "d839050acb06aa045e399e76a81e4ade9a55fc743dc0e22e7b3eaeaca5c19107",
+    "train_rows": 15486,
+    "train_sha256": "edb46f78d7d93df0bafb30568074463822312ee339200f627195ccb2ff1d2f7a"
+  }
+}

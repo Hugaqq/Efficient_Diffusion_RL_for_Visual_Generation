@@ -1,34 +1,47 @@
 """Contract tests for the World-R1 strict companion service.
 
 Uses the Flask test client with fake strict/legacy managers for protocol and
-fail-closed coverage, static artifact checks for the frozen
-requirements/env/README/patch files, and one real Gunicorn subprocess test for
-the worker_exit -> manager shutdown lifecycle wiring.  No GPU, no real model,
-no real World-R1 checkout.
+fail-closed coverage, static artifact checks for the bundled native service,
+and one real Gunicorn subprocess test for lifecycle supervision and manager
+shutdown wiring. No GPU or real model is required.
 """
 
 from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import http.client
 import json
 import multiprocessing
 import os
-from pathlib import Path
-import re
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from visual_rl.world_r1_protocol import (
+from services.world_r1_strict import (
+    gunicorn_conf,
+    manager_liveness,
+    process_supervision,
+    reference_contract,
+    reward_3d_app,
+    reward_general_app,
+)
+from services.world_r1_strict.native import general_reward
+from services.world_r1_strict.pose_alignment import (
+    align_camera_extrinsics,
+    is_degenerate_umeyama_error,
+)
+from services.world_r1_strict.service_revision import BUNDLED_SERVICE_REVISION
+from visual_rl.core.protocols.world_r1 import (
     ERROR_COMPUTE_FAILED,
     ERROR_MANAGER_NOT_READY,
     ERROR_REVISION_MISMATCH,
@@ -42,8 +55,6 @@ from visual_rl.world_r1_protocol import (
     encode_json,
     validate_score_response,
 )
-from services.world_r1_strict import gunicorn_conf, reference_contract
-from services.world_r1_strict import reward_3d_app, reward_general_app
 
 try:
     import flask  # noqa: F401
@@ -55,10 +66,12 @@ except ModuleNotFoundError:  # pragma: no cover - dev extra provides flask
 _HAS_GUNICORN = subprocess.run(
     [sys.executable, "-c", "import gunicorn"],
     capture_output=True,
+    check=False,
 ).returncode == 0
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PATCH_PATH = REPO_ROOT / "services/world_r1_strict/reference_patches/world_r1_fail_closed_v1.patch"
+NATIVE_ROOT = REPO_ROOT / "services/world_r1_strict/native"
+LICENSE_ROOT = REPO_ROOT / "services/world_r1_strict/licenses"
 REQUIREMENTS_PATH = REPO_ROOT / "services/world_r1_strict/requirements-service.txt"
 ENV_PATH = REPO_ROOT / "envs/world-r1-reward-cu128.yml"
 README_PATH = REPO_ROOT / "services/world_r1_strict/README.md"
@@ -81,6 +94,114 @@ ASYMMETRIC_4X4 = [
 ]
 
 requires_flask = pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+
+
+def _degenerate_geometry_error(message: str = "Degenerate covariance rank"):
+    error_type = type(
+        "GeometryException",
+        (Exception,),
+        {"__module__": "evo.core.geometry"},
+    )
+    return error_type(message)
+
+
+def test_degenerate_umeyama_path_keeps_unaligned_poses_and_marks_zero_credit():
+    predicted = object()
+
+    def align_fn(*args, **kwargs):
+        del args, kwargs
+        raise _degenerate_geometry_error()
+
+    resolved, is_degenerate = align_camera_extrinsics(
+        align_fn,
+        object(),
+        predicted,
+        ransac=True,
+    )
+
+    assert resolved is predicted
+    assert is_degenerate is True
+    assert is_degenerate_umeyama_error(_degenerate_geometry_error())
+
+
+def test_non_geometric_pose_alignment_failure_remains_fail_closed():
+    def align_fn(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("alignment implementation failed")
+
+    with pytest.raises(RuntimeError, match="alignment implementation failed"):
+        align_camera_extrinsics(
+            align_fn,
+            object(),
+            object(),
+            ransac=False,
+        )
+
+
+def test_successful_pose_alignment_is_unchanged():
+    aligned = object()
+    calls = []
+
+    def align_fn(target, predicted, **kwargs):
+        calls.append((target, predicted, kwargs))
+        return object(), object(), object(), aligned
+
+    target = object()
+    predicted = object()
+    resolved, is_degenerate = align_camera_extrinsics(
+        align_fn,
+        target,
+        predicted,
+        ransac=True,
+    )
+
+    assert resolved is aligned
+    assert is_degenerate is False
+    assert calls == [
+        (
+            target,
+            predicted,
+            {"return_aligned": True, "ransac": True},
+        )
+    ]
+
+
+def test_bundled_hps_tokenizer_repairs_omitted_wheel_resource(
+    tmp_path,
+    monkeypatch,
+):
+    package_root = tmp_path / "hpsv2"
+    target_root = package_root / "src" / "open_clip"
+    target_root.mkdir(parents=True)
+    package_init = package_root / "__init__.py"
+    package_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        general_reward.importlib.util,
+        "find_spec",
+        lambda name: (
+            SimpleNamespace(origin=str(package_init)) if name == "hpsv2" else None
+        ),
+    )
+
+    general_reward._install_bundled_hps_bpe()
+    target = target_root / general_reward._HPS_BPE_NAME
+    assert target.stat().st_size == general_reward._HPS_BPE_SIZE
+    assert (
+        general_reward._file_sha256(target)
+        == general_reward._HPS_BPE_SHA256
+    )
+
+    general_reward._install_bundled_hps_bpe()
+    target.write_bytes(b"corrupt")
+    with pytest.raises(RuntimeError, match="wrong size"):
+        general_reward._install_bundled_hps_bpe()
+
+
+def test_real_general_manager_passes_native_fault_injection_gate():
+    reference_contract.run_native_fault_injection_gate(
+        general_reward.MultiGPUGeneralRewardManager,
+        reward=REWARD_GENERAL,
+    )
 
 
 def _drain_registry() -> None:
@@ -172,6 +293,43 @@ class LegacyManagerDouble:
 
     def shutdown(self) -> None:
         self.shutdown_count += 1
+
+
+class _WorkerStateDouble:
+    """Process-shaped double for independent alive/exitcode health checks."""
+
+    def __init__(self, *, alive: bool, exitcode: int | None, pid: int = 1234):
+        self.alive = alive
+        self.exitcode = exitcode
+        self.pid = pid
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.alive = False
+
+    def kill(self) -> None:
+        self.alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+        self.alive = False
+
+
+class _NativeWorkerManagerDouble(FakeStrictManager):
+    """Strict manager double exposing the native worker supervision surface."""
+
+    def __init__(self, *, workers, reward: str | None = None):
+        super().__init__(reward=reward)
+        self._closed = False
+        self._workers = list(workers)
+        self.num_gpus = len(self._workers)
+
+    def shutdown(self) -> None:
+        self._closed = True
+        self._ready = False
+        super().shutdown()
 
 
 def _b64(raw: bytes) -> str:
@@ -276,6 +434,101 @@ def test_health_503_until_manager_ready():
     response = app.test_client().get(HEALTH_ROUTE)
     assert response.status_code == 503
     assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+
+
+@requires_flask
+@pytest.mark.parametrize(
+    ("alive", "exitcode", "worker_reason"),
+    [
+        (True, 70, "worker_exited"),
+        (False, -15, "worker_exited"),
+    ],
+    ids=("zombie-exitcode", "terminated"),
+)
+def test_general_health_fails_when_a_worker_is_not_running_cleanly(
+    alive,
+    exitcode,
+    worker_reason,
+):
+    healthy_worker = _WorkerStateDouble(alive=True, exitcode=None)
+    worker = _WorkerStateDouble(alive=True, exitcode=None, pid=5678)
+    manager = _NativeWorkerManagerDouble(workers=[healthy_worker, worker])
+    app = reward_general_app.create_app(manager=manager, server_revision=REVISION)
+    client = app.test_client()
+
+    assert client.get(HEALTH_ROUTE).status_code == 200
+    worker.alive = alive
+    worker.exitcode = exitcode
+
+    response = client.get(HEALTH_ROUTE)
+    assert response.status_code == 503
+    assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+    score = _post(client, _general_payload())
+    assert score.status_code == 503
+    assert manager.compute_calls == 0
+    status = manager_liveness.readiness_status(manager)
+    assert status["ready"] is False
+    assert status["reason"] == "worker_unhealthy"
+    assert status["expected_workers"] == status["actual_workers"] == 2
+    assert status["workers"][0]["healthy"] is True
+    assert status["workers"][1] == {
+        "slot": 1,
+        "pid": 5678,
+        "alive": alive,
+        "exitcode": exitcode,
+        "healthy": False,
+        "reason": worker_reason,
+        "errors": (),
+    }
+
+
+@requires_flask
+@pytest.mark.parametrize(
+    ("alive", "exitcode", "worker_reason"),
+    [
+        (True, 70, "worker_exited"),
+        (False, -15, "worker_exited"),
+    ],
+    ids=("zombie-exitcode", "terminated"),
+)
+def test_3d_health_fails_when_a_worker_is_not_running_cleanly(
+    alive,
+    exitcode,
+    worker_reason,
+):
+    healthy_worker = _WorkerStateDouble(alive=True, exitcode=None)
+    worker = _WorkerStateDouble(alive=True, exitcode=None, pid=5678)
+    manager = _NativeWorkerManagerDouble(
+        workers=[healthy_worker, worker],
+        reward=REWARD_3D,
+    )
+    app = reward_3d_app.create_app(manager=manager, server_revision=REVISION_3D)
+    client = app.test_client()
+
+    assert client.get(HEALTH_ROUTE).status_code == 200
+    worker.alive = alive
+    worker.exitcode = exitcode
+
+    response = client.get(HEALTH_ROUTE)
+    assert response.status_code == 503
+    assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+    score = _post(client, _3d_payload())
+    assert score.status_code == 503
+    assert manager.compute_calls == 0
+    status = manager_liveness.readiness_status(manager)
+    assert status["ready"] is False
+    assert status["reason"] == "worker_unhealthy"
+    assert status["expected_workers"] == status["actual_workers"] == 2
+    assert status["workers"][0]["healthy"] is True
+    assert status["workers"][1] == {
+        "slot": 1,
+        "pid": 5678,
+        "alive": alive,
+        "exitcode": exitcode,
+        "healthy": False,
+        "reason": worker_reason,
+        "errors": (),
+    }
 
 
 @requires_flask
@@ -447,7 +700,7 @@ def test_pid_change_rejects_request_and_closes_inherited_manager(monkeypatch):
 @requires_flask
 def test_build_app_runs_gates_constructor_initialize_exactly_once(monkeypatch):
     calls: list = []
-    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", REVISION)
+    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", BUNDLED_SERVICE_REVISION)
     monkeypatch.setattr(
         reference_contract, "require_service_runtime", lambda: calls.append("runtime")
     )
@@ -484,7 +737,7 @@ def test_build_app_runs_gates_constructor_initialize_exactly_once(monkeypatch):
 @requires_flask
 def test_build_app_runtime_gate_failure_precedes_manager_import(monkeypatch):
     calls: list = []
-    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", REVISION)
+    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", BUNDLED_SERVICE_REVISION)
 
     def failing_runtime():
         calls.append("runtime")
@@ -502,8 +755,44 @@ def test_build_app_runtime_gate_failure_precedes_manager_import(monkeypatch):
 
 
 @requires_flask
+def test_build_app_restores_signal_handlers_overwritten_by_native_import(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "WORLD_R1_SERVER_REVISION",
+        BUNDLED_SERVICE_REVISION,
+    )
+    monkeypatch.setattr(reference_contract, "require_service_runtime", lambda: None)
+    monkeypatch.setattr(
+        reference_contract,
+        "run_native_fault_injection_gate",
+        lambda cls, *, reward: None,
+    )
+    original = signal.getsignal(signal.SIGTERM)
+
+    class SignalClobberManager(FakeStrictManager):
+        def initialize(self):
+            return None
+
+    def clobbering_loader():
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        return SignalClobberManager
+
+    monkeypatch.setattr(
+        reward_general_app,
+        "_load_manager_class",
+        clobbering_loader,
+    )
+    try:
+        reward_general_app.build_app()
+        assert signal.getsignal(signal.SIGTERM) is original
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+@requires_flask
 def test_build_app_initialize_failure_cleans_up_once(monkeypatch):
-    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", REVISION_3D)
+    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", BUNDLED_SERVICE_REVISION)
     monkeypatch.setattr(reference_contract, "require_service_runtime", lambda: None)
     monkeypatch.setattr(
         reference_contract, "run_native_fault_injection_gate", lambda cls, *, reward: None
@@ -532,6 +821,17 @@ def test_build_app_initialize_failure_cleans_up_once(monkeypatch):
     with pytest.raises(RuntimeError, match="INIT_ERROR"):
         reward_3d_app.build_app()
     assert manager_instance[0].shutdown_count == 1
+
+
+def test_build_app_rejects_revision_not_owned_by_bundled_source(monkeypatch):
+    monkeypatch.setenv("WORLD_R1_SERVER_REVISION", REVISION)
+    monkeypatch.setattr(
+        reference_contract,
+        "require_service_runtime",
+        lambda: pytest.fail("runtime gate must not run for a stale revision"),
+    )
+    with pytest.raises(WorldR1ProtocolError, match="bundled service source"):
+        reward_general_app.build_app()
 
 
 @requires_flask
@@ -593,23 +893,22 @@ def test_repeated_manual_cleanup_and_wrong_pid_are_idempotent():
 
 
 # ---------------------------------------------------------------------------
-# Static artifact contracts (patch, requirements, env, README, gunicorn_conf)
+# Static artifact contracts (native source, requirements, env, README, gunicorn_conf)
 # ---------------------------------------------------------------------------
 
 
-def test_reference_patch_targets_exact_native_files_and_fail_closed_surface():
-    text = PATCH_PATH.read_text(encoding="utf-8")
-    targets = set(re.findall(r"^diff --git a/(\S+) b/\S+$", text, re.MULTILINE))
-    assert targets == {
-        "reward_server/general_reward.py",
-        "reward_server/reward_3d.py",
-        "reward_server/reward_3d_backend.py",
+def test_bundled_native_service_is_fail_closed_and_has_no_external_code_import():
+    sources = {
+        path.relative_to(NATIVE_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in NATIVE_ROOT.rglob("*.py")
     }
-    added = "\n".join(
-        line[1:]
-        for line in text.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    )
+    assert {
+        "general_reward.py",
+        "reward_3d.py",
+        "reward_3d_backend.py",
+        "depth_anything_3/api.py",
+    } <= set(sources)
+    combined = "\n".join(sources.values())
     for marker in (
         'STRICT_MANAGER_PROTOCOL = "world_r1_fail_closed_v1"',
         "STRICT_REWARD_KIND",
@@ -626,20 +925,131 @@ def test_reference_patch_targets_exact_native_files_and_fail_closed_surface():
         "StrictRewardTimeoutError",
         "StrictRewardDecodeError",
     ):
-        assert marker in added, f"patch is missing {marker!r}"
-    assert "ThreadPoolExecutor" not in added
-    assert "= 0.5" not in added
-    assert "append(0.0)" not in added
+        assert marker in combined, f"bundled service is missing {marker!r}"
+    assert "from reward_server" not in combined
+    assert "import reward_server" not in combined
+    assert "from flow_grpo" not in combined
+    assert "import flow_grpo" not in combined
+    assert ".generate(" not in sources["reward_3d.py"]
+    assert '"Qwen/Qwen3-VL-4B-Instruct"' not in combined
+    assert '"depth-anything/" + "DA3-GIANT"' not in combined
+    assert "WORLD_R1_HPS_CHECKPOINT" in sources["general_reward.py"]
+    assert "pretrained=None" in sources["general_reward.py"]
+    assert "torch.autocast" not in sources["general_reward.py"]
+    assert sources["general_reward.py"].count(
+        "outputs = self._model(image_batch, text_batch)"
+    ) == 1
+    assert "img_score" not in sources["general_reward.py"]
+    assert "hf_hub_download" not in sources["general_reward.py"]
+    assert "WORLD_R1_QWEN_MODEL" in sources["reward_3d.py"]
+    assert "WORLD_R1_DA3_MODEL" in sources["reward_3d.py"]
+    assert "WORLD_R1_LPIPS_ALEXNET_CHECKPOINT" in sources["reward_3d.py"]
+    assert "pnet_rand=True" in sources["reward_3d.py"]
+    assert "LPIPS(net=\"alex\")" not in sources["reward_3d.py"]
+    assert "StopIteration" not in sources["reward_3d.py"]
+    assert "MAX_RECONSTRUCTION_FRAMES = 16" in sources["reward_3d.py"]
+    assert "MAX_QWEN_SCORE_FRAMES = 8" in sources["reward_3d.py"]
+    assert "def _uniform_sample_indices" in sources["reward_3d.py"]
+    assert "camera_trajectory[index]" in sources["reward_3d.py"]
+    assert 'if batch_dir:' in sources["reward_3d.py"]
+    assert "def _require_gsplat_cuda_extension" in sources["reward_3d.py"]
+    assert "_require_gsplat_cuda_extension()" in sources["reward_3d.py"]
+    assert "target=supervised_worker_entry" in sources["general_reward.py"]
+    assert "target=supervised_worker_entry" in sources["reward_3d.py"]
+    assert "ThreadPoolExecutor" not in combined
+    assert "= 0.5" not in sources["general_reward.py"]
+    assert "append(0.0)" not in sources["reward_3d.py"]
     # All lock/init/score waits consume the same monotonic deadline budget.
-    assert added.count("deadline - time.monotonic()") >= 6
-    # Removed native fallbacks must actually be deleted by the patch.
-    removed = "\n".join(
-        line[1:]
-        for line in text.splitlines()
-        if line.startswith("-") and not line.startswith("---")
+    assert combined.count("deadline - time.monotonic()") >= 6
+    assert not (
+        REPO_ROOT / "services/world_r1_strict/reference_patches"
+    ).exists()
+    assert (LICENSE_ROOT / "WORLD_R1_LICENSE").is_file()
+    assert (LICENSE_ROOT / "DEPTH_ANYTHING_3_LICENSE").is_file()
+    assert (LICENSE_ROOT / "OPENAI_CLIP_LICENSE").is_file()
+    assert (
+        NATIVE_ROOT / "assets" / general_reward._HPS_BPE_NAME
+    ).stat().st_size == general_reward._HPS_BPE_SIZE
+
+
+def test_bundled_service_revision_matches_deterministic_source_digest():
+    service_root = REPO_ROOT / "services/world_r1_strict"
+    paths = [
+        path
+        for path in NATIVE_ROOT.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and (path.suffix == ".py" or "assets" in path.parts)
+    ]
+    paths.extend(
+        path
+        for path in service_root.glob("*.py")
+        if path.name != "service_revision.py"
     )
-    assert "ThreadPoolExecutor" in removed
-    assert "CUDA_VISIBLE_DEVICES" in removed
+    paths.append(REPO_ROOT / "visual_rl/core/protocols/world_r1.py")
+    ordered = sorted(paths, key=lambda path: path.relative_to(REPO_ROOT).as_posix())
+    records = b"".join(
+        (
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+            f"{path.relative_to(REPO_ROOT).as_posix()}\n"
+        ).encode()
+        for path in ordered
+    )
+    digest = hashlib.sha256(records).hexdigest()
+    assert BUNDLED_SERVICE_REVISION == f"world-r1-{digest[:12]}"
+
+
+def test_process_supervision_arms_before_importing_native_worker(monkeypatch):
+    events = []
+
+    def arm(parent_pid):
+        events.append(("arm", parent_pid))
+
+    def target(*args, **kwargs):
+        events.append(("target", args, kwargs))
+
+    monkeypatch.setattr(process_supervision, "arm_parent_death_signal", arm)
+    monkeypatch.setattr(
+        process_supervision.importlib,
+        "import_module",
+        lambda name: events.append(("import", name))
+        or SimpleNamespace(worker=target),
+    )
+    process_supervision.supervised_worker_entry(
+        1234,
+        "native.module",
+        "worker",
+        (1, 2),
+        {"value": 3},
+    )
+    assert events == [
+        ("arm", 1234),
+        ("import", "native.module"),
+        ("target", (1, 2), {"value": 3}),
+    ]
+
+
+def test_linux_supervision_configures_subreaper_and_parent_death(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        process_supervision,
+        "_prctl",
+        lambda option, value: calls.append((option, value)),
+    )
+    monkeypatch.setattr(process_supervision.os, "getppid", lambda: 1234)
+    monkeypatch.setattr(process_supervision.sys, "platform", "linux")
+    process_supervision.configure_child_subreaper()
+    process_supervision.arm_parent_death_signal(1234)
+    assert calls == [
+        (
+            process_supervision._PR_SET_CHILD_SUBREAPER,
+            1,
+        ),
+        (
+            process_supervision._PR_SET_PDEATHSIG,
+            signal.SIGKILL,
+        ),
+    ]
 
 
 EXPECTED_REQUIREMENTS = [
@@ -651,8 +1061,9 @@ EXPECTED_REQUIREMENTS = [
     "flask>=3,<4",
     "gunicorn>=23,<24",
     "transformers==4.57.6",
+    "accelerate==1.4.0",
     "sentencepiece>=0.2,<0.3",
-    "protobuf>=4.25,<7",
+    "protobuf>=3.20.3,<4",
     "hpsv2==1.2.0",
     "qwen-vl-utils==0.0.14",
     "lpips==0.1.4",
@@ -669,6 +1080,7 @@ EXPECTED_REQUIREMENTS = [
     "moviepy==1.0.3",
     "pycolmap>=3.11,<4",
     "gsplat==1.5.3",
+    "ninja==1.11.1.4",
     "evo>=1.31,<2",
     "e3nn>=0.5,<1",
     "tqdm>=4.66",
@@ -695,13 +1107,52 @@ def test_env_yml_declares_only_the_service_toolchain():
 
 def test_readme_freezes_install_order_and_both_gunicorn_commands():
     text = README_PATH.read_text(encoding="utf-8")
-    assert "python -m pip install -r services/world_r1_strict/requirements-service.txt" in text
-    assert text.index("git apply --check") < text.index("pip install --no-deps -e")
+    revision_suffix = BUNDLED_SERVICE_REVISION.removeprefix("world-r1-")
+    assert (
+        "python -m pip install /absolute/path/to/"
+        "visual_rl-0.8.0-py3-none-any.whl"
+    ) in text
+    assert 'print(files("services.world_r1_strict"))' in text
+    assert 'python -m pip install -r "$SERVICE_ROOT/requirements-service.txt"' in text
+    assert "No framecode checkout is required" in text
+    assert "git apply" not in text
+    assert "pip install --no-deps -e" not in text
+    for reward_kind in ("general", "3d"):
+        assert (
+            f"reward_artifacts/world-r1-{reward_kind}-{revision_suffix}/manifest.json"
+            in text
+        )
+    for variable in (
+        "WORLD_R1_HPS_CHECKPOINT",
+        "WORLD_R1_QWEN_MODEL",
+        "WORLD_R1_DA3_MODEL",
+        "WORLD_R1_LPIPS_ALEXNET_CHECKPOINT",
+    ):
+        assert variable in text
+    prefixes = {
+        "reward_general_app": (
+            "WORLD_R1_HPS_CHECKPOINT=/absolute/path/to/HPS_v2.1_compressed.pt \\\n"
+            f"WORLD_R1_SERVER_REVISION={BUNDLED_SERVICE_REVISION} \\\n"
+        ),
+        "reward_3d_app": (
+            "WORLD_R1_QWEN_MODEL=/absolute/path/to/Qwen3-VL-4B-Instruct \\\n"
+            "WORLD_R1_DA3_MODEL=/absolute/path/to/DA3-GIANT \\\n"
+            "WORLD_R1_LPIPS_ALEXNET_CHECKPOINT=/absolute/path/to/alexnet-owt-7be5be79.pth \\\n"
+            "CUDA_HOME=/absolute/path/to/world-r1-reward \\\n"
+            "CPATH=/absolute/path/to/world-r1-reward/targets/x86_64-linux/include \\\n"
+            "CPLUS_INCLUDE_PATH=/absolute/path/to/world-r1-reward/targets/x86_64-linux/include \\\n"
+            "LIBRARY_PATH=/absolute/path/to/world-r1-reward/lib:/absolute/path/to/world-r1-reward/targets/x86_64-linux/lib \\\n"
+            "LD_LIBRARY_PATH=/absolute/path/to/world-r1-reward/lib:/absolute/path/to/world-r1-reward/targets/x86_64-linux/lib \\\n"
+            "TORCH_EXTENSIONS_DIR=/absolute/path/to/torch_extensions/cu128 \\\n"
+            "TORCH_CUDA_ARCH_LIST=12.0 \\\n"
+            "MAX_JOBS=4 \\\n"
+            f"WORLD_R1_SERVER_REVISION={BUNDLED_SERVICE_REVISION} \\\n"
+        ),
+    }
     for app, port in (("reward_general_app", 8090), ("reward_3d_app", 8089)):
         command = (
-            "WORLD_R1_SERVER_REVISION=world-r1-<patched-commit> \\\n"
-            "python -m gunicorn \\\n"
-            "  --chdir /absolute/path/to/framecode \\\n"
+            prefixes[app]
+            + "python -m gunicorn \\\n"
             "  --config python:services.world_r1_strict.gunicorn_conf \\\n"
             f"  --bind 127.0.0.1:{port} \\\n"
             "  --workers 1 --worker-class gthread --threads 4 \\\n"
@@ -719,7 +1170,7 @@ def test_readme_freezes_install_order_and_both_gunicorn_commands():
             assert "forbidden" in occurrences[0]
 
 
-def test_gunicorn_conf_ast_defines_only_the_worker_exit_hook():
+def test_gunicorn_conf_ast_defines_only_lifecycle_supervision_hooks():
     path = REPO_ROOT / "services/world_r1_strict/gunicorn_conf.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     top_defs = [
@@ -727,7 +1178,13 @@ def test_gunicorn_conf_ast_defines_only_the_worker_exit_hook():
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    assert [node.name for node in top_defs] == ["worker_exit"]
+    assert [node.name for node in top_defs] == [
+        "on_starting",
+        "_close_worker_manager",
+        "worker_int",
+        "worker_abort",
+        "worker_exit",
+    ]
     # No server settings, app imports or heavy imports anywhere in the AST.
     assigned_names = {
         target.id
@@ -743,7 +1200,11 @@ def test_gunicorn_conf_ast_defines_only_the_worker_exit_hook():
             imported_modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported_modules.add(node.module)
-    assert imported_modules == {"os", "services.world_r1_strict"}
+    assert imported_modules == {
+        "os",
+        "services.world_r1_strict",
+        "services.world_r1_strict.process_supervision",
+    }
 
 
 # ---------------------------------------------------------------------------

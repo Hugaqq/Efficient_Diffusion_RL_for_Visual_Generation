@@ -1,0 +1,91 @@
+{
+  "schema_version": 3,
+  "selection": {
+    "final_test_candidate_count": 909,
+    "final_test_candidate_length_bins": {
+      "long": 222,
+      "medium": 613,
+      "very_long": 74
+    },
+    "final_test_candidate_pool": "eligible raw test prompts after excluding train-source duplicates and the frozen v2 validation prompts",
+    "final_test_rank_domain": "final_test",
+    "hps_clip_tokenizer_class": "CLIPTokenizer",
+    "hps_clip_tokenizer_vocab_sha256": "f9190aead40a965a09db1ba2e556dccac0eda8423cb4926bcd994722899ec68e",
+    "maximum_hps_clip_tokens": 77,
+    "maximum_t5_tokens": 128,
+    "minimum_words": 6,
+    "rank_function": "sha256('<seed>:<split>:<prompt>')",
+    "seed": 729,
+    "t5_tokenizer_class": "T5Tokenizer",
+    "t5_tokenizer_vocab_sha256": "3e4dac4c480136f1337a43a23a00b56e92b10e1e65483bb718ceb971eef2aa14",
+    "uses_model_outputs": false,
+    "uses_reward_outputs": false
+  },
+  "source": {
+    "commit": "879042cf5707f8b90daa98d147d7deac2317c5da",
+    "repository": "https://github.com/yifan123/flow_grpo",
+    "test_rows": 1024,
+    "test_sha256": "d839050acb06aa045e399e76a81e4ade9a55fc743dc0e22e7b3eaeaca5c19107",
+    "train_rows": 15486,
+    "train_sha256": "edb46f78d7d93df0bafb30568074463822312ee339200f627195ccb2ff1d2f7a"
+  },
+  "splits": {
+    "final_test": {
+      "access_policy": "sealed_until_final_multi_seed_conclusion",
+      "allowed_use": "open once for the final multi-seed conclusion after all training and model selection are frozen",
+      "artifact_version": 3,
+      "count": 64,
+      "length_bins": {
+        "long": 24,
+        "medium": 20,
+        "very_long": 20
+      },
+      "max_hps_clip_tokens": 73,
+      "max_t5_tokens": 106,
+      "min_hps_clip_tokens": 8,
+      "min_t5_tokens": 8,
+      "path": "pickapic_sfw_final_test_v3.txt",
+      "role": "final_test",
+      "sha256": "fe5def8d78ff1233a371cdb029cdc14cd30d4a20baa62714b4594973f6ad58d2",
+      "status": "not_used_for_c20_tuning"
+    },
+    "q100_train": {
+      "artifact_version": 2,
+      "count": 100,
+      "length_bins": {
+        "long": 40,
+        "medium": 30,
+        "very_long": 30
+      },
+      "max_hps_clip_tokens": 72,
+      "max_t5_tokens": 89,
+      "min_hps_clip_tokens": 8,
+      "min_t5_tokens": 8,
+      "path": "pickapic_sfw_q100_train_v2.txt",
+      "role": "training",
+      "sha256": "bda5208d4f90465063861d52c401fca8b4adcf22f273b892efb5cb848279c3d7"
+    },
+    "validation": {
+      "artifact_version": 2,
+      "count": 64,
+      "former_role": "heldout_eval",
+      "length_bins": {
+        "long": 24,
+        "medium": 20,
+        "very_long": 20
+      },
+      "max_hps_clip_tokens": 75,
+      "max_t5_tokens": 100,
+      "min_hps_clip_tokens": 8,
+      "min_t5_tokens": 9,
+      "path": "pickapic_sfw_heldout_eval_v2.txt",
+      "role": "validation",
+      "sha256": "26cd082a5677d5de1bfeefa8ff0da2be3e7d21d9ea35091dc7df10aae788f68d",
+      "status": "used_for_c20_tuning"
+    }
+  },
+  "v2_provenance": {
+    "path": "pickapic_sfw_provenance_v2.json",
+    "sha256": "57f37eea53c2420a4355c88e2d3f86205bceb4c68d1553ed2be59dd3e6e0316b"
+  }
+}
