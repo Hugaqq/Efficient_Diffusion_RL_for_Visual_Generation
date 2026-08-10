@@ -27,6 +27,7 @@ from services.world_r1_strict.native.reward_3d_backend import (
     Reward3DBackend,
 )
 from services.world_r1_strict.process_supervision import supervised_worker_entry
+from services.world_r1_strict.qwen_loader import load_qwen_model_on_cuda_device
 
 STRICT_MANAGER_PROTOCOL = "world_r1_fail_closed_v1"
 STRICT_REWARD_KIND = "reward_3d"
@@ -263,17 +264,15 @@ def reward_3d_worker_process(
                         "WORLD_R1_QWEN_MODEL must be an existing non-symlink directory"
                     )
 
-                # Load model on specific device (NOT device_map="auto")
-                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    model_path,
-                    torch_dtype=dtype,
-                    local_files_only=True,
-                ).to(device)
-                self.model.requires_grad_(False)
-                self.model.eval()
-
-                if hasattr(self.model.config, 'use_cache'):
-                    self.model.config.use_cache = False
+                # Stream local shards directly onto the worker-owned logical
+                # GPU.  The root-only map is explicit (never automatic), and
+                # the loader intentionally performs no post-load ``.to()``.
+                self.model = load_qwen_model_on_cuda_device(
+                    model_class=Qwen3VLForConditionalGeneration,
+                    model_path=model_path,
+                    device=device,
+                    dtype=dtype,
+                )
 
                 self.processor = AutoProcessor.from_pretrained(
                     model_path,

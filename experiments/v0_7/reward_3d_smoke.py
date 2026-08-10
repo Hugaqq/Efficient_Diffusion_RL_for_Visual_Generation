@@ -16,7 +16,7 @@ import os
 from PIL import Image, ImageDraw
 import requests
 
-from visual_rl.world_r1_protocol import SCORE_ROUTE, validate_score_response
+from visual_rl.core.protocols.world_r1 import SCORE_ROUTE, validate_score_response
 
 MAX_INPUT_FRAMES = 81
 
@@ -85,7 +85,15 @@ def main() -> None:
     )
     if len(scores) != 1 or not math.isfinite(scores[0]):
         raise RuntimeError("3D reward smoke received an invalid score")
-    print(body, flush=True)
+    print(
+        json.dumps(
+            {"request": payload, "response": body},
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

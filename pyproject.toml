@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visual-rl"
-version = "0.7.0"
+version = "0.8.0"
 description = "Unified Diffusion RL infrastructure for visual generation."
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
@@ -65,4 +65,18 @@ markers = [
 "services/world_r1_strict/native/depth_anything_3/utils/parallel_utils.py" = ["E731"]
 "services/world_r1_strict/native/reward_3d.py" = ["E722"]
 "services/world_r1_strict/native/reward_3d_backend.py" = ["F401"]
-"visual_rl/model_adapters/world_r1_camera.py" = ["E731", "E741", "F841"]
+# Preserve the bundled World-R1-derived numerical source without stylistic rewrites.
+"visual_rl/algorithms/conditioning/camera_math.py" = [
+  "B006",
+  "B018",
+  "C408",
+  "F841",
+  "I001",
+  "RUF046",
+  "RUF059",
+  "SIM114",
+  "UP006",
+  "UP007",
+  "UP035",
+  "UP045",
+]

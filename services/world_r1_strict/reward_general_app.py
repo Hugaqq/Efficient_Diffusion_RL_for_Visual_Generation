@@ -10,8 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from services.world_r1_strict import protocol, reference_contract
-from visual_rl.world_r1_protocol import (
+from services.world_r1_strict import manager_liveness, protocol, reference_contract
+from visual_rl.core.protocols.world_r1 import (
     ERROR_COMPUTE_FAILED,
     ERROR_INVALID_REQUEST,
     ERROR_MANAGER_NOT_READY,
@@ -74,7 +74,7 @@ def create_app(*, manager: Any, server_revision: str):
         guard = _pid_guard(app)
         if guard is not None:
             return guard
-        if not manager.is_ready():
+        if not manager_liveness.is_ready(manager):
             return jsonify(protocol.error_body(ERROR_MANAGER_NOT_READY)), 503
         return jsonify(build_health_payload(reward=REWARD, server_revision=revision)), 200
 
@@ -83,7 +83,7 @@ def create_app(*, manager: Any, server_revision: str):
         guard = _pid_guard(app)
         if guard is not None:
             return guard
-        if not manager.is_ready():
+        if not manager_liveness.is_ready(manager):
             return jsonify(protocol.error_body(ERROR_MANAGER_NOT_READY)), 503
         try:
             score_request = protocol.decode_score_request(

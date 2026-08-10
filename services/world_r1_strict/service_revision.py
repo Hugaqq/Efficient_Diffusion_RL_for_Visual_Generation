@@ -5,6 +5,6 @@ digest documented in ``README.md``.  This file is deliberately excluded from
 that digest so updating the generated identity is not self-referential.
 """
 
-BUNDLED_SERVICE_REVISION = "world-r1-e156b02bc171"
+BUNDLED_SERVICE_REVISION = "world-r1-8e46b1b63498"
 
 __all__ = ("BUNDLED_SERVICE_REVISION",)

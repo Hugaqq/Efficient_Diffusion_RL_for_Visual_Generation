@@ -1,4 +1,4 @@
-"""Contract tests for visual_rl.world_r1_protocol (the single protocol owner)."""
+"""Contract tests for visual_rl.core.protocols.world_r1 (the single protocol owner)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from visual_rl import world_r1_protocol as wrp
+from visual_rl.core.protocols import world_r1 as wrp
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -92,7 +92,7 @@ def test_revision_grammar_has_exactly_one_owner():
         text = path.read_text(encoding="utf-8")
         if "world-r1-[0-9a-f]{12,40}" in text or "SERVER_REVISION_PATTERN" in text:
             offenders.append(path.relative_to(REPO_ROOT).as_posix())
-    assert offenders == ["visual_rl/world_r1_protocol.py"]
+    assert offenders == ["visual_rl/core/protocols/world_r1.py"]
 
 
 def test_service_modules_call_the_shared_validator_without_local_copies():
@@ -107,7 +107,7 @@ def test_service_modules_call_the_shared_validator_without_local_copies():
         imported = False
         local_defs = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "visual_rl.world_r1_protocol":
+            if isinstance(node, ast.ImportFrom) and node.module == "visual_rl.core.protocols.world_r1":
                 if any(alias.name == "validate_server_revision" for alias in node.names):
                     imported = True
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
@@ -258,7 +258,7 @@ def test_score_response_requires_exact_keys_echo_and_all_true_mask():
 def test_protocol_modules_import_without_torch():
     code = (
         "import sys\n"
-        "import visual_rl.world_r1_protocol\n"
+        "import visual_rl.core.protocols.world_r1\n"
         "import services.world_r1_strict.protocol\n"
         "import services.world_r1_strict.reference_contract\n"
         "import services.world_r1_strict.gunicorn_conf\n"

@@ -2,9 +2,10 @@
 
 ## World-R1 camera trajectory utilities
 
-`visual_rl/model_adapters/world_r1_camera.py` is derived from the
-World-R1 camera trajectory utilities distributed by Microsoft under the
-MIT License.
+`visual_rl/algorithms/conditioning/camera_math.py` contains the camera trajectory
+utilities derived from Microsoft World-R1 under the MIT License. The v0.8
+`visual_rl/algorithms/conditioning/world_r1_camera.py` component consumes those
+utilities; it does not change their license or provenance.
 
 Copyright (c) Microsoft Corporation.
 
@@ -34,6 +35,14 @@ SOFTWARE.
 Microsoft World-R1 and are distributed under the MIT License. The complete
 license text is included at
 `services/world_r1_strict/licenses/WORLD_R1_LICENSE`.
+
+## World-R1 prompt subset
+
+`data/prompts/world_r1_dynamic_v1.txt` contains the first 20 prompts from
+Microsoft World-R1's `dataset/final/dynamic.txt`, preserved in upstream order
+under the MIT License. Its exact source and subset digests are recorded in
+`data/prompts/world_r1_provenance_v1.json`; the subset is a bounded Phase A
+execution fixture, not the complete upstream training dataset.
 
 ## Depth Anything 3
 

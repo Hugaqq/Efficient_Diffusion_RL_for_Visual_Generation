@@ -15,7 +15,7 @@ model:
     guidance_scale: 5.0
     height: 480
     width: 832
-    max_sequence_length: 226
+    max_sequence_length: 512
     local_files_only: true
     low_cpu_mem_usage: true
     offload_frozen_modules_during_update: true

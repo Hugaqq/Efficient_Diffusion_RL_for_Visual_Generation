@@ -29,6 +29,7 @@ import yaml
 
 from services.world_r1_strict import (
     gunicorn_conf,
+    manager_liveness,
     process_supervision,
     reference_contract,
     reward_3d_app,
@@ -40,7 +41,7 @@ from services.world_r1_strict.pose_alignment import (
     is_degenerate_umeyama_error,
 )
 from services.world_r1_strict.service_revision import BUNDLED_SERVICE_REVISION
-from visual_rl.world_r1_protocol import (
+from visual_rl.core.protocols.world_r1 import (
     ERROR_COMPUTE_FAILED,
     ERROR_MANAGER_NOT_READY,
     ERROR_REVISION_MISMATCH,
@@ -294,6 +295,43 @@ class LegacyManagerDouble:
         self.shutdown_count += 1
 
 
+class _WorkerStateDouble:
+    """Process-shaped double for independent alive/exitcode health checks."""
+
+    def __init__(self, *, alive: bool, exitcode: int | None, pid: int = 1234):
+        self.alive = alive
+        self.exitcode = exitcode
+        self.pid = pid
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.alive = False
+
+    def kill(self) -> None:
+        self.alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+        self.alive = False
+
+
+class _NativeWorkerManagerDouble(FakeStrictManager):
+    """Strict manager double exposing the native worker supervision surface."""
+
+    def __init__(self, *, workers, reward: str | None = None):
+        super().__init__(reward=reward)
+        self._closed = False
+        self._workers = list(workers)
+        self.num_gpus = len(self._workers)
+
+    def shutdown(self) -> None:
+        self._closed = True
+        self._ready = False
+        super().shutdown()
+
+
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
@@ -396,6 +434,101 @@ def test_health_503_until_manager_ready():
     response = app.test_client().get(HEALTH_ROUTE)
     assert response.status_code == 503
     assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+
+
+@requires_flask
+@pytest.mark.parametrize(
+    ("alive", "exitcode", "worker_reason"),
+    [
+        (True, 70, "worker_exited"),
+        (False, -15, "worker_exited"),
+    ],
+    ids=("zombie-exitcode", "terminated"),
+)
+def test_general_health_fails_when_a_worker_is_not_running_cleanly(
+    alive,
+    exitcode,
+    worker_reason,
+):
+    healthy_worker = _WorkerStateDouble(alive=True, exitcode=None)
+    worker = _WorkerStateDouble(alive=True, exitcode=None, pid=5678)
+    manager = _NativeWorkerManagerDouble(workers=[healthy_worker, worker])
+    app = reward_general_app.create_app(manager=manager, server_revision=REVISION)
+    client = app.test_client()
+
+    assert client.get(HEALTH_ROUTE).status_code == 200
+    worker.alive = alive
+    worker.exitcode = exitcode
+
+    response = client.get(HEALTH_ROUTE)
+    assert response.status_code == 503
+    assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+    score = _post(client, _general_payload())
+    assert score.status_code == 503
+    assert manager.compute_calls == 0
+    status = manager_liveness.readiness_status(manager)
+    assert status["ready"] is False
+    assert status["reason"] == "worker_unhealthy"
+    assert status["expected_workers"] == status["actual_workers"] == 2
+    assert status["workers"][0]["healthy"] is True
+    assert status["workers"][1] == {
+        "slot": 1,
+        "pid": 5678,
+        "alive": alive,
+        "exitcode": exitcode,
+        "healthy": False,
+        "reason": worker_reason,
+        "errors": (),
+    }
+
+
+@requires_flask
+@pytest.mark.parametrize(
+    ("alive", "exitcode", "worker_reason"),
+    [
+        (True, 70, "worker_exited"),
+        (False, -15, "worker_exited"),
+    ],
+    ids=("zombie-exitcode", "terminated"),
+)
+def test_3d_health_fails_when_a_worker_is_not_running_cleanly(
+    alive,
+    exitcode,
+    worker_reason,
+):
+    healthy_worker = _WorkerStateDouble(alive=True, exitcode=None)
+    worker = _WorkerStateDouble(alive=True, exitcode=None, pid=5678)
+    manager = _NativeWorkerManagerDouble(
+        workers=[healthy_worker, worker],
+        reward=REWARD_3D,
+    )
+    app = reward_3d_app.create_app(manager=manager, server_revision=REVISION_3D)
+    client = app.test_client()
+
+    assert client.get(HEALTH_ROUTE).status_code == 200
+    worker.alive = alive
+    worker.exitcode = exitcode
+
+    response = client.get(HEALTH_ROUTE)
+    assert response.status_code == 503
+    assert json.loads(response.get_data()) == {"error": ERROR_MANAGER_NOT_READY}
+    score = _post(client, _3d_payload())
+    assert score.status_code == 503
+    assert manager.compute_calls == 0
+    status = manager_liveness.readiness_status(manager)
+    assert status["ready"] is False
+    assert status["reason"] == "worker_unhealthy"
+    assert status["expected_workers"] == status["actual_workers"] == 2
+    assert status["workers"][0]["healthy"] is True
+    assert status["workers"][1] == {
+        "slot": 1,
+        "pid": 5678,
+        "alive": alive,
+        "exitcode": exitcode,
+        "healthy": False,
+        "reason": worker_reason,
+        "errors": (),
+    }
 
 
 @requires_flask
@@ -802,6 +935,10 @@ def test_bundled_native_service_is_fail_closed_and_has_no_external_code_import()
     assert '"depth-anything/" + "DA3-GIANT"' not in combined
     assert "WORLD_R1_HPS_CHECKPOINT" in sources["general_reward.py"]
     assert "pretrained=None" in sources["general_reward.py"]
+    assert "torch.autocast" not in sources["general_reward.py"]
+    assert sources["general_reward.py"].count(
+        "outputs = self._model(image_batch, text_batch)"
+    ) == 1
     assert "img_score" not in sources["general_reward.py"]
     assert "hf_hub_download" not in sources["general_reward.py"]
     assert "WORLD_R1_QWEN_MODEL" in sources["reward_3d.py"]
@@ -849,7 +986,7 @@ def test_bundled_service_revision_matches_deterministic_source_digest():
         for path in service_root.glob("*.py")
         if path.name != "service_revision.py"
     )
-    paths.append(REPO_ROOT / "visual_rl/world_r1_protocol.py")
+    paths.append(REPO_ROOT / "visual_rl/core/protocols/world_r1.py")
     ordered = sorted(paths, key=lambda path: path.relative_to(REPO_ROOT).as_posix())
     records = b"".join(
         (
@@ -924,6 +1061,7 @@ EXPECTED_REQUIREMENTS = [
     "flask>=3,<4",
     "gunicorn>=23,<24",
     "transformers==4.57.6",
+    "accelerate==1.4.0",
     "sentencepiece>=0.2,<0.3",
     "protobuf>=3.20.3,<4",
     "hpsv2==1.2.0",
@@ -942,6 +1080,7 @@ EXPECTED_REQUIREMENTS = [
     "moviepy==1.0.3",
     "pycolmap>=3.11,<4",
     "gsplat==1.5.3",
+    "ninja==1.11.1.4",
     "evo>=1.31,<2",
     "e3nn>=0.5,<1",
     "tqdm>=4.66",
@@ -968,15 +1107,21 @@ def test_env_yml_declares_only_the_service_toolchain():
 
 def test_readme_freezes_install_order_and_both_gunicorn_commands():
     text = README_PATH.read_text(encoding="utf-8")
+    revision_suffix = BUNDLED_SERVICE_REVISION.removeprefix("world-r1-")
     assert (
         "python -m pip install /absolute/path/to/"
-        "visual_rl-0.7.0-py3-none-any.whl"
+        "visual_rl-0.8.0-py3-none-any.whl"
     ) in text
     assert 'print(files("services.world_r1_strict"))' in text
     assert 'python -m pip install -r "$SERVICE_ROOT/requirements-service.txt"' in text
     assert "No framecode checkout is required" in text
     assert "git apply" not in text
     assert "pip install --no-deps -e" not in text
+    for reward_kind in ("general", "3d"):
+        assert (
+            f"reward_artifacts/world-r1-{reward_kind}-{revision_suffix}/manifest.json"
+            in text
+        )
     for variable in (
         "WORLD_R1_HPS_CHECKPOINT",
         "WORLD_R1_QWEN_MODEL",

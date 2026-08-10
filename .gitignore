@@ -20,6 +20,7 @@ outputs/
 checkpoints/
 wandb/
 tmp/
+reward_artifacts/
 
 # Local orchestration and research notes
 .codex/

@@ -4,10 +4,10 @@ This directory contains the self-contained reward service used by the Flash
 and World-R1 recipes. The fail-closed World-R1 managers and the required
 Depth Anything 3 inference source are bundled under `native/`; deployment does
 not clone, patch, import, or install a separate World-R1 repository. The
-service is not part of the `visual_rl` public API, but its implementation,
+service is not a second VisualRL training entry, but its implementation,
 configuration resources, licenses and frozen requirements file ship in the
-same `visual-rl` wheel. It never talks pickle or forwards to legacy HTTP
-servers.
+same `visual-rl` wheel used by `python -m visual_rl.train`. It never talks
+pickle or forwards to legacy HTTP servers.
 
 The service exposes exactly two reward-kind origins:
 
@@ -18,7 +18,7 @@ The service exposes exactly two reward-kind origins:
 Both origins share `protocol.py` (exact decoder/encoder),
 `reference_contract.py` (manager contract, runtime gate, native
 fault-injection gate, lifecycle registry) and the single revision-grammar
-owner `visual_rl.world_r1_protocol.validate_server_revision()`. Changing any
+owner `visual_rl.core.protocols.world_r1.validate_server_revision()`. Changing any
 timeout, scorer or manager protocol requires changing the public
 `server_revision`; training YAML cannot override any of it.
 
@@ -32,7 +32,7 @@ conda create -n world-r1-reward \
   -c nvidia -c conda-forge \
   python=3.10 pip cuda-nvcc=12.8
 conda activate world-r1-reward
-python -m pip install /absolute/path/to/visual_rl-0.7.0-py3-none-any.whl
+python -m pip install /absolute/path/to/visual_rl-0.8.0-py3-none-any.whl
 SERVICE_ROOT="$(python -c 'from importlib.resources import files; print(files("services.world_r1_strict"))')"
 python -m pip install -r "$SERVICE_ROOT/requirements-service.txt"
 ```
@@ -100,7 +100,7 @@ once. The two commands are frozen token-for-token:
 
 ```bash
 WORLD_R1_HPS_CHECKPOINT=/absolute/path/to/HPS_v2.1_compressed.pt \
-WORLD_R1_SERVER_REVISION=world-r1-e156b02bc171 \
+WORLD_R1_SERVER_REVISION=world-r1-8e46b1b63498 \
 python -m gunicorn \
   --config python:services.world_r1_strict.gunicorn_conf \
   --bind 127.0.0.1:8090 \
@@ -120,7 +120,7 @@ LD_LIBRARY_PATH=/absolute/path/to/world-r1-reward/lib:/absolute/path/to/world-r1
 TORCH_EXTENSIONS_DIR=/absolute/path/to/torch_extensions/cu128 \
 TORCH_CUDA_ARCH_LIST=12.0 \
 MAX_JOBS=4 \
-WORLD_R1_SERVER_REVISION=world-r1-e156b02bc171 \
+WORLD_R1_SERVER_REVISION=world-r1-8e46b1b63498 \
 python -m gunicorn \
   --config python:services.world_r1_strict.gunicorn_conf \
   --bind 127.0.0.1:8089 \
@@ -133,11 +133,11 @@ python -m gunicorn \
 `WORLD_R1_SERVER_REVISION` is required and must equal
 `services.world_r1_strict.service_revision.BUNDLED_SERVICE_REVISION`; a stale
 or operator-chosen value is rejected before model import. The full
-implementation digest for `world-r1-e156b02bc171` is
-`e156b02bc171895421de5a4ba9d74d14e2a225da70be7464e851f14edb585c0c`.
+implementation digest for `world-r1-8e46b1b63498` is
+`8e46b1b6349846c8f25af0a20bad8e7013fbee3e0ac1d7779b41eaf1d78039b0`.
 It is the SHA-256 of the sorted per-file SHA-256 records for the native Python
 and asset files, the top-level service Python files, and
-`visual_rl/world_r1_protocol.py`; the generated `service_revision.py` is the
+`visual_rl/core/protocols/world_r1.py`; the generated `service_revision.py` is the
 only excluded file, avoiding a self-referential digest.
 
 `GET /healthz` returns 503 until the manager is ready, and afterwards the exact
@@ -158,3 +158,57 @@ native imports, closes managers from the worker lifecycle hooks, makes the
 master a Linux child subreaper, and arms each model worker with
 `PR_SET_PDEATHSIG=SIGKILL`. This is required because native CUDA/geometry
 libraries may otherwise intercept TERM and orphan a GPU-owning child.
+
+## 4. Create the release reward markers only from real receipts
+
+The v0.8 configs pin these location names:
+
+- `reward_artifacts/world-r1-general-8e46b1b63498/manifest.json`
+- `reward_artifacts/world-r1-3d-8e46b1b63498/manifest.json`
+
+They are deliberately absent from the source tree. Do not satisfy environment
+preflight with an empty directory or a locally invented manifest. The release
+operator creates each marker only after all of the following refer to the same
+installed wheel and service revision:
+
+1. record the final wheel filename and SHA-256 after a normal
+   `pyproject.toml` package build;
+2. record content identities for the real HPS checkpoint and, for 3D, the
+   Qwen, DA3 and LPIPS AlexNet artifacts;
+3. capture the exact `/healthz` response showing
+   `server_revision=world-r1-8e46b1b63498`, `protocol_version=strict_v2`, and
+   `manager_contract=world_r1_fail_closed_v1`;
+4. capture one bounded real request/response receipt with finite scores from
+   the corresponding origin;
+5. verify the marker JSON contains exactly the reward kind, full service digest
+   above, wheel SHA-256, resource identities, and the two receipt SHA-256s;
+6. rerun VisualRL environment preflight so its filesystem-artifact identity is
+   computed from the completed marker directory, then retain that identity with
+   the launch evidence.
+
+The marker uses this exact top-level schema (values shown as `<receipt>` are
+operator-produced, never repository defaults):
+
+```json
+{
+  "schema_version": 1,
+  "kind": "world_r1_release_reward_marker",
+  "artifact_ref": "reward_general",
+  "reward": "reward_general",
+  "service_revision": "world-r1-8e46b1b63498",
+  "service_implementation_sha256": "8e46b1b6349846c8f25af0a20bad8e7013fbee3e0ac1d7779b41eaf1d78039b0",
+  "wheel": {"filename": "<wheel>", "sha256": "<sha256>"},
+  "resources": {"hps_checkpoint": {"identity": "<content identity>"}},
+  "receipts": {"health_sha256": "<sha256>", "score_sha256": "<sha256>"}
+}
+```
+
+For the 3D marker, `artifact_ref` and `reward` are `reward_3d`, and
+`resources` contains exactly `qwen_model`, `da3_model`, and
+`lpips_alexnet_checkpoint`. Every SHA-256 is lowercase hexadecimal; receipt
+files and resource-identity records are retained beside the run evidence, not
+embedded as mutable endpoint paths in the recipe.
+
+Marker creation is an external deployment/release action. It must happen on
+the server holding the verified wheel and resources; changing only the
+directory suffix in a config is not evidence that a marker exists or is valid.

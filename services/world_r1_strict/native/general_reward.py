@@ -243,14 +243,14 @@ class GeneralRewardInstance:
             device=self._device,
             non_blocking=True,
         )
-        with torch.autocast(
-            device_type=self._device.type,
-            enabled=self._device.type == "cuda",
-        ):
-            outputs = self._model(image_batch, text_batch)
-            image_features = outputs["image_features"]
-            text_features = outputs["text_features"]
-            scores = torch.diagonal(image_features @ text_features.T)
+        # The resource contract declares fp32. CUDA autocast would silently
+        # execute HPS in fp16 and can quantize nearby completion scores into an
+        # exact tie, producing an all-zero GRPO advantage. Preserve one real
+        # fp32 forward and its full score resolution.
+        outputs = self._model(image_batch, text_batch)
+        image_features = outputs["image_features"]
+        text_features = outputs["text_features"]
+        scores = torch.diagonal(image_features @ text_features.T)
         result = [float(value) for value in scores.float().cpu().tolist()]
         if self._device.type == "cuda":
             torch.cuda.empty_cache()

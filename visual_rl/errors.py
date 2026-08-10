@@ -67,11 +67,11 @@ def attach_cleanup_notes(
         if callable(add_note):
             add_note(note)
             return
-    except BaseException:
+    except BaseException:  # noqa: BLE001,S110
         pass
     try:
-        setattr(primary, "_visual_rl_cleanup_notes", projected)
-    except BaseException:
+        primary._visual_rl_cleanup_notes = projected
+    except BaseException:  # noqa: BLE001
         return
 
 
@@ -173,6 +173,10 @@ class ValidationError(VisualRLError):
     ) -> None:
         super().__init__(message)
         self.checks = checks
+
+
+class ExecutionTransformCompatibilityError(ValueError):
+    """An immutable execution-transform plan is statically unsafe."""
 
 
 class RunError(VisualRLError):
