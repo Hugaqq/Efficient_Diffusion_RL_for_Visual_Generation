@@ -1,7 +1,7 @@
 """Deployment-time contract for the patched native World-R1 reward managers.
 
-The companion service only accepts the fail-closed native managers produced by
-``reference_patches/world_r1_fail_closed_v1.patch``.  This module is the unique
+The companion service only accepts the bundled fail-closed native managers in
+``services.world_r1_strict.native``.  This module is the unique
 owner of
 
 - :func:`require_strict_manager` — class/instance marker and surface checks;
@@ -21,14 +21,19 @@ import atexit
 import importlib
 import io
 import multiprocessing
+import signal
 import threading
+from collections.abc import Mapping
 from typing import Any
 
-from visual_rl.world_r1_protocol import (
+from services.world_r1_strict.service_revision import BUNDLED_SERVICE_REVISION
+from visual_rl.core.protocols.world_r1 import (
     MANAGER_CONTRACT,
     REWARD_3D,
     REWARD_GENERAL,
+    WorldR1RevisionError,
     validate_reward_kind,
+    validate_server_revision,
 )
 
 _REQUIRED_METHODS = ("is_ready", "compute_batch_scores", "shutdown")
@@ -46,6 +51,39 @@ class NativeFaultGateError(RuntimeError):
     """The real manager class misbehaved under fault injection."""
 
 
+def require_bundled_service_revision(value: object) -> str:
+    """Return the configured revision only when it identifies this source."""
+
+    revision = validate_server_revision(value)
+    if revision != BUNDLED_SERVICE_REVISION:
+        raise WorldR1RevisionError(
+            "WORLD_R1_SERVER_REVISION must identify the bundled service source: "
+            f"expected {BUNDLED_SERVICE_REVISION!r}, got {revision!r}."
+        )
+    return revision
+
+
+def snapshot_termination_signal_handlers() -> dict[int, Any]:
+    """Capture Gunicorn's handlers before native imports can replace them."""
+
+    return {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    }
+
+
+def restore_termination_signal_handlers(handlers: Mapping[int, Any]) -> None:
+    """Restore the exact handlers captured in the Gunicorn worker main thread."""
+
+    expected = {signal.SIGINT, signal.SIGQUIT, signal.SIGTERM}
+    if not isinstance(handlers, Mapping) or set(handlers) != expected:
+        raise TypeError(
+            "termination handlers must contain SIGINT, SIGQUIT and SIGTERM"
+        )
+    for signum in sorted(expected):
+        signal.signal(signum, handlers[signum])
+
+
 def require_strict_manager(manager: Any, *, reward: str) -> Any:
     """Validate the fail-closed manager markers and surface, or refuse startup."""
 
@@ -54,8 +92,7 @@ def require_strict_manager(manager: Any, *, reward: str) -> Any:
     if protocol != MANAGER_CONTRACT:
         raise ManagerContractError(
             f"{reward} manager must declare STRICT_MANAGER_PROTOCOL="
-            f"{MANAGER_CONTRACT!r} (apply reference_patches/"
-            f"world_r1_fail_closed_v1.patch), got {protocol!r}."
+            f"{MANAGER_CONTRACT!r}, got {protocol!r}."
         )
     kind = getattr(manager, "STRICT_REWARD_KIND", None)
     if kind != reward:
@@ -106,7 +143,10 @@ def require_service_runtime() -> None:
     if not torch.cuda.is_available():
         raise ServiceRuntimeError("strict World-R1 service requires an available CUDA device.")
     try:
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration  # noqa: F401
+        from transformers import (  # noqa: F401
+            AutoProcessor,
+            Qwen3VLForConditionalGeneration,
+        )
     except (ModuleNotFoundError, ImportError) as exc:
         raise ServiceRuntimeError(
             "strict World-R1 service requires transformers with "
@@ -273,16 +313,34 @@ def _run_gate_case(manager_class: type, *, reward: str, case: str) -> None:
         _assert_poisoned(instance, case=case)
         return
     if case == "scorer_raise":
+        task_queue = instance._mp_context.Queue()
+        result_queue = instance._mp_context.Queue()
+        init_queue = instance._mp_context.Queue()
         worker = instance._start_worker(
             0,
-            instance._mp_context.Queue(),
-            instance._mp_context.Queue(),
-            instance._mp_context.Queue(),
+            task_queue,
+            result_queue,
+            init_queue,
             instance_factory=_gate_raising_factory,
         )
         instance._score_timeout_s = 30.0
-        _ready_with_workers(instance, [worker])
-        _expect_batch_failure(instance, manager_class, reward=reward, corrupt=False)
+        instance.num_gpus = 1
+        instance._task_queues = [task_queue]
+        instance._result_queue = result_queue
+        instance._workers = [worker]
+        instance._ready = True
+        try:
+            _expect_batch_failure(
+                instance,
+                manager_class,
+                reward=reward,
+                corrupt=False,
+            )
+        finally:
+            try:
+                init_queue.cancel_join_thread()
+            finally:
+                init_queue.close()
         _assert_poisoned(instance, case=case)
         if worker.is_alive():
             raise NativeFaultGateError("strict gate scorer case left a live worker process.")
@@ -412,7 +470,10 @@ __all__ = (
     "close_registered_manager",
     "register_manager",
     "registered_manager_count",
+    "require_bundled_service_revision",
     "require_service_runtime",
     "require_strict_manager",
+    "restore_termination_signal_handlers",
     "run_native_fault_injection_gate",
+    "snapshot_termination_signal_handlers",
 )

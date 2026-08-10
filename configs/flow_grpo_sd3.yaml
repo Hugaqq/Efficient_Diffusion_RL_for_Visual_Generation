@@ -8,7 +8,6 @@ model:
   adapter_checkpoint: null
   params:
     checkpoint: ../checkpoints/stable-diffusion-3.5-medium
-    reference_repo: ../reference_code/TempFlow-GRPO-main
     lora_rank: 32
     lora_alpha: 64
     lora_target_modules:
@@ -26,6 +25,7 @@ model:
     max_sequence_length: 128
     local_files_only: true
     low_cpu_mem_usage: true
+    offload_frozen_modules_during_update: true
 
 dataset:
   path: ../data/prompts/geneval_rgb_train_36.txt

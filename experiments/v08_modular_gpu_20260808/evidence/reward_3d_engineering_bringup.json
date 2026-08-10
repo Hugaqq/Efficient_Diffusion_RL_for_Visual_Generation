@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "kind": "world_r1_engineering_bringup_reward_evidence",
+  "evidence_class": "engineering_bringup_not_release",
+  "reward": "reward_3d",
+  "deployment": {
+    "kind": "source_tree",
+    "server_revision": "world-r1-2173e1e166a3",
+    "service_implementation_sha256": "2173e1e166a36d561a31ce71529630944209ba9f4e95dab41e0c0e9a0a55e696"
+  },
+  "resources": {
+    "qwen3_vl_4b": {
+      "file_count": 17,
+      "byte_count": 8887292435
+    },
+    "da3_giant": {
+      "file_count": 2,
+      "byte_count": 5422816524
+    },
+    "lpips_alexnet": {
+      "byte_count": 244408911,
+      "content_sha256": "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02"
+    }
+  },
+  "receipts": {
+    "health": {
+      "filename": "health.json",
+      "sha256": "22ddf568fd84fd0af9af8e587cbd01e49c44ddd9b47bab44220a868ef2043b90"
+    },
+    "score": {
+      "filename": "score.json",
+      "sha256": "18d49609a44407be04fa75e02e831449d0d7a75aa2de5db63efd849147c924a7"
+    }
+  }
+}

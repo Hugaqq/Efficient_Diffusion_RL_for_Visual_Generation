@@ -1,110 +1,98 @@
-# VisualRL v0.7 项目概览
+# VisualRL v0.8 项目概览
 
-更新日期：2026-07-29
+更新日期：2026-08-09
 
-VisualRL 的目标是为 image/video diffusion reinforcement learning 提供一条
-容易阅读、可恢复、可审计的研究训练主线。v0.7 优先保证训练数学和数据合同唯一，
-再以真实实验验证正确性、质量与效率。
-
-## 唯一公开路径
+VisualRL 是面向图像和视频 Diffusion RL 的模块化训练基础设施。v0.8 的核心目标不是让
+任意模型和算法无条件组合，而是把两条独立变化轴做成可声明、可匹配、可拒绝和可验证的组件：
 
 ```text
-完整 YAML
-→ vr.load()
-→ resolve()
-→ validate()
-→ run()
-→ RunResult
-→ inspect_run() / audit_run()
+ModelAdapter × AlgorithmModule
 ```
 
-公开配置只有 YAML；Python API 只加载、验证和执行它。项目不提供训练 console
-command、preset/profile/recipe 合并、外部插件注册或 public Runner constructor。
-单进程和 DDP 共用同一个 `_execute_step()`、UpdateEngine 和 artifact commit
-lifecycle。
+模型、算法和 reward artifact 的可用性最终由真实训练证明，不从 fake model、相邻配置或历史
+版本继承。
 
-完整使用方式见 [v0.7 用户指南](V0_7_USER_GUIDE.md) 和仓库
-[README](../README.md)。当前实验判定见
-[v0.7 验收矩阵](V0_7_ACCEPTANCE.md)。
-
-## 共享训练合同
+## 唯一训练主线
 
 ```text
-PromptDataset
-→ StepContext
-→ RolloutRequest / RolloutBatch
-→ RewardBatch
-→ AdvantageResult
-→ PolicyLossInputs
-→ PolicyRecomputeStats
-→ ObjectiveOutput / UpdateResult
-→ StepMetrics / StepArtifacts / StepResult
-→ authoritative commit marker
+schema-v2 YAML
+→ import-safe model/algorithm declarations
+→ compile + static compatibility
+→ artifact/environment preflight
+→ runtime component graph
+→ prepared ModelAdapter
+→ PolicyRuntimePort + model-bound Dynamics
+→ BoundAlgorithm
+→ rollout/reward/advantage/credit/recompute/update
+→ atomic checkpoint + terminal inspection
 ```
 
-关键约束：
+唯一训练入口是：
 
-- 同一个 `StepContext` 穿过 rollout、reward、update 和 record；
-- ManifestBuilder 是 `SampleRecord` 的唯一 producer；
-- GRPO、Flash-GRPO、TempFlow-GRPO 共用唯一 clipped-surrogate objective；
-- reference KL 只在 update 时由 current/reference policy statistics 计算；
-- DDP 只注入 shard、collective、gradient sync、failure consensus 和
-  rank-zero commit 差异；
-- authoritative marker 决定 committed step，manifest/metrics 是可重建投影。
+```bash
+python -m visual_rl.train CONFIG
+```
 
-## v0.7 支持范围
+项目不再提供 v0.7 的 `visual_rl.api`、`vr.load().run()`、public Runner、
+`runtime_factory.py`、`builtins.py` 或第二套训练循环。历史 v0.7 文档只用于解释旧产物，不能作为
+v0.8 使用指南或源码路径索引。
 
-| 方向 | 组合 | 当前源码状态 | 真实实验状态 |
-|---|---|---|---|
-| Flow-GRPO | SD3.5 + full trajectory | 已接入统一 objective | `not_run` |
-| TempFlow-GRPO | SD3.5 + branching | 已接入统一 objective | `not_run` |
-| Flash-GRPO | Wan2.1 + single step | 已接入统一 objective | `not_run` |
-| World-R1 | Wan2.1 + strict reward service | 已接入统一主线 | `not_run` |
-| Tiny | CPU single/Gloo contract | 本地测试使用 | 不代表真实模型 |
+## 模型与算法边界
 
-本地全仓自动化、Tiny single/Gloo API smoke 和基础 wheel 隔离安装已经通过。
-真实 C20/Q100、Flow native CUDA parity、MG1/NCCL、远端执行和上传尚未运行。
-源码准备、synthetic fixture、Gloo 或基础 wheel 测试不能替代这些真实结论。
+- `ModelAdapter` 拥有模型 artifact/component、conditioning、latent geometry、单步
+  current/reference prediction 和 decode；不拥有 rollout、transition 或算法判断。
+- `AlgorithmModule` 声明 requirements 和完整 blueprint，并组合 trainer、Dynamics、rollout、
+  reward、advantage、credit 和 update；不导入具体 SD3/Wan implementation。
+- composition 在重资源加载前匹配 model/algorithm/Dynamics contract，并通过
+  `DynamicsProjectionRegistry` 选择 model-bound Dynamics。
+- runtime 是唯一同时构造具体 model 和 algorithm component 的 composition root；算法运行时只拿
+  `PolicyRuntimePort` 和已验证的 `ModelAlgorithmBinding`。
 
-完整范围与明确排除项见 [V0_7_SCOPE.md](V0_7_SCOPE.md)。
+详细职责、扩展步骤和永久门禁见
+[Model–Algorithm boundary](MODEL_ALGORITHM_BOUNDARY.md)。
+
+## 当前六条 route
+
+| 配置 | Model × Algorithm/integration | 当前 frozen A7 状态 |
+| --- | --- | --- |
+| `flow_grpo_sd3.yaml` | SD3.5 × Flow-GRPO | 20/20 accepted；峰值 24,892 MiB |
+| `flow_grpo_wan.yaml` | Wan2.1 T2V × Flow-GRPO | 20/20 accepted；峰值 17,568 MiB |
+| `tempflow_sd3.yaml` | SD3.5 × TempFlow-GRPO | 20/20 accepted；峰值 25,148 MiB |
+| `flash_wan.yaml` | Wan2.1 T2V × Flash-GRPO | 20/20 accepted；峰值 22,555 MiB |
+| `world_r1_core_wan.yaml` | Wan2.1 T2V × Flow-GRPO + camera/general/3D | running；step-10 已提交 |
+| `world_r1_release_surrogate_wan.yaml` | 同组合 + main/dynamic phase integration | 首次 run exit 143；同 freeze fresh retry 已排队 |
+
+“20/20 accepted”要求同一 frozen code/wheel/config 下同时满足：20 次 optimizer commit、exit zero、
+`SUCCESS`、完整 step-20 checkpoint、正梯度、日志无失败签名，以及绑定 trainer PID/物理 GPU 的
+显存时间序列。World-R1 两条尚未满足，因此当前不能声明六路 A7 完成。
 
 ## 代码阅读顺序
 
-1. `visual_rl/api.py`：唯一 public experiment handle。
-2. `visual_rl/configs/schema.py` 与 `resolver.py`：完整 YAML 合同。
-3. `visual_rl/preflight.py`：环境与 topology 验证。
-4. `visual_rl/runtime_factory.py`：唯一 component construction。
-5. `visual_rl/runner.py`：共享 step 与 commit lifecycle。
-6. `visual_rl/optimizers/objective.py` 和 `clipped_surrogate.py`：唯一策略损失。
-7. `visual_rl/artifacts/manager.py`：marker、projection 和 recovery。
+1. `visual_rl/models/interface.py`：模型单步 port 和生命周期边界。
+2. `visual_rl/algorithms/modules/{config,descriptor,interface}.py`：算法 requirements/blueprint/runtime facade。
+3. `visual_rl/composition/config/{compiler,integration}.py`：recipe 编译和 model-bound Dynamics projection。
+4. `visual_rl/composition/compatibility/`：model/algorithm/Dynamics 匹配与拒绝原因。
+5. `visual_rl/runtime/{lifecycle,component_graph,model_binding,algorithm_binding}.py`：唯一具体装配路径。
+6. `visual_rl/algorithms/rollout/` 与 `optimization/`：轨迹控制、recompute、objective 和一次 commit。
+7. `visual_rl/artifacts/checkpoint/` 与 `artifacts/inspection.py`：safe point、原子持久化和只读审计。
 
-内置组件清单只由 `visual_rl/builtins.py` 维护。新增内部组件必须实现已有 ABC、
-加入该静态清单，并使用相同 typed contracts；不能创建第二个 registry、factory
-或训练循环。
+## 当前支持边界
 
-## 当前执行顺序
+- single process、单 GPU；
+- `gradient_accumulation_steps=1`；
+- SD3.5/Wan2.1 T2V 与当前列出的 GRPO family/integration；
+- remote reward service 作为独立进程和 artifact identity；
+- checkpoint 只在 optimizer commit 后保存，不恢复 in-flight trajectory。
 
-W06 已准备固定实验 source/config/controller，正式导航位于
-[experiments/v0_7/README.md](../experiments/v0_7/README.md)。后续必须按
-[EXPERIMENT_PLAN.md](../experiments/EXPERIMENT_PLAN.md) 执行：
+当前不承诺 DDP、多节点、FSDP、DeepSpeed、异步 reward、新的非 GRPO trainer family，或未列出的
+模型—算法组合。结构测试通过不等于真实 CUDA 支持；真实 20-step 通过也不等于 native parity、
+resume、训练质量或 phase-boundary 已验证。
 
-1. 每个算法先完成 C20 continuous 与 interrupted/fresh-resume parity；
-2. Flow-GRPO 额外通过 14-item native parity；
-3. 对应 correctness gate 通过后才能运行 Q100 三 seed；
-4. MG1 在真实双 GPU/NCCL 上验证内部 node 和 Tiny C20；
-5. W07 才构建、检查并在干净环境安装最终 wheel；
-6. 远端执行和 evidence 上传需要单独授权。
+## 证据入口
 
-任何 `not_run`、缺设备或缺依赖都必须保持未完成状态，不能通过 skip、fake
-result 或历史证据晋级。
-
-## 维护原则
-
-- 只维护一套训练流程和一套数据合同；
-- 删除旧入口，不保留兼容 wrapper；
-- 失败必须在对应 mutation 前同步暴露，marker 后失败保留已提交 head；
-- 测试结论按范围陈述，Tiny/Gloo 不外推到真实 CUDA/NCCL；
-- 质量结论必须在 evidence completeness 后使用预注册统计规则；
-- W06 controller 只编排正式 API，不修补 production lifecycle。
+- 总计划与 gate：[Plan_8_2.md](../Plan_8_2.md)
+- frozen A7 路线、收据和恢复策略：
+  [v0.8 real-GPU evidence](../experiments/v08_modular_gpu_20260808/README.md)
+- v0.7 历史 operational evidence：[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)
 
 版本变化见 [CHANGELOG](../CHANGELOG.md)。

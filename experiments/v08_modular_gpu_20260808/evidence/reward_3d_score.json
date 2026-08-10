@@ -1,0 +1,1 @@
+{"request":{"camera_trajectory":"four explicit 4x4 extrinsics","frame_count":4,"prompt":"a red cube with a blue sphere, orbit camera to the left","sample_id":["reward-3d-smoke-0"]},"response":{"outputs":[1.9351264214596995],"protocol_version":"strict_v2","sample_id":["reward-3d-smoke-0"],"server_revision":"world-r1-2173e1e166a3","valid_mask":[true]}}

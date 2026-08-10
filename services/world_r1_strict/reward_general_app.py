@@ -10,7 +10,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from visual_rl.world_r1_protocol import (
+from services.world_r1_strict import manager_liveness, protocol, reference_contract
+from visual_rl.core.protocols.world_r1 import (
     ERROR_COMPUTE_FAILED,
     ERROR_INVALID_REQUEST,
     ERROR_MANAGER_NOT_READY,
@@ -23,7 +24,6 @@ from visual_rl.world_r1_protocol import (
     build_health_payload,
     validate_server_revision,
 )
-from services.world_r1_strict import protocol, reference_contract
 
 REWARD = REWARD_GENERAL
 
@@ -74,7 +74,7 @@ def create_app(*, manager: Any, server_revision: str):
         guard = _pid_guard(app)
         if guard is not None:
             return guard
-        if not manager.is_ready():
+        if not manager_liveness.is_ready(manager):
             return jsonify(protocol.error_body(ERROR_MANAGER_NOT_READY)), 503
         return jsonify(build_health_payload(reward=REWARD, server_revision=revision)), 200
 
@@ -83,7 +83,7 @@ def create_app(*, manager: Any, server_revision: str):
         guard = _pid_guard(app)
         if guard is not None:
             return guard
-        if not manager.is_ready():
+        if not manager_liveness.is_ready(manager):
             return jsonify(protocol.error_body(ERROR_MANAGER_NOT_READY)), 503
         try:
             score_request = protocol.decode_score_request(
@@ -117,7 +117,9 @@ def create_app(*, manager: Any, server_revision: str):
 
 
 def _load_manager_class() -> type:
-    from reward_server.general_reward import MultiGPUGeneralRewardManager
+    from services.world_r1_strict.native.general_reward import (
+        MultiGPUGeneralRewardManager,
+    )
 
     return MultiGPUGeneralRewardManager
 
@@ -125,9 +127,15 @@ def _load_manager_class() -> type:
 def build_app():
     """Zero-argument deployment entry point used by the frozen Gunicorn command."""
 
-    revision = validate_server_revision(os.environ["WORLD_R1_SERVER_REVISION"])
-    reference_contract.require_service_runtime()
-    manager_class = _load_manager_class()
+    revision = reference_contract.require_bundled_service_revision(
+        os.environ["WORLD_R1_SERVER_REVISION"]
+    )
+    signal_handlers = reference_contract.snapshot_termination_signal_handlers()
+    try:
+        reference_contract.require_service_runtime()
+        manager_class = _load_manager_class()
+    finally:
+        reference_contract.restore_termination_signal_handlers(signal_handlers)
     reference_contract.require_strict_manager(manager_class, reward=REWARD)
     reference_contract.run_native_fault_injection_gate(manager_class, reward=REWARD)
     manager = manager_class()

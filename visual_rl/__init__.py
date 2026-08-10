@@ -1,31 +1,10 @@
-"""VisualRL v0.7 public Python API."""
+"""VisualRL v0.8 package metadata.
 
-from visual_rl.api import audit_run, inspect_run, load
-from visual_rl.api_types import AuditReport, RunResult, RunStatus, ValidationReport
-from visual_rl.errors import (
-    ArtifactError,
-    ComponentError,
-    ConfigError,
-    ResumeError,
-    RunError,
-    ValidationError,
-)
+Training is intentionally exposed through ``python -m visual_rl.train``.
+Runtime construction stays behind the internal composition root instead of a
+second high-level Python orchestration API.
+"""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
-__all__ = (
-    "__version__",
-    "load",
-    "inspect_run",
-    "audit_run",
-    "ValidationReport",
-    "RunResult",
-    "RunStatus",
-    "AuditReport",
-    "ConfigError",
-    "ComponentError",
-    "ValidationError",
-    "RunError",
-    "ResumeError",
-    "ArtifactError",
-)
+__all__ = ("__version__",)

@@ -1,0 +1,14 @@
+{
+  "dataset": "Microsoft World-R1",
+  "official_repository": "https://github.com/microsoft/World-R1",
+  "source_path": "dataset/final/dynamic.txt",
+  "source_rows": 499,
+  "source_sha256": "72549235856de40a4649fa74d7c72220f927fa3d3d6300dbaad660c298ec131e",
+  "selection": {
+    "content_sha256": "05468300506f967152f31a41f198674bcb5d1a0ab899cbc59541d09df58e040c",
+    "count": 20,
+    "path": "data/prompts/world_r1_dynamic_v1.txt",
+    "rule": "Preserve the first 20 non-empty rows in upstream order without rewriting."
+  },
+  "purpose": "A bounded prompt artifact for exercising the World-R1 main/dynamic phase transition in the Phase A demo; it is not the full upstream training split or an evaluation dataset."
+}

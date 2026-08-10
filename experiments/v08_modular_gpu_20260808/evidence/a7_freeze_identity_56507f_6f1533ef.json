@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "visual_rl_a7_freeze_identity",
+  "code": {
+    "identity_schema": "python-code.v1",
+    "content_sha256": "56507f6ea6b24ed788306988bbecdaaabf3d7eeabf80fb21f46c6bd426aa375b",
+    "file_count": 183,
+    "byte_count": 2648703,
+    "source_wheel_file_record_sha256": "238a9d83bf9fe8f1accc4a6142f4766d7cd2ee53df45b7383c5baf61205335f8"
+  },
+  "wheel": {
+    "filename": "visual_rl-0.8.0-py3-none-any.whl",
+    "sha256": "6f1533ef8e1d3ed471414ddea8ee956db199bd3b154500ed66a44f51b31bca61",
+    "byte_count": 2173836
+  },
+  "configs": {
+    "flash_wan.yaml": "930dbea4551b915085a66a66a4f7033306d74c670ed49030257890a17b0c1315",
+    "flow_grpo_sd3.yaml": "0eb480395e2a6808b3bf08f8f0a89f1b1427a6afd17502381dbfe75599aef861",
+    "flow_grpo_wan.yaml": "22ad2716f0c1b582b6e0d7b6e61c4ba117c4fc474ce8db87592bf43a0590e3db",
+    "tempflow_sd3.yaml": "102ae443e468293521539f38b375db809b11cf0395a88c06acd1ee0370fb82ff",
+    "world_r1_core_wan.yaml": "74cb229f251d8cebe3ccf3f57bf8d3a099e831c958138fcb3091f4c810b8e0e3",
+    "world_r1_release_surrogate_wan.yaml": "6f7feacc33fdc9a28cec4a569e3e7f775f3ba5dcc525953a5c41cb8b59914a0e"
+  },
+  "reward_markers": {
+    "reward_general": {
+      "service_revision": "world-r1-8e46b1b63498",
+      "service_implementation_sha256": "8e46b1b6349846c8f25af0a20bad8e7013fbee3e0ac1d7779b41eaf1d78039b0",
+      "manifest_sha256": "648cebfbbc4eabdf6003022ee208c3d6653d207e46571e96c5f38600f8cff123"
+    },
+    "reward_3d": {
+      "service_revision": "world-r1-8e46b1b63498",
+      "service_implementation_sha256": "8e46b1b6349846c8f25af0a20bad8e7013fbee3e0ac1d7779b41eaf1d78039b0",
+      "manifest_sha256": "fbceb8637bd068e29cbfc111bb38565b987901ea050839e67d2dcac43da60af0"
+    },
+    "resource_identities_sha256": "d694447aac5bed009bd0518e24ec46d1f9ccabdf71645ac59d80a8b3281de4c8"
+  },
+  "external_evidence_tools": {
+    "sample_gpu_memory.sh": "3a8e2030678b4ca2aa606e635621f850467ad0c6f7e1e0ed657db78b9f19efd8",
+    "launch_a7_route.sh": "4c1b260babe9135d6ec23017358d210f511cef1675836bce556ea5539a00c5dd"
+  }
+}
