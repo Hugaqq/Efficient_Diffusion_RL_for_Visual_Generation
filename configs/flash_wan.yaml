@@ -16,7 +16,7 @@ model:
     height: 480
     width: 832
     frames: 81
-    max_sequence_length: 226
+    max_sequence_length: 512
     local_files_only: true
     low_cpu_mem_usage: true
     offload_frozen_modules_during_update: true

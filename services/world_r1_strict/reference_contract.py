@@ -27,7 +27,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from services.world_r1_strict.service_revision import BUNDLED_SERVICE_REVISION
-from visual_rl.world_r1_protocol import (
+from visual_rl.core.protocols.world_r1 import (
     MANAGER_CONTRACT,
     REWARD_3D,
     REWARD_GENERAL,

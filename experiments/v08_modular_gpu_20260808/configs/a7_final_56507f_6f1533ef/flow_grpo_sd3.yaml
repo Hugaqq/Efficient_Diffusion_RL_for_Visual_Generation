@@ -1,0 +1,33 @@
+# Bounded A7 candidate for code identity 56507f6e. Not final until promoted.
+schema_version: 2
+recipe: flow_grpo_v1
+
+overrides:
+  training:
+    seed: 41
+    global_prompt_batch_size: 1
+    max_optimizer_steps: 20
+    gradient_accumulation_steps: 1
+    adamw:
+      learning_rate: 3.0e-4
+      weight_decay: 1.0e-4
+    lr_schedule:
+      warmup_steps: 0
+    policy_recompute:
+      row_microbatch_size: null
+      transition_window_size: 1
+  execution:
+    precision: fp32
+    distribution_mode: single
+    group_size: 8
+
+launch:
+  output_dir: /dev/shm/v-qiaoqifan/visualrl-v08-a7-final-56507f-6f1533ef/runs/flow-grpo-sd3
+  resume_from: null
+  checkpoint_every_optimizer_steps: 10
+  artifacts:
+    model: /tmp/v-qiaoqifan/model_cache/stable-diffusion-3.5-medium
+    datasets:
+      main: /dev/shm/v-qiaoqifan/visualrl-v08-candidate-56507f6e-source/data/prompts/geneval_rgb_train_36.txt
+    rewards:
+      reward_quality: /dev/shm/v-qiaoqifan/visualrl-v08-candidate-56507f6e-source/reward_artifacts/prompt-color-guarded-v1

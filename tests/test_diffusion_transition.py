@@ -8,7 +8,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from visual_rl.model_adapters.diffusion_transition import (
+from visual_rl.algorithms.dynamics.config import WanFlowSDEProfile
+from visual_rl.algorithms.dynamics.transition import (
     sd3_sde_step_with_logprob,
     wan_sde_step_with_logprob,
 )
@@ -70,9 +71,7 @@ def test_sd3_transition_matches_the_frozen_flow_equations() -> None:
     diffusion = torch.sqrt(sigma / (1 - torch.tensor(0.75))) * 0.7
     expected_mean = (
         sample * (1 + diffusion.square() / (2 * sigma) * dt)
-        + model_output
-        * (1 + diffusion.square() * (1 - sigma) / (2 * sigma))
-        * dt
+        + model_output * (1 + diffusion.square() * (1 - sigma) / (2 * sigma)) * dt
     )
     expected_std = diffusion * torch.sqrt(-dt)
     assert torch.equal(next_sample, target)
@@ -87,7 +86,7 @@ def test_sd3_transition_matches_the_frozen_flow_equations() -> None:
     assert torch.isfinite(model_output.grad).all()
 
 
-def test_world_transition_uses_scheduler_step_mean_when_deterministic() -> None:
+def test_standard_transition_uses_scheduler_step_mean_when_deterministic() -> None:
     scheduler = _Scheduler(
         (1.0, 0.5, 0.0),
         stochastic_sampling=False,
@@ -102,7 +101,7 @@ def test_world_transition_uses_scheduler_step_mean_when_deterministic() -> None:
         model_output,
         timestep,
         sample,
-        variant="world_r1",
+        profile=WanFlowSDEProfile.STANDARD,
         prev_sample=expected.detach(),
     )
 
@@ -129,7 +128,7 @@ def test_flash_transition_exposes_the_frozen_rectification_coefficient() -> None
         model_output,
         timestep,
         sample,
-        variant="flash",
+        profile=WanFlowSDEProfile.FLASH,
         prev_sample=target,
         return_flash_coefficient=True,
     )

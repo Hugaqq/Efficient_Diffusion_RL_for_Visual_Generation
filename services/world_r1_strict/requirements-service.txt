@@ -6,6 +6,7 @@ pillow>=10
 flask>=3,<4
 gunicorn>=23,<24
 transformers==4.57.6
+accelerate==1.4.0
 sentencepiece>=0.2,<0.3
 protobuf>=3.20.3,<4
 hpsv2==1.2.0
@@ -24,6 +25,7 @@ plyfile>=1,<2
 moviepy==1.0.3
 pycolmap>=3.11,<4
 gsplat==1.5.3
+ninja==1.11.1.4
 evo>=1.31,<2
 e3nn>=0.5,<1
 tqdm>=4.66

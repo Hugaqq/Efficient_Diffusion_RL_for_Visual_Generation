@@ -3,7 +3,7 @@
 Pure Python and Flask-free: the decoder turns bounded request bytes into a
 typed :class:`ScoreRequest` before any manager compute happens, and the
 encoder builds the exact-key response mappings.  All grammar rules come from
-:mod:`visual_rl.world_r1_protocol`; this module adds no second definitions.
+:mod:`visual_rl.core.protocols.world_r1`; this module adds no second definitions.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any
 
-from visual_rl.world_r1_protocol import (
+from visual_rl.core.protocols.world_r1 import (
     MAX_REQUEST_BYTES,
     PROTOCOL_VERSION,
     REWARD_GENERAL,
