@@ -354,7 +354,7 @@ class CoordinatorCheckpointSink:
 
         _optimized, update = _final_update(summary.last_iteration.value.payload)
         last_metrics = FrozenMapping(
-            _last_metrics(summary.last_iteration.value.identity.batch_size, update)
+            _last_metrics(_nominal_rows(bound, summary.last_iteration.value.identity.batch_size), update)
         )
         resolved_bytes = _canonical_line(
             recipe_manifest_payload(
@@ -516,6 +516,14 @@ def _capture_and_commit(
     data_view = ports.data_plane.capture_checkpoint_view(summary.committed_steps)
     if data_view.next_optimizer_step != summary.committed_steps:
         raise RuntimeCheckpointError("data plane next step disagrees with summary")
+    runtime_state = data_view.state.runtime_state
+    if runtime_state is not None:
+        if runtime_state["committed_steps"] != summary.committed_steps:
+            raise RuntimeCheckpointError("collection commit cursor disagrees with summary")
+        if terminal_artifacts and bound.prepared.training.flash_evaluation:
+            expected = [s for s in (0, 36, 76, 116) if s < summary.committed_steps]
+            if runtime_state["evaluations_completed"] != expected:
+                raise RuntimeCheckpointError("terminal checkpoint lacks required real evaluation receipts")
     rank = bound.runtime.session.runtime_facts.rank
     world_size = bound.runtime.session.runtime_facts.world_size
     rng_snapshot = RankRNGSnapshot.capture_current(rank)
@@ -530,7 +538,7 @@ def _capture_and_commit(
         source_cursors=data_view.source_cursors,
         dynamics_selection_policy=ports.dynamics_selection_policy,
         gradient_accumulation_position=0,
-        ema_state_saved=False,
+        ema_state_saved=data_view.state.runtime_state is not None,
         reference_state_saved=reference_state.has_active_reference_owner,
         execution_transform_plan_id=bound.transforms.plan_id,
         rng_state_id=rng_snapshot.state_identity,
@@ -555,7 +563,7 @@ def _capture_and_commit(
         terminal_artifacts=terminal_artifacts,
         bound_reward_resource_ids=rewards,
         last_metrics=FrozenMapping(
-            _last_metrics(summary.last_iteration.value.identity.batch_size, update)
+            _last_metrics(_nominal_rows(bound, summary.last_iteration.value.identity.batch_size), update)
         ),
     )
     component_states = {
@@ -879,11 +887,15 @@ def _build_prepared_contract(
             scaler=None,
             lr_scheduler=request.prepared.lr_scheduler,
             execution_transform_plan=_execution_transform_plan(materialized),
-            ema_state_schema=_EMA_STATE_SCHEMA,
+            ema_state_schema=_ema_schema(request.prepared.training),
             reference_state_schema=_reference_state_schema(effective_reference_state),
             state_schema_versions=_STATE_SCHEMA_VERSIONS,
         )
     )
+
+
+def _ema_schema(training):
+    return ("cpu-lora-ema.collection.v1" if training.collection is not None else _EMA_STATE_SCHEMA)
 
 
 def _build_full_contract(
@@ -916,7 +928,7 @@ def _build_full_contract(
             preprocess_requirement_set_id=(
                 bound.evidence.preprocess_requirement_set_id
             ),
-            ema_state_schema=_EMA_STATE_SCHEMA,
+            ema_state_schema=_ema_schema(bound.prepared.training),
             reference_state_schema=_reference_state_schema(effective_reference_state),
             state_schema_versions=_STATE_SCHEMA_VERSIONS,
         )
@@ -1067,8 +1079,8 @@ def _validate_contract_modes(
         )
     if contract.scaler_schema != "none.v1":
         raise RuntimeCheckpointError("V0 does not restore mixed-precision scalers")
-    if contract.ema_state_schema != _EMA_STATE_SCHEMA:
-        raise RuntimeCheckpointError("V0 does not restore independent EMA state")
+    if contract.ema_state_schema not in {_EMA_STATE_SCHEMA, "cpu-lora-ema.collection.v1"}:
+        raise RuntimeCheckpointError("unsupported EMA state schema")
     expected_reference_schema = _reference_state_schema(reference_state)
     if contract.reference_state_schema != expected_reference_schema:
         raise RuntimeCheckpointError(
@@ -1245,6 +1257,11 @@ def _validate_data_payload_schema(payload: Mapping[str, object]) -> None:
         "phase_schedule_state",
         "sampler_state",
     }
+    if "runtime_state" in payload:
+        expected.add("runtime_state")
+        state = payload["runtime_state"]
+        if not isinstance(state, Mapping) or state.get("schema_version") != 1:
+            raise ValueError("invalid collection runtime state")
     if set(payload) != expected:
         raise ValueError("data-plane state has an invalid exact key set")
     if payload["schema_version"] != 1 or payload["kind"] != "data_plane_prelude_state":
@@ -1500,6 +1517,11 @@ def _rollback_rng_and_data(
                 primary.add_note(
                     f"{label} rollback failed: {type(error).__name__}: {error}"
                 )
+
+
+def _nominal_rows(bound, default):
+    config = bound.prepared.training.collection
+    return default if config is None else config.collection_rows_per_commit
 
 
 def _last_metrics(

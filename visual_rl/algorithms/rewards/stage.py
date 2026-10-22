@@ -58,6 +58,8 @@ class RewardStageInput:
             raise TypeError("samples must be a StackedSampleBatch")
         if not isinstance(self.runtime_context, RewardRuntimeContext):
             raise TypeError("runtime_context must be a RewardRuntimeContext")
+        if self.trajectory.reward_media_released:
+            raise ValueError("released reward media cannot be scored again")
         if self.samples.batch_size != self.trajectory.batch_size:
             raise ValueError("samples and trajectory batch sizes differ")
         contexts = self.trajectory.contexts

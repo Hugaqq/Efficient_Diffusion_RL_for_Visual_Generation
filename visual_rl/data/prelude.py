@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from visual_rl.algorithms.trainer.interface import IterationIdentity, StageValue
@@ -115,6 +115,7 @@ class DataPlanePreludeState:
     placement_contract_id: str
     phase_schedule_state: PhaseScheduleState
     sampler_state: SamplerState
+    runtime_state: object | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         for name in ("prelude_id", "placement_contract_id"):
@@ -136,6 +137,7 @@ class DataPlanePreludeState:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            **({"runtime_state": self.runtime_state} if self.runtime_state is not None else {}),
             "schema_version": _SCHEMA_VERSION,
             "kind": _STATE_KIND,
             "prelude_id": self.prelude_id,
@@ -265,6 +267,7 @@ class DataPlanePrelude:
         self._prelude_id = hashlib.sha256(_canonical(identity_payload)).hexdigest()
         self._active_reservation: SamplerReservation | None = None
         self._active_identity: IterationIdentity | None = None
+        self.runtime_state_owner = None
 
     @property
     def prelude_id(self) -> str:
@@ -423,12 +426,14 @@ class DataPlanePrelude:
             placement_contract_id=self.placement_contract.contract_id,
             phase_schedule_state=self.phase_schedule.capture_state(next_optimizer_step),
             sampler_state=preview.sampler_state,
+            runtime_state=(None if self.runtime_state_owner is None else self.runtime_state_owner.state_dict()),
         )
         return DataPlaneCheckpointView(
             state=state,
             next_route=route,
             source_cursors=preview.sampler_state.cursors,
-            next_prompt_batch_identity=preview.prompt_batch_identity,
+            next_prompt_batch_identity=(preview.prompt_batch_identity if self.runtime_state_owner is None
+                else self.runtime_state_owner.next_batch_identity(preview.prompt_batch_identity)),
             has_open_reservation=False,
             group_geometry_id=self.group_geometry_id,
         )
@@ -449,6 +454,8 @@ class DataPlanePrelude:
             "phase_schedule_state",
             "sampler_state",
         }
+        if self.runtime_state_owner is not None:
+            expected.add("runtime_state")
         if set(payload) != expected:
             raise ValueError("data-plane state has an invalid exact key set")
         if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
@@ -465,11 +472,14 @@ class DataPlanePrelude:
             raise TypeError("nested data-plane states have invalid types")
         phase_state = self.phase_schedule.restore_state(raw_phase)
         sampler_state = self.source_sampler.restore_state(raw_sampler)
+        if self.runtime_state_owner is not None:
+            self.runtime_state_owner.load_state_dict(payload["runtime_state"])
         return DataPlanePreludeState(
             prelude_id=self.prelude_id,
             placement_contract_id=self.placement_contract.contract_id,
             phase_schedule_state=phase_state,
             sampler_state=sampler_state,
+            runtime_state=payload.get("runtime_state"),
         )
 
     def restore_checkpoint_state(

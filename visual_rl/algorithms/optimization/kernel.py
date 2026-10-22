@@ -503,6 +503,25 @@ class PolicyUpdateKernel:
         accumulator = _StreamingObjectiveAccumulator(trajectory, slot_plan)
         optimizer.zero_grad(set_to_none=execution_plan.zero_grad_set_to_none)
 
+        # A multi-commit collection has one immutable behavior policy. Gate
+        # replay against THAT snapshot before building current-policy graphs;
+        # the second update's legitimate PPO ratio is not expected to be one.
+        if recompute_request.behavior_context is not None:
+            parity_request = replace(recompute_request, require_reference_statistics=False,
+                                     reference_context=None)
+            with recompute_request.behavior_context(), torch.enable_grad():
+                for slot in slot_plan.slots:
+                    stats = recomputer.compute_current_slot(parity_request, slot)
+                    rows = torch.tensor(slot.row_indices, device=trajectory.old_log_probs.device)
+                    old = trajectory.old_log_probs.index_select(0, rows)[:, slot.transition_start:slot.transition_stop]
+                    active = loss_inputs.active_mask.index_select(0, rows)[:, slot.transition_start:slot.transition_stop]
+                    delta = (stats.current_log_probs.detach() - old.to(stats.current_log_probs.device)).masked_select(active.to(stats.current_log_probs.device))
+                    if self.max_initial_logprob_delta is not None and float(delta.abs().max()) > self.max_initial_logprob_delta:
+                        raise RuntimeError("behavior snapshot old/current ratio parity gate failed")
+                    if self.require_initial_clipfrac_zero and bool((delta.exp().sub(1).abs() > loss_inputs.clip_range).any()):
+                        raise RuntimeError("behavior snapshot parity gate failed: clipfrac is not zero")
+                    del stats, delta, old, active
+
         reference_by_slot: dict[str, ReferencePolicyStats] = {}
         if require_reference:
             context = (
@@ -581,7 +600,8 @@ class PolicyUpdateKernel:
                     active_mask=active_mask,
                 )
                 if (
-                    self.max_initial_logprob_delta is not None
+                    recompute_request.behavior_context is None
+                    and self.max_initial_logprob_delta is not None
                     and delta_max > self.max_initial_logprob_delta
                 ):
                     raise RuntimeError(
@@ -590,7 +610,8 @@ class PolicyUpdateKernel:
                         f"{self.max_initial_logprob_delta:.6g}"
                     )
                 if (
-                    self.require_initial_clipfrac_zero
+                    recompute_request.behavior_context is None
+                    and self.require_initial_clipfrac_zero
                     and float(output.clipfrac.detach().cpu()) != 0.0
                 ):
                     raise RuntimeError(

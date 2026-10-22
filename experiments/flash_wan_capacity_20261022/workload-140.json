@@ -1,0 +1,900 @@
+{
+  "schema_version": 1,
+  "manifest_kind": "quantity_schedule_not_execution_evidence",
+  "paper_exact_endpoint_confirmed": false,
+  "sampling_plan_materialized": false,
+  "optimizer_commits_target": 140,
+  "active_collection_rounds": 70,
+  "group_size": 8,
+  "training_videos_target": 26880,
+  "evaluation_videos_target": 1200,
+  "logical_hps_frame_scores_target": 2274480,
+  "train_sampling_steps": 20,
+  "evaluation_sampling_steps": 50,
+  "frames_per_video": 81,
+  "additional_final_evaluation": false,
+  "collections": [
+    {
+      "collection_index": 0,
+      "source_epoch": 2,
+      "expected_behavior_policy_after_commits": 0,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        1,
+        2
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 1,
+      "source_epoch": 3,
+      "expected_behavior_policy_after_commits": 2,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        3,
+        4
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 2,
+      "source_epoch": 4,
+      "expected_behavior_policy_after_commits": 4,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        5,
+        6
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 3,
+      "source_epoch": 5,
+      "expected_behavior_policy_after_commits": 6,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        7,
+        8
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 4,
+      "source_epoch": 6,
+      "expected_behavior_policy_after_commits": 8,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        9,
+        10
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 5,
+      "source_epoch": 7,
+      "expected_behavior_policy_after_commits": 10,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        11,
+        12
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 6,
+      "source_epoch": 8,
+      "expected_behavior_policy_after_commits": 12,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        13,
+        14
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 7,
+      "source_epoch": 9,
+      "expected_behavior_policy_after_commits": 14,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        15,
+        16
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 8,
+      "source_epoch": 10,
+      "expected_behavior_policy_after_commits": 16,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        17,
+        18
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 9,
+      "source_epoch": 11,
+      "expected_behavior_policy_after_commits": 18,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        19,
+        20
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 10,
+      "source_epoch": 12,
+      "expected_behavior_policy_after_commits": 20,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        21,
+        22
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 11,
+      "source_epoch": 13,
+      "expected_behavior_policy_after_commits": 22,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        23,
+        24
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 12,
+      "source_epoch": 14,
+      "expected_behavior_policy_after_commits": 24,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        25,
+        26
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 13,
+      "source_epoch": 15,
+      "expected_behavior_policy_after_commits": 26,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        27,
+        28
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 14,
+      "source_epoch": 16,
+      "expected_behavior_policy_after_commits": 28,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        29,
+        30
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 15,
+      "source_epoch": 17,
+      "expected_behavior_policy_after_commits": 30,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        31,
+        32
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 16,
+      "source_epoch": 18,
+      "expected_behavior_policy_after_commits": 32,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        33,
+        34
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 17,
+      "source_epoch": 19,
+      "expected_behavior_policy_after_commits": 34,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        35,
+        36
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 18,
+      "source_epoch": 20,
+      "expected_behavior_policy_after_commits": 36,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        37,
+        38
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 19,
+      "source_epoch": 21,
+      "expected_behavior_policy_after_commits": 38,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        39,
+        40
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 20,
+      "source_epoch": 22,
+      "expected_behavior_policy_after_commits": 40,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        41,
+        42
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 21,
+      "source_epoch": 23,
+      "expected_behavior_policy_after_commits": 42,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        43,
+        44
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 22,
+      "source_epoch": 24,
+      "expected_behavior_policy_after_commits": 44,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        45,
+        46
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 23,
+      "source_epoch": 25,
+      "expected_behavior_policy_after_commits": 46,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        47,
+        48
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 24,
+      "source_epoch": 26,
+      "expected_behavior_policy_after_commits": 48,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        49,
+        50
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 25,
+      "source_epoch": 27,
+      "expected_behavior_policy_after_commits": 50,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        51,
+        52
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 26,
+      "source_epoch": 28,
+      "expected_behavior_policy_after_commits": 52,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        53,
+        54
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 27,
+      "source_epoch": 29,
+      "expected_behavior_policy_after_commits": 54,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        55,
+        56
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 28,
+      "source_epoch": 30,
+      "expected_behavior_policy_after_commits": 56,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        57,
+        58
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 29,
+      "source_epoch": 31,
+      "expected_behavior_policy_after_commits": 58,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        59,
+        60
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 30,
+      "source_epoch": 32,
+      "expected_behavior_policy_after_commits": 60,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        61,
+        62
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 31,
+      "source_epoch": 33,
+      "expected_behavior_policy_after_commits": 62,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        63,
+        64
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 32,
+      "source_epoch": 34,
+      "expected_behavior_policy_after_commits": 64,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        65,
+        66
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 33,
+      "source_epoch": 35,
+      "expected_behavior_policy_after_commits": 66,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        67,
+        68
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 34,
+      "source_epoch": 36,
+      "expected_behavior_policy_after_commits": 68,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        69,
+        70
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 35,
+      "source_epoch": 37,
+      "expected_behavior_policy_after_commits": 70,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        71,
+        72
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 36,
+      "source_epoch": 38,
+      "expected_behavior_policy_after_commits": 72,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        73,
+        74
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 37,
+      "source_epoch": 39,
+      "expected_behavior_policy_after_commits": 74,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        75,
+        76
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 38,
+      "source_epoch": 40,
+      "expected_behavior_policy_after_commits": 76,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        77,
+        78
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 39,
+      "source_epoch": 41,
+      "expected_behavior_policy_after_commits": 78,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        79,
+        80
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 40,
+      "source_epoch": 42,
+      "expected_behavior_policy_after_commits": 80,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        81,
+        82
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 41,
+      "source_epoch": 43,
+      "expected_behavior_policy_after_commits": 82,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        83,
+        84
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 42,
+      "source_epoch": 44,
+      "expected_behavior_policy_after_commits": 84,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        85,
+        86
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 43,
+      "source_epoch": 45,
+      "expected_behavior_policy_after_commits": 86,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        87,
+        88
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 44,
+      "source_epoch": 46,
+      "expected_behavior_policy_after_commits": 88,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        89,
+        90
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 45,
+      "source_epoch": 47,
+      "expected_behavior_policy_after_commits": 90,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        91,
+        92
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 46,
+      "source_epoch": 48,
+      "expected_behavior_policy_after_commits": 92,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        93,
+        94
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 47,
+      "source_epoch": 49,
+      "expected_behavior_policy_after_commits": 94,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        95,
+        96
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 48,
+      "source_epoch": 50,
+      "expected_behavior_policy_after_commits": 96,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        97,
+        98
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 49,
+      "source_epoch": 51,
+      "expected_behavior_policy_after_commits": 98,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        99,
+        100
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 50,
+      "source_epoch": 52,
+      "expected_behavior_policy_after_commits": 100,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        101,
+        102
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 51,
+      "source_epoch": 53,
+      "expected_behavior_policy_after_commits": 102,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        103,
+        104
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 52,
+      "source_epoch": 54,
+      "expected_behavior_policy_after_commits": 104,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        105,
+        106
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 53,
+      "source_epoch": 55,
+      "expected_behavior_policy_after_commits": 106,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        107,
+        108
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 54,
+      "source_epoch": 56,
+      "expected_behavior_policy_after_commits": 108,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        109,
+        110
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 55,
+      "source_epoch": 57,
+      "expected_behavior_policy_after_commits": 110,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        111,
+        112
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 56,
+      "source_epoch": 58,
+      "expected_behavior_policy_after_commits": 112,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        113,
+        114
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 57,
+      "source_epoch": 59,
+      "expected_behavior_policy_after_commits": 114,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        115,
+        116
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 58,
+      "source_epoch": 60,
+      "expected_behavior_policy_after_commits": 116,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        117,
+        118
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 59,
+      "source_epoch": 61,
+      "expected_behavior_policy_after_commits": 118,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        119,
+        120
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 60,
+      "source_epoch": 62,
+      "expected_behavior_policy_after_commits": 120,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        121,
+        122
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 61,
+      "source_epoch": 63,
+      "expected_behavior_policy_after_commits": 122,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        123,
+        124
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 62,
+      "source_epoch": 64,
+      "expected_behavior_policy_after_commits": 124,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        125,
+        126
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 63,
+      "source_epoch": 65,
+      "expected_behavior_policy_after_commits": 126,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        127,
+        128
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 64,
+      "source_epoch": 66,
+      "expected_behavior_policy_after_commits": 128,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        129,
+        130
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 65,
+      "source_epoch": 67,
+      "expected_behavior_policy_after_commits": 130,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        131,
+        132
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 66,
+      "source_epoch": 68,
+      "expected_behavior_policy_after_commits": 132,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        133,
+        134
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 67,
+      "source_epoch": 69,
+      "expected_behavior_policy_after_commits": 134,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        135,
+        136
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 68,
+      "source_epoch": 70,
+      "expected_behavior_policy_after_commits": 136,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        137,
+        138
+      ],
+      "nominal_rows_per_commit": 192
+    },
+    {
+      "collection_index": 69,
+      "source_epoch": 71,
+      "expected_behavior_policy_after_commits": 138,
+      "training_video_slots": 384,
+      "nominal_groups": 48,
+      "expected_commit_numbers": [
+        139,
+        140
+      ],
+      "nominal_rows_per_commit": 192
+    }
+  ],
+  "evaluations": [
+    {
+      "source_epoch": 0,
+      "after_optimizer_commits": 0,
+      "prompt_slots": 300,
+      "sampling_steps": 50,
+      "before_training_collection": true
+    },
+    {
+      "source_epoch": 20,
+      "after_optimizer_commits": 36,
+      "prompt_slots": 300,
+      "sampling_steps": 50,
+      "before_training_collection": true
+    },
+    {
+      "source_epoch": 40,
+      "after_optimizer_commits": 76,
+      "prompt_slots": 300,
+      "sampling_steps": 50,
+      "before_training_collection": true
+    },
+    {
+      "source_epoch": 60,
+      "after_optimizer_commits": 116,
+      "prompt_slots": 300,
+      "sampling_steps": 50,
+      "before_training_collection": true
+    }
+  ],
+  "author_datasets": {
+    "train": {
+      "sha256": "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016",
+      "nonempty_rows": 19700,
+      "deduplicated": false
+    },
+    "test": {
+      "sha256": "96536b01ab2d091158118c4fd9f548950abce4fa5fa9a7f9ac2ebaae47776da5",
+      "nonempty_rows": 300,
+      "deduplicated": false
+    }
+  }
+}
