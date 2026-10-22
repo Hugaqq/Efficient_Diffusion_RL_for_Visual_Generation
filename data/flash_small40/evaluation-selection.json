@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "preset": "small40",
+  "selection_rule": "Manual category-balanced choice frozen before SMALL40 results: four people/action, four animals, four nature, four complex scenes. No reward-based selection. Indices are zero-based author test.txt line indices.",
+  "source_sha256": "96536b01ab2d091158118c4fd9f548950abce4fa5fa9a7f9ac2ebaae47776da5",
+  "train_sha256": "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016",
+  "entries": [
+    {"index": 2, "category": "people/action", "seed": 42000, "prompt": "A young man with dark hair in a blue shirt says something to two other men on the street"},
+    {"index": 17, "category": "people/action", "seed": 42001, "prompt": "woman dancing by a car on a sunny day,"},
+    {"index": 18, "category": "people/action", "seed": 42002, "prompt": "women drink a cup of herbal tea with pleasant emotion"},
+    {"index": 38, "category": "people/action", "seed": 42003, "prompt": "A female secretary is calling the office"},
+    {"index": 9, "category": "animals", "seed": 42004, "prompt": "a fox and a wolf running together in a forest"},
+    {"index": 14, "category": "animals", "seed": 42005, "prompt": "a bunnyowl breaking out of an egg, cinematic"},
+    {"index": 15, "category": "animals", "seed": 42006, "prompt": "2 ants are running out in a jungle"},
+    {"index": 44, "category": "animals", "seed": 42007, "prompt": "a sloth stretching its arms, realistic, 4k, detailed fur"},
+    {"index": 28, "category": "nature", "seed": 42008, "prompt": "begonia flowers growing from beginning to end high resolution 15sec long"},
+    {"index": 30, "category": "nature", "seed": 42009, "prompt": "snow mountain, nightsky galaxy, fantasy vibe, vaporwave Y2K, high definitaion, complex"},
+    {"index": 36, "category": "nature", "seed": 42010, "prompt": "some white lotus in nature with breeze"},
+    {"index": 37, "category": "nature", "seed": 42011, "prompt": "macro vision of a different stones starts a fire, 4k, cinematic"},
+    {"index": 13, "category": "complex scenes", "seed": 42012, "prompt": "cyberpunk city of newyork in full hdr ,3d"},
+    {"index": 22, "category": "complex scenes", "seed": 42013, "prompt": "futuristic house made of cristal and steel under construction in the downtown of Madrid"},
+    {"index": 40, "category": "complex scenes", "seed": 42014, "prompt": "a steam locomotive train chugging on tracks at night flooding"},
+    {"index": 43, "category": "complex scenes", "seed": 42015, "prompt": "centered on indoor mantel with fireplace hearth below with fire going and is decorated for fall with pumpkin decorations on the mantel"}
+  ]
+}

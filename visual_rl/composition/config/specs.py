@@ -657,6 +657,7 @@ class TrainingSpec:
     schema_version: int = 1
     collection: GRPOTrainerConfig | None = None
     flash_evaluation: bool = False
+    flash_preset: str = "approved140"
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or type(self.schema_version) is not int:
@@ -664,12 +665,24 @@ class TrainingSpec:
                 "expected integer 1",
                 path="training.schema_version",
             )
+        from visual_rl.algorithms.trainer.flash_presets import flash_preset
+        try:
+            preset = flash_preset(self.flash_preset)
+        except ValueError as exc:
+            raise SpecValidationError(str(exc), path="training.flash_preset") from exc
         _bool(self.flash_evaluation, path="training.flash_evaluation")
         if self.flash_evaluation and self.collection is None:
             raise SpecValidationError("Flash evaluation requires collection cadence", path="training.flash_evaluation")
         if self.collection is not None:
             if not isinstance(self.collection, GRPOTrainerConfig) or self.collection.collection_rows_per_commit is None:
                 raise SpecValidationError("collection requires a typed row/commit cadence", path="training.collection")
+        if self.flash_preset == "small40" and (
+                not self.flash_evaluation or self.collection is None
+                or self.max_optimizer_steps != preset.optimizer_steps
+                or self.global_prompt_batch_size != 4
+                or self.collection.collection_rows_per_commit != preset.rows_per_commit
+                or self.collection.collection_commits != 2):
+            raise SpecValidationError("SMALL40 requires 40 commits, 4 prompts, 2x16 and evaluation", path="training.flash_preset")
         seed = _integer(self.seed, path="training.seed")
         if seed > 0xFFFF_FFFF:
             raise SpecValidationError(
@@ -718,7 +731,7 @@ class TrainingSpec:
     def from_mapping(cls, value: object) -> TrainingSpec:
         raw_input = _mapping(value, path="training")
         raw = _exact(
-            {k: v for k, v in raw_input.items() if k not in {"collection", "flash_evaluation"}},
+            {k: v for k, v in raw_input.items() if k not in {"collection", "flash_evaluation", "flash_preset"}},
             frozenset(
                 {
                     "schema_version",
@@ -746,6 +759,7 @@ class TrainingSpec:
             policy_recompute=PolicyRecomputeSpec.from_mapping(raw["policy_recompute"]),
             collection=(None if raw_input.get("collection") is None else GRPOTrainerConfig.from_mapping(raw_input["collection"], context=None)),
             flash_evaluation=raw_input.get("flash_evaluation", False),
+            flash_preset=raw_input.get("flash_preset", "approved140"),
         )
 
     @classmethod
@@ -786,6 +800,7 @@ class TrainingSpec:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            **({"flash_preset": self.flash_preset} if self.flash_preset != "approved140" else {}),
             **({"flash_evaluation": True} if self.flash_evaluation else {}),
             **({"collection": {
                 "collection_rows_per_commit": self.collection.collection_rows_per_commit,

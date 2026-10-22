@@ -282,6 +282,7 @@ class CollectionState:
         self.pending = None
         self.commit_cursor = 0
         self.evaluations_completed = []
+        self.evaluation_steps = (0, 36, 76, 116)
         self.evaluator = None
         self.active_cache = None
         self.cache_root = None
@@ -289,7 +290,7 @@ class CollectionState:
     def before_iteration(self, step):
         if step != self.committed_steps:
             raise ValueError("collection committed-step cursor differs from trainer")
-        if self.evaluator is not None and step in (0, 36, 76, 116) and step not in self.evaluations_completed:
+        if self.evaluator is not None and step in self.evaluation_steps and step not in self.evaluations_completed:
             self.evaluator(step)
             self.evaluations_completed.append(step)
 
@@ -409,7 +410,7 @@ class CollectionState:
                 raise ValueError("invalid ema parameter")
         evaluated = state["evaluations_completed"]
         if (not isinstance(evaluated, list) or evaluated != sorted(set(evaluated))
-                or any(type(s) is not int or s not in (0, 36, 76, 116) or s > step for s in evaluated)):
+                or any(type(s) is not int or s not in self.evaluation_steps or s > step for s in evaluated)):
             raise ValueError("invalid evaluation cursor")
         pool = state["pool"]
         pending = None

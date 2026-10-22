@@ -13,15 +13,15 @@ from tests import test_v2_demo_default_composition as demo
 from visual_rl.runtime.composition import create_default_run_controller
 
 
-def config(root, artifacts, output, *, resume=None, steps=2):
+def config(root, artifacts, output, *, resume=None, steps=2, rows=192):
     root.mkdir()
     case = next(c for c in demo._DEMO_CASES if c.recipe_id == "flash_grpo_v1")
     path = demo._write_smoke_config(root, case, output_dir=output, artifacts=artifacts,
                                      resume_from=resume, max_optimizer_steps=steps)
     raw = yaml.safe_load(path.read_text())
     raw["overrides"]["training"].update({
-        "global_prompt_batch_size": 48,
-        "collection": {"collection_rows_per_commit": 192, "collection_commits": 2,
+        "global_prompt_batch_size": rows * 2 // 8,
+        "collection": {"collection_rows_per_commit": rows, "collection_commits": 2,
                        "collection_chunk_rows": 16},
         "policy_recompute": {"row_microbatch_size": 4, "transition_window_size": 1},
     })
@@ -138,6 +138,45 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert events.count("collection_chunk_durable") == 48
     assert events.count("collection_start") == 2  # none on odd resume
     assert "checkpoint_durable" in events and "optimizer_commit" in events
+
+    # Same real controller/PPO/std/resume regression at SMALL40's 32 ->16+16.
+    replay_calls.clear()
+    small_out = tmp_path / "small-out"
+    small_rewards = demo._FakeRewardResourceFactory()
+    small = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                          reward_resource_factory=small_rewards)
+    observe_checkpoints(small, pause_after=1)
+    with pytest.raises(SafePointPause):
+        small.run(config(tmp_path / "small-first", artifacts, small_out, rows=16))
+    assert small_rewards.resources[0].score_calls == 2
+    assert len(replay_calls) == 4  # four row4 slots, not an extra prepass
+    _, small_saved = e2e._checkpoint_snapshot(small_out / "checkpoints/step-1")
+    small_state = small_saved.component_state("data_plane").payload["runtime_state"]
+    small_pool = small_state["pool"]
+    assert small_pool["execution"].trajectory.batch_size == 32
+    reward = small_pool["reward"]["weighted_total"]
+    expected = np.zeros(32)
+    grouping = small_pool["advantage"].grouping
+    for group in dict.fromkeys(grouping.group_ids):
+        indices = np.array([i for i, g in enumerate(grouping.group_ids) if g == group])
+        expected[indices] = (reward[indices] - reward[indices].mean()) / (reward.std() + 1e-4)
+    np.testing.assert_allclose(small_pool["advantage"].values.numpy(), expected, rtol=1e-5, atol=1e-6)
+    resumed_rewards = demo._FakeRewardResourceFactory()
+    small_resume = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                 reward_resource_factory=resumed_rewards)
+    final_small = small_resume.run(config(tmp_path / "small-resume", artifacts, small_out, rows=16,
+                                           resume=small_out / "checkpoints/step-1"))
+    assert resumed_rewards.resources[0].score_calls == 0
+    assert final_small.last_metrics["active_transition_count"] == 16
+    assert final_small.last_metrics["logprob_delta_max"] > 0
+    assert len(replay_calls) == 8
+    continuous_small = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                      reward_resource_factory=demo._FakeRewardResourceFactory())
+    reference_small = continuous_small.run(config(tmp_path / "small-continuous", artifacts,
+                                                   tmp_path / "small-continuous-out", rows=16))
+    e2e._assert_checkpoint_state_exact(e2e._checkpoint_snapshot(reference_small.authoritative_checkpoint),
+                                      e2e._checkpoint_snapshot(final_small.authoritative_checkpoint),
+                                      include_run_summary=False)
 
 
 def test_collection_disk_chunks_survive_failure_before_first_commit(monkeypatch, tmp_path):
@@ -381,6 +420,156 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
     _, snapshot = e2e._checkpoint_snapshot(result.authoritative_checkpoint)
     assert snapshot.component_state("data_plane").payload["runtime_state"]["evaluations_completed"] == [0]
 
+    # Real SMALL40 dispatch/controller/terminal hook; only heavy model geometry,
+    # scorer and MP4 encoder are explicit CPU fake leaves. Production guards,
+    # author source hashes, fixed selection, 40 commits and 0/20/40 stay real.
+    from visual_rl.models.implementations.wan import WanT2VAdapter
+    from visual_rl.algorithms.trainer.flash_presets import SMALL40
+    from scripts.launch_flash140 import SMALL_CONFIG
+    author = Path(__file__).resolve().parents[3] / "dataset/video"
+    assert author.is_dir()  # task's local author data, not downloaded fixtures
+    # Restore the actual loader used in production (the earlier300 case used synthetic prompts).
+    monkeypatch.undo()
+    e2e._patch_default_runtime(monkeypatch)
+    monkeypatch.setattr(evaluation.FlashEvaluationStage, "__call__", checked_evaluation)
+    tiny_config = lambda cfg: replace(cfg, height=16, width=16, frames=5)
+    latent = WanT2VAdapter.latent_spec_for_batch
+    validate = WanT2VAdapter._validate_latent_spec
+    def tiny_latent(self, *args, **kwargs):
+        original_config = self.config
+        self.config = tiny_config(original_config)
+        try:
+            return latent(self, *args, **kwargs)
+        finally:
+            self.config = original_config
+    def tiny_validate(self, *args, **kwargs):
+        original_config = self.config
+        self.config = tiny_config(original_config)
+        try:
+            return validate(self, *args, **kwargs)
+        finally:
+            self.config = original_config
+    monkeypatch.setattr(WanT2VAdapter, "latent_spec_for_batch", tiny_latent)
+    monkeypatch.setattr(WanT2VAdapter, "_validate_latent_spec", tiny_validate)
+    saved_media = []
+    def fake_encoder(path, media, contract):
+        assert media.tensor.shape[1] == contract.frames == 81  # not21 latent frames
+        assert media.tensor.shape[-2:] == (2, 2)  # explicit CPU fake model
+        saved_media.append(weakref.ref(media.tensor))
+        path.write_bytes(b"CPU fake MP4 encoder output")
+    monkeypatch.setattr(evaluation, "write_evaluation_video", fake_encoder)
+    evaluation_calls.clear()
+    steps.clear()
+    seeds = []
+    def small_counted(self, request, *, num_steps):
+        seeds.append((request.samples.prompts[0], request.generator.initial_seed()))
+        steps.append(num_steps)
+        return original(self, request, num_steps=num_steps)
+    monkeypatch.setattr(RolloutCollector, "evaluate_deterministic", small_counted)
+    class SmallClient(Client):
+        fail_terminal = True
+        def __init__(self):
+            super().__init__()
+            self.contract = VideoContract(81, 2, 2)
+            self.terminal_calls = 0
+        def score_video(self, *, sample_id, prompt, frames_base64):
+            assert len(frames_base64) == 81
+            if "step-40-" in sample_id:
+                if type(self).fail_terminal and self.terminal_calls == 3:
+                    raise RuntimeError("terminal40 evaluation interruption")
+                self.terminal_calls += 1
+            self.eval_calls += 1
+            # Descriptive nonconstant values permit checking paired differences.
+            score = 0.4 + int(sample_id.split("step-")[1].split("-")[0]) / 1000
+            return score, {"scored_frame_indices": list(range(81)),
+                           "selected_frame_indices": list(range(24)), "frame_scores": [score] * 81}
+    small_clients = []
+    def small_factory(request):
+        acquired = base_factory(request)
+        client = SmallClient()
+        small_clients.append(client)
+        return replace(acquired, resource=client)
+    small_out = tmp_path / "small40-out"
+    def small_path(name, resume=None):
+        p = config(tmp_path / name, artifacts, small_out, steps=40, rows=16, resume=resume)
+        raw = yaml.safe_load(p.read_text())
+        approved = yaml.safe_load(SMALL_CONFIG.read_text())["overrides"]
+        raw["overrides"]["training"] = approved["training"]
+        raw["overrides"]["algorithm"]["params"].update(approved["algorithm"]["params"])
+        raw["overrides"]["model"]["params"].update(approved["model"]["params"])
+        raw["launch"]["checkpoint_every_optimizer_steps"] = 2
+        raw["launch"]["artifacts"]["datasets"]["main"] = str(author / "train.txt")
+        raw["launch"]["artifacts"]["evaluation_prompts"] = str(author / "test.txt")
+        p.write_text(yaml.safe_dump(raw))
+        return p
+    controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                reward_resource_factory=small_factory)
+    with pytest.raises(RuntimeError, match="terminal40 evaluation interruption"):
+        controller.run(small_path("small40-first"))
+    assert not (small_out / "SUCCESS").exists()
+    assert not (small_out / "checkpoints/step-40").exists()
+    assert (small_out / "checkpoints/step-38").is_dir()
+    assert small_clients[0].score_calls == 40  #20 collections x2 chunks x16=640 videos
+    assert evaluation_calls == [0, 20, 40]
+    assert steps == [20] * 36  #16+16+3 durable+1 interrupted
+    assert [seed for _, seed in seeds[:16]] == list(SMALL40.noise_seeds)
+    assert seeds[:16] == seeds[16:32]  # identical prompt noise across EMA rounds
+    assert len(list((small_out / "evaluations/step-40").glob("video-*.json"))) == 3
+    SmallClient.fail_terminal = False
+    controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                reward_resource_factory=small_factory)
+    small_result = controller.run(small_path("small40-retry", small_out / "checkpoints/step-38"))
+    assert small_result.committed_steps == 40 and (small_out / "SUCCESS").is_file()
+    assert evaluation_calls == [0, 20, 40, 40]  # no baseline/step20 redo
+    assert small_clients[-1].eval_calls == 13  #3 terminal receipts reused
+    assert steps == [20] * 49  #48 logical videos +1 interrupted physical RPC
+    small_inspection, small_snapshot = e2e._checkpoint_snapshot(small_result.authoritative_checkpoint)
+    assert dict(small_inspection.progress.source_cursors)["main"] == 80  #20 x4 prompts, no extra logical collection
+    terminal_state = small_snapshot.component_state("data_plane").payload["runtime_state"]
+    assert terminal_state["evaluations_completed"] == [0, 20, 40]
+    assert terminal_state["committed_steps"] == 40 and terminal_state["commit_cursor"] == 0
+    assert terminal_state["pool"] is None
+    assert sorted(int(p.name.removeprefix("step-")) for p in (small_out / "checkpoints").iterdir()
+                  if p.name.removeprefix("step-").isdigit()) == list(range(2, 41, 2))
+    for step in (0, 20, 40):
+        root = small_out / f"evaluations/step-{step}"
+        assert len(list(root.glob("*.mp4"))) == 16
+        summary = json.loads((root / "summary.json").read_text())
+        assert summary["sampling_steps"] == 20 and summary["noise_seeds"] == list(SMALL40.noise_seeds)
+        assert summary["decoded_frames"] == 81 and summary["fps"] == 15
+        assert summary["videos_scored"] == len(summary["per_prompt"]) == 16
+        assert summary["physical_video_attempts_started"] == (17 if step == 40 else 16)
+        if step:
+            assert summary["paired_differences"]["step-0"]["mean"] == pytest.approx(step / 1000)
+    import gc
+    gc.collect()
+    assert all(ref() is None for ref in saved_media)
+    # Even already-completed earlier rounds must retain their videos before
+    # finalization; a saved evaluations_completed cursor is not enough.
+    terminal_summary = json.loads((small_out / "evaluations/step-40/summary.json").read_text())
+    evaluation.validate_small40_evaluation_artifacts(small_out, terminal_summary["recipe_id"])
+    baseline_video = small_out / "evaluations/step-0/video-000-seed-42000.mp4"
+    baseline_bytes = baseline_video.read_bytes()
+    baseline_video.unlink()
+    with pytest.raises(ValueError, match="video missing/corrupt"):
+        evaluation.validate_small40_evaluation_artifacts(small_out, terminal_summary["recipe_id"])
+    baseline_video.write_bytes(baseline_bytes)
+    # Existing receipt without its associated MP4 must never be silently reused.
+    # Reuse the terminal evaluator before close is not possible; exercise the
+    # same real journal path by another even-checkpoint restore.
+    (small_out / "evaluations/step-40/video-000-seed-42000.mp4").unlink()
+    stale = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                          reward_resource_factory=small_factory)
+    stale_out = tmp_path / "stale-small40"
+    # Clone only evaluation journals to a new owned test output (no SUCCESS).
+    import shutil
+    shutil.copytree(small_out / "evaluations", stale_out / "evaluations")
+    original_out = small_out
+    small_out = stale_out
+    with pytest.raises(ValueError, match="video missing/corrupt"):
+        stale.run(small_path("stale-small40-case", original_out / "checkpoints/step-38"))
+    assert not (stale_out / "SUCCESS").exists()
+
 
 def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     from scripts import launch_flash140 as launch
@@ -417,6 +606,49 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     launch_path = tmp_path / "rendered.yaml"
     launch_path.write_text(yaml.safe_dump(rendered))
     assert compile_recipe_v2(load_source_recipe(launch_path)).training == recipe.training
+    small_path = launch.preset_config("small40")
+    assert launch.preset_config("approved140") == path.resolve()
+    with pytest.raises(ValueError, match="unknown"):
+        launch.preset_config("unapproved")
+    small_source = load_source_recipe(small_path)
+    small_recipe = compile_recipe_v2(small_source)
+    small_raw = yaml.safe_load(small_path.read_text())
+    assert small_recipe.training.flash_preset == "small40"
+    assert small_recipe.training.max_optimizer_steps == 40
+    assert small_recipe.training.global_prompt_batch_size == 4
+    assert small_recipe.training.collection.collection_rows_per_commit == 16
+    assert small_recipe.training.collection.collection_commits == 2
+    assert small_recipe.training.collection.collection_chunk_rows == 16
+    assert small_recipe.training.flash_evaluation
+    assert small_recipe.training.policy_recompute == recipe.training.policy_recompute
+    assert small_recipe.training.update_safety == recipe.training.update_safety
+    assert small_recipe.execution_policy == recipe.execution_policy
+    assert small_raw["overrides"]["model"] == raw["overrides"]["model"]
+    assert small_raw["overrides"]["algorithm"] == raw["overrides"]["algorithm"]
+    assert small_raw["overrides"]["rewards"] == raw["overrides"]["rewards"]
+    assert small_raw["launch"]["artifacts"] == raw["launch"]["artifacts"]
+    assert small_raw["launch"]["checkpoint_every_optimizer_steps"] == 2
+    small_render = launch.render_config(small_raw, tmp_path / "small40-run", None)
+    assert small_render["overrides"] == small_raw["overrides"]
+    launch.check_preset_mode("small40", "run", None, False)
+    launch.check_preset_mode("small40", "preflight", None, False)
+    for mode, resume, retry in (("validate", None, False), ("run", Path("old140/step-1"), False),
+                                 ("run", None, True)):
+        with pytest.raises(RuntimeError, match="fresh RUN"):
+            launch.check_preset_mode("small40", mode, resume, retry)
+    with pytest.raises(RuntimeError, match="fresh"):
+        launch.render_config(small_raw, tmp_path / "bad", Path("old140/step-1"))
+    import copy
+    from visual_rl.errors import ConfigError
+    for target in (2, 39, 140):
+        bad = copy.deepcopy(small_raw)
+        bad["overrides"]["training"]["max_optimizer_steps"] = target
+        with pytest.raises(RuntimeError, match="endpoint"):
+            launch.render_config(bad, tmp_path / "bad", None)
+        p = tmp_path / f"invalid-small-{target}.yaml"
+        p.write_text(yaml.safe_dump(bad))
+        with pytest.raises(ConfigError, match="SMALL40"):
+            compile_recipe_v2(load_source_recipe(p))
     safe = {"gpu_free_gib": 68.03, "host_available_gib": 88, "disk_free_gib": 1024}
     launch.check_budget(safe, admission=True, disk_required_gib=1024)
     for key in safe:
@@ -477,3 +709,25 @@ def test_approved140_manifest_counts():
     assert all(e["prompt_slots"] == 300 and e["sampling_steps"] == 50 for e in manifest["evaluations"])
     assert manifest["evaluation_videos_target"] == 1200
     assert not manifest["additional_final_evaluation"]
+    from visual_rl.algorithms.trainer.flash_presets import SMALL40, APPROVED140
+    from visual_rl.algorithms.trainer.evaluation import load_evaluation_prompts, select_small40_prompts
+    assert APPROVED140.optimizer_steps == 140 and APPROVED140.evaluation_steps == (0, 36, 76, 116)
+    assert SMALL40.optimizer_steps == 40
+    assert SMALL40.optimizer_steps // 2 == 20
+    assert SMALL40.optimizer_steps // 2 * SMALL40.collection_rows == 640
+    assert SMALL40.collection_rows == 2 * SMALL40.rows_per_commit == 32
+    assert SMALL40.evaluation_steps == (0, 20, 40)
+    assert SMALL40.prompt_count * len(SMALL40.evaluation_steps) == 48
+    assert SMALL40.sampling_steps == 20 and SMALL40.save_videos
+    author = Path(__file__).resolve().parents[3] / "dataset/video"
+    selected = select_small40_prompts(load_evaluation_prompts(author / "test.txt"), author / "train.txt")
+    assert len(set(selected)) == 16
+    train = set((author / "train.txt").read_text().splitlines())
+    assert not set(selected).intersection(train)
+    small = json.loads((Path(__file__).parents[1] / "experiments/flash_wan_capacity_20261022/workload-small40.json").read_text())
+    assert small["optimizer_commits_target"] == small["collection_count"] * small["optimizer_commits_per_collection"] == 40
+    assert small["training_videos_target"] == small["collection_count"] * small["training_videos_per_collection"] == 640
+    assert small["training_videos_per_collection"] == small["prompts_per_collection"] * small["group_size"] == 32
+    assert small["evaluation_steps"] == [0, 20, 40] and small["terminal_evaluation_required"]
+    assert small["evaluation_videos_target"] == small["evaluation_prompts"] * 3 == 48
+    assert small["logical_hps_frame_scores_target"] == (640 + 48) * 81
