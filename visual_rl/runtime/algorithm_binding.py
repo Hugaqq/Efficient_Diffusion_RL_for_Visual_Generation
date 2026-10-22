@@ -1045,8 +1045,7 @@ class DefaultStageAssembler:
                 raise DefaultStageAssemblyError("streamed Flash collection currently requires KL=0 and no conditioner")
             parameters = tuple(p for g in request.prepared.optimizer.param_groups for p in g["params"])
             collection = CollectionState(config=trainer_config, parameters=parameters,
-                request_factory=rollout_request_factory,
-                current_context=lambda: manager.execution(current_policy))
+                request_factory=rollout_request_factory)
             if training.max_optimizer_steps == 140 and (
                     total_rows != 384 or nominal != 192 or trainer_config.collection_commits != 2
                     or group_size != 8 or forward != 4
@@ -1116,7 +1115,6 @@ class DefaultStageAssembler:
             execution_plan=update_plan,
             require_reference_statistics=algorithm.requires_reference_statistics,
             current_context=lambda: manager.execution(current_policy),
-            behavior_context=None if collection is None else collection.behavior_context,
             reference_context=(
                 None
                 if reference_policy is None

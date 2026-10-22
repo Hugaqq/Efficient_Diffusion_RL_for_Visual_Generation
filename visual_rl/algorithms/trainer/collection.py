@@ -191,10 +191,9 @@ class StreamedRolloutStage(RolloutStage):
         selection = self.rollout._policy_step_selection(virtual)
         session = DynamicsSession.create(request.dynamics, num_steps=self.rollout.num_steps,
                                          device=request.latent_spec.device, selection=selection)
-        behavior_hash = hashlib.sha256()
-        for p in self.collection.behavior:
-            behavior_hash.update(p.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
-        collection_key = hashlib.sha256((self.recipe_id + str(value.identity) + behavior_hash.hexdigest()
+        if self.collection.sampling_fingerprint is None:
+            raise RuntimeError("missing collection sampling fingerprint")
+        collection_key = hashlib.sha256((self.recipe_id + str(value.identity) + self.collection.sampling_fingerprint
                                         + session.snapshot.snapshot_identity).encode()).hexdigest()
         cache = self.cache_dir / f"collection-{value.identity.optimizer_step}"
         self.collection.active_cache = cache
@@ -260,13 +259,12 @@ class StreamedRolloutStage(RolloutStage):
 
 
 class CollectionState:
-    """One fixed behavior snapshot, pending credit pool, and CPU LoRA EMA."""
-    def __init__(self, *, config, parameters, request_factory, current_context):
+    """Pending fixed-policy credit pool, ephemeral cache identity, and CPU LoRA EMA."""
+    def __init__(self, *, config, parameters, request_factory):
         self.config = config
         self.parameters = tuple(parameters)
         self.request_factory = request_factory
-        self.current_context = current_context
-        self.behavior = None
+        self.sampling_fingerprint = None
         self.ema = [p.detach().cpu().clone() for p in self.parameters]
         self.committed_steps = 0
         self.pending = None
@@ -285,30 +283,32 @@ class CollectionState:
 
     def close(self):
         self.pending = None
-        self.behavior = None
+        self.sampling_fingerprint = None
         self.evaluator = None
         self.ema = []
         self.parameters = ()
 
     def begin(self):
-        self.behavior = [p.detach().cpu().clone() for p in self.parameters]
-
-    def behavior_context(self):
-        if self.behavior is None:
-            raise RuntimeError("missing behavior-policy snapshot")
-        return self.parameter_context(self.behavior, execution=True)
+        import torch
+        digest = hashlib.sha256()
+        for index, parameter in enumerate(self.parameters):
+            metadata = (index, tuple(parameter.shape), str(parameter.dtype))
+            digest.update(json.dumps(metadata).encode() + b"\0")
+            # At most one temporary CPU parameter; never retain behavior weights.
+            cpu = parameter.detach().to(device="cpu").contiguous()
+            digest.update(cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
+            del cpu
+        self.sampling_fingerprint = digest.hexdigest()
 
     @contextmanager
-    def parameter_context(self, values, *, execution=False):
+    def parameter_context(self, values):
         import torch
-        from contextlib import nullcontext
         backup = [p.detach().cpu().clone() for p in self.parameters]
         with torch.no_grad():
             for p, old in zip(self.parameters, values, strict=True):
                 p.copy_(old)
         try:
-            with (self.current_context() if execution else nullcontext()):
-                yield
+            yield
         finally:
             with torch.no_grad():
                 for p, current in zip(self.parameters, backup, strict=True):
@@ -352,7 +352,7 @@ class CollectionState:
         self.commit_cursor += 1
         if self.commit_cursor == self.config.collection_commits:
             self.pending = None
-            self.behavior = None
+            self.sampling_fingerprint = None
             self.commit_cursor = 0
             if self.active_cache is not None:
                 import shutil
@@ -378,26 +378,23 @@ class CollectionState:
             pool = dict(identity=self.pending.identity, samples=samples,
                 execution=rollout.execution, reward=reward,
                 advantage=credit.advantaged.advantage, loss_inputs=credit.loss_inputs)
-        return dict(schema_version=1, committed_steps=self.committed_steps,
-                    commit_cursor=self.commit_cursor, behavior=self.behavior,
+        return dict(schema_version=2, committed_steps=self.committed_steps,
+                    commit_cursor=self.commit_cursor,
                     ema=self.ema, pool=pool, evaluations_completed=list(self.evaluations_completed))
 
     def load_state_dict(self, state):
         import torch
-        if set(state) != {"schema_version", "committed_steps", "commit_cursor", "behavior", "ema", "pool", "evaluations_completed"} or state["schema_version"] != 1:
-            raise ValueError("invalid collection state schema")
+        if set(state) != {"schema_version", "committed_steps", "commit_cursor", "ema", "pool", "evaluations_completed"} or state["schema_version"] != 2:
+            raise ValueError("invalid collection state schema (requires schema 2; old candidates cannot resume)")
         step, cursor = state["committed_steps"], state["commit_cursor"]
-        if type(step) is not int or step < 0 or cursor != step % self.config.collection_commits:
+        if type(step) is not int or step < 0 or type(cursor) is not int or cursor != step % self.config.collection_commits:
             raise ValueError("invalid collection commit cursor")
-        for name in ("ema", "behavior"):
-            values = state[name]
-            if values is None and name == "behavior" and cursor == 0:
-                continue
-            if not isinstance(values, list) or len(values) != len(self.parameters):
-                raise ValueError(f"invalid {name} parameter count")
-            for p, saved in zip(self.parameters, values, strict=True):
-                if saved.shape != p.shape or saved.dtype != p.dtype or saved.device.type != "cpu" or not bool(torch.isfinite(saved).all()):
-                    raise ValueError(f"invalid {name} parameter")
+        values = state["ema"]
+        if not isinstance(values, list) or len(values) != len(self.parameters):
+            raise ValueError("invalid ema parameter count")
+        for p, saved in zip(self.parameters, values, strict=True):
+            if not isinstance(saved, torch.Tensor) or saved.shape != p.shape or saved.dtype != p.dtype or saved.device.type != "cpu" or not bool(torch.isfinite(saved).all()):
+                raise ValueError("invalid ema parameter")
         evaluated = state["evaluations_completed"]
         if (not isinstance(evaluated, list) or evaluated != sorted(set(evaluated))
                 or any(type(s) is not int or s not in (0, 36, 76, 116) or s > step for s in evaluated)):
@@ -420,6 +417,7 @@ class CollectionState:
         if pending is not None and self.cache_root is not None:
             candidate = self.cache_root / f"collection-{pending.identity.optimizer_step}"
             self.active_cache = candidate if candidate.exists() else None
-        self.pending, self.behavior, self.ema = pending, state["behavior"], state["ema"]
+        self.pending, self.ema = pending, state["ema"]
+        self.sampling_fingerprint = None
         self.committed_steps, self.commit_cursor = step, cursor
         self.evaluations_completed = list(evaluated)
