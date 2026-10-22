@@ -669,6 +669,20 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     monkeypatch.setattr(launch, "resource_sample", lambda _: {**observed, "torch_peak_reserved_gib": 61})
     with pytest.raises(RuntimeError, match="peak reservation"):
         monitor.sample()
+    # Explicit user-approved GPU policy: no headroom or reserved-peak abort;
+    # host/disk and invalid telemetry still fail, and CUDA errors aren't caught.
+    launch.check_budget({**safe, "gpu_free_gib": 0}, admission=True, gpu_memory_policy="oom")
+    oom_monitor = launch.ResourceMonitor(tmp_path, tmp_path / "oom-resources.json",
+                                       gpu_reserved_limit=60, gpu_memory_policy="oom")
+    monkeypatch.setattr(launch, "resource_sample", lambda _: {**observed, "gpu_free_gib": 1,
+                                                            "torch_peak_reserved_gib": 77})
+    oom_monitor.sample()
+    assert oom_monitor.peaks["torch_peak_reserved_gib"] == 77
+    for key, low in (("host_available_gib", 23), ("disk_free_gib", 63)):
+        with pytest.raises(RuntimeError, match="resource safety"):
+            launch.check_budget({**safe, key: low}, gpu_memory_policy="oom")
+    with pytest.raises(RuntimeError, match="invalid GPU"):
+        launch.check_budget({**safe, "gpu_free_gib": float("nan")}, gpu_memory_policy="oom")
     lock = tmp_path / "launch.lock"
     with launch.exclusive_launch(lock, {"pid": 123}):
         with pytest.raises(RuntimeError, match="duplicate"):
