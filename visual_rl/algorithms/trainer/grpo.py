@@ -63,6 +63,12 @@ class BaseTrainer:
         self._state = TrainerState.NEW
         self._prepare_context: PrepareRunContext | None = None
         self._next_optimizer_step: int | None = None
+        self._collection = None
+
+    def bind_collection(self, collection) -> None:
+        if self._state is not TrainerState.NEW or self._collection is not None:
+            raise RuntimeError("collection cadence must bind once before prepare")
+        self._collection = collection
 
     @property
     def state(self) -> TrainerState:
@@ -93,7 +99,15 @@ class BaseTrainer:
             raise ValueError(
                 f"expected optimizer step {self._next_optimizer_step}, got {optimizer_step}"
             )
-        value = self._prelude.build(optimizer_step)
+        collection = self._collection
+        if collection is not None:
+            collection.before_iteration(optimizer_step)
+        value = None if collection is None else collection.resume_credit(optimizer_step)
+        reused = value is not None
+        if not reused:
+            if collection is not None:
+                collection.begin()
+            value = self._prelude.build(optimizer_step)
         if not isinstance(value, StageValue):
             raise TypeError("prelude must return StageValue")
         if value.identity.optimizer_step != optimizer_step:
@@ -101,7 +115,11 @@ class BaseTrainer:
         identity = value.identity
         next_value: StageValue[object] | None = None
         try:
-            for name in self._STAGE_NAMES:
+            for name in (("optimize",) if reused else self._STAGE_NAMES):
+                if name == "optimize" and collection is not None:
+                    if not reused:
+                        collection.remember(value)
+                    value = collection.masked(value)
                 next_value = self._stages[name](value)
                 if not isinstance(next_value, StageValue):
                     raise TypeError(f"{name} stage must return StageValue")
@@ -112,7 +130,7 @@ class BaseTrainer:
                 value = next_value
         except BaseException as primary:
             abort = getattr(self._prelude, "abort_iteration", None)
-            if callable(abort):
+            if callable(abort) and not reused:
                 try:
                     abort(identity)
                 except BaseException as cleanup:  # noqa: BLE001
@@ -127,8 +145,10 @@ class BaseTrainer:
             del value, next_value
             raise
         commit = getattr(self._prelude, "commit_iteration", None)
-        if callable(commit):
+        if callable(commit) and not reused:
             commit(identity)
+        if collection is not None:
+            collection.commit()
         result = IterationResult(
             optimizer_step=optimizer_step,
             value=value,
@@ -150,6 +170,8 @@ class BaseTrainer:
                 method()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+        if self._collection is not None:
+            self._collection.close()
         self._state = TrainerState.CLOSED
         if errors:
             primary = errors[0]

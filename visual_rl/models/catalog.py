@@ -76,6 +76,7 @@ _WAN_CONFIG_KEYS = frozenset(
         "lora_rank",
         "lora_target_modules",
         "max_sequence_length",
+        "text_encoder_residency",
         "vae_tiling",
         "width",
     }
@@ -191,6 +192,7 @@ class WanConfig:
     frame_rate_numerator: int = 16
     frame_rate_denominator: int = 1
     max_sequence_length: int = 226
+    text_encoder_residency: str = "cpu"
     vae_tiling: bool = True
 
     def __post_init__(self) -> None:
@@ -239,6 +241,8 @@ class WanConfig:
             "max_sequence_length",
             positive_int("max_sequence_length", self.max_sequence_length),
         )
+        if not isinstance(self.text_encoder_residency, str) or self.text_encoder_residency not in {"cpu", "stage"}:
+            raise ValueError("text_encoder_residency must be cpu or stage")
         if type(self.vae_tiling) is not bool:
             raise TypeError("vae_tiling must be bool")
 

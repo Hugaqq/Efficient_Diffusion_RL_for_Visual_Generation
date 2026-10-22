@@ -280,6 +280,11 @@ class RewardPipelineStage:
         if not isinstance(value, StageValue):
             raise TypeError("RewardPipelineStage requires a StageValue")
         payload = value.payload
+        if isinstance(payload, RewardedRollout):
+            # StreamedRolloutStage already scored each real media chunk.
+            if not payload.rollout.trajectory.reward_media_released:
+                raise ValueError("pre-scored collection must release reward media")
+            return StageValue(value.identity, payload)
         if not isinstance(payload, RolloutStagePayload):
             raise TypeError("reward payload must be a RolloutStagePayload")
         runtime_context = self.runtime_context_factory(payload, value.identity)
@@ -387,6 +392,7 @@ class OptimizeStage:
         recomputer: PolicyRecomputer | None = None,
         current_context: ContextFactory | None = None,
         reference_context: ContextFactory | None = None,
+        behavior_context: ContextFactory | None = None,
     ) -> None:
         if optimizer is None:
             raise TypeError("optimizer must not be None")
@@ -433,6 +439,7 @@ class OptimizeStage:
         self.recomputer = recomputer or PolicyRecomputer()
         self.current_context = current_context
         self.reference_context = reference_context
+        self.behavior_context = behavior_context
 
     def __call__(self, value: StageValue[object]) -> StageValue[OptimizedIteration]:
         if not isinstance(value, StageValue):
@@ -452,6 +459,7 @@ class OptimizeStage:
             require_reference_statistics=self.require_reference_statistics,
             current_context=self.current_context,
             reference_context=self.reference_context,
+            behavior_context=self.behavior_context,
         )
         try:
             update = self.kernel.step_slots(

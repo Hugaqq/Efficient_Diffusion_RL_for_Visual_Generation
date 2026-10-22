@@ -610,6 +610,7 @@ class TrajectoryBatch:
     selection_mapping_identity: str | None = None
     transition_std_dev: Any | None = None
     rectification_coefficient: Any | None = None
+    reward_media_released: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -729,7 +730,13 @@ class TrajectoryBatch:
         ):
             raise ValueError("storage dtype identity does not match x_t")
 
-        _validate_detached_tensor("media", self.media, floating=True)
+        if type(self.reward_media_released) is not bool:
+            raise TypeError("reward_media_released must be bool")
+        if self.reward_media_released:
+            if self.media is not None or self.kind != "single_step":
+                raise ValueError("only scored single-step replay may release media")
+        else:
+            _validate_detached_tensor("media", self.media, floating=True)
         expected_media_ndim = {
             "BCHW": 4,
             "BFCHW": 5,
@@ -737,7 +744,9 @@ class TrajectoryBatch:
         }.get(self.media_layout)
         if expected_media_ndim is None:
             raise ValueError("invalid batched media layout")
-        if self.media.ndim != expected_media_ndim or self.media.shape[0] != batch_size:
+        if not self.reward_media_released and (
+            self.media.ndim != expected_media_ndim or self.media.shape[0] != batch_size
+        ):
             raise ValueError("media layout does not match batched media shape")
 
         from visual_rl.data.samples.collate import ConditionBatchState
