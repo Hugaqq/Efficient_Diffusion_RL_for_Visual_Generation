@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from visual_rl.algorithms.trainer.config import GRPOTrainerConfig
+from visual_rl.runtime.flash140_logging import progress
 from visual_rl.algorithms.trainer.interface import (
     IterationPrelude,
     IterationResult,
@@ -120,6 +121,8 @@ class BaseTrainer:
                     if not reused:
                         collection.remember(value)
                     value = collection.masked(value)
+                if collection is not None:
+                    progress("training_stage_start", optimizer_step=optimizer_step, stage=name, reused_pool=reused)
                 next_value = self._stages[name](value)
                 if not isinstance(next_value, StageValue):
                     raise TypeError(f"{name} stage must return StageValue")
@@ -149,6 +152,8 @@ class BaseTrainer:
             commit(identity)
         if collection is not None:
             collection.commit()
+            progress("optimizer_commit", committed_steps=collection.committed_steps,
+                     pending_pool=collection.pending is not None)
         result = IterationResult(
             optimizer_step=optimizer_step,
             value=value,

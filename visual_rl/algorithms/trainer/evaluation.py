@@ -16,6 +16,7 @@ from visual_rl.artifacts.terminal import atomic_write
 from visual_rl.artifacts.checkpoint import RankRNGSnapshot
 from visual_rl.core.protocols.flash_hpsv3 import canonical_json
 from visual_rl.data.samples import T2VItem, SourceItemContext, BatchRowContext, ExplicitCollator
+from visual_rl.runtime.flash140_logging import progress
 
 EVALUATION_PROMPT_SHA256 = "96536b01ab2d091158118c4fd9f548950abce4fa5fa9a7f9ac2ebaae47776da5"
 
@@ -78,6 +79,8 @@ class FlashEvaluationStage:
                 raise ValueError("evaluation journal belongs to different EMA/data/service")
         else:
             atomic_write(manifest, canonical_json(identity))
+        progress("evaluation_start", committed_steps=step, prompts=300, sampling_steps=50,
+                 warning="Baseline evaluation precedes training; 300 real videos can take many hours")
         scores = []
         for index, prompt in enumerate(self.prompts):
             sample_id = f"flash-evaluation-step-{step}-prompt-{index}"
@@ -91,8 +94,10 @@ class FlashEvaluationStage:
                         or len(record["selected_frame_indices"]) != resource.contract.top_k):
                     raise ValueError("evaluation receipt identity/frame contract mismatch")
                 scores.append(record["score"])
+                progress("evaluation_receipt_reused", committed_steps=step, completed_prompts=index + 1, total_prompts=300)
                 continue
             record_attempt(root / f"attempt-{index:03d}.json", {"sample_id": sample_id, **identity})
+            progress("evaluation_video_start", committed_steps=step, prompt_index=index, total_prompts=300)
             source = SourceItemContext(source_item_id=f"evaluation-{index}", dataset_source_id="evaluation",
                                        dataset_index=index, dataset_revision=EVALUATION_PROMPT_SHA256)
             item = T2VItem(prompt=prompt, source=source)
@@ -114,6 +119,8 @@ class FlashEvaluationStage:
                 record = {"sample_id": sample_id, "prompt": prompt, "score": score, **metadata}
                 atomic_write(receipt, canonical_json(record))
                 scores.append(score)
+                progress("evaluation_video_durable", committed_steps=step, completed_prompts=index + 1,
+                         total_prompts=300, reward=score)
             finally:
                 del media, request, conditioning
         atomic_write(root / "summary.json", canonical_json({**identity,
@@ -121,3 +128,5 @@ class FlashEvaluationStage:
             "physical_video_attempts_started": sum(json.loads(path.read_text())["physical_attempts_started"]
                 for path in root.glob("attempt-*.json")),
             "full_gpu_validation": False}))
+        progress("evaluation_complete", committed_steps=step, videos_scored=len(scores),
+                 reward_mean=sum(scores) / len(scores))
