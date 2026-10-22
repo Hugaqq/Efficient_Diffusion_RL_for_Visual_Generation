@@ -176,6 +176,23 @@ class RolloutCollector(RolloutComponent, ABC):
                 model_forward_replay=replay,
             )
 
+    def evaluate_deterministic(self, request: RolloutRequest, *, num_steps: int) -> DecodedMediaBatch:
+        """Real ODE evaluation through the same model, Dynamics and decode ports.
+
+        Evaluation has no stochastic policy actions or fabricated log-probs.
+        Its explicit schedule length is independent of the training rollout.
+        """
+        import torch
+        with torch.no_grad():
+            episode = self._prepare_episode(request)
+            selection = PolicyStepSelection.all_steps(num_steps=num_steps, generator=request.selection_generator)
+            session = DynamicsSession.create(request.dynamics, num_steps=num_steps,
+                device=request.latent_spec.device, selection=selection)
+            schedule = session.transition_schedule(device=request.latent_spec.device)
+            for step in range(num_steps):
+                self._deterministic_ode_step(episode, session, schedule, step)
+            return self._decode_media(episode, episode.latents)
+
     def _independent_forward_replay_plan(
         self,
         batch_size: int,
@@ -615,6 +632,7 @@ class RolloutCollector(RolloutComponent, ABC):
         width = batch_size if configured is None else min(configured, batch_size)
         output: Any | None = None
         output_layout: DecodedMediaLayout | None = None
+        media_backing = None
         for start in range(0, batch_size, width):
             stop = min(start + width, batch_size)
             chunk_spec = replace(
@@ -654,14 +672,16 @@ class RolloutCollector(RolloutComponent, ABC):
                 if start == 0 and stop == batch_size:
                     output = chunk
                     continue
-                output = torch.empty(
-                    (batch_size, *chunk.shape[1:]),
-                    dtype=chunk.dtype,
-                    device="cpu",
+                from visual_rl.data.media_storage import allocate_cpu_media
+
+                output, media_backing = allocate_cpu_media(
+                    (batch_size, *chunk.shape[1:]), chunk.dtype,
                 )
             elif tuple(output.shape[1:]) != tuple(chunk.shape[1:]):
                 raise RolloutContractError("decode chunk geometry changed across rows")
             output[start:stop].copy_(chunk)
+            if media_backing is not None:
+                media_backing.flush_rows(start, stop)
         assert output is not None
         assert output_layout is not None
         return DecodedMediaBatch(tensor=output, layout=output_layout)

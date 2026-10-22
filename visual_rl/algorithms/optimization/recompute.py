@@ -202,6 +202,7 @@ class PolicyRecomputeRequest:
     require_reference_statistics: bool = False
     current_context: RecomputeContextFactory | None = None
     reference_context: RecomputeContextFactory | None = None
+    behavior_context: RecomputeContextFactory | None = None
 
     def __post_init__(self) -> None:
         required = ["predict"]
@@ -226,6 +227,7 @@ class PolicyRecomputeRequest:
         for name, factory in (
             ("current_context", self.current_context),
             ("reference_context", self.reference_context),
+            ("behavior_context", self.behavior_context),
         ):
             if factory is not None and not callable(factory):
                 raise TypeError(f"{name} must be callable or None")

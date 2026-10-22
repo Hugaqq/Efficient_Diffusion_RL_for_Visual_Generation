@@ -502,6 +502,28 @@ def test_sd3_components_exact_parameters_and_typed_forward(tmp_path) -> None:
     manager.close()
 
 
+def test_wan_opt_in_stage_owned_text_encoder(tmp_path) -> None:
+    _resolved, adapter, _loader, loaded = _load_adapter(
+        tmp_path, "wan-t2v", {
+            "artifact_ref": "main", "height": 16, "width": 16,
+            "frames": 5, "text_encoder_residency": "stage",
+        },
+    )
+    manager, components, _optimizer, _accelerator, _handle = _prepare_manager(adapter, loaded)
+    try:
+        binding = components.binding("prompt_encoder")
+        assert binding.managed_residency is True
+        before = binding.component.move_calls
+        with manager.preprocess():
+            adapter.encode(_batch("t2v"))
+        assert binding.component.move_calls > before
+        assert adapter.describe_preprocess().preprocess_config["text_encoder_residency"] == "stage"
+    finally:
+        manager.close()
+    with pytest.raises(ValueError):
+        WanConfig(artifact_ref="main", text_encoder_residency="arbitrary-device")
+
+
 def test_wan_components_exact_parameters_and_typed_forward(tmp_path) -> None:
     resolved, adapter, loader, loaded = _load_adapter(
         tmp_path,

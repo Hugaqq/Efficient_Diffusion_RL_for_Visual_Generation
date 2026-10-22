@@ -646,7 +646,7 @@ def _override_component(
 ) -> RequestedComponent:
     raw = _exact_mapping(
         value,
-        allowed={"id", "params"},
+        allowed={"id", "params", "replace_params"},
         required=set(),
         key=key,
     )
@@ -660,10 +660,16 @@ def _override_component(
             "changing a component id requires an explicit complete params mapping",
             key=f"{key}.params",
         )
+    replace_params = raw.get("replace_params", False)
+    if type(replace_params) is not bool or (replace_params and "params" not in raw):
+        raise ConfigError(
+            "replace_params must be boolean and true requires explicit params",
+            key=f"{key}.replace_params",
+        )
     supplied = _plain_mapping(raw.get("params", {}), key=f"{key}.params")
     params = (
         supplied
-        if alias != current.alias
+        if alias != current.alias or replace_params
         else _deep_merge(to_plain_dict(current.params), supplied)
     )
     return RequestedComponent(alias, FrozenMapping(params))

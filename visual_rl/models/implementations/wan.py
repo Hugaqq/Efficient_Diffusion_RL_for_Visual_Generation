@@ -271,6 +271,7 @@ class WanT2VAdapter(ModelAdapter):
                     "max_sequence_length": self.config.max_sequence_length,
                     "negative_prompt_policy": "empty_string",
                     "outputs_per_prompt": 1,
+                    **({"text_encoder_residency": "stage"} if self.config.text_encoder_residency == "stage" else {}),
                 }
             ),
         )
@@ -342,11 +343,11 @@ class WanT2VAdapter(ModelAdapter):
             "prompt_encoder",
             parts.prompt_encoder,
             roles=(ComponentRole.PREPROCESS,),
-            # Wan's frozen text encoder is substantially larger than the
-            # trainable transformer.  Keep its weights on CPU while the
-            # prepared transformer owns the execution device; only the small
-            # encoded conditioning tensors cross the model port below.
-            managed_residency=False,
+            # Preserve the CPU default for small cards. Opt-in stage ownership
+            # places the encoder on the execution device only in PREPROCESS
+            # (and EVAL), then offloads it before rollout/training. Never move
+            # the prepared transformer outside its backend owner.
+            managed_residency=self.config.text_encoder_residency == "stage",
         )
         session.register(
             "transformer",
