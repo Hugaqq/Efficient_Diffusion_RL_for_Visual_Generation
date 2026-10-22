@@ -1260,8 +1260,8 @@ def _validate_data_payload_schema(payload: Mapping[str, object]) -> None:
     if "runtime_state" in payload:
         expected.add("runtime_state")
         state = payload["runtime_state"]
-        if not isinstance(state, Mapping) or state.get("schema_version") != 1:
-            raise ValueError("invalid collection runtime state")
+        if not isinstance(state, Mapping) or state.get("schema_version") != 2:
+            raise ValueError("invalid collection runtime state (requires schema 2; old candidates cannot resume)")
     if set(payload) != expected:
         raise ValueError("data-plane state has an invalid exact key set")
     if payload["schema_version"] != 1 or payload["kind"] != "data_plane_prelude_state":
