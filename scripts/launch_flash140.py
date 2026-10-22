@@ -2,7 +2,7 @@
 
 No training loop, model/reward replacement, dependency installation or service
 management. `validate` pauses ONLY after a real durable non-terminal checkpoint;
-the recipe endpoint stays140, including its LR schedule and all evaluations.
+approved140 stays140; explicit SMALL40 runs40 with terminal EMA evaluation.
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "experiments/flash_wan_capacity_20261022/approved140-runtime.yaml"
+SMALL_CONFIG = CONFIG.with_name("small40-runtime.yaml")
 OVERLAY = Path("/home/ubuntu/qifan/visualrl-flash140-20261022/dependency-overlay")
 PYTHON = Path("/home/ubuntu/qifan/envs/visual-rl/bin/python")
 LOCK = Path("/mnt/data/qifan/runs/flash140-20261022/.flash140-launch.lock")
@@ -35,6 +36,18 @@ GPU_MARGIN_GIB = 16.0
 HOST_MARGIN_GIB = 24.0
 HOST_WORKLOAD_GIB = 64.0  # conservative admission budget, not a measurement
 DISK_MARGIN_GIB = 64.0
+
+
+def preset_config(name):
+    from visual_rl.algorithms.trainer.flash_presets import flash_preset
+    flash_preset(name)  # fail closed on unknown identity
+    return SMALL_CONFIG if name == "small40" else CONFIG
+
+
+def check_preset_mode(preset, mode, resume, retry_incomplete):
+    if preset == "small40" and (mode == "validate" or (
+            mode != "inspect" and (resume is not None or retry_incomplete))):
+        raise RuntimeError("SMALL40 is fresh RUN only: no bounded validation or old-run resume/retry")
 
 
 def publish(path, value):
@@ -280,8 +293,13 @@ def inspect_checkpoint(path):
 def render_config(raw, output, resume):
     import copy
     rendered = copy.deepcopy(raw)
-    if raw["overrides"]["training"]["max_optimizer_steps"] != 140:
-        raise RuntimeError("formal endpoint must remain140, including validation")
+    from visual_rl.algorithms.trainer.flash_presets import flash_preset
+    training = raw["overrides"]["training"]
+    preset = flash_preset(training.get("flash_preset", "approved140"))
+    if training["max_optimizer_steps"] != preset.optimizer_steps:
+        raise RuntimeError(f"formal endpoint must remain{preset.optimizer_steps} for {preset.name}")
+    if preset.name == "small40" and resume is not None:
+        raise RuntimeError("SMALL40 starts fresh; never resume an old experiment")
     rendered["launch"]["output_dir"] = str(output)
     rendered["launch"]["resume_from"] = None if resume is None else str(Path(resume).absolute())
     return rendered
@@ -299,6 +317,13 @@ def check_artifacts(raw):
         if (hashlib.sha256(data).hexdigest() != expected["sha256"]
                 or len(data.decode().splitlines()) != expected["nonempty_rows"]):
             raise RuntimeError(f"author {key} data hash/count mismatch")
+    preset_name = raw["overrides"]["training"].get("flash_preset", "approved140")
+    if preset_name == "small40":
+        from visual_rl.algorithms.trainer.evaluation import load_evaluation_prompts, select_small40_prompts
+        selected = select_small40_prompts(load_evaluation_prompts(artifacts["evaluation_prompts"]),
+                                          artifacts["datasets"]["main"])
+        if len(selected) != 16:
+            raise RuntimeError("SMALL40 selection must have16 prompts")
     model = Path(artifacts["model"])
     for name in ("model_index.json", "scheduler/scheduler_config.json", "transformer/config.json",
                  "vae/config.json", "text_encoder/config.json", "tokenizer/tokenizer_config.json"):
@@ -321,12 +346,15 @@ def check_artifacts(raw):
             raise RuntimeError("live HPSv3 identity differs from the pinned artifact; main must handle ownership")
     finally:
         client.close()  # does not restart/move/change the existing worker
-    return {"train_rows": 19700, "eval_rows": 300, "service_identity": semantic["service_identity"]}
+    return {"train_rows": 19700, "author_eval_rows": 300,
+            "eval_rows": 16 if preset_name == "small40" else 300,
+            "service_identity": semantic["service_identity"]}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("preflight", "validate", "run", "inspect"))
+    parser.add_argument("--preset", choices=("approved140", "small40"), default="approved140")
     parser.add_argument("--expected-sha", required=True, help="full40-character pulled Git commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlay", type=Path, default=OVERLAY)
@@ -337,28 +365,40 @@ def main(argv=None):
     parser.add_argument("--compare", type=Path, help="inspect only: compare another trusted checkpoint's trainable hash")
     args = parser.parse_args(argv)
     if args.mode != "validate" and args.until is not None:
-        parser.error("--until is only for bounded validate; formal run stays140")
+        parser.error("--until is only for bounded validate; run keeps the selected preset target")
     if args.compare is not None and args.mode != "inspect":
         parser.error("--compare is only for read-only checkpoint inspection")
     if args.mode == "inspect" and (args.resume is None or args.retry_incomplete):
         parser.error("inspect requires --resume pointing to a trusted owned checkpoint")
+    check_preset_mode(args.preset, args.mode, args.resume, args.retry_incomplete)
     sha = git_identity(args.expected_sha)
     modules = configure_imports(args.overlay)
     import yaml
     from visual_rl.runtime.composition import create_default_run_controller
     from visual_rl.runtime.flash140_logging import progress
-    raw = yaml.safe_load(CONFIG.read_text())
+    from visual_rl.algorithms.trainer.flash_presets import flash_preset
+    preset = flash_preset(args.preset)
+    config = preset_config(args.preset)
+    raw = yaml.safe_load(config.read_text())
+    if raw["overrides"]["training"].get("flash_preset", "approved140") != args.preset:
+        raise RuntimeError("launcher/config preset identity mismatch")
+    render_config(raw, args.output, None)  # endpoint guard also applies to preflight
     output = args.output.absolute()
     if output == ROOT or ROOT in output.parents or output.is_symlink() or any(p.is_symlink() for p in output.parents):
         raise RuntimeError("outputs must be outside source and must not contain symlinks")
     parent = output.parent
     parent.mkdir(parents=True, exist_ok=True)
-    identity = {"git_sha": sha, "source_config_sha256": hashlib.sha256(CONFIG.read_bytes()).hexdigest()}
+    identity = {"git_sha": sha, "source_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
     owner = {**identity, "pid": os.getpid(), "uid": os.getuid(), "source": str(ROOT),
-             "output": str(output), "mode": args.mode, "started_unix": time.time()}
+             "output": str(output), "mode": args.mode, "preset": preset.name, "started_unix": time.time()}
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     with exclusive_launch(LOCK, owner):
         progress("launch_admission_start", **owner, imports=modules)
+        progress("experiment_plan", preset=preset.name, optimizer_target=preset.optimizer_steps,
+                 collection_rows=preset.collection_rows, rows_per_commit=preset.rows_per_commit,
+                 commits_per_collection=2, training_videos=preset.optimizer_steps // 2 * preset.collection_rows,
+                 evaluation_steps=list(preset.evaluation_steps), evaluation_prompts=preset.prompt_count,
+                 evaluation_sampling_steps=preset.sampling_steps, save_evaluation_videos=preset.save_videos)
         if args.mode == "inspect":
             if json.loads((output / "flash140-owner.json").read_text()) != identity:
                 raise RuntimeError("inspection requires the same source/config owned output")
@@ -373,9 +413,11 @@ def main(argv=None):
             progress("checkpoint_inspection", **first)
             return 0
         sample = resource_sample(parent)
-        # All checkpoints are retained. Formal admission reserves1TiB; validate
-        # reserves64GiB. Measured checkpoint sizes are reported for replanning.
-        check_budget(sample, admission=True, disk_required_gib=1024 if args.mode == "run" else 64)
+        # All checkpoints retained: original140 run reserves1TiB; SMALL40
+        # and preflight/validate reserve64GiB. Do not shrink the GPU budget:
+        # batch4 model execution is unchanged by the smaller collection.
+        check_budget(sample, admission=True,
+                     disk_required_gib=1024 if args.mode == "run" and preset.name == "approved140" else 64)
         artifacts = check_artifacts(raw)
         if args.mode == "preflight":
             progress("preflight_only", sample=sample, artifacts=artifacts, full_gpu_validation=False)
@@ -415,9 +457,9 @@ def main(argv=None):
             monitor.thread.start()
             result = controller.run(config_path)
             monitor.sample()
-            if result.committed_steps != 140:
-                raise RuntimeError("formal endpoint did not commit140")
-            publish(attempt / "result.json", {"status": "training_terminal", "committed_steps": 140,
+            if result.committed_steps != preset.optimizer_steps:
+                raise RuntimeError(f"formal endpoint did not commit{preset.optimizer_steps}")
+            publish(attempt / "result.json", {"status": "training_terminal", "committed_steps": preset.optimizer_steps,
                     "checkpoint": str(result.authoritative_checkpoint), "full_gpu_validation": False})
         except SafePointPause as pause:
             notes = list(getattr(pause, "__notes__", ()))

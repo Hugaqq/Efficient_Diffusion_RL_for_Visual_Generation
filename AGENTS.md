@@ -10,7 +10,17 @@
 - Do not overwrite unknown dirty server/local changes. Preserve and reconcile them explicitly before deploying.
 - Progress inquiries do not cancel, pause or restart work. Only an explicit stop instruction or a real safety/failure condition warrants stopping.
 
-## Current migration state
+## Current approved experiment: SMALL40 (supersedes immediate140)
+
+- User approved stopping the old run, adapting locally and starting SMALL40. Main reports owned PID704136 was verified and stopped; private HPS18820 is still ready. Do not repeat stop commands or disturb any service. Preserve the old validation output.
+- Explicit `training.flash_preset: small40` uses40 optimizer commits,20 collections of32 videos (4 prompts x8),two16-row commits per fixed-policy pool and full32 reward std. Checkpoint every2; no bounded1/2/8 validation phase. Wan480x832x81,20 train steps,CFG4.5,BF16,LoRA16/32,lr1e-4,clip.001,seed42,forward/replay4,decode1 and real all81/top24 HPS stay unchanged.
+- Frozen16 heldout prompts/seeds/categories are committed in `data/flash_small40`; full author train19700/test300 hashes and no training overlap remain checked. EMA16x20 ODE evaluation at0,20,40 saves every MP4 at15fps with prompt/sample/seed/hash receipts. Terminal40 evaluation is an explicit pre-terminal-checkpoint hook; finalization requires all48 finite receipts and hashed videos before SUCCESS. No quality claim from paired HPS differences.
+- `docs/flash_small40_launch.md` contains exact Git deployment, one preflight and background RUN40 commands, fresh output `/mnt/data/qifan/runs/flash-small40-20261022/run-001`. `--preset small40` rejects bounded validate and resume/retry; never reuse old140 output. Both presets share the same global lock and16GiB GPU/24GiB host margins. Model batch4 memory budget is unchanged despite the smaller pool.
+- Original approved140 YAML/manifest remain unchanged as a separate option; the older140 handoff below is historical, not the current launch mandate.
+- Existing seven CPU test functions are extended, not replaced or parameterized into more tests. They passed7/7 in11.79s after initial fixture fixes, then7/7 in12.07s with all48-video terminal finalization checks and docs in place. Rerun this same gate after any subsequent source changes before commit/push. Tests include real40-commit SMALL40 dispatch with explicit tiny fake model/scorer/MP4 encoder leaves and the actual task-local author dataset. They do not establish GPU,real ffmpeg,HTTP or quality readiness. All server source repairs still require Mac ->7 tests -> GitHub -> server Git deployment.
+- Coding does not operate the server or claim a launched PID. After tested commit/push, the sole deployment role must fetch the exact SHA, verify clean/import identity, preflight and directly nohup RUN40; return actual live PID/log/16x20 baseline/40 target/heartbeats. No progress inquiry cancels it.
+
+## Historical migration state (140 remains a separate preserved preset)
 
 - Local branch `main` was reset by switching back to baseline `6b7f6d5`, not by deleting history. The candidate implementation remains on pushed `v0.9`, commit `5367716`.
 - One-time reconciliation: six existing server source patches were copied back to this Mac checkout with per-file SHA256 verification. They cover HPSv3 integration, explicit component-param replacement, and stage-managed GPU text encoding. This is not a merge of the fullv0.9 candidate.
@@ -21,7 +31,7 @@
 - Milestone A core tests in the actual candidate passed7/7 in9.96s, then7/7 in28.97s after evaluation/RNG/config assertions. The gate also verifies imported `visual_rl` and collection paths resolve inside this checkout; rerun it after changes before commit/push. CPU evidence only. Milestone A was pushed as `a9a3b245ecdb3f95594fc6807fae4cbe3304033c`; final A core gate was7/7 in9.41s.
 - Milestone B adds `scripts/launch_flash140.py` and `docs/flash140_launch.md`: clean Git/import/dependency admission, existing model/data/HPS identity checks, one cooperative global flock, external owned fresh/resume/retry outputs, per-attempt PID/import/resource/metric logs,15s safety heartbeat, real durable-checkpoint validation pause/inspection and unchanged140 formal continuation. Runtime progress events cover evaluation, chunk/reward, stages/commits and checkpoints without tensor/RNG retention.
 - B CPU gate passed7/7 in9.59s,10.30s, then9.85s after the completed launcher, inspection, safety tests and handoff. This is the required pre-commit seven-test gate, not a full-suite substitution. No local GPU, dependency-overlay/server import, HTTP health or server resource admission was executed; simplified full384/two192 GPU validation and formal140 remain pending. Only main performs those real commands after Git deployment; do not turn unit-test samples into GPU evidence.
-- Target remains140 optimizer updates,384-video fixed-policy collections followed by two nominal192-row updates;26,880 training videos. Do not silently substitute one192-video collection per update.
+- Preserved approved140 target is140 optimizer updates,384-video fixed-policy collections followed by two nominal192-row updates;26,880 training videos. Do not silently mutate it into SMALL40 or substitute one192-video collection per update; use the new explicit preset instead.
 - A real8-video single-update GPU smoke passed. The formal140-update experiment has NOT started; do not describe unit tests or smoke updates as formal progress.
 
 ## Progress log

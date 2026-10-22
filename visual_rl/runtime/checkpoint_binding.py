@@ -426,6 +426,9 @@ class CoordinatorRunFinalizer:
             )
         _validate_run_summary(bound, inspection, summary, rewards)
         launch = bound.preflight.compiled.launch
+        if bound.prepared.training.flash_preset == "small40":
+            from visual_rl.algorithms.trainer.evaluation import validate_small40_evaluation_artifacts
+            validate_small40_evaluation_artifacts(launch.output_dir, summary.recipe_id)
         try:
             terminal = finalize_terminal_run(
                 TerminalFinalizationRequest(
@@ -513,6 +516,13 @@ def _capture_and_commit(
     reference_state = _bound_reference_policy_state(bound)
     _validate_contract_modes(contract, reference_state)
     _optimized, update = _final_update(summary.last_iteration.value.payload)
+    # The optimizer loop has ended: explicitly execute any approved terminal
+    # evaluation BEFORE capturing terminal state or permitting SUCCESS.
+    if terminal_artifacts and bound.prepared.training.flash_evaluation:
+        owner = ports.data_plane.runtime_state_owner
+        if owner is None:
+            raise RuntimeCheckpointError("Flash terminal evaluation lacks collection owner")
+        owner.before_iteration(summary.committed_steps)
     data_view = ports.data_plane.capture_checkpoint_view(summary.committed_steps)
     if data_view.next_optimizer_step != summary.committed_steps:
         raise RuntimeCheckpointError("data plane next step disagrees with summary")
@@ -521,7 +531,9 @@ def _capture_and_commit(
         if runtime_state["committed_steps"] != summary.committed_steps:
             raise RuntimeCheckpointError("collection commit cursor disagrees with summary")
         if terminal_artifacts and bound.prepared.training.flash_evaluation:
-            expected = [s for s in (0, 36, 76, 116) if s < summary.committed_steps]
+            from visual_rl.algorithms.trainer.flash_presets import flash_preset
+            preset = flash_preset(bound.prepared.training.flash_preset)
+            expected = [s for s in preset.evaluation_steps if s <= summary.committed_steps]
             if runtime_state["evaluations_completed"] != expected:
                 raise RuntimeCheckpointError("terminal checkpoint lacks required real evaluation receipts")
     rank = bound.runtime.session.runtime_facts.rank

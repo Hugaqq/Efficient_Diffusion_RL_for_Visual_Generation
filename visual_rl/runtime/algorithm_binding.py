@@ -1046,23 +1046,32 @@ class DefaultStageAssembler:
             parameters = tuple(p for g in request.prepared.optimizer.param_groups for p in g["params"])
             collection = CollectionState(config=trainer_config, parameters=parameters,
                 request_factory=rollout_request_factory)
-            if training.max_optimizer_steps == 140 and (
-                    total_rows != 384 or nominal != 192 or trainer_config.collection_commits != 2
+            from visual_rl.algorithms.trainer.flash_presets import flash_preset
+            preset = flash_preset(training.flash_preset)
+            collection.evaluation_steps = preset.evaluation_steps
+            approved_run = training.max_optimizer_steps == 140 or training.flash_preset == "small40"
+            if approved_run and (
+                    training.max_optimizer_steps != preset.optimizer_steps
+                    or total_rows != preset.collection_rows or nominal != preset.rows_per_commit or trainer_config.collection_commits != 2
                     or group_size != 8 or forward != 4
                     or rollout.rollout_execution_policy.decode_microbatch_size != 1
                     or training.policy_recompute.row_microbatch_size != 4
                     or not training.flash_evaluation):
-                raise DefaultStageAssemblyError("APPROVED140 requires 384/2x192/group8/forward4/replay4/decode1 and real evaluation")
-            if training.max_optimizer_steps == 140:
+                raise DefaultStageAssemblyError("approved Flash preset requires exact target/collection/group8/forward4/replay4/decode1 and real evaluation")
+            if approved_run:
                 train_bytes = request.preflight.compiled.launch.artifacts.dataset("main").read_bytes()
                 if hashlib.sha256(train_bytes).hexdigest() != "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016":
-                    raise DefaultStageAssemblyError("APPROVED140 training prompt SHA256 mismatch")
+                    raise DefaultStageAssemblyError(f"{preset.name} training prompt SHA256 mismatch")
                 if (schedule_step_count != 20 or (adapter.config.height, adapter.config.width, adapter.config.frames) != (480, 832, 81)
                         or adapter.config.max_sequence_length != 512 or adapter.config.vae_tiling):
-                    raise DefaultStageAssemblyError("APPROVED140 model/schedule geometry mismatch")
+                    raise DefaultStageAssemblyError(f"{preset.name} model/schedule geometry mismatch")
             if training.flash_evaluation:
                 from visual_rl.algorithms.trainer.evaluation import FlashEvaluationStage, load_evaluation_prompts
                 prompts = load_evaluation_prompts(request.preflight.compiled.launch.artifacts.evaluation_prompts)
+                if training.flash_preset == "small40":
+                    from visual_rl.algorithms.trainer.evaluation import select_small40_prompts
+                    prompts = select_small40_prompts(prompts,
+                        request.preflight.compiled.launch.artifacts.dataset("main"))
                 if len(reward_plan.resources) != 1:
                     raise DefaultStageAssemblyError("Flash evaluation requires one HPSv3 resource")
                 resource_id = reward_plan.resources[0].resource_identity
@@ -1072,7 +1081,7 @@ class DefaultStageAssembler:
                     rollout_context=lambda: manager.execution(rollout_policy),
                     resource=lambda: container.view().get(resource_id),
                     output_dir=request.preflight.compiled.launch.output_dir,
-                    recipe_id=materialized.recipe_id)
+                    recipe_id=materialized.recipe_id, preset=preset)
             trainer.bind_collection(collection)
             prelude.runtime_state_owner = collection
             rollout_stage = StreamedRolloutStage(

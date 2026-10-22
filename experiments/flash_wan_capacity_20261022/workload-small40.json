@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "manifest_kind": "quantity_schedule_not_execution_evidence",
+  "preset": "small40",
+  "optimizer_commits_target": 40,
+  "collection_count": 20,
+  "prompts_per_collection": 4,
+  "group_size": 8,
+  "training_videos_per_collection": 32,
+  "optimizer_commits_per_collection": 2,
+  "nominal_rows_per_commit": 16,
+  "training_videos_target": 640,
+  "evaluation_steps": [0, 20, 40],
+  "evaluation_prompts": 16,
+  "evaluation_sampling_steps": 20,
+  "evaluation_videos_target": 48,
+  "frames_per_video": 81,
+  "logical_hps_frame_scores_target": 55728,
+  "terminal_evaluation_required": true,
+  "checkpoint_every_optimizer_steps": 2,
+  "evaluation_video_fps": 15
+}
