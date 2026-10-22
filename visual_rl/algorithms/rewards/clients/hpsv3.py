@@ -14,6 +14,7 @@ from visual_rl.core.protocols.flash_hpsv3 import (
     PROTOCOL, VERSION, MAX_HEALTH_BYTES, MAX_REQUEST_BYTES, VideoContract,
     canonical_json, decode_json, digest, sha256_id, validate_health, validate_score,
 )
+from visual_rl.runtime.flash140_logging import progress
 from visual_rl.algorithms.rewards.clients.input import (
     resolve_pointwise_reward_input, pointwise_reward_output,
 )
@@ -120,6 +121,7 @@ class Hpsv3VideoClient:
             raise ValueError('invalid or oversized HPSv3 prompt')
         if len(frames_base64) != self.contract.frames:
             raise ValueError('must transmit every video frame')
+        progress("hpsv3_video_start", sample_id=sample_id, frames=len(frames_base64))
         payload = self._request('POST', '/score', {
             'protocol': PROTOCOL, 'protocol_version': VERSION,
             'service_identity': self.service_identity, 'sample_id': sample_id,
@@ -127,6 +129,7 @@ class Hpsv3VideoClient:
         })
         score, indices = validate_score(payload, sample_id=sample_id,
                                        identity=self.service_identity, contract=self.contract)
+        progress("hpsv3_video_complete", sample_id=sample_id, frames=self.contract.frames, reward=score)
         return score, {
             'scored_frame_indices': list(range(self.contract.frames)),
             'selected_frame_indices': list(indices),

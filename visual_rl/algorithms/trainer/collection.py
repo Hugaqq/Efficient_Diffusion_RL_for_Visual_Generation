@@ -26,6 +26,7 @@ from visual_rl.algorithms.dynamics.session import DynamicsSession, ScheduleSnaps
 from visual_rl.algorithms.rewards.types import RewardResult
 from visual_rl.core.types import FrozenMapping
 from visual_rl.data.samples import NoConditionBatchState
+from visual_rl.runtime.flash140_logging import progress
 
 
 def cpu_tree(value):
@@ -198,6 +199,8 @@ class StreamedRolloutStage(RolloutStage):
         cache = self.cache_dir / f"collection-{value.identity.optimizer_step}"
         self.collection.active_cache = cache
         trajectories, rewards, conditions = [], [], []
+        progress("collection_start", optimizer_step=value.identity.optimizer_step,
+                 rows=samples.batch_size, chunk_rows=self.chunk_rows)
         for start in range(0, samples.batch_size, self.chunk_rows):
             rows = tuple(range(start, min(start + self.chunk_rows, samples.batch_size)))
             chunk_samples = samples.slice(rows)
@@ -221,9 +224,13 @@ class StreamedRolloutStage(RolloutStage):
                 conditions.append(saved["conditioning"])
                 request.generator.set_state(saved["generator_after"])
                 del saved, trajectory
+                progress("collection_chunk_reused", optimizer_step=value.identity.optimizer_step,
+                         completed_rows=rows[-1] + 1, total_rows=samples.batch_size)
                 continue
             record_attempt(self.cache_dir.parent / "physical-attempts" / cache.name / f"rows-{start}.json",
                 {"collection_key": collection_key, "row_ids": list(identity.row_identities)})
+            progress("collection_chunk_start", optimizer_step=value.identity.optimizer_step,
+                     first_row=start, rows=len(rows), total_rows=samples.batch_size)
             with _context(self.preprocess_context), torch.no_grad():
                 conditioning = cpu_tree(request.adapter.encode(chunk_samples))
             condition_ids = tuple(row.identity for row in chunk_samples.rows)
@@ -235,6 +242,8 @@ class StreamedRolloutStage(RolloutStage):
                 dynamics_session=DynamicsSession.from_snapshot(request.dynamics, snapshot_rows(session.snapshot, rows)))
             with _context(self.rollout_context):
                 execution = self.rollout.run_with_snapshot(chunk_request)
+            progress("collection_chunk_generated", optimizer_step=value.identity.optimizer_step,
+                     first_row=start, rows=len(rows))
             payload = RolloutStagePayload(chunk_samples, chunk_request, execution)
             scored = self.reward_pipeline(StageValue(identity, payload)).payload
             compact = replace(scored.rollout.trajectory, media=None, reward_media_released=True)
@@ -246,6 +255,9 @@ class StreamedRolloutStage(RolloutStage):
             conditions.append(conditioning)
             # Do not retain chunk media, VAE outputs or generator-bearing requests.
             del scored, payload, execution, chunk_request, conditioning
+            progress("collection_chunk_durable", optimizer_step=value.identity.optimizer_step,
+                     completed_rows=rows[-1] + 1, total_rows=samples.batch_size)
+        progress("collection_pool_merge", optimizer_step=value.identity.optimizer_step, rows=samples.batch_size)
         trajectory = join_trajectories(trajectories)
         conditioning = join_conditioning(conditions)
         execution = RolloutExecution(trajectory, session.snapshot, conditioning,

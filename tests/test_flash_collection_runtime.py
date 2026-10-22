@@ -54,8 +54,10 @@ def setup(monkeypatch, tmp_path):
     return artifacts, code
 
 
-def test_real_controller_collects384_then_two192_and_resumes_without_scoring(monkeypatch, tmp_path):
+def test_real_controller_collects384_then_two192_and_resumes_without_scoring(monkeypatch, tmp_path, caplog):
     from dataclasses import replace
+    from scripts.launch_flash140 import SafePointPause, observe_checkpoints, inspect_checkpoint
+    caplog.set_level("INFO", logger="visual_rl.flash140")
     from visual_rl.algorithms.optimization.recompute import PolicyRecomputer
     artifacts, code = setup(monkeypatch, tmp_path)
     replay_calls = []
@@ -72,17 +74,20 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     rewards = demo._FakeRewardResourceFactory()
     controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
                                                reward_resource_factory=rewards)
-    sink = controller._backend.checkpoint_sink
-    original = sink.checkpoint_safe_point
-    def crash(request):
-        receipt = original(request)
-        assert rewards.resources[0].score_calls == 24
-        raise RuntimeError("after first durable commit")
-    sink.checkpoint_safe_point = crash
+    checkpoints = []
+    observe_checkpoints(controller, pause_after=1, on_checkpoint=checkpoints.append)
     output = tmp_path / "out"
-    with pytest.raises(RuntimeError, match="after first durable commit"):
+    with pytest.raises(SafePointPause) as paused:
         controller.run(config(tmp_path / "first", artifacts, output))
+    assert paused.value.record["status"] == "paused_not_success"
+    assert paused.value.record["committed_steps"] == 1
+    assert checkpoints[0]["metrics"]["active_transition_count"] == 192
+    assert rewards.resources[0].score_calls == 24
+    assert not (output / "SUCCESS").exists()
     checkpoint = output / "checkpoints/step-1"
+    inspected_first = inspect_checkpoint(checkpoint)
+    assert inspected_first["pending_rows"] == 384 and inspected_first["commit_cursor"] == 1
+    assert inspected_first["trainable_parameter_count"] == inspected_first["ema_parameter_count"] > 0
     inspection, saved = e2e._checkpoint_snapshot(checkpoint)
     state = saved.component_state("data_plane").payload["runtime_state"]
     assert state["committed_steps"] == state["commit_cursor"] == 1
@@ -111,6 +116,10 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert result.last_metrics["logprob_delta_max"] > 0
     assert result.last_metrics["gradient_norm_pre_clip"] > 0
     assert len(replay_calls) == 96  # 48 per commit, no behavior-policy prepass
+    inspected_second = inspect_checkpoint(result.authoritative_checkpoint)
+    assert inspected_second["pending_rows"] == 0 and inspected_second["commit_cursor"] == 0
+    assert inspected_first["trainable_sha256"] != inspected_second["trainable_sha256"]
+    assert inspected_first["ema_sha256"] == inspected_second["ema_sha256"]
     _, final = e2e._checkpoint_snapshot(result.authoritative_checkpoint)
     final_state = final.component_state("data_plane").payload["runtime_state"]
     assert final_state["pool"] is None
@@ -125,6 +134,10 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
                                       e2e._checkpoint_snapshot(result.authoritative_checkpoint),
                                       include_run_summary=False)
     assert len(replay_calls) == 192  # another 2 x 48 in continuous reference
+    events = [json.loads(r.message)["event"] for r in caplog.records if r.name == "visual_rl.flash140"]
+    assert events.count("collection_chunk_durable") == 48
+    assert events.count("collection_start") == 2  # none on odd resume
+    assert "checkpoint_durable" in events and "optimizer_commit" in events
 
 
 def test_collection_disk_chunks_survive_failure_before_first_commit(monkeypatch, tmp_path):
@@ -369,7 +382,11 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
     assert snapshot.component_state("data_plane").payload["runtime_state"]["evaluations_completed"] == [0]
 
 
-def test_approved140_candidate_compiles_typed_cadence(monkeypatch):
+def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
+    from scripts import launch_flash140 as launch
+    with pytest.raises(SystemExit) as help_result:
+        launch.main(["--help"])
+    assert help_result.value.code == 0
     from visual_rl.composition.config.compiler import compile_recipe_v2
     from visual_rl.composition.config.source import load_source_recipe
     from visual_rl.composition.config.bootstrap import bootstrap_recipe_v2
@@ -391,6 +408,63 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch):
     assert recipe.training.max_optimizer_steps == 140
     assert recipe.training.flash_evaluation
     assert bootstrap_recipe_v2(source).require_launch().artifacts.evaluation_prompts.name == "test.txt"
+    raw = yaml.safe_load(path.read_text())
+    rendered = launch.render_config(raw, tmp_path / "run", tmp_path / "run/checkpoints/step-1")
+    assert rendered["overrides"] == raw["overrides"]
+    assert rendered["launch"]["artifacts"] == raw["launch"]["artifacts"]
+    assert raw["launch"]["resume_from"] is None
+    assert rendered["overrides"]["training"]["max_optimizer_steps"] == 140
+    launch_path = tmp_path / "rendered.yaml"
+    launch_path.write_text(yaml.safe_dump(rendered))
+    assert compile_recipe_v2(load_source_recipe(launch_path)).training == recipe.training
+    safe = {"gpu_free_gib": 68.03, "host_available_gib": 88, "disk_free_gib": 1024}
+    launch.check_budget(safe, admission=True, disk_required_gib=1024)
+    for key in safe:
+        with pytest.raises(RuntimeError, match="resource safety"):
+            launch.check_budget({**safe, key: safe[key] - 0.01}, admission=True, disk_required_gib=1024)
+    launch.check_budget(dict(gpu_free_gib=16, host_available_gib=24, disk_free_gib=64))
+    with pytest.raises(RuntimeError, match="resource safety"):
+        launch.check_budget({**safe, "gpu_free_gib": float("nan")})
+    monitor = launch.ResourceMonitor(tmp_path, tmp_path / "resources.json", gpu_reserved_limit=60)
+    observed = {**safe, "torch_peak_reserved_gib": 52.03, "process_peak_rss_gib": 10}
+    monkeypatch.setattr(launch, "resource_sample", lambda _: observed)
+    monitor.sample()  # explicit CPU sample leaf, never described as GPU evidence
+    assert json.loads(monitor.report.read_text())["sampled_minima"]["gpu_free_gib"] == 68.03
+    monkeypatch.setattr(launch, "resource_sample", lambda _: {**observed, "gpu_free_gib": 15})
+    with pytest.raises(RuntimeError, match="resource safety"):
+        monitor.sample()
+    assert json.loads(monitor.report.read_text())["sampled_minima"]["gpu_free_gib"] == 15
+    monkeypatch.setattr(launch, "resource_sample", lambda _: {**observed, "torch_peak_reserved_gib": 61})
+    with pytest.raises(RuntimeError, match="peak reservation"):
+        monitor.sample()
+    lock = tmp_path / "launch.lock"
+    with launch.exclusive_launch(lock, {"pid": 123}):
+        with pytest.raises(RuntimeError, match="duplicate"):
+            with launch.exclusive_launch(lock, {"pid": 456}):
+                pytest.fail("second owner entered")
+    with launch.exclusive_launch(lock, {"pid": 789}):
+        assert json.loads(lock.read_text())["pid"] == 789
+    identity = {"git_sha": "a" * 40, "source_config_sha256": "b" * 64}
+    out = launch.prepare_output(tmp_path / "owned", identity=identity)
+    with pytest.raises(FileExistsError):
+        launch.prepare_output(out, identity=identity)
+    launch.prepare_output(out, identity=identity, retry_incomplete=True)
+    with pytest.raises(RuntimeError, match="different source/config"):
+        launch.prepare_output(out, identity={**identity, "git_sha": "c" * 40}, retry_incomplete=True)
+    checkpoint = out / "checkpoints/step-1"
+    checkpoint.mkdir(parents=True)
+    launch.prepare_output(out, identity=identity, resume=checkpoint)
+    with pytest.raises(RuntimeError, match="explicit --resume"):
+        launch.prepare_output(out, identity=identity, retry_incomplete=True)
+    (out / "checkpoints/step-2").mkdir()
+    with pytest.raises(RuntimeError, match="latest"):
+        launch.prepare_output(out, identity=identity, resume=checkpoint)
+    (out / "checkpoints/step-3.tmp-orphan").mkdir()
+    launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
+    assert (out / "checkpoints/step-3.tmp-orphan").exists()
+    (out / "SUCCESS").write_text("terminal")
+    with pytest.raises(RuntimeError, match="terminal"):
+        launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
 
 
 def test_approved140_manifest_counts():

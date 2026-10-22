@@ -1,5 +1,6 @@
-# Deployment candidate ONLY: main must review and GPU-validate before launch.
-# Derived from real-entry-smoke-v3 identity, not execution evidence.
+# Production-shaped140 candidate, NOT GPU execution evidence.
+# Use scripts/launch_flash140.py for admission, ownership, logs and safe-point validation.
+# Derived from real-entry-smoke-v3 identity; do not reuse old schema1 outputs.
 schema_version: 2
 recipe: flash_grpo_v1
 overrides:
@@ -68,7 +69,7 @@ overrides:
       decode_microbatch_size: 1
       trajectory_storage_device: cpu
 launch:
-  output_dir: /mnt/data/qifan/runs/flash140-20261022/approved140
+  output_dir: /mnt/data/qifan/runs/flash140-20261022/approved140-simplified
   resume_from: null
   checkpoint_every_optimizer_steps: 1
   reward_runtime_bindings:
