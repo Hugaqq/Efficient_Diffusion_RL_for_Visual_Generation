@@ -120,10 +120,15 @@ def exclusive_launch(path, owner):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def check_budget(sample, *, admission=False, disk_required_gib=DISK_MARGIN_GIB):
-    floors = {"gpu_free_gib": GPU_MARGIN_GIB + (GPU_WORKLOAD_GIB if admission else 0),
-              "host_available_gib": HOST_MARGIN_GIB + (HOST_WORKLOAD_GIB if admission else 0),
+def check_budget(sample, *, admission=False, disk_required_gib=DISK_MARGIN_GIB, gpu_memory_policy="reserve"):
+    if gpu_memory_policy not in {"reserve", "oom"}:
+        raise ValueError("unknown GPU memory policy")
+    floors = {"host_available_gib": HOST_MARGIN_GIB + (HOST_WORKLOAD_GIB if admission else 0),
               "disk_free_gib": disk_required_gib}
+    if gpu_memory_policy == "reserve":
+        floors["gpu_free_gib"] = GPU_MARGIN_GIB + (GPU_WORKLOAD_GIB if admission else 0)
+    elif not math.isfinite(sample["gpu_free_gib"]) or sample["gpu_free_gib"] < 0:
+        raise RuntimeError("invalid GPU memory telemetry")
     for name, minimum in floors.items():
         observed = sample[name]
         if not isinstance(observed, (int, float)) or not math.isfinite(observed) or observed < minimum:
@@ -154,8 +159,9 @@ class ResourceMonitor:
     Native CUDA/HTTP calls can delay delivery until Python regains control.
     Sampled minima are not a proof of the unsampled device-wide peak.
     """
-    def __init__(self, output, report, *, gpu_reserved_limit=None):
+    def __init__(self, output, report, *, gpu_reserved_limit=None, gpu_memory_policy="reserve"):
         self.output, self.report = Path(output), Path(report)
+        self.gpu_memory_policy = gpu_memory_policy
         self.gpu_reserved_limit = gpu_reserved_limit
         self.stop = threading.Event()
         self.error = None
@@ -173,8 +179,8 @@ class ResourceMonitor:
         publish(self.report, {"sample": observed, "sampled_minima": self.minima, "peaks": self.peaks,
                               "time_unix": time.time(), "full_gpu_validation": False})
         progress("resource_heartbeat", **observed)
-        check_budget(observed)
-        if self.gpu_reserved_limit is not None and self.peaks["torch_peak_reserved_gib"] > self.gpu_reserved_limit:
+        check_budget(observed, gpu_memory_policy=self.gpu_memory_policy)
+        if self.gpu_memory_policy == "reserve" and self.gpu_reserved_limit is not None and self.peaks["torch_peak_reserved_gib"] > self.gpu_reserved_limit:
             raise RuntimeError("resource safety: Torch peak reservation exceeded admitted GPU budget")
         return observed
 
@@ -358,6 +364,8 @@ def main(argv=None):
     parser.add_argument("--expected-sha", required=True, help="full40-character pulled Git commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlay", type=Path, default=OVERLAY)
+    parser.add_argument("--gpu-memory-policy", choices=("reserve", "oom"), default="reserve",
+                        help="oom: log GPU memory without headroom/peak-budget aborts; real CUDA OOM still fails")
     recovery = parser.add_mutually_exclusive_group()
     recovery.add_argument("--resume", type=Path)
     recovery.add_argument("--retry-incomplete", action="store_true", help="only pre-first-checkpoint receipts/chunks")
@@ -390,7 +398,8 @@ def main(argv=None):
     parent.mkdir(parents=True, exist_ok=True)
     identity = {"git_sha": sha, "source_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}
     owner = {**identity, "pid": os.getpid(), "uid": os.getuid(), "source": str(ROOT),
-             "output": str(output), "mode": args.mode, "preset": preset.name, "started_unix": time.time()}
+             "output": str(output), "mode": args.mode, "preset": preset.name, "started_unix": time.time(),
+             "gpu_memory_policy": args.gpu_memory_policy}
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     with exclusive_launch(LOCK, owner):
         progress("launch_admission_start", **owner, imports=modules)
@@ -416,7 +425,7 @@ def main(argv=None):
         # All checkpoints retained: original140 run reserves1TiB; SMALL40
         # and preflight/validate reserve64GiB. Do not shrink the GPU budget:
         # batch4 model execution is unchanged by the smaller collection.
-        check_budget(sample, admission=True,
+        check_budget(sample, admission=True, gpu_memory_policy=args.gpu_memory_policy,
                      disk_required_gib=1024 if args.mode == "run" and preset.name == "approved140" else 64)
         artifacts = check_artifacts(raw)
         if args.mode == "preflight":
@@ -437,7 +446,8 @@ def main(argv=None):
         config_path = attempt / "launch.yaml"
         config_path.write_text(yaml.safe_dump(launch))
         monitor = ResourceMonitor(output, attempt / "resources.json",
-                                  gpu_reserved_limit=sample["gpu_free_gib"] - GPU_MARGIN_GIB)
+                                  gpu_reserved_limit=sample["gpu_free_gib"] - GPU_MARGIN_GIB,
+                                  gpu_memory_policy=args.gpu_memory_policy)
         def safety_signal(*_):
             raise ResourceSafetyError(monitor.error)
         def term_signal(*_):
