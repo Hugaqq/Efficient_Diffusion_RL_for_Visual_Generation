@@ -1,0 +1,117 @@
+{
+  "status": "capacity_preflight_pass",
+  "batch": 4,
+  "geometry": {
+    "height": 480,
+    "width": 832,
+    "frames": 81,
+    "denoising_steps": 20,
+    "cfg": 4.5,
+    "max_sequence_length": 512
+  },
+  "scope": "actual VisualRL model ports capacity preflight only",
+  "full_trainer_g3_exercised": false,
+  "reward_evaluated": false,
+  "formal_training_started": false,
+  "probe_loss": "mean square prediction, only for backward/optimizer memory allocation",
+  "phases": [
+    {
+      "phase": "backward_safety_preflight",
+      "seconds": 65.35183799092192,
+      "initial_allocated_gib": 2.7255730628967285,
+      "peak_allocated_gib": 45.53983211517334,
+      "peak_reserved_gib": 52.033203125
+    },
+    {
+      "phase": "rollout-0",
+      "seconds": 331.51464740000665,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 8.89932918548584,
+      "peak_reserved_gib": 15.302734375
+    },
+    {
+      "phase": "decode1-0",
+      "seconds": 23.002745870966464,
+      "initial_allocated_gib": 2.8303017616271973,
+      "peak_allocated_gib": 12.072610855102539,
+      "peak_reserved_gib": 14.888671875
+    },
+    {
+      "phase": "backward-0",
+      "seconds": 65.0638411269756,
+      "initial_allocated_gib": 2.8303022384643555,
+      "peak_allocated_gib": 45.629809856414795,
+      "peak_reserved_gib": 50.69921875
+    },
+    {
+      "phase": "rollout-1",
+      "seconds": 331.4599852609681,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 8.89932918548584,
+      "peak_reserved_gib": 15.302734375
+    },
+    {
+      "phase": "decode1-1",
+      "seconds": 21.875486902077682,
+      "initial_allocated_gib": 2.8303017616271973,
+      "peak_allocated_gib": 12.072610855102539,
+      "peak_reserved_gib": 14.888671875
+    },
+    {
+      "phase": "backward-1",
+      "seconds": 65.10624963406008,
+      "initial_allocated_gib": 2.8303022384643555,
+      "peak_allocated_gib": 45.629809856414795,
+      "peak_reserved_gib": 50.69921875
+    },
+    {
+      "phase": "rollout-2",
+      "seconds": 331.5045607780339,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 8.89932918548584,
+      "peak_reserved_gib": 15.302734375
+    },
+    {
+      "phase": "decode1-2",
+      "seconds": 22.780619035940617,
+      "initial_allocated_gib": 2.8303017616271973,
+      "peak_allocated_gib": 12.072610855102539,
+      "peak_reserved_gib": 14.888671875
+    },
+    {
+      "phase": "backward-2",
+      "seconds": 65.09563817398157,
+      "initial_allocated_gib": 2.8303022384643555,
+      "peak_allocated_gib": 45.629809856414795,
+      "peak_reserved_gib": 50.69921875
+    }
+  ],
+  "initial_free_gib": 76.22198486328125,
+  "total_gib": 79.249755859375,
+  "allocator_budget_gib": 58.22198486328125,
+  "reserve_gib": 16.0,
+  "versions": {
+    "torch": "2.7.1+cu128",
+    "diffusers": "0.33.1",
+    "peft": "0.10.0",
+    "visualrl_file": "/home/ubuntu/qifan/envs/visual-rl/lib/python3.10/site-packages/visual_rl/__init__.py"
+  },
+  "visualrl_adapter_sha256": "6ebf1c01cd5e04907f0bad2f40f7b18059636fb104ba83ed3fe2aff40d542474",
+  "phase": "backward-2",
+  "conditioning_encode_seconds": 0.0,
+  "prompt": "Camera orbit left. A detailed stone sculpture in a sunlit garden.",
+  "conditioning_from": "/mnt/data/qifan/runs/visualrl-capacity-20261022/batch1-r2/conditioning-512.pt",
+  "text_encoder_timing_excluded": true,
+  "cold_load_seconds": 14.710048291017301,
+  "median_rollout_seconds": 331.482273019501,
+  "median_decode_seconds": 22.32805296900915,
+  "rollout_only_videos_per_minute": 0.7240206174943203,
+  "rollout_decode_videos_per_minute": 0.6783295522239616,
+  "discarded_probe_optimizer_steps": 4,
+  "total_seconds": 1341.2568291879725,
+  "gpu_sample_count": 1298,
+  "gpu_samples_path": "/mnt/data/qifan/runs/visualrl-capacity-20261022/batch4-r1/gpu_samples.json",
+  "host_peak_rss_gib": 20.114459991455078,
+  "observed_min_free_gib": 24.216796875,
+  "observed_card_peak_used_gib": 55.0341796875
+}

@@ -18,6 +18,7 @@ from visual_rl.core.contracts import (
     ExecutionTransformPlan,
     TrainingMode,
 )
+from visual_rl.algorithms.trainer.config import GRPOTrainerConfig
 from visual_rl.core.identity import canonical_identity
 from visual_rl.core.types import ResolutionContext, validate_step_seed_budget
 
@@ -654,6 +655,8 @@ class TrainingSpec:
     update_safety: UpdateSafetySpec
     policy_recompute: PolicyRecomputeSpec
     schema_version: int = 1
+    collection: GRPOTrainerConfig | None = None
+    flash_evaluation: bool = False
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or type(self.schema_version) is not int:
@@ -661,6 +664,12 @@ class TrainingSpec:
                 "expected integer 1",
                 path="training.schema_version",
             )
+        _bool(self.flash_evaluation, path="training.flash_evaluation")
+        if self.flash_evaluation and self.collection is None:
+            raise SpecValidationError("Flash evaluation requires collection cadence", path="training.flash_evaluation")
+        if self.collection is not None:
+            if not isinstance(self.collection, GRPOTrainerConfig) or self.collection.collection_rows_per_commit is None:
+                raise SpecValidationError("collection requires a typed row/commit cadence", path="training.collection")
         seed = _integer(self.seed, path="training.seed")
         if seed > 0xFFFF_FFFF:
             raise SpecValidationError(
@@ -707,8 +716,9 @@ class TrainingSpec:
 
     @classmethod
     def from_mapping(cls, value: object) -> TrainingSpec:
+        raw_input = _mapping(value, path="training")
         raw = _exact(
-            value,
+            {k: v for k, v in raw_input.items() if k not in {"collection", "flash_evaluation"}},
             frozenset(
                 {
                     "schema_version",
@@ -734,6 +744,8 @@ class TrainingSpec:
             lr_schedule=LearningRateScheduleSpec.from_mapping(raw["lr_schedule"]),
             update_safety=UpdateSafetySpec.from_mapping(raw["update_safety"]),
             policy_recompute=PolicyRecomputeSpec.from_mapping(raw["policy_recompute"]),
+            collection=(None if raw_input.get("collection") is None else GRPOTrainerConfig.from_mapping(raw_input["collection"], context=None)),
+            flash_evaluation=raw_input.get("flash_evaluation", False),
         )
 
     @classmethod
@@ -774,6 +786,12 @@ class TrainingSpec:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            **({"flash_evaluation": True} if self.flash_evaluation else {}),
+            **({"collection": {
+                "collection_rows_per_commit": self.collection.collection_rows_per_commit,
+                "collection_commits": self.collection.collection_commits,
+                "collection_chunk_rows": self.collection.collection_chunk_rows,
+            }} if self.collection is not None else {}),
             "schema_version": self.schema_version,
             "seed": self.seed,
             "global_prompt_batch_size": self.global_prompt_batch_size,
@@ -847,8 +865,13 @@ class ArtifactLocations:
     model: Path
     datasets: tuple[tuple[str, Path], ...]
     rewards: tuple[tuple[str, Path], ...]
+    evaluation_prompts: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.evaluation_prompts is not None and (
+            not isinstance(self.evaluation_prompts, Path) or not self.evaluation_prompts.is_absolute()
+        ):
+            raise ValueError("evaluation prompts must be an absolute artifact path")
         if not isinstance(self.model, Path) or not self.model.is_absolute():
             raise ValueError("model artifact location must be an absolute Path")
         for name in ("datasets", "rewards"):
@@ -873,12 +896,15 @@ class ArtifactLocations:
         *,
         config_dir: Path,
     ) -> ArtifactLocations:
+        raw_input = _mapping(value, path="launch.artifacts")
         raw = _exact(
-            value,
+            {k: v for k, v in raw_input.items() if k != "evaluation_prompts"},
             frozenset({"model", "datasets", "rewards"}),
             path="launch.artifacts",
         )
         return cls(
+            evaluation_prompts=(None if raw_input.get("evaluation_prompts") is None else
+                _resolved_path(raw_input["evaluation_prompts"], config_dir=config_dir, path="launch.artifacts.evaluation_prompts")),
             model=_resolved_path(
                 raw["model"],
                 config_dir=config_dir,
@@ -904,6 +930,7 @@ class ArtifactLocations:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            **({"evaluation_prompts": str(self.evaluation_prompts)} if self.evaluation_prompts is not None else {}),
             "model": str(self.model),
             "datasets": {key: str(value) for key, value in self.datasets},
             "rewards": {key: str(value) for key, value in self.rewards},

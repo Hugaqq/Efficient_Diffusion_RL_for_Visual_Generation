@@ -1,0 +1,123 @@
+{
+  "schema": "experiment_design_not_executable.v1",
+  "status": "140_commit_target_approved_implementation_pending",
+  "user_approved": true,
+  "formal_training_started": false,
+  "formal_configuration_ready": false,
+  "scope": "Wan2.1-1.3B Flash-GRPO/HPSv3 main experiment; no full-paper correctness claim",
+  "capacity_evidence": {
+    "suite": "suite-summary.json",
+    "analysis": "planning-numbers.json",
+    "real_visualrl_model_ports_used": true,
+    "full_trainer_g3_exercised": false,
+    "real_reward_in_capacity_test": false,
+    "probe_optimizer_changes_discarded": true,
+    "valid_test_batches": [1, 2, 4],
+    "largest_tested_safe_group_divisor_batch": 4,
+    "batch4_max_reserved_gib": 52.033203125,
+    "batch4_min_card_free_gib": 24.216796875,
+    "batch8_tested": false,
+    "batch8_skipped_reason": "forecast110.10GiB exceeds own-process58.22GiB safety budget; not an observed OOM"
+  },
+  "proposed_model": {
+    "checkpoint": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "height": 480,
+    "width": 832,
+    "frames": 81,
+    "train_sampling_steps": 20,
+    "evaluation_sampling_steps": 50,
+    "guidance_scale": 4.5,
+    "max_sequence_length": 512,
+    "export_fps": 15,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "gradient_checkpointing": true,
+    "vae_tiling": false,
+    "base_precision": "bf16",
+    "trainable_parameter_precision": "fp32"
+  },
+  "proposed_execution": {
+    "videos_per_nominal_group": 8,
+    "rollout_forward_microbatch_ceiling": 4,
+    "recompute_geometry": "preserve the recorded forward partitions, initially4; no unvalidated geometry change",
+    "decode_microbatch": 1,
+    "reward_frame_microbatch_initial": 1,
+    "raw_media_chunk_videos_initial": 16,
+    "gpu_minimum_free_gib": 16,
+    "cpu_minimum_available_gib": 24,
+    "heavy_reward_and_model_gpu_compute_concurrent": false,
+    "prepared_training_root_forced_cpu_offload": false,
+    "reward_service_persistent": true,
+    "fallback_before_formal_start_if_full_entry_exceeds_budget": 2,
+    "mid_run_batch_changes": "only through a validated safe-point transition; never silently alter old-policy replay"
+  },
+  "workload_choice": "engineering_140_commit_reference_only",
+  "selected_workload": {
+    "optimizer_commits": 140,
+    "active_collection_rounds": 70,
+    "training_videos_per_collection": 384,
+    "nominal_rows_per_commit": 192,
+    "training_videos": 26880,
+    "evaluation_rounds": 4,
+    "evaluation_prompts": 300,
+    "evaluation_videos": 1200,
+    "evaluation_after_committed_steps": [0, 36, 76, 116],
+    "additional_final_evaluation_authorized": false,
+    "target_is_optimizer_commits_not_denoising_steps": true
+  },
+  "paper_exact_workload_confirmed": false,
+  "workload_options": {
+    "public_code_upper_ceiling": {
+      "source_epochs": 300,
+      "first_empty_epochs": 2,
+      "active_collection_epochs": 298,
+      "videos_per_collection": 384,
+      "optimizer_commits_per_collection": 2,
+      "nominal_rows_per_commit": 192,
+      "training_videos": 114432,
+      "optimizer_commits": 596,
+      "evaluation_rounds": 15,
+      "evaluation_prompts": 300,
+      "evaluation_videos": 4500,
+      "logical_hps_frame_scores": 9633492,
+      "model_compute_proxy_days": 149.78734446230334,
+      "is_confirmed_paper_run_endpoint": false
+    },
+    "engineering_140_commit_reference_only": {
+      "training_videos": 26880,
+      "optimizer_commits": 140,
+      "evaluation_videos": 1200,
+      "logical_hps_frame_scores": 2274480,
+      "model_compute_proxy_days": 35.536965906633526,
+      "is_confirmed_paper_run_endpoint": false,
+      "not_automatically_selected": true
+    }
+  },
+  "time_estimate_excludes": [
+    "actual HPSv3 frame-score latency",
+    "JPEG/RPC and filesystem overhead",
+    "text preprocessing/cache preparation",
+    "full trainer scheduling and PPO-specific overhead",
+    "EMA/checkpoint and shared-GPU pauses"
+  ],
+  "minimum_migration_tasks_not_yet_implemented": [
+    "real HPSv3 video reward resource/adapter identity and all81/top24 aggregation",
+    "bounded384-video collection preserving old policy, then two192-sample commits",
+    "stream media and retain compact policy/reward pool instead of138GiB float media",
+    "LoRA EMA shadow,300-prompt50-step periodic evaluation and resume state",
+    "supported frozen text cache or staged GPU preprocessing",
+    "full training-entry smoke and resource revalidation before formal launch"
+  ],
+  "no_silent_reductions": [
+    "no smaller resolution or frame count",
+    "no group-size reduction",
+    "no fewer denoising steps",
+    "no replacing all81 frame scoring by only24 or a single frame",
+    "no more optimizer commits to hide a smaller effective batch",
+    "no substituting World-R1 general reward or toy dataset"
+  ],
+  "source_data_sha256": {
+    "train19700": "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016",
+    "eval300": "96536b01ab2d091158118c4fd9f548950abce4fa5fa9a7f9ac2ebaae47776da5"
+  }
+}

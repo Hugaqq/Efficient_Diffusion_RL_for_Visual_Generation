@@ -1,0 +1,117 @@
+{
+  "status": "capacity_preflight_pass",
+  "batch": 2,
+  "geometry": {
+    "height": 480,
+    "width": 832,
+    "frames": 81,
+    "denoising_steps": 20,
+    "cfg": 4.5,
+    "max_sequence_length": 512
+  },
+  "scope": "actual VisualRL model ports capacity preflight only",
+  "full_trainer_g3_exercised": false,
+  "reward_evaluated": false,
+  "formal_training_started": false,
+  "probe_loss": "mean square prediction, only for backward/optimizer memory allocation",
+  "phases": [
+    {
+      "phase": "backward_safety_preflight",
+      "seconds": 32.923649544944055,
+      "initial_allocated_gib": 2.7099480628967285,
+      "peak_allocated_gib": 24.158902168273926,
+      "peak_reserved_gib": 26.78515625
+    },
+    {
+      "phase": "rollout-0",
+      "seconds": 166.16530068893917,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 5.865063667297363,
+      "peak_reserved_gib": 9.18359375
+    },
+    {
+      "phase": "decode1-0",
+      "seconds": 11.55958985898178,
+      "initial_allocated_gib": 2.814680576324463,
+      "peak_allocated_gib": 12.066671371459961,
+      "peak_reserved_gib": 14.88671875
+    },
+    {
+      "phase": "backward-0",
+      "seconds": 32.67130811302923,
+      "initial_allocated_gib": 2.814681053161621,
+      "peak_allocated_gib": 24.247802257537842,
+      "peak_reserved_gib": 26.919921875
+    },
+    {
+      "phase": "rollout-1",
+      "seconds": 166.28517521498725,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 5.865063667297363,
+      "peak_reserved_gib": 9.18359375
+    },
+    {
+      "phase": "decode1-1",
+      "seconds": 11.53709712496493,
+      "initial_allocated_gib": 2.814680576324463,
+      "peak_allocated_gib": 12.066106796264648,
+      "peak_reserved_gib": 14.87890625
+    },
+    {
+      "phase": "backward-1",
+      "seconds": 32.69498767098412,
+      "initial_allocated_gib": 2.814681053161621,
+      "peak_allocated_gib": 24.247802257537842,
+      "peak_reserved_gib": 26.919921875
+    },
+    {
+      "phase": "rollout-2",
+      "seconds": 166.2815337420907,
+      "initial_allocated_gib": 2.7990593910217285,
+      "peak_allocated_gib": 5.865063667297363,
+      "peak_reserved_gib": 9.18359375
+    },
+    {
+      "phase": "decode1-2",
+      "seconds": 11.533976630074903,
+      "initial_allocated_gib": 2.814680576324463,
+      "peak_allocated_gib": 12.066106796264648,
+      "peak_reserved_gib": 14.87890625
+    },
+    {
+      "phase": "backward-2",
+      "seconds": 32.68367616797332,
+      "initial_allocated_gib": 2.814681053161621,
+      "peak_allocated_gib": 24.247802257537842,
+      "peak_reserved_gib": 26.919921875
+    }
+  ],
+  "initial_free_gib": 76.22198486328125,
+  "total_gib": 79.249755859375,
+  "allocator_budget_gib": 58.22198486328125,
+  "reserve_gib": 16.0,
+  "versions": {
+    "torch": "2.7.1+cu128",
+    "diffusers": "0.33.1",
+    "peft": "0.10.0",
+    "visualrl_file": "/home/ubuntu/qifan/envs/visual-rl/lib/python3.10/site-packages/visual_rl/__init__.py"
+  },
+  "visualrl_adapter_sha256": "6ebf1c01cd5e04907f0bad2f40f7b18059636fb104ba83ed3fe2aff40d542474",
+  "phase": "backward-2",
+  "conditioning_encode_seconds": 0.0,
+  "prompt": "Camera orbit left. A detailed stone sculpture in a sunlit garden.",
+  "conditioning_from": "/mnt/data/qifan/runs/visualrl-capacity-20261022/batch1-r2/conditioning-512.pt",
+  "text_encoder_timing_excluded": true,
+  "cold_load_seconds": 14.602666983031668,
+  "median_rollout_seconds": 166.28335447853897,
+  "median_decode_seconds": 11.535536877519917,
+  "rollout_only_videos_per_minute": 0.7216597258115066,
+  "rollout_decode_videos_per_minute": 0.6748439329751293,
+  "discarded_probe_optimizer_steps": 4,
+  "total_seconds": 682.5436587650329,
+  "gpu_sample_count": 659,
+  "gpu_samples_path": "/mnt/data/qifan/runs/visualrl-capacity-20261022/batch2-r1/gpu_samples.json",
+  "host_peak_rss_gib": 22.569259643554688,
+  "observed_min_free_gib": 49.166015625,
+  "observed_card_peak_used_gib": 30.0849609375
+}

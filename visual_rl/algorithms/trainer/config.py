@@ -27,7 +27,22 @@ __all__ = (
 
 @dataclass(frozen=True, slots=True)
 class GRPOTrainerConfig:
-    """The trainer has no algorithm-variant knobs; stages are typed binds."""
+    """Execution cadence, independent of GRPO objective mathematics."""
+
+    collection_rows_per_commit: int | None = None
+    collection_commits: int = 1
+    collection_chunk_rows: int = 16
+
+    def __post_init__(self) -> None:
+        for name in ("collection_commits", "collection_chunk_rows"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.collection_rows_per_commit is None:
+            if self.collection_commits != 1:
+                raise ValueError("collection_commits requires collection_rows_per_commit")
+        elif (type(self.collection_rows_per_commit) is not int
+              or self.collection_rows_per_commit < 1):
+            raise ValueError("collection_rows_per_commit must be positive")
 
     @classmethod
     def from_mapping(
@@ -39,9 +54,10 @@ class GRPOTrainerConfig:
         del context
         if not isinstance(values, Mapping):
             raise TypeError("grpo trainer params must be a mapping")
-        if values:
-            raise ValueError(f"unknown grpo trainer params: {sorted(values)}")
-        return cls()
+        unknown = set(values) - {"collection_rows_per_commit", "collection_commits", "collection_chunk_rows"}
+        if unknown:
+            raise ValueError(f"unknown grpo trainer params: {sorted(unknown)}")
+        return cls(**values)
 
     def describe_contract(self) -> DeclaredContract:
         return DeclaredContract(

@@ -1,0 +1,105 @@
+{
+  "status": "capacity_tests_complete_plan_pending_user_review",
+  "capacity_scope": "real VisualRL model ports; no full trainer/G3 or real reward integration exercised",
+  "formal_training_started": false,
+  "rows": [
+    {
+      "batch": 1,
+      "rollout_seconds_per_video": 84.24701899202773,
+      "decode_seconds_per_video": 6.039710019540507,
+      "backward_probe_seconds_per_video": 16.682418387033977,
+      "rollout_decode_videos_per_minute": 0.6645494931188872,
+      "max_allocated_gib": 13.557197093963623,
+      "max_reserved_gib": 15.046875,
+      "observed_card_peak_used_gib": 18.1083984375,
+      "observed_min_free_gib": 61.142578125,
+      "host_peak_rss_gib": 20.11379623413086,
+      "throughput_gain_percent_vs_batch1": 0.0
+    },
+    {
+      "batch": 2,
+      "rollout_seconds_per_video": 83.14167723926948,
+      "decode_seconds_per_video": 5.767768438759958,
+      "backward_probe_seconds_per_video": 16.34466595973936,
+      "rollout_decode_videos_per_minute": 0.6748439329751293,
+      "max_allocated_gib": 24.247802257537842,
+      "max_reserved_gib": 26.919921875,
+      "observed_card_peak_used_gib": 30.0849609375,
+      "observed_min_free_gib": 49.166015625,
+      "host_peak_rss_gib": 22.569259643554688,
+      "throughput_gain_percent_vs_batch1": 1.5490855027106898
+    },
+    {
+      "batch": 4,
+      "rollout_seconds_per_video": 82.87056825487525,
+      "decode_seconds_per_video": 5.5820132422522875,
+      "backward_probe_seconds_per_video": 16.275235976005206,
+      "rollout_decode_videos_per_minute": 0.6783295522239616,
+      "max_allocated_gib": 45.629809856414795,
+      "max_reserved_gib": 52.033203125,
+      "observed_card_peak_used_gib": 55.0341796875,
+      "observed_min_free_gib": 24.216796875,
+      "host_peak_rss_gib": 20.114459991455078,
+      "throughput_gain_percent_vs_batch1": 2.073594103638743
+    }
+  ],
+  "largest_tested_safe_group_divisor_batch": 4,
+  "within_3percent_best_throughput_smallest_batch": 1,
+  "skipped": [
+    {
+      "batch": 8,
+      "reason": "conservative forecast exceeds own-process safety budget; not an observed OOM",
+      "forecast_gib": 110.1005758523941,
+      "budget_gib": 58.22198486328125
+    }
+  ],
+  "proposed_rollout_microbatch_ceiling": 4,
+  "proposed_recompute_geometry": "match the recorded rollout forward partitions; do not shrink without actual runtime parity gate",
+  "proposed_decode_microbatch": 1,
+  "formal_configuration_ready": false,
+  "workload_options_not_automatically_selected": [
+    {
+      "optimizer_commits": 596,
+      "training_videos": 114432,
+      "evaluation_videos": 4500,
+      "interpretation": "public code upper ceiling, NOT confirmed paper endpoint",
+      "paper_exact_workload_confirmed": false,
+      "model_train_compute_proxy_days": 138.7061760310825,
+      "model_eval_compute_proxy_days": 11.081168431220854,
+      "model_compute_proxy_total_days": 149.78734446230334,
+      "not_a_measured_total_training_time": true,
+      "logical_hps_frame_scores": 9633492,
+      "hypothetical_reward_extra_days": {
+        "0.05": 5.574937500000001,
+        "0.1": 11.149875000000002,
+        "0.2": 22.299750000000003
+      },
+      "reward_seconds_per_frame_were_measured": false
+    },
+    {
+      "optimizer_commits": 140,
+      "training_videos": 26880,
+      "evaluation_videos": 1200,
+      "interpretation": "engineering reference near README curve scale, NOT a confirmed exact paper endpoint",
+      "paper_exact_workload_confirmed": false,
+      "model_train_compute_proxy_days": 32.581987658307966,
+      "model_eval_compute_proxy_days": 2.9549782483255616,
+      "model_compute_proxy_total_days": 35.536965906633526,
+      "not_a_measured_total_training_time": true,
+      "logical_hps_frame_scores": 2274480,
+      "hypothetical_reward_extra_days": {
+        "0.05": 1.31625,
+        "0.1": 2.6325,
+        "0.2": 5.265
+      },
+      "reward_seconds_per_frame_were_measured": false
+    }
+  ],
+  "extrapolation_caveats": [
+    "Backward uses a memory-probe scalar loss, not a measured full PPO update.",
+    "Eval50 cost is extrapolated from20 forward steps, not a measured full300-prompt evaluation.",
+    "Real reward, JPEG/RPC, filesystem, preprocessing, framework scheduling, EMA/checkpoint and shared-GPU pauses add costs.",
+    "Hypothetical reward timings are sensitivity inputs, not benchmark results.",
+    "Exact paper endpoint is not recoverable from GPU-hours or plot pixels."
+  ]
+}

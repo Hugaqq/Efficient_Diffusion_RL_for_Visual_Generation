@@ -983,11 +983,9 @@ class DefaultStageAssembler:
             if not isinstance(identity, IterationIdentity):
                 raise TypeError("reward context identity must be IterationIdentity")
             route = payload.phase_route
-            if route is None:
-                raise DefaultStageAssemblyError(
-                    "default reward execution requires DataPlanePrelude routing"
-                )
-            if (
+            # Streamed collection projects canonical sample rows, not a second
+            # sampler/placement reservation. RewardStage validates its route.
+            if route is not None and (
                 route.optimizer_step != identity.optimizer_step
                 or route.source_id != identity.source_id
                 or route.phase_id != identity.phase_id
@@ -1025,6 +1023,68 @@ class DefaultStageAssembler:
             coefficient_mean_reducer=LocalCoefficientMeanReducer(),
         )
 
+        collection = None
+        trainer = components["trainer"]
+        trainer_config = training.collection
+        if trainer_config is not None:
+            from visual_rl.algorithms.trainer.collection import CollectionState, StreamedRolloutStage
+            from visual_rl.algorithms.rollout.single_step import SingleStepRollout
+            from visual_rl.models.implementations.wan import WanT2VAdapter
+            if not isinstance(rollout, SingleStepRollout) or not isinstance(adapter, WanT2VAdapter) or len(reward_plan.routes) != 1:
+                raise DefaultStageAssemblyError("collection cadence currently requires single-route Flash/Wan")
+            total_rows = training.global_prompt_batch_size * group_size
+            nominal = trainer_config.collection_rows_per_commit
+            chunk = trainer_config.collection_chunk_rows
+            forward = rollout.rollout_execution_policy.forward_microbatch_size
+            if (total_rows != nominal * trainer_config.collection_commits
+                    or nominal % group_size or chunk % group_size
+                    or forward is None or nominal % forward or chunk % forward
+                    or training.max_optimizer_steps % trainer_config.collection_commits):
+                raise DefaultStageAssemblyError("collection/commit/chunk/group/forward geometry does not align")
+            if algorithm.requires_reference_statistics or conditioner is not None:
+                raise DefaultStageAssemblyError("streamed Flash collection currently requires KL=0 and no conditioner")
+            parameters = tuple(p for g in request.prepared.optimizer.param_groups for p in g["params"])
+            collection = CollectionState(config=trainer_config, parameters=parameters,
+                request_factory=rollout_request_factory,
+                current_context=lambda: manager.execution(current_policy))
+            if training.max_optimizer_steps == 140 and (
+                    total_rows != 384 or nominal != 192 or trainer_config.collection_commits != 2
+                    or group_size != 8 or forward != 4
+                    or rollout.rollout_execution_policy.decode_microbatch_size != 1
+                    or training.policy_recompute.row_microbatch_size != 4
+                    or not training.flash_evaluation):
+                raise DefaultStageAssemblyError("APPROVED140 requires 384/2x192/group8/forward4/replay4/decode1 and real evaluation")
+            if training.max_optimizer_steps == 140:
+                train_bytes = request.preflight.compiled.launch.artifacts.dataset("main").read_bytes()
+                if hashlib.sha256(train_bytes).hexdigest() != "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016":
+                    raise DefaultStageAssemblyError("APPROVED140 training prompt SHA256 mismatch")
+                if (schedule_step_count != 20 or (adapter.config.height, adapter.config.width, adapter.config.frames) != (480, 832, 81)
+                        or adapter.config.max_sequence_length != 512 or adapter.config.vae_tiling):
+                    raise DefaultStageAssemblyError("APPROVED140 model/schedule geometry mismatch")
+            if training.flash_evaluation:
+                from visual_rl.algorithms.trainer.evaluation import FlashEvaluationStage, load_evaluation_prompts
+                prompts = load_evaluation_prompts(request.preflight.compiled.launch.artifacts.evaluation_prompts)
+                if len(reward_plan.resources) != 1:
+                    raise DefaultStageAssemblyError("Flash evaluation requires one HPSv3 resource")
+                resource_id = reward_plan.resources[0].resource_identity
+                collection.evaluator = FlashEvaluationStage(
+                    prompts=prompts, collection=collection, request_factory=rollout_request_factory,
+                    rollout=rollout, preprocess_context=lambda: manager.execution(preprocess_policy),
+                    rollout_context=lambda: manager.execution(rollout_policy),
+                    resource=lambda: container.view().get(resource_id),
+                    output_dir=request.preflight.compiled.launch.output_dir,
+                    recipe_id=materialized.recipe_id)
+            trainer.bind_collection(collection)
+            prelude.runtime_state_owner = collection
+            rollout_stage = StreamedRolloutStage(
+                rollout=rollout, request_factory=rollout_request_factory,
+                preprocess_context=lambda: manager.execution(preprocess_policy),
+                rollout_context=lambda: manager.execution(rollout_policy),
+                reward_pipeline=reward_pipeline, chunk_rows=chunk, collection=collection,
+                cache_dir=request.preflight.compiled.launch.output_dir / "collection-cache",
+                recipe_id=materialized.recipe_id)
+            collection.cache_root = rollout_stage.cache_dir
+
         safety = training.update_safety
         recompute = training.policy_recompute
         update_plan = UpdateExecutionPlan(
@@ -1056,6 +1116,7 @@ class DefaultStageAssembler:
             execution_plan=update_plan,
             require_reference_statistics=algorithm.requires_reference_statistics,
             current_context=lambda: manager.execution(current_policy),
+            behavior_context=None if collection is None else collection.behavior_context,
             reference_context=(
                 None
                 if reference_policy is None
