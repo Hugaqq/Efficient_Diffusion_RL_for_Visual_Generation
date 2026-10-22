@@ -45,9 +45,8 @@ def preset_config(name):
 
 
 def check_preset_mode(preset, mode, resume, retry_incomplete):
-    if preset == "small40" and (mode == "validate" or (
-            mode != "inspect" and (resume is not None or retry_incomplete))):
-        raise RuntimeError("SMALL40 is fresh RUN only: no bounded validation or old-run resume/retry")
+    if preset == "small40" and (mode == "validate" or retry_incomplete):
+        raise RuntimeError("SMALL40 requires fresh RUN or explicit owned latest resume; no bounded validation/retry")
 
 
 def publish(path, value):
@@ -304,8 +303,6 @@ def render_config(raw, output, resume):
     preset = flash_preset(training.get("flash_preset", "approved140"))
     if training["max_optimizer_steps"] != preset.optimizer_steps:
         raise RuntimeError(f"formal endpoint must remain{preset.optimizer_steps} for {preset.name}")
-    if preset.name == "small40" and resume is not None:
-        raise RuntimeError("SMALL40 starts fresh; never resume an old experiment")
     rendered["launch"]["output_dir"] = str(output)
     rendered["launch"]["resume_from"] = None if resume is None else str(Path(resume).absolute())
     return rendered
@@ -364,6 +361,8 @@ def main(argv=None):
     parser.add_argument("--expected-sha", required=True, help="full40-character pulled Git commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlay", type=Path, default=OVERLAY)
+    parser.add_argument("--upgrade-launcher-from", choices=("00cee786df783f36cb254a9a666a48a5952dc0a3",),
+                        help="audited launcher-only upgrade of original run-002 step2; never rewrites checkpoint identities")
     parser.add_argument("--gpu-memory-policy", choices=("reserve", "oom"), default="reserve",
                         help="oom: log GPU memory without headroom/peak-budget aborts; real CUDA OOM still fails")
     recovery = parser.add_mutually_exclusive_group()
@@ -379,6 +378,8 @@ def main(argv=None):
     if args.mode == "inspect" and (args.resume is None or args.retry_incomplete):
         parser.error("inspect requires --resume pointing to a trusted owned checkpoint")
     check_preset_mode(args.preset, args.mode, args.resume, args.retry_incomplete)
+    if args.upgrade_launcher_from is not None and (args.preset != "small40" or args.resume is None):
+        parser.error("launcher upgrade requires SMALL40 explicit owned latest --resume")
     sha = git_identity(args.expected_sha)
     modules = configure_imports(args.overlay)
     import yaml
@@ -408,8 +409,19 @@ def main(argv=None):
                  commits_per_collection=2, training_videos=preset.optimizer_steps // 2 * preset.collection_rows,
                  evaluation_steps=list(preset.evaluation_steps), evaluation_prompts=preset.prompt_count,
                  evaluation_sampling_steps=preset.sampling_steps, save_evaluation_videos=preset.save_videos)
+        existing_owner = upgraded_owner = identity
+        if args.preset == "small40" and args.resume is not None:
+            from scripts.flash_small40_repair import resume_owner, validate_small40_resume, REPAIR_OUTPUT
+            if output == REPAIR_OUTPUT and args.gpu_memory_policy != "oom":
+                raise RuntimeError("run-002 recovery must retain the approved --gpu-memory-policy oom")
+            existing_owner, upgraded_owner = resume_owner(output, identity, args.resume,
+                upgrade_from=args.upgrade_launcher_from, root=ROOT, config=config)
+            if args.mode != "inspect":
+                restored = validate_small40_resume(output, args.resume)
+                progress("resume_checkpoint_validated", **restored,
+                         warning="production prepared/full contract checks still execute before continuation")
         if args.mode == "inspect":
-            if json.loads((output / "flash140-owner.json").read_text()) != identity:
+            if json.loads((output / "flash140-owner.json").read_text()) != existing_owner:
                 raise RuntimeError("inspection requires the same source/config owned output")
             for path in (args.resume, args.compare):
                 if path is not None and (path.absolute().parent != output / "checkpoints" or path.is_symlink()):
@@ -434,7 +446,12 @@ def main(argv=None):
         if args.mode == "validate" and args.resume is not None:
             if int(args.resume.name.removeprefix("step-")) >= (args.until or 2):
                 raise RuntimeError("validation --until must be beyond the explicitly resumed checkpoint")
-        output = prepare_output(output, identity=identity, resume=args.resume, retry_incomplete=args.retry_incomplete)
+        output = prepare_output(output, identity=existing_owner, resume=args.resume, retry_incomplete=args.retry_incomplete)
+        if upgraded_owner != existing_owner:
+            # One atomic owner+proof transition, under flock, after complete
+            # checkpoint/schema/latest validation. No checkpoint bytes change.
+            publish(output / "flash140-owner.json", upgraded_owner)
+            progress("compatible_launcher_owner_upgrade", **upgraded_owner)
         attempt = output / "launcher" / str(time.time_ns())
         attempt.mkdir(parents=True)
         handler = logging.FileHandler(attempt / "events.jsonl")
@@ -460,7 +477,9 @@ def main(argv=None):
             publish(attempt / f"checkpoint-{record['committed_steps']}.json", record)
             monitor.sample()  # includes compact-pool/checkpoint peak, before pause
         try:
-            controller = create_default_run_controller(code_root=ROOT / "visual_rl")
+            from scripts.flash_small40_repair import CacheHandoffRewardFactory
+            controller = create_default_run_controller(code_root=ROOT / "visual_rl",
+                reward_resource_factory=CacheHandoffRewardFactory() if preset.name == "small40" else None)
             observe_checkpoints(controller, pause_after=(args.until or 2) if args.mode == "validate" else None,
                                 on_checkpoint=checkpoint_record)
             monitor.sample()

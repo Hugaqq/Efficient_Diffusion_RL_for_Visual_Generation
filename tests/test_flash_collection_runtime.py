@@ -179,7 +179,7 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
                                       include_run_summary=False)
 
 
-def test_collection_disk_chunks_survive_failure_before_first_commit(monkeypatch, tmp_path):
+def test_collection_disk_chunks_survive_failure_before_first_commit(monkeypatch, tmp_path, caplog):
     from visual_rl.algorithms.trainer.collection import CollectionState
     artifacts, code = setup(monkeypatch, tmp_path)
     fingerprints = []
@@ -224,6 +224,101 @@ def test_collection_disk_chunks_survive_failure_before_first_commit(monkeypatch,
     attempts = list((output / "physical-attempts/collection-0").glob("*.json"))
     assert len(attempts) == 24
     assert sum(json.loads(p.read_text())["physical_attempts_started"] for p in attempts) == 25
+
+    # The supported resource-factory seam runs after managed rollout exit, with
+    # detached media and no autograd at empty_cache. CUDA counters here are
+    # explicit fake leaves: ordering/logging evidence, NOT reclaimed GPU bytes.
+    from contextlib import contextmanager
+    from dataclasses import replace
+    from scripts.flash_small40_repair import CacheHandoffRewardFactory, CacheHandoffHpsClient
+    from visual_rl.algorithms.rewards.clients.hpsv3 import Hpsv3VideoClient
+    from visual_rl.core.protocols.flash_hpsv3 import VideoContract
+    from visual_rl.models.lifecycle.components import ComponentManager
+    caplog.set_level("INFO", logger="visual_rl.flash140")
+    active = []
+    released = []
+    managed = ComponentManager.execution
+    @contextmanager
+    def tracking(self, policy):
+        with managed(self, policy):
+            active.append(policy)
+            try:
+                yield
+            finally:
+                active.pop()
+    monkeypatch.setattr(ComponentManager, "execution", tracking)
+    # Fake CUDA is ONLY active inside release_reward_cache; RNG capture must
+    # continue to observe the actual CPU-only runtime.
+    from scripts import flash_small40_repair as repair
+    release = repair.release_reward_cache
+    def handoff(phase):
+        assert not active
+        with monkeypatch.context() as cuda:
+            cuda.setattr(torch.cuda, "synchronize", lambda _: None)
+            cuda.setattr(torch.cuda, "mem_get_info", lambda _: (10, 100))
+            cuda.setattr(torch.cuda, "memory_allocated", lambda _: 20)
+            cuda.setattr(torch.cuda, "memory_reserved", lambda _: 60)
+            def empty():
+                assert not torch.is_grad_enabled()
+                released.append(phase)
+            cuda.setattr(torch.cuda, "empty_cache", empty)
+            release(phase)
+    def enabled_handoff(phase):
+        with monkeypatch.context() as cuda:
+            cuda.setattr(torch.cuda, "is_available", lambda: True)
+            handoff(phase)
+    monkeypatch.setattr(repair, "release_reward_cache", enabled_handoff)
+    class FakeHps(demo._FakeRewardResource, Hpsv3VideoClient):
+        fail = False
+        def __init__(self):
+            demo._FakeRewardResource.__init__(self)
+            self.service_identity, self.contract = "1" * 64, VideoContract(5, 2, 2)
+        def score(self, *, batch):
+            assert released[-1] == "collection_chunk" and not active
+            if self.fail:
+                raise RuntimeError("ordinary HPS503")
+            return original(self, batch=batch)
+        def score_video(self, **kwargs):
+            assert released[-1] == "evaluation_video"
+            return 0.5, {"real_leaf": False}
+    clients = []
+    facts = demo._FakeRewardResourceFactory()
+    def leaf(request):
+        acquired = facts(request)
+        acquired.resource.close()
+        client = FakeHps()
+        clients.append(client)
+        return replace(acquired, resource=client)
+    wrapped_factory = CacheHandoffRewardFactory(leaf)
+    before = len(released)
+    cache_controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                      reward_resource_factory=wrapped_factory)
+    cache_result = cache_controller.run(config(tmp_path / "handoff", artifacts, tmp_path / "handoff-out", rows=16))
+    assert len(released) - before == 2  # one release per generated16 chunk, not per optimizer/slot
+    assert clients[-1].score_calls == 2 and clients[-1].close_calls == 1
+    assert clients[-1].activate_calls == 1
+    baseline = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                               reward_resource_factory=demo._FakeRewardResourceFactory())
+    baseline_result = baseline.run(config(tmp_path / "handoff-baseline", artifacts, tmp_path / "handoff-reference", rows=16))
+    e2e._assert_checkpoint_state_exact(e2e._checkpoint_snapshot(cache_result.authoritative_checkpoint),
+                                      e2e._checkpoint_snapshot(baseline_result.authoritative_checkpoint),
+                                      include_run_summary=False)
+    FakeHps.fail = True
+    failing = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                            reward_resource_factory=wrapped_factory)
+    with pytest.raises(RuntimeError, match="ordinary HPS503"):
+        failing.run(config(tmp_path / "handoff-failed", artifacts, tmp_path / "handoff-failed-out", rows=16))
+    assert not (tmp_path / "handoff-failed-out/SUCCESS").exists()
+    assert clients[-1].close_calls == 1
+    adapted = CacheHandoffHpsClient(FakeHps())
+    assert isinstance(adapted, Hpsv3VideoClient)
+    assert adapted.score_video(sample_id="fake") == (0.5, {"real_leaf": False})
+    adapted.close()
+    events = [json.loads(r.message) for r in caplog.records if r.name == "visual_rl.flash140"]
+    before_events = [r for r in events if r["event"] == "reward_cuda_handoff_before"]
+    after_events = [r for r in events if r["event"] == "reward_cuda_handoff_after"]
+    assert len(before_events) == len(after_events) == len(released)
+    assert all(e["allocated_bytes"] == 20 and e["reserved_bytes"] == 60 for e in after_events)
 
 
 def test_step0_gate_media_release_and_resumed_step1_safety(monkeypatch, tmp_path):
@@ -502,14 +597,48 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
         raw["launch"]["artifacts"]["evaluation_prompts"] = str(author / "test.txt")
         p.write_text(yaml.safe_dump(raw))
         return p
+    from scripts.launch_flash140 import SafePointPause, observe_checkpoints
+    from scripts.flash_small40_repair import CacheHandoffRewardFactory, validate_small40_resume
     controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
-                                                reward_resource_factory=small_factory)
-    with pytest.raises(RuntimeError, match="terminal40 evaluation interruption"):
+                                                reward_resource_factory=CacheHandoffRewardFactory(small_factory))
+    observe_checkpoints(controller, pause_after=2)  # test-only interruption, production RUN remains40
+    with pytest.raises(SafePointPause):
         controller.run(small_path("small40-first"))
+    assert small_clients[0].score_calls == 2 and small_clients[0].eval_calls == 16
+    step2 = small_out / "checkpoints/step-2"
+    restored = validate_small40_resume(small_out, step2)
+    assert restored["committed_steps"] == 2 and restored["evaluations_completed"] == [0]
+    latest_file = step2.parent / "latest.json"
+    latest_bytes = latest_file.read_bytes()
+    latest_file.write_text(json.dumps(dict(json.loads(latest_bytes), step=0)))
+    with pytest.raises(RuntimeError, match="latest.json"):
+        validate_small40_resume(small_out, step2)
+    latest_file.write_bytes(latest_bytes)
+    newer = step2.parent / "step-4"
+    newer.mkdir()
+    with pytest.raises(RuntimeError, match="latest checkpoint"):
+        validate_small40_resume(small_out, step2)
+    newer.rmdir()  # test-only empty collision, never a real checkpoint
+    baseline_receipts = {p.name: p.read_bytes() for p in (small_out / "evaluations/step-0").iterdir()}
+    # Actual immutable contract decoding rejects a changed code artifact; no
+    # owner upgrade can suppress the production prepared/full restore checks.
+    changed_code = tmp_path / "changed-code"
+    changed_code.mkdir()
+    (changed_code / "identity.py").write_text("DIFFERENT = True\n")
+    incompatible = create_default_run_controller(code_root=changed_code, model_loader=demo._FakeModelLoader(),
+                                                  reward_resource_factory=CacheHandoffRewardFactory(small_factory))
+    from visual_rl.errors import ResumeError
+    with pytest.raises(ResumeError, match="recipe_id differs"):
+        incompatible.run(small_path("small40-wrong-source", step2))
+    controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                                reward_resource_factory=CacheHandoffRewardFactory(small_factory))
+    with pytest.raises(RuntimeError, match="terminal40 evaluation interruption"):
+        controller.run(small_path("small40-resume2", step2))
+    assert {p.name: p.read_bytes() for p in (small_out / "evaluations/step-0").iterdir()} == baseline_receipts
     assert not (small_out / "SUCCESS").exists()
     assert not (small_out / "checkpoints/step-40").exists()
     assert (small_out / "checkpoints/step-38").is_dir()
-    assert small_clients[0].score_calls == 40  #20 collections x2 chunks x16=640 videos
+    assert small_clients[0].score_calls + small_clients[-1].score_calls == 40  # no recollection at step2
     assert evaluation_calls == [0, 20, 40]
     assert steps == [20] * 36  #16+16+3 durable+1 interrupted
     assert [seed for _, seed in seeds[:16]] == list(SMALL40.noise_seeds)
@@ -517,7 +646,7 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
     assert len(list((small_out / "evaluations/step-40").glob("video-*.json"))) == 3
     SmallClient.fail_terminal = False
     controller = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
-                                                reward_resource_factory=small_factory)
+                                                reward_resource_factory=CacheHandoffRewardFactory(small_factory))
     small_result = controller.run(small_path("small40-retry", small_out / "checkpoints/step-38"))
     assert small_result.committed_steps == 40 and (small_out / "SUCCESS").is_file()
     assert evaluation_calls == [0, 20, 40, 40]  # no baseline/step20 redo
@@ -544,6 +673,17 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
     import gc
     gc.collect()
     assert all(ref() is None for ref in saved_media)
+    # Fresh continuous reference: exact prepared owners/RNG/sampler/EMA/cursors
+    # versus the actual step2 continuation (and later terminal receipt retry).
+    resumed_out = small_out
+    small_out = tmp_path / "small40-continuous"
+    reference = create_default_run_controller(code_root=code, model_loader=demo._FakeModelLoader(),
+                                              reward_resource_factory=CacheHandoffRewardFactory(small_factory))
+    reference_result = reference.run(small_path("small40-continuous-config"))
+    e2e._assert_checkpoint_state_exact(e2e._checkpoint_snapshot(reference_result.authoritative_checkpoint),
+                                      e2e._checkpoint_snapshot(small_result.authoritative_checkpoint),
+                                      include_run_summary=False)
+    small_out = resumed_out
     # Even already-completed earlier rounds must retain their videos before
     # finalization; a saved evaluations_completed cursor is not enough.
     terminal_summary = json.loads((small_out / "evaluations/step-40/summary.json").read_text())
@@ -632,12 +772,14 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     assert small_render["overrides"] == small_raw["overrides"]
     launch.check_preset_mode("small40", "run", None, False)
     launch.check_preset_mode("small40", "preflight", None, False)
-    for mode, resume, retry in (("validate", None, False), ("run", Path("old140/step-1"), False),
-                                 ("run", None, True)):
-        with pytest.raises(RuntimeError, match="fresh RUN"):
+    for mode in ("preflight", "run", "inspect"):
+        launch.check_preset_mode("small40", mode, Path("owned/checkpoints/step-2"), False)
+    for mode, resume, retry in (("validate", None, False), ("run", None, True)):
+        with pytest.raises(RuntimeError, match="explicit owned latest"):
             launch.check_preset_mode("small40", mode, resume, retry)
-    with pytest.raises(RuntimeError, match="fresh"):
-        launch.render_config(small_raw, tmp_path / "bad", Path("old140/step-1"))
+    resumed_render = launch.render_config(small_raw, tmp_path / "small40-run", Path("owned/checkpoints/step-2"))
+    assert resumed_render["overrides"] == small_raw["overrides"]
+    assert resumed_render["launch"]["resume_from"].endswith("owned/checkpoints/step-2")
     import copy
     from visual_rl.errors import ConfigError
     for target in (2, 39, 140):
@@ -711,6 +853,70 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     (out / "SUCCESS").write_text("terminal")
     with pytest.raises(RuntimeError, match="terminal"):
         launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
+
+    from scripts import flash_small40_repair as repair
+    import hashlib
+    # Real candidate Git object/working-tree check, not package-version trust.
+    assert repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, "--name-only", "--", "visual_rl", "experiments", "data") == ""
+    real_proof = repair.prove_launcher_upgrade(launch.ROOT, repair.REPAIR_BASE, small_path)
+    assert set(real_proof["unchanged_git_objects"]) == {"visual_rl", "experiments", "data"}
+    new_sha = "f" * 40
+    def git(*args):
+        if args[0] == "merge-base":
+            return repair.REPAIR_BASE
+        if args[0] == "diff":
+            return "scripts/launch_flash140.py\nscripts/flash_small40_repair.py\ndocs/flash_small40_repair.md"
+        if args[0] == "hash-object":
+            return "config-blob"
+        if args[0] == "rev-parse":
+            path = args[1].split(":", 1)[1]
+            return "config-blob" if path.endswith(".yaml") else "tree-" + path
+        raise AssertionError(args)
+    proof = repair.prove_launcher_upgrade(launch.ROOT, new_sha, small_path, git=git)
+    assert proof["base_sha"] == repair.REPAIR_BASE
+    for failure in ("ancestry", "paths", "runtime", "config"):
+        def bad_git(*args):
+            if failure == "ancestry" and args[0] == "merge-base":
+                return "unrelated"
+            if failure == "paths" and args[0] == "diff":
+                return "visual_rl/algorithms/trainer/collection.py"
+            if failure == "runtime" and args == ("rev-parse", f"{new_sha}:visual_rl"):
+                return "different-runtime-tree"
+            if failure == "config" and args[0] == "hash-object":
+                return "changed-config-bytes"
+            return git(*args)
+        with pytest.raises(RuntimeError, match="ancestry|runtime|content|config"):
+            repair.prove_launcher_upgrade(launch.ROOT, new_sha, small_path, git=bad_git)
+    monkeypatch.setattr(repair, "git_read", lambda root, *args: git(*args))
+    original = tmp_path / "run-002"
+    monkeypatch.setattr(repair, "REPAIR_OUTPUT", original)
+    original.mkdir()
+    step2 = original / "checkpoints/step-2"
+    step2.mkdir(parents=True)
+    new_identity = dict(git_sha=new_sha, source_config_sha256=hashlib.sha256(small_path.read_bytes()).hexdigest())
+    old_identity = dict(new_identity, git_sha=repair.REPAIR_BASE)
+    owner_file = original / "flash140-owner.json"
+    launch.publish(owner_file, old_identity)
+    def authorize(**kwargs):
+        return repair.resume_owner(original, kwargs.pop("identity", new_identity), kwargs.pop("resume", step2),
+            upgrade_from=kwargs.pop("upgrade_from", repair.REPAIR_BASE), root=launch.ROOT, config=small_path, **kwargs)
+    before_owner = owner_file.read_bytes()
+    previous, next_owner = authorize()
+    assert previous == old_identity and next_owner == {**new_identity, "launcher_upgrade": proof}
+    assert owner_file.read_bytes() == before_owner  # preflight/read-only authorization
+    for kw in ({"upgrade_from": None}, {"upgrade_from": "a" * 40},
+               {"identity": dict(new_identity, source_config_sha256="a" * 64)},
+               {"resume": original / "checkpoints/step-0"}):
+        with pytest.raises(RuntimeError, match="different source/config"):
+            authorize(**kw)
+    launch.prepare_output(original, identity=previous, resume=step2)
+    launch.publish(owner_file, next_owner)  # same single atomic owner+audit publication as main
+    assert authorize(upgrade_from=None) == (next_owner, next_owner)
+    launch.prepare_output(original, identity=next_owner, resume=step2)
+    launch.publish(owner_file, {**next_owner, "launcher_upgrade": dict(proof, new_sha="forged")})
+    with pytest.raises(RuntimeError, match="audit/source"):
+        authorize()
+    assert list(original.glob("checkpoints/step-*")) == [step2]  # no reset/conversion
 
 
 def test_approved140_manifest_counts():
