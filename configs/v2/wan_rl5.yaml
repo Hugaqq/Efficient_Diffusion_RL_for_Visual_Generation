@@ -1,0 +1,90 @@
+# Independent real Wan/Flash regression, NOT a SMALL40/140 continuation.
+# Five commits over three fixed-policy pools: 4 -> 2+2, 4 -> 2+2, 4 -> 2.
+# The terminal step5 checkpoint retains the last real pool and cursor1.
+schema_version: 2
+recipe: flash_grpo_v1
+overrides:
+  algorithm:
+    params:
+      num_steps: 20
+      candidate_timestep_window: [0, 10]
+      selection_key: prompt
+      selection_domain: single_process
+      clip_range: 0.001
+  model:
+    params:
+      lora_rank: 16
+      lora_alpha: 32
+      guidance_scale: 4.5
+      height: 480
+      width: 832
+      frames: 81
+      frame_rate_numerator: 15
+      frame_rate_denominator: 1
+      max_sequence_length: 512
+      text_encoder_residency: stage
+      gradient_checkpointing: true
+      vae_tiling: false
+  rewards:
+    reward_general:
+      replace_params: true
+      params:
+        resource:
+          schema_version: 1
+          factory_class: visual_rl.algorithms.rewards.clients.hpsv3:Hpsv3VideoResourceFactory
+          artifact_ref: reward_general
+          protocol: flash_hpsv3_json
+          protocol_version: v1
+          semantic_factory_config:
+            service_identity: 4c831491cb7b413839ad07459f777bd674cbd59aadbc7d7d3e2ce25b11c993e9
+            video_contract: {frames: 81, height: 480, width: 832, top_k: 24}
+          allowed_runtime_policy:
+            allowed_devices: [cpu]
+            allowed_dtypes: [fp32]
+            allowed_worker_domains: [remote]
+  training:
+    seed: 42
+    global_prompt_batch_size: 2
+    max_optimizer_steps: 5
+    gradient_accumulation_steps: 1
+    collection:
+      collection_rows_per_commit: 2
+      collection_commits: 2
+      collection_chunk_rows: 2
+    flash_evaluation: false
+    policy_recompute:
+      row_microbatch_size: 1
+      transition_window_size: 1
+    adamw:
+      learning_rate: 0.0001
+      weight_decay: 0.0001
+    lr_schedule:
+      warmup_steps: 0
+  execution:
+    precision: bf16
+    distribution_mode: single
+    group_size: 2
+    rollout:
+      forward_microbatch_size: 1
+      decode_microbatch_size: 1
+      trajectory_storage_device: cpu
+launch:
+  output_dir: /mnt/data/qifan/runs/visualrl-readable-h3-20261024/wan-rl5-001
+  resume_from: null
+  checkpoint_every_optimizer_steps: 1
+  reward_runtime_bindings:
+    reward_general:
+      execution_domain: remote
+      device: cpu
+      dtype: fp32
+      endpoint: http://127.0.0.1:18820
+      timeout_s: 900.0
+      trusted_hosts: [127.0.0.1]
+      ca_bundle: null
+      max_response_bytes: 262144
+  artifacts:
+    model: /mnt/data/qifan/models/Wan2.1-T2V-1.3B-Diffusers
+    datasets:
+      main: /home/ubuntu/qifan/Flash-GRPO/dataset/video/train.txt
+    rewards:
+      reward_general: /mnt/data/qifan/runs/flash140-20261022/hpsv3-service.json

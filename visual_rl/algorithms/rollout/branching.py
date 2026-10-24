@@ -31,7 +31,6 @@ from visual_rl.algorithms.rollout.interface import (
 from visual_rl.core.contracts import DeclaredContract
 from visual_rl.core.contracts.runtime import (
     ExecutionPolicyReceipt,
-    PolicyTransitionRequest,
 )
 from visual_rl.data.media import DecodedMediaBatch
 from visual_rl.models.interface import BatchProjectableModelPayload, ModelInput
@@ -416,22 +415,10 @@ class BranchingRollout(RolloutCollector):
                 transition,
                 row_to_mainline=row_to_mainline,
             )
-            transition_port = getattr(episode.request.adapter, "transition", None)
-            if callable(transition_port):
-                port_result = transition_port(
-                    PolicyTransitionRequest(
-                        mode="sample",
-                        transition_input=expanded_transition,
-                        transition_session=session,
-                        generator=episode.request.generator,
-                    )
-                )
-                output = port_result.transition_output
-            else:
-                output = session.sample_transition(
-                    expanded_transition,
-                    generator=episode.request.generator,
-                )
+            output = session.sample_transition(
+                expanded_transition,
+                generator=episode.request.generator,
+            )
             conditioned_next = self._after_step(
                 episode,
                 step_index,

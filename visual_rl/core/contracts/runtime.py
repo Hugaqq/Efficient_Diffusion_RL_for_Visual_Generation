@@ -609,7 +609,7 @@ class PolicyTransitionRequest:
 
 @dataclass(frozen=True, slots=True)
 class PolicyTransitionResult:
-    """Model-independent result returned by ``PolicyRuntimePort.transition``."""
+    """Legacy transition DTO, retained for imports; not a live model operation."""
 
     next_latents: object
     log_prob: object | None
@@ -649,7 +649,11 @@ class AlgorithmStepResult:
 
 @runtime_checkable
 class PolicyRuntimePort(Protocol):
-    """The sole model-facing surface available to an algorithm module."""
+    """Prepared training model port; numerical transitions belong to Dynamics.
+
+    Pure native inference uses a model's generate capability instead, without
+    implementing trainable parameters, reference views or checkpoint state.
+    """
 
     @property
     def capabilities(self) -> BoundPolicyCapabilities: ...
@@ -666,11 +670,7 @@ class PolicyRuntimePort(Protocol):
     @property
     def runtime_capabilities(self) -> object: ...
 
-    def preprocess(self, raw_batch: object) -> object: ...
-
     def encode(self, batch: object) -> object: ...
-
-    def initialize_latents(self, batch_geometry: object, rng: object) -> object: ...
 
     def prepare_latents(
         self,
@@ -696,11 +696,6 @@ class PolicyRuntimePort(Protocol):
     ) -> object: ...
 
     def predict_reference(self, model_input: object) -> object: ...
-
-    def transition(
-        self,
-        request: PolicyTransitionRequest,
-    ) -> PolicyTransitionResult: ...
 
     def decode(self, latents: object, latent_spec: object) -> object: ...
 

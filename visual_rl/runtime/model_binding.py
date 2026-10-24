@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from visual_rl.algorithms.dynamics.session import DynamicsSession
 from visual_rl.composition.compatibility import bind_model_algorithm
 from visual_rl.composition.preflight.types import RuntimeFacts
 from visual_rl.composition.recipes.schema import MaterializedRecipe
@@ -19,10 +18,6 @@ from visual_rl.core.contracts import (
     DeclaredContract,
     DynamicsContract,
     RuntimeBoundContract,
-)
-from visual_rl.core.contracts.runtime import (
-    PolicyTransitionRequest,
-    PolicyTransitionResult,
 )
 from visual_rl.core.serialization import canonical_json_text
 from visual_rl.core.types import FrozenMapping, to_plain_dict
@@ -440,14 +435,8 @@ class DefaultPolicyRuntimePort:
     def state_contract(self) -> object:
         return self._manager.parameter_state.state_projection
 
-    def preprocess(self, raw_batch: object) -> object:
-        return self._adapter.encode(raw_batch)
-
     def encode(self, batch: object) -> object:
-        return self.preprocess(batch)
-
-    def initialize_latents(self, batch_geometry: object, rng: object) -> object:
-        return self._adapter.prepare_latents(batch_geometry, generator=rng)
+        return self._adapter.encode(batch)
 
     def prepare_latents(
         self,
@@ -455,7 +444,7 @@ class DefaultPolicyRuntimePort:
         *,
         generator: object,
     ) -> object:
-        return self.initialize_latents(latent_spec, generator)
+        return self._adapter.prepare_latents(latent_spec, generator=generator)
 
     def latent_spec_for_batch(
         self,
@@ -491,39 +480,6 @@ class DefaultPolicyRuntimePort:
 
     def predict_reference(self, model_input: object) -> object:
         return self.predict(model_input, ParameterView.REFERENCE)
-
-    def transition(self, request: PolicyTransitionRequest) -> PolicyTransitionResult:
-        if not isinstance(request, PolicyTransitionRequest):
-            raise TypeError("request must be PolicyTransitionRequest")
-        session = request.transition_session
-        if not isinstance(session, DynamicsSession):
-            raise TypeError("transition_session must be a DynamicsSession")
-        if request.mode == "sample":
-            result = session.sample_transition(
-                request.transition_input,
-                generator=request.generator,
-            )
-            return PolicyTransitionResult(
-                next_latents=result.sampled_next,
-                log_prob=result.log_prob,
-                transition_output=result,
-                replay_state=session.snapshot,
-            )
-        evaluation = session.evaluate_transition(
-            request.transition_input,
-            request.action_latent,
-        )
-        metadata = session.policy_metadata(
-            request.transition_input,
-            evaluation.stats,
-        )
-        return PolicyTransitionResult(
-            next_latents=request.action_latent,
-            log_prob=evaluation.log_prob,
-            transition_output=evaluation,
-            policy_metadata=metadata,
-            replay_state=session.snapshot,
-        )
 
     def decode(
         self,
