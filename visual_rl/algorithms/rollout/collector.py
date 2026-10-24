@@ -30,7 +30,6 @@ from visual_rl.algorithms.rollout.interface import (
 )
 from visual_rl.core.contracts.runtime import (
     ExecutionPolicyReceipt,
-    PolicyTransitionRequest,
     RolloutExecutionPolicy,
 )
 from visual_rl.data.media import DecodedMediaBatch, DecodedMediaLayout
@@ -468,24 +467,10 @@ class RolloutCollector(RolloutComponent, ABC):
             step_index,
             mask=mask,
         )
-        transition_port = getattr(episode.request.adapter, "transition", None)
-        if callable(transition_port):
-            port_result = transition_port(
-                PolicyTransitionRequest(
-                    mode="sample",
-                    transition_input=transition,
-                    transition_session=session,
-                    generator=episode.request.generator,
-                )
-            )
-            output = port_result.transition_output
-        else:
-            # Structural compatibility for narrow unit adapters. The
-            # production stage graph always injects DefaultPolicyRuntimePort.
-            output = session.sample_transition(
-                transition,
-                generator=episode.request.generator,
-            )
+        output = session.sample_transition(
+            transition,
+            generator=episode.request.generator,
+        )
         candidate = output.sampled_next
         if inactive_deterministic_path and bool((~mask).any()):
             deterministic = session.deterministic_ode_step(transition)

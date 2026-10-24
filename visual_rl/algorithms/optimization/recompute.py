@@ -23,10 +23,7 @@ from visual_rl.algorithms.rollout.interface import (
     RolloutExecution,
     project_model_payload_rows,
 )
-from visual_rl.core.contracts.runtime import (
-    PolicyRuntimePort,
-    PolicyTransitionRequest,
-)
+from visual_rl.core.contracts.runtime import PolicyRuntimePort
 from visual_rl.data.samples.trajectory import TrajectoryBatch
 from visual_rl.models.interface import ModelInput, ModelLatentSpec
 
@@ -380,18 +377,7 @@ class PolicyRecomputer:
                 trajectory.scoring_target[:, step],
                 slot.row_indices,
             ).to(device=prediction.device, dtype=prediction.dtype)
-            transition_port = getattr(request.adapter, "transition", None)
-            if callable(transition_port):
-                evaluation = transition_port(
-                    PolicyTransitionRequest(
-                        mode="evaluate",
-                        transition_input=transition,
-                        transition_session=session,
-                        action_latent=action,
-                    )
-                ).transition_output
-            else:
-                evaluation = session.evaluate_transition(transition, action)
+            evaluation = session.evaluate_transition(transition, action)
             log_probs.append(evaluation.log_prob)
             if request.require_reference_statistics:
                 current_means.append(evaluation.stats.mean)

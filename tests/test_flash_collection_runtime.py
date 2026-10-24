@@ -856,10 +856,20 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
 
     from scripts import flash_small40_repair as repair
     import hashlib
-    # Real candidate Git object/working-tree check, not package-version trust.
-    assert repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, "--name-only", "--", "visual_rl", "experiments", "data") == ""
+    # Preserve the historical launcher-only repair proof. The new readable
+    # runtime is deliberately NOT eligible to continue that old SMALL40 run.
+    historical = "f51033af981204f510ad5e4d76ab47e57f26980c"
+    assert repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, historical, "--name-only", "--", "visual_rl", "experiments", "data") == ""
     real_proof = repair.prove_launcher_upgrade(launch.ROOT, repair.REPAIR_BASE, small_path)
     assert set(real_proof["unchanged_git_objects"]) == {"visual_rl", "experiments", "data"}
+    changed_paths = repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, "--name-only", "--", "visual_rl", "experiments", "data")
+    assert "visual_rl/runtime/model_binding.py" in changed_paths.splitlines()
+    def prospective_git(*args):
+        if args[0] == "diff":
+            return repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, "--name-only")
+        return repair.git_read(launch.ROOT, *args)
+    with pytest.raises(RuntimeError, match="outside the allowed paths"):
+        repair.prove_launcher_upgrade(launch.ROOT, historical, small_path, git=prospective_git)
     new_sha = "f" * 40
     def git(*args):
         if args[0] == "merge-base":

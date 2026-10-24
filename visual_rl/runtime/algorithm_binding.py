@@ -1038,11 +1038,13 @@ class DefaultStageAssembler:
             forward = rollout.rollout_execution_policy.forward_microbatch_size
             if (total_rows != nominal * trainer_config.collection_commits
                     or nominal % group_size or chunk % group_size
-                    or forward is None or nominal % forward or chunk % forward
-                    or training.max_optimizer_steps % trainer_config.collection_commits):
+                    or forward is None or nominal % forward or chunk % forward):
                 raise DefaultStageAssemblyError("collection/commit/chunk/group/forward geometry does not align")
             if algorithm.requires_reference_statistics or conditioner is not None:
                 raise DefaultStageAssemblyError("streamed Flash collection currently requires KL=0 and no conditioner")
+            # A run may stop after an odd commit. The terminal checkpoint must
+            # retain the real pending pool/cursor; never round the target up or
+            # silently discard the unused half. Approved presets remain exact.
             parameters = tuple(p for g in request.prepared.optimizer.param_groups for p in g["params"])
             collection = CollectionState(config=trainer_config, parameters=parameters,
                 request_factory=rollout_request_factory)
