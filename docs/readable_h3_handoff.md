@@ -1,6 +1,6 @@
 # 可读模型/算法边界：阶段A → Wan RL5 → H3原生推理
 
-阶段A精确交付SHA：`9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`。B因新异常root GPU进程939604外部安全阻塞，未部署/运行RL5，不是五次GPU通过。阶段C已增加原生H3 Model+rollout；部署和模型/依赖/容量/一条→三条/下载命令见[H3交接](h3_native_inference.md)。C最终40位VisualRL SHA以任务`local-c-result.md`为准，固定上游后端SHA为`0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c`。GPU安全复查及真实B/D尚未完成。
+阶段A精确SHA：`9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`；C为`36ca4d6344fded2083711b1e347e178dee25c3ff`。server后来安全复核通过并只启动一次真实RL5，已验4次更新，最终5/5因bridge超时未知。**下文RL5首次fresh/nohup命令是历史交接，不可重放；先只读原OUT/942782 PID/step5并保留36ca4d6供验收，确认原进程退出后才更新source。** H3嵌套video VAE布局修复SHA见任务`local-vae-repair-result.md`；原生后端仍固定`0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c`。具体格式/依赖/容量/1→3/下载说明见[H3交接](h3_native_inference.md)，真实H3生成及下载未完成。
 
 ## 一页 review 导航
 
@@ -143,4 +143,4 @@ PY
 改动：`runtime/model_binding.py`、`core/contracts/runtime.py`、`algorithms/rollout/{collector,branching}.py`、`algorithms/optimization/recompute.py`、`runtime/algorithm_binding.py`、原7测试中的历史升级兼容检查。
 新增：`models/inference.py`、`configs/v2/wan_rl5.yaml`、`scripts/validate_wan_rl5.py`、专项`tests/test_readable_inference.py`和本文。
 
-B若发现内部bug，Mac修复→原7+专项→commit/push→server Git，不server patch。B此次只有外部安全阻塞，C已继续本地原生AV推理/rollout接入；它不是GPU验证或下载完成。原RL5 YAML与验收仍有效，新代码只fresh运行，不热续旧pool。旧ComfyUI三段视频不是D验收素材。
+B若发现内部bug，Mac修复→原7+专项→commit/push→server Git，不server patch。目前server已验4次真实更新，第5次未知，先恢复访问只读核验，不重启。H3官方video VAE布局问题按server证据在Mac单独修复；原RL5 YAML、数学和原结果未改，不用新代码热续旧pool。旧ComfyUI三段视频不是D验收素材。

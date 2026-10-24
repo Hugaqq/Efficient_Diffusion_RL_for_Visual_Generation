@@ -38,6 +38,37 @@ def verify_backend(root):
     return root
 
 
+def _video_vae_weight_directory(component, config):
+    """Resolve the native standalone VAE's config-owned source, not a fallback.
+
+    HF snapshot weight files may be symlinks to its blob cache; directory
+    symlinks and absolute/traversing config paths are not accepted.
+    """
+    if not {"source_path", "source_safetensors_path"}.intersection(config):
+        return component  # Existing native flat layout.
+    source = config.get("source_path")
+    weight = config.get("source_safetensors_path")
+    if (config.get("mode") != "standalone" or not isinstance(source, str)
+            or not source or "\\" in source or ":" in source
+            or any(part in {"", ".", ".."} for part in source.split("/"))
+            or Path(source).is_absolute()
+            or not isinstance(weight, str) or not weight
+            or "/" in weight or "\\" in weight or ":" in weight
+            or Path(weight).suffix != ".safetensors"):
+        raise ValueError("unsafe or unsupported native video VAE source_path/source_safetensors_path")
+    directory = component
+    for part in source.split("/"):
+        directory = directory / part
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("missing or unsafe native video VAE source directory")
+    if not (directory / weight).is_file() or (directory / weight).stat().st_size == 0:
+        raise ValueError("missing native video VAE source weight")
+    source_config = json.loads((directory / "config.json").read_text())
+    if source_config.get("quantization_config"):
+        raise ValueError("quantized video VAE source format is not validated")
+    return directory
+
+
 def inspect_assets(root, revision):
     """Inventory the complete native FL2VA partition, including processor/code.
 
@@ -62,13 +93,17 @@ def inspect_assets(root, revision):
         config = json.loads((partition / name / "config.json").read_text())
         if config.get("quantization_config"):
             raise ValueError("quantized model format is not validated for this backend/device")
-        weights = list((partition / name).glob("*.safetensors"))
-        if not weights or any("nvfp4" in p.name.lower() or "pruned" in p.name.lower() for p in weights):
+        component = partition / name
+        weight_directory = _video_vae_weight_directory(component, config) if name == "video_vae" else component
+        weights = list(weight_directory.glob("*.safetensors"))
+        if (not weights or any(p.stat().st_size == 0 for p in weights)
+                or any("nvfp4" in p.name.lower() or "pruned" in p.name.lower()
+                       for p in component.rglob("*.safetensors"))):
             raise ValueError(f"missing native safetensors or unsupported format: {name}")
-        for shard_index in (partition / name).glob("*.safetensors.index.json"):
+        for shard_index in weight_directory.glob("*.safetensors.index.json"):
             shard_map = json.loads(shard_index.read_text())["weight_map"]
             for shard in set(shard_map.values()):
-                if Path(shard).name != shard or not (partition / name / shard).is_file():
+                if Path(shard).name != shard or "\\" in shard or ":" in shard or not (weight_directory / shard).is_file():
                     raise ValueError(f"missing or unsafe native weight shard: {name}/{shard}")
     for name in ("tokenizer", "processor"):
         if not (partition / name).is_dir() or not list((partition / name).glob("*.json")):
