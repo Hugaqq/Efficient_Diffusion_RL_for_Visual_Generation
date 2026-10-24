@@ -2,9 +2,9 @@
 
 ## 状态先读
 
-A已经实现并推送 `9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`。B服务器于2026-10-24 17:01:49 UTC发现新root PID939604、`/var/tmp/python`、同特征外连及GPU100%，**没有部署或运行RL5**。这是外部安全阻塞，不是算法失败；不能将A的CPU结果称为五次GPU通过。C按TASK继续本地实施，D仍须安全复查。
+A已经实现并推送 `9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`；C为 `36ca4d6344fded2083711b1e347e178dee25c3ff`。server后续安全复查通过，实际部署clean C SHA并只启动一次RL5（PID942782、OUT=wan-rl5-001），已读回4次finite/nonzero梯度和逐次权重变化。最终5/5与step5因bridge访问超时未读回，**不能推断成功或重放nohup**。旧17:01安全blocked是历史状态，不代表新鲜复查结果；仍须部署前fresh安全检查。
 
-本次C代码在同一`h3-readable-integration`分支交付。最终测试/40位VisualRL部署SHA见任务 `outputs/visualrl-h3-integration/local-c-result.md`（文件不能自含自身commit SHA）。不要以分支名/latest代替精确SHA。若服务器B尚未运行，可在最新测试C SHA上fresh运行原RL5；旧run不要热续到新code identity。
+本次修复仍在同一`h3-readable-integration`分支：支持官方video VAE嵌套source布局，不改资源门或RL5。最终候选门禁原7项`7 passed in13.77s`、H3专项`9 passed in1.86s`、A回归`10 passed in3.33s`，编译/diff检查通过；专项资产仍为小型inventory fixture，不是下载/加载官方完整权重。修复精确部署SHA见任务 `outputs/visualrl-h3-integration/local-vae-repair-result.md`。**server必须先恢复授权访问、只读核验原36ca4d6的RL5输出/PID/终点，确认进程自然退出后才更新该source；不要在未知活进程下切代码或以新SHA重跑/热续原pool。**
 
 ## 用户review：两层，而不是另起HTTP流程
 
@@ -28,6 +28,7 @@ python -m visual_rl.infer_h3 CONFIG
 
 - 第一版仅原始`MiniMaxAI/MiniMax-H3`的完整本地`FL2VA/`分区；T2VA无图，FL2VA明确first/optional last本地图，B=1，原prompt和seed不改。三场景使用T2VA请求、FL2VA权重。
 - 不是ComfyUI单文件pruned DiT/NVFP4 AWQ encoder，不是FastH3/Turbo/VDN，不带LoRA。发现量化config、缺shard/processor/tokenizer、非FL2VA或固定DMD base_schedule立即失败；不下载/转换/HTTP fallback。
+- 官方video VAE的`mode=standalone, source_path=source, source_safetensors_path=model.safetensors`指向`FL2VA/video_vae/source/model.safetensors`。检查按config解析这一明确布局，而非对任意递归文件放行；保留native平面布局。source目录只接受规范相对路径、禁止目录symlink/绝对路径/..遍历，weight只接受相对safetensors basename；缺少被引用权重（即使有flat decoy）、空权重、量化source config、pruned/NVFP4和缺shard仍拒绝。HF snapshot文件到blob cache的symlink保留，实际内容SHA仍逐文件记录；不在服务器复制/链接权重制造平面假布局。
 - 参考请求1344×768、124帧、24fps、20 `res_multistep`。上游拥有packed video/audio、条件prefix、两路shift12/3与RES历史；VisualRL不复写其数学，不套Wan CFG。
 - 连续base边界u从1到0，video sigma=12u/(1+11u)，audio=3u/(1+2u)。原生模型的FP32 patch projection、BF16 condition projection、FP32 velocity/solver和VAE各自精度由固定上游实现保留，不对整个pipeline粗暴`.to(bfloat16)`。
 - 不绕过上游reference anchor/tokenizer/processor。FL2VA传PIL副本，rollout校验输入图片在生成前后SHA未变，并保存condition image hashes。
@@ -70,10 +71,10 @@ FFmpeg需要支持libx264、AAC、PCM float、showinfo/ashowinfo和`-fps_mode pa
 
 ### 原始模型必须独立下载到数据盘，不能拿现有Comfy文件顶替
 
-`MODEL_REVISION`必须是官方HF仓库确定的40位commit（不是main）。本轮未在线查询一个新HF revision，因此不伪造模型SHA。server下载前记录官方revision和下载清单，容量不够则阻塞。`inspect_assets`的`declared_revision`如实名名：这是调用者来源声明，不能单独认证远端；实际所有本地配置/tokenizer/processor/代码/weights文件均独立流式hash记录。
+server已通过官方HF只读API核对revision **42ed227ee7df40d41602854ae760620d6eb651fe**（非main），其FL2VA共81文件/29 safetensors；来源证据为任务`evidence/server-h3-02-official-layout-capacity.md`。server尚未下载完整权重或执行模型Python；不能把文件清单等同可加载验证。下载前先复测容量。`inspect_assets`的`declared_revision`是调用者来源声明，不能单独认证远端；实际所有本地配置/tokenizer/processor/代码/weights文件均独立流式hash记录。
 
 ```bash
-export MODEL_REVISION='<确认并记录的官方HF40位commit>'
+export MODEL_REVISION=42ed227ee7df40d41602854ae760620d6eb651fe
 # 下载阶段不要设offline=1；此处只下载文件，不执行模型Python。
 "$H3PY" - <<'PY'
 import os
@@ -90,7 +91,7 @@ export MODEL_ROOT='<上面真实返回的本地snapshot根目录>'
 
 ### 容量风险（不是实测承诺）
 
-原完整分区约135GiB（TASK记录），旧机RAM约167GiB、最近available142GiB、系统盘只剩28G。全部依赖/cache/tmp/权重放`/mnt/data`，**不要在系统盘再下载135GiB或升级既有Wan venv**。
+server官方API实际统计权重144016376436字节=134.125702489GiB，当前host准入需158.125702489GiB；RL5启动前available142.588607788GiB，不满足预算。RL5退出后的最新空闲值尚因访问故障未复测，不能把运行中低值当最终值。旧机RAM约167GiB、系统盘只剩28G。全部依赖/cache/tmp/权重放`/mnt/data`，**不要在系统盘再下载完整分区或升级既有Wan venv**。
 
 CLI保守准入：GPU free>=68GiB；host available>=全部safetensors字节+24GiB；disk>=64GiB。执行期复用原15s心跳和16GiB GPU/24GiB host/64GiB disk门。上游encoder保留50层约51.5GB BF16，加DiT/VAEs必须由原生组件owner分阶段module-offload；pin_memory=False避免额外大规模pinned副本。
 
@@ -98,12 +99,12 @@ CLI保守准入：GPU free>=68GiB；host available>=全部safetensors字节+24Gi
 
 ## D：精确Git部署与一条→三条
 
-先按TASK、`server-rl5.md`复查主机和新root异常；新PID939604的证据不能泛化成处置未来新PID授权。若仍同特征活跃，**GPU阻塞**，只落证据，不启动模型/停止服务。安全恢复后，只通过授权origin和hostname的WebCLI操作；main保活idle-only，server确认前台完成，不重放未知启动。
+先读最新TASK及`server-h3.md`：恢复bridge后只读验收已启动的原RL5（36ca4d6、PID942782、原OUT），不重放启动；保留旧source以便其checkpoint/contract检查。再fresh复查主机/新root异常，用户处置旧PID的授权不能泛化到未来PID。同特征异常仍活跃则GPU blocked，只落证据，不擅自启动模型/停止服务。无冲突且原进程确认退出后，才Git更新H3修复版。仅授权origin/hostname WebCLI；main保活idle-only，server确认前台完成。
 
-按 `docs/readable_h3_handoff.md` 的任务checkout Git fetch/stash规则部署**local-c-result精确AGREED_SHA**，不改其他旧worktree/SMALL40/服务。核对clean和真实imports：
+按 `docs/readable_h3_handoff.md` 的任务checkout Git fetch/stash规则部署**local-vae-repair-result精确AGREED_SHA**，不改其他旧worktree/SMALL40/服务。核对clean和真实imports：
 
 ```bash
-export AGREED_SHA='<local-c-result测试通过的40位VisualRL SHA>'
+export AGREED_SHA='<local-vae-repair-result测试通过的40位VisualRL SHA>'
 export SOURCE=/home/ubuntu/qifan/visualrl-readable-h3-20261024/source
 # 首次worktree或已有任务checkout保留dirty/stash的步骤见A交接。
 git -C "$SOURCE" fetch origin h3-readable-integration

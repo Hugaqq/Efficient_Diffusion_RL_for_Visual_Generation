@@ -25,9 +25,19 @@ def assets_fixture(tmp_path):
     for name in ("transformer", "text_encoder", "video_vae", "audio_vae"):
         folder = partition / name
         folder.mkdir()
-        (folder / "config.json").write_text("{}")
+        # Match the official video VAE layout observed by server at
+        # 42ed227ee7df40d41602854ae760620d6eb651fe, not a fake flat duplicate.
+        config = {}
+        weights = folder
+        if name == "video_vae":
+            config = {"mode": "standalone", "source_path": "source",
+                      "source_safetensors_path": "model.safetensors"}
+            weights = folder / "source"
+            weights.mkdir()
+            (weights / "config.json").write_text('{"_class_name":"AutoencoderKLLegacy"}')
+        (folder / "config.json").write_text(json.dumps(config))
         # Inventory-only bytes, deliberately not real model weights.
-        (folder / "model.safetensors").write_bytes(b"CPU_TEST_ASSET_NOT_MODEL")
+        (weights / "model.safetensors").write_bytes(b"CPU_TEST_ASSET_NOT_MODEL")
     for name in ("tokenizer", "processor"):
         (partition / name).mkdir()
         (partition / name / "config.json").write_text("{}")
@@ -93,6 +103,78 @@ def test_asset_inventory_rejects_wrong_format_missing_shards_and_dmd(tmp_path):
     processor.unlink()
     with pytest.raises(ValueError, match="processor"):
         h3.inspect_assets(root, "a" * 40)
+
+
+def test_official_video_vae_source_layout_and_strict_path_rejections(tmp_path):
+    root = assets_fixture(tmp_path)
+    revision = "42ed227ee7df40d41602854ae760620d6eb651fe"
+    component = root / "FL2VA/video_vae"
+    config_path = component / "config.json"
+    config = json.loads(config_path.read_text())
+    weight = component / "source/model.safetensors"
+    report = h3.inspect_assets(root, revision)
+    assert not list(component.glob("*.safetensors"))
+    key = "FL2VA/video_vae/source/model.safetensors"
+    assert report["files"][key] == {"bytes": weight.stat().st_size, "sha256": h3.sha256_file(weight)}
+    assert "FL2VA/video_vae/source/config.json" in report["files"]
+    assert report["total_bytes"] == sum(p.stat().st_size for p in (root / "FL2VA").rglob("*") if p.is_file())
+    for field, invalid in (
+        ("source_path", ("../source", "/tmp/source", "./source", "source/../source", "source//inner", "source/", "C:\\source", "", None)),
+        ("source_safetensors_path", ("../model.safetensors", "/model.safetensors", "inner/model.safetensors", "..\\model.safetensors", "C:model.safetensors", "model.bin", "", None)),
+        ("mode", ("other", None)),
+    ):
+        for value in invalid:
+            config_path.write_text(json.dumps({**config, field: value}))
+            with pytest.raises(ValueError, match="unsafe or unsupported"):
+                h3.inspect_assets(root, revision)
+    config_path.write_text(json.dumps(config))
+    # Metadata-owned missing weight must fail even if an unrelated flat file
+    # exists. No broad rglob-based acceptance or server copying workaround.
+    weight.unlink()
+    decoy = component / "decoy.safetensors"
+    decoy.write_bytes(b"UNRELATED")
+    with pytest.raises(ValueError, match="missing native video VAE source weight"):
+        h3.inspect_assets(root, revision)
+    weight.write_bytes(b"")
+    with pytest.raises(ValueError, match="missing native video VAE source weight"):
+        h3.inspect_assets(root, revision)
+    weight.write_bytes(b"CPU_TEST_ASSET_NOT_MODEL")
+    decoy.unlink()
+    source_config = component / "source/config.json"
+    source_config.write_text('{"quantization_config":{"quant_method":"nvfp4"}}')
+    with pytest.raises(ValueError, match="quantized video VAE source"):
+        h3.inspect_assets(root, revision)
+    source_config.write_text("{}")
+    unsupported = component / "source/pruned.safetensors"
+    unsupported.write_bytes(b"UNSUPPORTED")
+    with pytest.raises(ValueError, match="unsupported format"):
+        h3.inspect_assets(root, revision)
+    unsupported.unlink()
+    shard_index = component / "source/model.safetensors.index.json"
+    shard_index.write_text('{"weight_map":{"weight":"missing.safetensors"}}')
+    with pytest.raises(ValueError, match="missing or unsafe native weight shard"):
+        h3.inspect_assets(root, revision)
+    shard_index.unlink()
+    alias = component / "alias"
+    alias.symlink_to(component / "source", target_is_directory=True)
+    config_path.write_text(json.dumps({**config, "source_path": "alias"}))
+    with pytest.raises(ValueError, match="unsafe native video VAE source directory"):
+        h3.inspect_assets(root, revision)
+    alias.unlink()
+    config_path.write_text(json.dumps(config))
+    # HF snapshots use file symlinks to cache blobs: retain those exact bytes,
+    # while never accepting directory redirects in config-owned source_path.
+    blob = tmp_path / "hf-cache-blob"
+    weight.replace(blob)
+    weight.symlink_to(blob)
+    assert h3.inspect_assets(root, revision)["files"][key]["sha256"] == h3.sha256_file(blob)
+    # Preserve the previous native flat layout too, without changing config at
+    # runtime or manufacturing an extra copy of a real model weight.
+    flat = assets_fixture(tmp_path / "flat-case")
+    folder = flat / "FL2VA/video_vae"
+    (folder / "config.json").write_text("{}")
+    (folder / "source/model.safetensors").replace(folder / "model.safetensors")
+    assert "FL2VA/video_vae/model.safetensors" in h3.inspect_assets(flat, revision)["files"]
 
 
 def test_backend_identity_uses_real_import_path_and_full_sha(monkeypatch, tmp_path):
