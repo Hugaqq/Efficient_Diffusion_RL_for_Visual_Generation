@@ -1,4 +1,6 @@
-# 可读模型/算法边界：阶段A → Wan RL5
+# 可读模型/算法边界：阶段A → Wan RL5 → H3原生推理
+
+阶段A精确交付SHA：`9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`。B因新异常root GPU进程939604外部安全阻塞，未部署/运行RL5，不是五次GPU通过。阶段C已增加原生H3 Model+rollout；部署和模型/依赖/容量/一条→三条/下载命令见[H3交接](h3_native_inference.md)。C最终40位VisualRL SHA以任务`local-c-result.md`为准，固定上游后端SHA为`0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c`。GPU安全复查及真实B/D尚未完成。
 
 ## 一页 review 导航
 
@@ -22,7 +24,7 @@
 
 保留：模型内部 CFG/decoder 差异、prepared root、forward-only autocast、FP32 latent/probability、原始 forward partitions、old probability、固定 action 重放、组内优势、PPO clipping、有限/非零梯度、采集权重摘要、pending pool/cursor、EMA/finally 和完整恢复所有者。Flow-GRPO、TempFlow、Flash、World-R1 各自 rollout/conditioner 不合并成万能算法。
 
-纯推理新增的是明确的 **generate能力**，不是把完整 pipeline 假装成单步 predict。Wan 原生 Diffusers pipeline 负责自身生成循环；这里冻结组件、离线加载、显式 seed、验证真实返回媒体和关闭。不新增 registry/factory/调度平台。H3 尚未接入，须在B实际结果后实施C；H3应有明确联合音视频结果，不能套Wan视频tensor/CFG。
+纯推理新增的是明确的 **generate能力**，不是把完整 pipeline 假装成单步 predict。Wan 原生 Diffusers pipeline 负责自身生成循环；这里冻结组件、离线加载、显式 seed、验证真实返回媒体和关闭。不新增 registry/factory/调度平台。C现已增加明确H3联合音视频result与原生generate路径，不套Wan视频tensor/CFG；B仅有外部阻塞，C未被描述为GPU通过。
 
 ## 版本与测试边界
 
@@ -141,4 +143,4 @@ PY
 改动：`runtime/model_binding.py`、`core/contracts/runtime.py`、`algorithms/rollout/{collector,branching}.py`、`algorithms/optimization/recompute.py`、`runtime/algorithm_binding.py`、原7测试中的历史升级兼容检查。
 新增：`models/inference.py`、`configs/v2/wan_rl5.yaml`、`scripts/validate_wan_rl5.py`、专项`tests/test_readable_inference.py`和本文。
 
-B若发现内部bug，Mac修复→原7+专项→commit/push→server Git，不server patch。B真实5次通过或仅外部安全/访问/容量阻塞后，local再做C的H3原生AV推理/rollout，不提前声称H3已接入或下载完成。旧ComfyUI三段视频不是D验收素材。
+B若发现内部bug，Mac修复→原7+专项→commit/push→server Git，不server patch。B此次只有外部安全阻塞，C已继续本地原生AV推理/rollout接入；它不是GPU验证或下载完成。原RL5 YAML与验收仍有效，新代码只fresh运行，不热续旧pool。旧ComfyUI三段视频不是D验收素材。

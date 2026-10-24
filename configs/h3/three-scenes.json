@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "description": "Original scene text/seeds; native T2VA on FL2VA weights, no Turbo LoRA. Request defaults: 1344x768,124frames,24fps,20 RES steps.",
+  "requests": [
+    {"sample_id": "snow-mountain-galaxy", "prompt": "snow mountain, nightsky galaxy, fantasy vibe, vaporwave Y2K, high definitaion, complex", "seed": 42009},
+    {"sample_id": "cyberpunk-city", "prompt": "cyberpunk city of newyork in full hdr ,3d", "seed": 42012},
+    {"sample_id": "madrid-glass-house", "prompt": "futuristic house made of cristal and steel under construction in the downtown of Madrid", "seed": 42013}
+  ]
+}
