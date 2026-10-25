@@ -1,9 +1,9 @@
 """Serial H3 inference rollout and real AV export, not an RL training loop.
 
-Model calculation stays in H3InferenceAdapter. This algorithm owns request
-order, output isolation, full media decode verification and durable receipts.
+Model calculation stays in H3InferenceAdapter. This algorithm explicitly owns
+both sigma schedules, the joint Euler loop, artifact isolation and receipts.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,71 @@ import subprocess
 import tempfile
 import time
 
-from visual_rl.models.h3 import BACKEND_SHA, H3Result, sha256_file
+from visual_rl.models.h3 import DIFFUSERS_SHA, H3Result, sha256_file
+
+
+def sigma_schedule(points, shift):
+    """Pinned H3 baseline: grid includes terminal0, t=1-sigma, no extra step."""
+    import torch
+    if type(points) is not int or points < 2 or shift not in (12.0, 3.0):
+        raise ValueError("H3 requires >=2 grid points and native video12/audio3 shift")
+    base = torch.linspace(1.0, 0.0, points, dtype=torch.float32)
+    return torch.unique_consecutive(shift * base / (1 + (shift - 1) * base))
+
+
+def joint_euler_step(state, velocity, sigmas, next_sigmas):
+    """Data-ward +v, independent clocks, FP32 state; no CFG or re-noising.
+
+    Matches MiniMaxH3Scheduler.step, including the float32 sigma -> t -> sigma
+    round trip for x0, while the blend ratio uses the original sigma grid.
+    This is deterministic inference, NOT a stochastic RL/logprob transition.
+    """
+    import torch
+    if any(set(values) != {"video", "audio"} for values in (state, velocity, sigmas, next_sigmas)):
+        raise ValueError("joint H3 step requires both modalities")
+    result = {}
+    for name in ("video", "audio"):
+        x, v = state[name], velocity[name]
+        sigma, following = sigmas[name], next_sigmas[name]
+        if (x.dtype != torch.float32 or x.ndim != 3 or x.shape[0] != 1 or v.shape != x.shape
+                or not bool(torch.isfinite(x).all()) or not bool(torch.isfinite(v).all())
+                or not 0 <= float(following) < float(sigma) <= 1):
+            raise ValueError(f"invalid joint H3 {name} state/velocity/sigma")
+        timestep = (1 - sigma).to(x.device, x.dtype)
+        denoised = x + (1 - timestep) * v.float()
+        ratio = (following / sigma).to(x.device, x.dtype)
+        result[name] = ratio * x + (1 - ratio) * denoised
+        if not bool(torch.isfinite(result[name]).all()):
+            raise ValueError(f"nonfinite H3 {name} step")
+    return result
+
+
+def sample_h3(adapter, request):
+    """VisualRL-owned joint sampling. No third-party pipeline call is used."""
+    import torch
+    import logging
+    started = time.monotonic()
+    with torch.inference_mode():
+        prompt = adapter.encode(request)
+        state, layout, geometry = adapter.prepare_latents(request, prompt)
+        video_sigmas = sigma_schedule(request.steps, 12.0)
+        audio_sigmas = sigma_schedule(request.steps, 3.0)
+        if len(video_sigmas) != len(audio_sigmas):
+            raise ValueError("H3 joint clocks have different transition counts")
+        with adapter.denoising():
+            for index in range(len(video_sigmas) - 1):
+                sigmas = {"video": video_sigmas[index], "audio": audio_sigmas[index]}
+                following = {"video": video_sigmas[index + 1], "audio": audio_sigmas[index + 1]}
+                velocity = adapter.predict(state, prompt, layout, 1 - sigmas["video"], 1 - sigmas["audio"])
+                state = joint_euler_step(state, velocity, sigmas, following)
+                logging.info(json.dumps({"event": "h3_joint_step", "sample_id": request.sample_id,
+                    "step": index + 1, "transitions": len(video_sigmas) - 1,
+                    "video_sigma": float(sigmas["video"]), "audio_sigma": float(sigmas["audio"])}))
+                del velocity
+        # No denoiser weights survive into either decoder phase.
+        result = adapter.decode(request, state, geometry)
+    return replace(result, metrics={**result.metrics, "generate_seconds": time.monotonic() - started,
+        "model_evaluations": len(video_sigmas) - 1, "sigma_grid_points": request.steps})
 
 
 def ffmpeg_executable():
@@ -140,17 +204,18 @@ def run_h3_rollout(adapter, requests, output_dir, *, diagnostic=False):
             staging = output / f".{request.sample_id}.partial"
             staging.mkdir()
             condition_images = [{"path": str(p), "sha256": sha256_file(p)} for p in request.images]
-            result = adapter.generate(request)
+            result = sample_h3(adapter, request)
             media = export_result(result, staging)
             if condition_images != [{"path": str(p), "sha256": sha256_file(p)} for p in request.images]:
                 raise ValueError("H3 conditioning image changed during generation")
             receipt = {"schema_version": 1, "sample_id": request.sample_id,
                        "request": {**asdict(request), "images": [str(p) for p in request.images]},
                        "conditioning_images": condition_images,
-                       "backend": "vllm-omni-native-uni", "backend_sha": BACKEND_SHA,
+                       "implementation": "visualrl-pytorch-joint-loop", "diffusers_commit": DIFFUSERS_SHA,
                        "model_revision_declared": adapter.assets["declared_revision"],
                        "assets_sha256": adapter.assets["assets_sha256"],
-                       "sampler": "res_multistep", "video_shift": 12.0, "audio_shift": 3.0,
+                       "sampler": "euler_eta0", "sigma_grid_points": request.steps,
+                       "model_evaluations": request.steps - 1, "video_shift": 12.0, "audio_shift": 3.0,
                        "quality": "lossless", "turbo_lora": False, "rl_training_supported": False,
                        "diagnostic": diagnostic, "media": media, "metrics": result.metrics,
                        "generate_export_seconds": time.monotonic() - started}

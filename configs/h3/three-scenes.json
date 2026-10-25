@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Original scene text/seeds; native T2VA on FL2VA weights, no Turbo LoRA. Request defaults: 1344x768,124frames,24fps,20 RES steps.",
+  "description": "PyTorch baseline: original three texts/seeds,1344x768,124frames,24fps. Native Diffusers Euler eta0 with40 sigma grid points INCLUDING terminal0 (39 joint forwards). No Turbo, cache approximation or extra CFG.",
   "requests": [
     {"sample_id": "snow-mountain-galaxy", "prompt": "snow mountain, nightsky galaxy, fantasy vibe, vaporwave Y2K, high definitaion, complex", "seed": 42009},
     {"sample_id": "cyberpunk-city", "prompt": "cyberpunk city of newyork in full hdr ,3d", "seed": 42012},

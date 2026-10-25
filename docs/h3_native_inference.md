@@ -1,181 +1,191 @@
-# H3原生联合音视频：阶段C交付 / D真实验证
+# H3 PyTorch — executable handoff (supersedes earlier engine instructions)
 
-## 状态先读
+**No H3 GPU success claimed.** The tested Mac candidate provides component code
+and CPU evidence; Experimenter must validate dependencies, raw→derived conversion,
+normal generation, AV decode, resource peaks and service restoration.
+Never restart the already completed Wan5 or SMALL40.
 
-A已经实现并推送 `9d5c1e4afcdbefa5ef61c0754d3ce3bb844b3c75`；C为 `36ca4d6344fded2083711b1e347e178dee25c3ff`。server后续安全复查通过，实际部署clean C SHA并只启动一次RL5（PID942782、OUT=wan-rl5-001），已读回4次finite/nonzero梯度和逐次权重变化。最终5/5与step5因bridge访问超时未读回，**不能推断成功或重放nohup**。旧17:01安全blocked是历史状态，不代表新鲜复查结果；仍须部署前fresh安全检查。
+## Computation boundary
 
-本次修复仍在同一`h3-readable-integration`分支：支持官方video VAE嵌套source布局，不改资源门或RL5。最终候选门禁原7项`7 passed in13.77s`、H3专项`9 passed in1.86s`、A回归`10 passed in3.33s`，编译/diff检查通过；专项资产仍为小型inventory fixture，不是下载/加载官方完整权重。修复精确部署SHA见任务 `outputs/visualrl-h3-integration/local-vae-repair-result.md`。**server必须先恢复授权访问、只读核验原36ca4d6的RL5输出/PID/终点，确认进程自然退出后才更新该source；不要在未知活进程下切代码或以新SHA重跑/热续原pool。**
+- `models/h3.py`: raw official inventory, request, joint CPU AV result validation.
+- `models/h3_components.py`: known HF Qwen3-VL encoder, native Diffusers DiT and
+  video/audio VAEs. Public ports are `encode`, `prepare_latents`, `predict`, `decode`.
+- `algorithms/rollout/h3.py:sample_h3`: explicit joint video/audio sampling loop.
+  One forward per step returns both velocities; independently shifted clocks,
+  positive data-ward velocity, FP32 transition state. No pipeline invocation,
+  engine registry, HTTP, subprocess generator, optimizer, LoRA or RL probabilities.
+- `infer_h3.py`: Git/import identity, offline gates, shared flock,15s resource
+  heartbeat, fresh outputs, overall SUCCESS only after close and final checks.
+- Native checkpoint is CFG-distilled: one conditional pass, no negative branch.
+  No added Turbo/distillation/quantization/cache approximation.
 
-## 用户review：两层，而不是另起HTTP流程
+Current supported task is **text-only T2VA**, B=1, on official FL2VA weights.
+Image/reference requests fail explicitly; they are not silently converted to text.
+H3 RL is not implemented. Wan training and its numerical/restore paths are unchanged.
 
-```text
-python -m visual_rl.infer_h3 CONFIG
-  Model: H3InferenceAdapter.load(local assets) / generate(H3Request) / close
-    → pinned vLLM-Omni DiffusionEngine, uni executor（GPU worker就在本进程）
-    → MiniMaxH3Pipeline：Qwen3-VL hidden50 + native tokenizer/processor
-    → packed联合video/audio状态 + 两路sigma/RES solver + condition anchors
-    → native video-VAE + audio-VAE → 两路真实tensor
-  Algorithm: run_h3_rollout
-    → 串行一条/三条原prompt请求 → 校验AV → 导出MP4/float WAV
-    → 全部decode/实测metadata/哈希 → 每样本receipt → 完整关闭后SUCCESS
-```
+### Schedule is explicit, not the old engine's RES schedule
 
-模型`generate`是明确的原生推理能力，不是已统一到RL单步`predict`、概率、轨迹或训练ABI。本路径**不支持H3 RL训练**，不构造reward、LoRA、optimizer、ParameterStateManager或训练checkpoint；既有Wan训练/数值/恢复路径不改。没有在VisualRL新建engine registry、服务stage调度器或第二个训练loop。上游库内部必要执行器/请求控制不复制进项目。
+Use native Diffusers H3 baseline **Euler eta=0**,40 sigma grid points INCLUDING
+terminal zero, hence **39 joint forwards**. `sigma=s*b/(1+(s-1)*b)` with
+`b=linspace(1,0,40)`, shifts video12/audio3. Model time `t=1-sigma`.
+`x0=x+(1-t)*v`, then `x_next=(sigma_next/sigma)*x+(1-sigma_next/sigma)*x0`.
+The sigma→time→sigma float32 round trip in x0 follows the pinned implementation.
+There is no extra appended zero or forward at sigma0. This is not20 RES steps.
+Normal geometry remains1344×768×124 at24fps; audio40Hz latent clock gives207
+latents/channel →165600 samples/channel at32kHz. Original prompts/seeds42009,
+42012,42013 remain byte-identical. `--diagnostic` uses384×224×107 and is NOT
+normal acceptance. Do not publish diagnostic output as the requested result.
 
-`uni`仍会初始化上游one-rank distributed/device/env全局状态，故运行在独立H3 CLI进程/venv，不嵌入正在运行的Wan trainer；这不是外部生成服务。唯一额外子进程为FFmpeg编解码，不执行模型生成。
+## Fixed source and original assets
 
-## 支持范围与原生数值边界
+See [provenance](h3_pytorch_sources.md). Diffusers fixed commit
+`aaf57d03a3edfbd9de457d2872417a92f149a91d`, Transformers5.19.0.
+Actual installed H3 source hashes and live imports are checked, not just versions.
+Runtime refuses installed/imported vllm, vllm_omni, sglang or Comfy packages.
+No checkpoint-local Python is imported (`trust_remote_code=False`). No model
+Python-review digest option is needed: native torch classes replace custom wrappers.
+Original Python files remain inventoried and preserved but inert.
 
-- 第一版仅原始`MiniMaxAI/MiniMax-H3`的完整本地`FL2VA/`分区；T2VA无图，FL2VA明确first/optional last本地图，B=1，原prompt和seed不改。三场景使用T2VA请求、FL2VA权重。
-- 不是ComfyUI单文件pruned DiT/NVFP4 AWQ encoder，不是FastH3/Turbo/VDN，不带LoRA。发现量化config、缺shard/processor/tokenizer、非FL2VA或固定DMD base_schedule立即失败；不下载/转换/HTTP fallback。
-- 官方video VAE的`mode=standalone, source_path=source, source_safetensors_path=model.safetensors`指向`FL2VA/video_vae/source/model.safetensors`。检查按config解析这一明确布局，而非对任意递归文件放行；保留native平面布局。source目录只接受规范相对路径、禁止目录symlink/绝对路径/..遍历，weight只接受相对safetensors basename；缺少被引用权重（即使有flat decoy）、空权重、量化source config、pruned/NVFP4和缺shard仍拒绝。HF snapshot文件到blob cache的symlink保留，实际内容SHA仍逐文件记录；不在服务器复制/链接权重制造平面假布局。
-- 参考请求1344×768、124帧、24fps、20 `res_multistep`。上游拥有packed video/audio、条件prefix、两路shift12/3与RES历史；VisualRL不复写其数学，不套Wan CFG。
-- 连续base边界u从1到0，video sigma=12u/(1+11u)，audio=3u/(1+2u)。原生模型的FP32 patch projection、BF16 condition projection、FP32 velocity/solver和VAE各自精度由固定上游实现保留，不对整个pipeline粗暴`.to(bfloat16)`。
-- 不绕过上游reference anchor/tokenizer/processor。FL2VA传PIL副本，rollout校验输入图片在生成前后SHA未变，并保存condition image hashes。
-- 原生帧边界17n+5，不静默round。audio latent为40Hz，decode×800、32kHz stereo；124帧对应207个音频latent、165600个原生audio samples（约5.175s），视频124/24约5.1667s。保留这一原生时钟差，不补静音/截掉音频假对齐。
-- `--diagnostic`显式改成384×224×107，原prompt/seed/20RES保持，所有receipt/成功标记注明diagnostic；**不计入正式三场景展示**。
-
-## 固定后端、依赖与资产
-
-### 后端源码pin与独立环境
-
-后端必须clean **vllm-project/vllm-omni@0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c**。`verify_backend`核对Git完整SHA/dirty及实际`vllm_omni.__file__`。不能仅相信package version，也不能用本项目文本审查快照当完整可安装仓库。
-
-本地已经读过该pin的native pipeline、encoder、VAE加载、双solver、uni executor、engine/config/request及Flow-Factory直接joint实现；未安装/执行上游模型。vLLM-Omni的依赖由该pin的`setup.py`读取`requirements/cuda.txt`及递归`-r`文件，不是在pyproject里静态全列。本地审查文本副本未包含requirements目录，**不编造已测试的torch/vllm/CUDA精确版本或可安装性**。部署应fetch完整固定Git后读取这些固定版本依赖文件，再仅在新环境安装、`pip check`并保存完整freeze/driver信息；若依赖/driver不兼容即返回真实阻塞，不改Wan环境。源码pin决定所用API，实际freeze和模型文件SHA随run保存。
-
-以下是隔离路径和执行模板，仅server经授权WebCLI、复查安全之后操作；local没有执行：
-
-```bash
-export BACKEND=/mnt/data/qifan/src/vllm-omni-0f79bd8
-export H3ENV=/mnt/data/qifan/envs/visualrl-h3-native
-export H3PY="$H3ENV/bin/python"
-export HF_HOME=/mnt/data/qifan/models/h3-native/hub-cache
-export PIP_CACHE_DIR=/mnt/data/qifan/cache/pip-h3
-export TMPDIR=/mnt/data/qifan/tmp/h3
-mkdir -p /mnt/data/qifan/src /mnt/data/qifan/envs "$HF_HOME" "$PIP_CACHE_DIR" "$TMPDIR"
-# 仅当BACKEND/H3ENV不存在时首次建立；存在则检查，不能覆盖/自动重装。
-git clone --no-checkout https://github.com/vllm-project/vllm-omni.git "$BACKEND"
-git -C "$BACKEND" checkout --detach 0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c
-git -C "$BACKEND" status --short --branch
-# 阅读该pin的requirements/cuda.txt及所有-r引用；确认不改变共享环境。
-python3.12 -m venv "$H3ENV"
-export VLLM_OMNI_TARGET_DEVICE=cuda
-"$H3PY" -m pip install -r "$BACKEND/requirements/cuda.txt"
-"$H3PY" -m pip install --no-deps -e "$BACKEND"
-"$H3PY" -m pip install imageio-ffmpeg
-"$H3PY" -m pip check
-"$H3PY" -m pip freeze --all > /mnt/data/qifan/runs/visualrl-readable-h3-20261024/h3-dependencies.freeze
-```
-
-FFmpeg需要支持libx264、AAC、PCM float、showinfo/ashowinfo和`-fps_mode passthrough`（建议>=6）。优先既有系统FFmpeg，否则imageio-ffmpeg。每份媒体receipt记录实际binary路径/version；本地真实FFmpeg导出/全decode测试不证明服务器binary版本相同。不要安装NVFP4/Blackwell专属backend来尝试在A100上蒙混通过。
-
-### 原始模型必须独立下载到数据盘，不能拿现有Comfy文件顶替
-
-server已通过官方HF只读API核对revision **42ed227ee7df40d41602854ae760620d6eb651fe**（非main），其FL2VA共81文件/29 safetensors；来源证据为任务`evidence/server-h3-02-official-layout-capacity.md`。server尚未下载完整权重或执行模型Python；不能把文件清单等同可加载验证。下载前先复测容量。`inspect_assets`的`declared_revision`是调用者来源声明，不能单独认证远端；实际所有本地配置/tokenizer/processor/代码/weights文件均独立流式hash记录。
+Raw root (already downloaded; **do not redownload134GiB**):
 
 ```bash
-export MODEL_REVISION=42ed227ee7df40d41602854ae760620d6eb651fe
-# 下载阶段不要设offline=1；此处只下载文件，不执行模型Python。
-"$H3PY" - <<'PY'
-import os
-from huggingface_hub import snapshot_download
-path = snapshot_download('MiniMaxAI/MiniMax-H3', revision=os.environ['MODEL_REVISION'],
-    cache_dir=os.environ['HF_HOME'], allow_patterns=['FL2VA/**'])
-print('MODEL_ROOT=' + path)
-PY
-# 把上面真实返回的snapshot根目录设为MODEL_ROOT；其下必须有FL2VA/。
-export MODEL_ROOT='<上面真实返回的本地snapshot根目录>'
+export MODEL=/mnt/data/qifan/models/h3-native/hub-cache/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe
+export REV=42ed227ee7df40d41602854ae760620d6eb651fe
 ```
 
-模型VAE可能通过`auto_map`执行权重目录中的本地Python。preflight仅列出/hash，不加载模型；**server须逐份阅读清单中的模型.py及其相关文件**，确认来源/内容可执行，再把整个代码清单digest作为`--reviewed-model-code-sha256`显式批准。digest缺失/不符则不会load engine。不能不看代码就复制digest；这个参数记录显式审阅，不是自动安全证明。模型与后端文件应保持只读、不可在运行时热改。所有HF/Transformers生成时强制offline，下载与执行分开。
+It contains `FL2VA/{transformer,text_encoder,video_vae,audio_vae,tokenizer,processor}`.
+Video VAE source is `video_vae/source/model.safetensors`, selected by its config,
+not a guessed flat file.81 original files were verified in the preceding task;
+that verification is asset evidence, NOT PyTorch generation evidence.
+Quantized/pruned/AWQ/NVFP4 files remain unsupported.
 
-### 容量风险（不是实测承诺）
+Raw DiT/VAE keys differ from Diffusers. Preparation uses the **reviewed SHA-checked
+upstream streaming converter**, not `from_pretrained(raw DiT)` and not strict=False.
+It deinterleaves per-head QKV before splitting q/k/v, swaps gate/value FF halves,
+preserves FP32 patch/time/output islands, drops only the documented recomputed
+RoPE buffer and unused VAE mask token, verifies full key plans, and writes separate
+derived components. Audio VAE keeps its exact state tree. Original raw files stay
+unchanged. Tokenizer and Qwen weights continue loading from the original snapshot.
 
-server官方API实际统计权重144016376436字节=134.125702489GiB，当前host准入需158.125702489GiB；RL5启动前available142.588607788GiB，不满足预算。RL5退出后的最新空闲值尚因访问故障未复测，不能把运行中低值当最终值。旧机RAM约167GiB、系统盘只剩28G。全部依赖/cache/tmp/权重放`/mnt/data`，**不要在系统盘再下载完整分区或升级既有Wan venv**。
+## Server Git and isolated environment
 
-CLI保守准入：GPU free>=68GiB；host available>=全部safetensors字节+24GiB；disk>=64GiB。执行期复用原15s心跳和16GiB GPU/24GiB host/64GiB disk门。上游encoder保留50层约51.5GB BF16，加DiT/VAEs必须由原生组件owner分阶段module-offload；pin_memory=False避免额外大规模pinned副本。
-
-**按最近旧机available值，完整原权重很可能在host准入即被阻塞。** 预算不是实测上界，loader临时副本/页缓存/AV workspace可更高，单A100可行性未知。若容量不足，报告确切数值，需安全的更大内存设备或另行证明受支持的权重格式；不删门禁、强行读取Comfy pruned/NVFP4、不编造已生成。D不能因为C有fake测试通过就算完成。
-
-## D：精确Git部署与一条→三条
-
-先读最新TASK及`server-h3.md`：恢复bridge后只读验收已启动的原RL5（36ca4d6、PID942782、原OUT），不重放启动；保留旧source以便其checkpoint/contract检查。再fresh复查主机/新root异常，用户处置旧PID的授权不能泛化到未来PID。同特征异常仍活跃则GPU blocked，只落证据，不擅自启动模型/停止服务。无冲突且原进程确认退出后，才Git更新H3修复版。仅授权origin/hostname WebCLI；main保活idle-only，server确认前台完成。
-
-按 `docs/readable_h3_handoff.md` 的任务checkout Git fetch/stash规则部署**local-vae-repair-result精确AGREED_SHA**，不改其他旧worktree/SMALL40/服务。核对clean和真实imports：
+Only after Mac tests+push, set the **exact SHA from coder-handoff.md**. Preserve
+all old worktrees/results/services. Check unknown GPU processes and ownership first.
+Do not reuse cancelled inference PIDs or environments. No server source patches.
 
 ```bash
-export AGREED_SHA='<local-vae-repair-result测试通过的40位VisualRL SHA>'
+export AGREED_SHA='<40-character tested SHA from coder-handoff.md>'
 export SOURCE=/home/ubuntu/qifan/visualrl-readable-h3-20261024/source
-# 首次worktree或已有任务checkout保留dirty/stash的步骤见A交接。
+# Only after checking this task checkout is clean and has no active old process:
 git -C "$SOURCE" fetch origin h3-readable-integration
 git -C "$SOURCE" switch --detach "$AGREED_SHA"
-cd "$SOURCE"
-git rev-parse HEAD
-git status --short --branch
-export PYTHONPATH="$SOURCE:$BACKEND"
-export CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+git -C "$SOURCE" rev-parse HEAD
+git -C "$SOURCE" status --short --branch
+```
+
+Prepare a NEW environment, without the old Wan overlay or SG LD_LIBRARY_PATH.
+Do not install the project's broad training extras or upgrade a shared venv.
+The following dependency pins were source-reviewed, **not installed/tested on Mac**;
+record real resolver/pip/CUDA outcomes, return incompatibilities rather than patching.
+
+```bash
+python3.12 -m venv /mnt/data/qifan/envs/visualrl-h3-torch
+export PY=/mnt/data/qifan/envs/visualrl-h3-torch/bin/python
+"$PY" -m pip install --upgrade pip
+"$PY" -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+"$PY" -m pip install -r "$SOURCE/configs/h3/requirements-torch.txt"
+"$PY" -m pip check
+mkdir -p /mnt/data/qifan/runs/visualrl-h3-torch-20261025
+"$PY" -m pip freeze > /mnt/data/qifan/runs/visualrl-h3-torch-20261025/freeze.txt
+export PYTHONPATH="$SOURCE" CUDA_VISIBLE_DEVICES=0
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_ENABLE_PARALLEL_LOADING=false
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false
-"$H3PY" -c 'import visual_rl; from visual_rl.models import h3; import vllm_omni; print(visual_rl.__file__, h3.__file__, vllm_omni.__file__, sep="\n")'
+cd "$SOURCE"
+"$PY" -c 'import torch, visual_rl; from visual_rl.models.h3_components import audit_runtime; print(visual_rl.__file__); print(audit_runtime()); print(torch.cuda.get_device_name()); print((torch.ones(2,device="cuda")+1).cpu())'
 ```
 
-明确新OUT，不存在或没有重复活跃作业才启动：
+Prepare the exact converter source (plain component library, not an engine):
 
 ```bash
-export H3BASE=/mnt/data/qifan/runs/visualrl-readable-h3-20261024/h3-native
-export ONE="$H3BASE/one-001"
-export THREE="$H3BASE/three-001"
-mkdir -p "$H3BASE"
-"$H3PY" -u -m visual_rl.infer_h3 configs/h3/one-scene.json \
-  --expected-sha "$AGREED_SHA" --backend-root "$BACKEND" \
-  --model-root "$MODEL_ROOT" --model-revision "$MODEL_REVISION" --output "$ONE" --preflight
+export DIFF=/mnt/data/qifan/src/diffusers-h3-aaf57d03
+# If absent, create once. If already present, inspect HEAD/dirty; do not overwrite.
+git clone https://github.com/huggingface/diffusers.git "$DIFF"
+git -C "$DIFF" checkout --detach aaf57d03a3edfbd9de457d2872417a92f149a91d
+git -C "$DIFF" status --short --branch
+export DERIVED=/mnt/data/qifan/models/h3-torch/FL2VA-diffusers-aaf57d03
 ```
 
-RC非0保留错误返回，不自动放松资源预算。RC0后读取`$ONE.preflight.json`的`assets.model_python_files`，逐文件read审阅；审阅接受才手工设 `REVIEWED_CODE_SHA` 为其中实际`model_code_review_sha256`。
+Run conversion as one owned background command with log/RC, not on an interactive
+foreground shell that requires polling input. It may take minutes; check existing
+PID/output before any repeat. `*.partial` is preserved on failure, never reused.
 
 ```bash
-# 唯一server确认安全/准入/代码审阅后只提交一次，不等同于本地已运行：
-LOG="$H3BASE/one-console-$(date +%Y%m%d-%H%M%S).log"
-nohup "$H3PY" -u -m visual_rl.infer_h3 configs/h3/one-scene.json \
-  --expected-sha "$AGREED_SHA" --backend-root "$BACKEND" \
-  --model-root "$MODEL_ROOT" --model-revision "$MODEL_REVISION" --output "$ONE" \
-  --reviewed-model-code-sha256 "$REVIEWED_CODE_SHA" >"$LOG" 2>&1 < /dev/null &
-PID=$!; printf 'PID=%s LOG=%s OUT=%s\n' "$PID" "$LOG" "$ONE"
-ps -p "$PID" -o pid,etime,stat,args
-readlink /proc/"$PID"/cwd
+mkdir -p /mnt/data/qifan/models/h3-torch
+export RUNS=/mnt/data/qifan/runs/visualrl-h3-torch-20261025
+LOG="$RUNS/convert.log"
+nohup bash -c '"$PY" -u -m scripts.prepare_h3_torch_assets --model-root "$MODEL" --model-revision "$REV" --diffusers-source "$DIFF" --output "$DERIVED"; rc=$?; printf "%s\n" "$rc" > "$RUNS/convert.rc"; exit "$rc"' >"$LOG" 2>&1 < /dev/null &
+printf 'WRAPPER_PID=%s LOG=%s\n' "$!" "$LOG"
+# Record wrapper/child cmdline and log immediately. Confirm convert.rc=0, final
+# conversion.json and byte hashes before moving to inference. No success by PID alone.
 ```
 
-这次须等真实原生视频+音频、完整decode和自然退出，不能仅见PID就放行三条。必要容量诊断另用新OUT加`--diagnostic`，不可将小规格视频计入正式三条。
+The converter itself logs key counts and fails on unexpected/missing keys/dtypes.
+At failure return code/problem to Coder. No installed-package monkeypatches.
+`conversion.json` atomically binds raw inventory, converter SHA and every derived
+file SHA. No conversion receipt means the derived directory cannot be loaded.
 
-一条成功后再复查安全与资源，以同参数、**`configs/h3/three-scenes.json`、`--output "$THREE"`、独立LOG**运行三条；仍是B=1串行，不同时跑两组。不能改scene原prompt/seed或自动扩80条/640条；也不能重用ONE作为THREE目录。
+## Stage/resource model
 
-## 结果、验收与Mac下载
+Only **one** CPU model is live at a time: Qwen encoder → release → joint DiT →
+release → video VAE → release → audio VAE → release. Per request, unused components
+are deleted; no134GiB all-components loader. Qwen uses Accelerate CPU offload on
+its actual called `.model` root, reads hidden_states[50] without the LM head.
+DiT uses synchronous one-block group offload (no stream-prefetch/pinned full-copy),
+FF token chunks1024, no approximation to full attention. PyTorch flash/efficient
+SDPA only; no dangerous quadratic math-attention fallback. VAEs decode sequentially,
+video uses its native tiling and per-channel/ImageNet denormalization, audio stays
+stereo (two mono decoder batch items), never averaged.
 
-每样本：`<OUT>/<sample_id>/{video.mp4,audio.wav,receipt.json}`。
-每attempt：`<OUT>.launch/{owner.json,assets.json,load.json,resources.json,result.json}`。
-失败保留`.partial`、FAILED/result；不覆盖、自动retry或把旧文件当生成。
+Phase admission derives from actual files: live phase weight bytes + largest phase
+shard +24GiB host reserve. Initial admission checks the maximum of these per-phase
+requirements, not a sum. Conversion needs48GiB host available and raw-size+64GiB
+disk. Inference admission GPU free>=32GiB; runtime global floors remain GPU16GiB,
+host24GiB,disk64GiB. These are conservative engineering budgets, **not measured
+full H3 peaks**.15s global sampling can miss brief minima. Stage logs and Torch peak
+reservation/RSS are recorded. If resources fail, preserve failure; do not weaken
+guards or assume HPS memory is available. Existing HPS restoration and temporary
+release permissions remain governed by TASK/TRANSITION and main ownership.
 
-- receipt包含原request/seed/actual rates/layout/时长、模型实际assets SHA与声明revision、后端pin、RES/双shift、诊断标记、native stage timings/peak、MP4/WAV字节数和SHA。
-- MP4逐帧和audio全解码；实际showinfo/ashowinfo确认宽高/fps/stereo32k，检查帧/样本数及finite/nonzero audio。浮点WAV完全decode并与原生waveform字节一致，不造静音；AAC允许最多2048 samples编码padding且实记观察值。
-- `ROLLOUT_COMPLETE.json`仅表示媒体rollout阶段完成；必须`<OUT>.launch/result.json.status=native_av_generated_and_decoded`及`<OUT>/SUCCESS.json`同时存在、diagnostic=false，且native close及最终资源sample成功，才是该run通过。这些均不证明RL5通过。
-- 最终三份request须1344×768×124/20RES，fps24、WAV2×165600/32k；seed42009/42012/42013、原prompt完全匹配。复核文件真实SHA，不能用旧Comfy文件或只inspect已有结果冒充生成。
+## Actual one, then three
 
-server应从**真实三条新receipt**生成下载清单（实际remote路径/bytes/SHA），通过已有授权OpenCLI分块读取机制拉取到：
+```bash
+export RUNS=/mnt/data/qifan/runs/visualrl-h3-torch-20261025
+"$PY" -u -m visual_rl.infer_h3 configs/h3/one-scene.json --expected-sha "$AGREED_SHA" --model-root "$MODEL" --model-revision "$REV" --converted-root "$DERIVED" --output "$RUNS/one-001" --preflight
+# Only RC0 plus fresh safety/resource checks permits the following ONCE:
+nohup bash -c '"$PY" -u -m visual_rl.infer_h3 configs/h3/one-scene.json --expected-sha "$AGREED_SHA" --model-root "$MODEL" --model-revision "$REV" --converted-root "$DERIVED" --output "$RUNS/one-001"; rc=$?; printf "%s\n" "$rc" > "$RUNS/one-001.rc"; exit "$rc"' >"$RUNS/one-001.log" 2>&1 < /dev/null &
+printf 'WRAPPER_PID=%s LOG=%s\n' "$!" "$RUNS/one-001.log"
+```
 
-`~/Desktop/ZIP Lab/Diffusion RL Infra/artifacts/visualrl-h3-native/`
+Inspect owned PID/log and15s heartbeats; wait bounded multi-minute intervals, no
+injected foreground commands or automatic retry. `h3_phase_start/end` surrounds
+loads/compute; `h3_joint_step` records both sigmas and39 joint forwards. Confirm
+`one-001/SUCCESS.json`, launch result, actual MP4 and float WAV, full decode and
+finite nonzero stereo/audio lengths and hashes. Only then fresh safety check and
+one new run with `configs/h3/three-scenes.json`, output `three-001`, separate log:
 
-建议本地名`<sample_id>-seed<seed>.mp4`，同时下载WAV、receipt、launch metadata。已有`outputs/h3-scene-inference-20261024/download_videos.py`硬编码旧ComfyUI路径/哈希，**禁止原样运行来冒充本次下载**；主会话/获准部署角色只复用其64KiB（必要时32KiB）read-only base64分块逻辑，改用本次新receipt manifest与本目标目录，遵守同一bridge lock及idle prompt检查。local编码角色不操作browser或越权写该artifacts目录。
+```bash
+# Execute only AFTER accepted one-001 and fresh safety/resource checks.
+nohup bash -c '"$PY" -u -m visual_rl.infer_h3 configs/h3/three-scenes.json --expected-sha "$AGREED_SHA" --model-root "$MODEL" --model-revision "$REV" --converted-root "$DERIVED" --output "$RUNS/three-001"; rc=$?; printf "%s\n" "$rc" > "$RUNS/three-001.rc"; exit "$rc"' >"$RUNS/three-001.log" 2>&1 < /dev/null &
+printf 'WRAPPER_PID=%s LOG=%s\n' "$!" "$RUNS/three-001.log"
+```
 
-Mac每文件先`.partial`，全部字节到齐后SHA一致才rename、写`.sha256`，再完整decode核对双轨；保存native-download-manifest。不仅发远端路径或飞书旧预览。若server下载权限不足，由主会话处理；未完成这一步不能报告总任务完成。
+No80-prompt batch. Every sample has receipt/MP4/float WAV; all3 must pass.
 
-## CPU门禁和证据范围
-
-C交付前在实际candidate运行原`tests/test_flash_collection_runtime.py`恰好7项，加独立`tests/test_h3_native_inference.py`及A专项/compile/diff检查。H3单测使用显式fake backend/assets，不下载/导入/执行上游模型代码；真实FFmpeg对小型fake视频/音频编码并全decode，不能当H3模型/GPU成功。
-
-最终实际候选门禁：原7项`7 passed in13.95s`；H3专项`8 passed in1.86s`；A专项`10 passed in3.32s`；compileall及diff检查无错误。初轮H3专项5通过/3失败暴露本机FFmpeg移除`-vsync`，改为`-fps_mode passthrough`后全通过；加actual showinfo metadata时发现必须读取输入帧率而非输出未定义0/0，修正后全通过；没有删断言/skip。最终提交SHA及Git状态记录见local-c-result。GPU、原始权重兼容性、独立依赖安装、性能/RAM/HBM及正式三段下载仍待D真实证据。
-
-### 固定源码依据
-
-- vLLM-Omni pin如上，`diffusion/models/minimax_h3/pipeline_minimax_h3.py`：native FL2VA权重解析、tokenizer/processor、no_grad joint diffuse/decode、postprocess uint8 BFHWC+stereo audio。
-- 同目录`denoise_loop.py`、`sampling.py`、`time_request.py`：两路sigma/solver、condition anchors、17n+5及40Hz时钟。`encoder.py`为Qwen3-VL layer50；`vae.py`有auto_map trust gate。
-- `diffusion/{data.py,diffusion_engine.py,request.py}`及`executor/uniproc_executor.py`：本进程单GPU执行与明确关闭；uni超时不强制打断卡死模型，故资源/进度异常应如实保留并返回，不自动重放。
-- Flow-Factory@3dd5ca4dff396c1db9b59c16dceaaca7836c6ed1 `models/minimax_h3/{workflow,blocks,denoise,dependency}.py`作为双状态/模型边界反例参照；没有复制其厚BaseAdapter，也没有把它的SDE训练loop当本次RES纯推理实现。
+Failure returns to Coder with exact tested SHA, actual imports/versions, traceback,
+phase/resource data and asset/conversion receipt. Preserve evidence; no hotfix.
+Main downloads only the newly verified files, compares remote bytes/SHA locally and
+fully decodes them before reporting completion. HPS must be original-identity ready
+on completion/failure. Main's task evidence records restored ready/identity/81-frame
+contract at11:30:52 UTC on2026-10-25 (PID1001593); this is not a fresh Coder HTTP
+check. Recheck the existing service, do not duplicate-start restoration. No Feishu
+success update before real normal AV + Mac verification succeeds.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "First native acceptance clip; original text/seed,1344x768,124frames,24fps,20 RES steps.",
+  "description": "PyTorch baseline acceptance; original text/seed,1344x768,124frames,24fps. Native Diffusers Euler eta0 with40 sigma grid points INCLUDING terminal0 (39 joint model forwards), no Turbo/cache/CFG.",
   "requests": [
     {"sample_id": "snow-mountain-galaxy", "prompt": "snow mountain, nightsky galaxy, fantasy vibe, vaporwave Y2K, high definitaion, complex", "seed": 42009}
   ]
