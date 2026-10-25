@@ -1,6 +1,9 @@
 # Readable model/algorithm boundary — current handoff
 
-Latest mandate: **direct PyTorch H3**, no serving engines. See
+Latest mandate: **direct PyTorch H3**, no serving engines and no weight-integrity
+machinery. Raw/derived checks read layout/config and stat sizes only; no checksum
+inventory/mandatory conversion receipt or fast/full option. Source checks,
+resources, normal model key/shape loading and output media SHA/decode remain. See
 [h3_native_inference.md](h3_native_inference.md) for current commands and
 [h3_pytorch_sources.md](h3_pytorch_sources.md) for fixed source/license evidence.
 Earlier engine setup instructions are superseded and preserved only in Git.
@@ -47,12 +50,14 @@ T2VA; unsupported conditioning fails explicitly. No claim of H3 RL support.
   evidence is not evidence for H3 or execution of a later SHA.
 - CPU original7 gate stays separate from H3 and readable专项. Candidate import
   checks and exact assertions remain. Counts/timings/precise new pushed SHA are
-  in outer `outputs/h3-pytorch-integration/coder-handoff.md` (avoids self-SHA).
+  in outer `outputs/h3-remove-weight-integrity/coder-handoff.md` (avoids self-SHA).
 
 ## Deployment boundary
 
 Mac source edits → original7 + H3/readable tests → commit/push → server Git precise
-SHA, clean/import checks → isolated dependency check/conversion → normal1→3 AV.
+SHA in a new worktree, clean/import checks → reuse existing environment/assets →
+metadata-only preflight → normal1→3 AV after old GPU work ends naturally.
+Do not touch live7ac7dba one-001 source or cancel/duplicate wrapper1007707.
 Never hotfix server source/packages, edit old checkpoints, discard pending pools,
 use cancelled engine environments or overwrite old outputs. Preserve services;
 main owns HPS restoration; latest task evidence records ready/identity match at11:30:52 UTC. Resource/service actions require current

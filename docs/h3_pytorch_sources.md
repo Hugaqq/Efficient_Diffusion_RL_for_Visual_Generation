@@ -41,7 +41,10 @@
    Read official FL2VA configs (raw Qwen3-VL, DiT, video wrapper/source, audio
    wrapper/metadata). Video wrapper uses `source/model.safetensors`. No new
    weights downloaded on Mac. Server's previous81-file verification is separate
-   evidence, not inferred from this source review.
+   historical evidence, not inferred from this source review. Current RL infra
+   does not verify weight contents or require this historical inventory; revision
+   and path are declared provenance. Output media and executable source hashes
+   are distinct and retained.
 
 ## What is reused versus implemented
 
@@ -62,7 +65,8 @@
 
 CPU tests execute exact small-tensor schedule/step/reference geometry, real
 VisualRL loop, component ownership with explicit fake heavy torch classes,
-conversion/source identity refusals, and real FFmpeg encode/full decode. They do
+executable-source identity refusals, metadata-only layout checks without weight
+reads/mandatory conversion receipts, and real FFmpeg encode/full decode. They do
 not prove the isolated GPU dependency environment, full raw conversion, mixed
 precision GPU kernels, memory peak or normal H3 output. Those require Experimenter
 on the tested pushed SHA. Never use a preflight/diagnostic/old clip as that proof.

@@ -6,7 +6,8 @@ FFmpeg really encodes and fully decodes the tiny generated CPU test tensors.
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 import gc
-import hashlib
+import builtins
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -49,19 +50,28 @@ def assets_fixture(tmp_path):
     return root
 
 
-def converted_fixture(tmp_path, assets):
+def converted_fixture(tmp_path):
     root = tmp_path / "derived"
     for name in ("transformer", "vae", "audio_vae"):
         folder = root / name
         folder.mkdir(parents=True)
         (folder / "config.json").write_text("{}")
         (folder / "diffusion_pytorch_model.safetensors").write_bytes(b"CPU_FAKE_DERIVED_WEIGHTS")
-    files = {p.relative_to(root).as_posix(): {"bytes": p.stat().st_size, "sha256": h3.sha256_file(p)}
-             for p in root.rglob("*") if p.is_file()}
-    receipt = {"diffusers_commit": h3.DIFFUSERS_SHA, "converter_sha256": components.CONVERTER_SHA256,
-               "raw_assets_sha256": assets["assets_sha256"], "files": files}
-    (root / "conversion.json").write_text(json.dumps(receipt))
     return root
+
+
+@pytest.fixture
+def no_weight_reads(monkeypatch):
+    """Fail on ANY Python weight open, not just a particular hashing helper."""
+    def guard(original):
+        def checked(file, mode="r", *args, **kwargs):
+            if isinstance(file, (str, bytes, Path)) and str(file).endswith(".safetensors"):
+                if "r" in mode or "+" in mode:
+                    raise AssertionError(f"weight content read outside actual loader/converter: {file}")
+            return original(file, mode, *args, **kwargs)
+        return checked
+    monkeypatch.setattr(builtins, "open", guard(builtins.open))
+    monkeypatch.setattr(io, "open", guard(io.open))
 
 
 def tiny_request(name="tiny", **kwargs):
@@ -94,11 +104,11 @@ def test_request_result_joint_geometry_and_unsupported_modes():
         replace(result, video=result.video.float())
 
 
-def test_asset_inventory_rejects_wrong_format_missing_shards_and_dmd(tmp_path):
+def test_asset_layout_rejects_wrong_format_missing_shards_and_dmd(tmp_path, no_weight_reads):
     root = assets_fixture(tmp_path)
     report = h3.inspect_assets(root, "a" * 40)
-    assert report["total_bytes"] > 0 and report["model_python_files"]
-    assert report["files"]["FL2VA/processor/config.json"]["sha256"] == hashlib.sha256(b"{}").hexdigest()
+    assert report == {"repo": h3.MODEL_REPO, "declared_revision": "a" * 40,
+                      "root": str(root), "weight_bytes": 4 * len(b"CPU_TEST_ASSET_NOT_MODEL")}
     with pytest.raises(ValueError, match="revision"):
         h3.inspect_assets(root, "main")
     index = root / "FL2VA/model_index.json"
@@ -122,7 +132,7 @@ def test_asset_inventory_rejects_wrong_format_missing_shards_and_dmd(tmp_path):
         h3.inspect_assets(root, "a" * 40)
 
 
-def test_official_video_vae_source_layout_and_strict_path_rejections(tmp_path):
+def test_official_video_vae_source_layout_and_strict_path_rejections(tmp_path, no_weight_reads):
     root = assets_fixture(tmp_path)
     revision = "42ed227ee7df40d41602854ae760620d6eb651fe"
     component = root / "FL2VA/video_vae"
@@ -131,10 +141,7 @@ def test_official_video_vae_source_layout_and_strict_path_rejections(tmp_path):
     weight = component / "source/model.safetensors"
     report = h3.inspect_assets(root, revision)
     assert not list(component.glob("*.safetensors"))
-    key = "FL2VA/video_vae/source/model.safetensors"
-    assert report["files"][key] == {"bytes": weight.stat().st_size, "sha256": h3.sha256_file(weight)}
-    assert "FL2VA/video_vae/source/config.json" in report["files"]
-    assert report["total_bytes"] == sum(p.stat().st_size for p in (root / "FL2VA").rglob("*") if p.is_file())
+    assert report["weight_bytes"] == sum(p.stat().st_size for p in (root / "FL2VA").rglob("*.safetensors"))
     for field, invalid in (
         ("source_path", ("../source", "/tmp/source", "./source", "source/../source", "source//inner", "source/", "C:\\source", "", None)),
         ("source_safetensors_path", ("../model.safetensors", "/model.safetensors", "inner/model.safetensors", "..\\model.safetensors", "C:model.safetensors", "model.bin", "", None)),
@@ -180,31 +187,43 @@ def test_official_video_vae_source_layout_and_strict_path_rejections(tmp_path):
     blob = tmp_path / "hf-cache-blob"
     weight.replace(blob)
     weight.symlink_to(blob)
-    assert h3.inspect_assets(root, revision)["files"][key]["sha256"] == h3.sha256_file(blob)
+    assert h3.inspect_assets(root, revision)["weight_bytes"] == report["weight_bytes"]
     flat = assets_fixture(tmp_path / "flat-case")
     folder = flat / "FL2VA/video_vae"
     (folder / "config.json").write_text("{}")
     (folder / "source/model.safetensors").replace(folder / "model.safetensors")
-    assert "FL2VA/video_vae/model.safetensors" in h3.inspect_assets(flat, revision)["files"]
+    assert h3.inspect_assets(flat, revision)["weight_bytes"] == report["weight_bytes"]
 
 
-def test_converted_identity_and_bytes_are_independently_checked(tmp_path):
-    raw = assets_fixture(tmp_path)
-    assets = h3.inspect_assets(raw, "a" * 40)
-    converted = converted_fixture(tmp_path, assets)
-    assert components.inspect_converted(converted, assets)["diffusers_commit"] == h3.DIFFUSERS_SHA
-    with pytest.raises(ValueError, match="identity"):
-        components.inspect_converted(converted, {**assets, "assets_sha256":"wrong"})
+def test_existing_converted_layout_needs_no_receipt_or_content_scan(tmp_path, no_weight_reads):
+    converted = converted_fixture(tmp_path)
+    assert not (converted / "conversion.json").exists()
+    assert components.inspect_converted(converted) is None
+    # Old receipts are inert, even malformed; bytes are the loader's responsibility.
+    (converted / "conversion.json").write_text("not a checksum receipt")
     weight = converted / "transformer/diffusion_pytorch_model.safetensors"
-    weight.write_bytes(b"corrupt")
-    with pytest.raises(ValueError, match="hash"):
-        components.inspect_converted(converted, assets)
+    weight.write_bytes(b"changed bytes, not checked by infra")
+    components.inspect_converted(converted)
+    index = converted / "transformer/model.safetensors.index.json"
+    for shard in ("missing.safetensors", "../escape.safetensors", "C:escape.safetensors"):
+        index.write_text(json.dumps({"weight_map": {"weight": shard}}))
+        with pytest.raises(ValueError, match="shard"):
+            components.inspect_converted(converted)
+    index.unlink()
+    config = converted / "vae/config.json"
+    config.write_text('{"quantization_config":{"quant_method":"nvfp4"}}')
+    with pytest.raises(ValueError, match="quantized"):
+        components.inspect_converted(converted)
+    config.write_text("{}")
+    weight.unlink()
+    with pytest.raises(ValueError, match="missing converted component"):
+        components.inspect_converted(converted)
 
 
-def test_adapter_load_is_metadata_only_and_rejects_offline_or_conversion_mismatch(monkeypatch,tmp_path):
+def test_adapter_load_is_metadata_only_without_weight_receipt(monkeypatch,tmp_path,no_weight_reads):
     raw = assets_fixture(tmp_path)
     assets = h3.inspect_assets(raw,"a"*40)
-    derived = converted_fixture(tmp_path,assets)
+    derived = converted_fixture(tmp_path)
     audits = []
     monkeypatch.setattr(components,"audit_runtime",lambda:audits.append("audited"))
     monkeypatch.setattr(components,"release_memory",lambda:None)
@@ -223,8 +242,9 @@ def test_adapter_load_is_metadata_only_and_rejects_offline_or_conversion_mismatc
     with pytest.raises(RuntimeError,match="closed"):
         adapter.prepare_latents(tiny_request(),torch.ones(1,3,8))
     (derived / "transformer/diffusion_pytorch_model.safetensors").write_bytes(b"changed")
-    with pytest.raises(ValueError,match="hash"):
-        h3.H3InferenceAdapter.load(model_root=raw,converted_root=derived,model_revision="a"*40)
+    with h3.H3InferenceAdapter.load(model_root=raw,converted_root=derived,model_revision="a"*40) as adapter:
+        assert adapter.assets == assets  # No content guarantee or checksum fields.
+    assert audits == ["audited", "audited"]
 
 
 def test_runtime_refuses_installed_and_live_engines_and_checks_source(monkeypatch, tmp_path):
@@ -307,11 +327,11 @@ def install_geometry(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
-def test_packed_geometry_noise_order_prediction_and_component_release(monkeypatch, tmp_path):
+def test_packed_geometry_noise_order_prediction_and_component_release(monkeypatch, tmp_path, no_weight_reads):
     install_geometry(monkeypatch)
     raw = assets_fixture(tmp_path)
     assets = h3.inspect_assets(raw,"a"*40)
-    converted = converted_fixture(tmp_path, assets)
+    converted = converted_fixture(tmp_path)
     adapter = h3.H3InferenceAdapter(raw, converted, assets, device="cpu")
     request = tiny_request(steps=4)
     prompt = torch.randn(1,7,12,dtype=torch.bfloat16)
@@ -363,20 +383,27 @@ def test_packed_geometry_noise_order_prediction_and_component_release(monkeypatc
                 pass
     gc.collect()
     assert adapter.phase is None and adapter.transformer is None and refs[0]() is None
+    def bad_state_dict(*_, **__):
+        raise RuntimeError("state_dict key/shape mismatch from actual component loader")
+    monkeypatch.setattr(Transformer, "from_pretrained", bad_state_dict)
+    with pytest.raises(RuntimeError, match="key/shape mismatch"):
+        with adapter.denoising():
+            pytest.fail("must not swallow normal loading failures")
+    assert adapter.phase is None and adapter.transformer is None
     adapter.close()
     with pytest.raises(RuntimeError,match="closed"):
         with adapter.denoising():
             pass
 
 
-def test_encoder_and_decoders_execute_staged_ports_without_pipeline_or_remote_code(monkeypatch,tmp_path):
+def test_encoder_and_decoders_execute_staged_ports_without_pipeline_or_remote_code(monkeypatch,tmp_path,no_weight_reads):
     import accelerate
     import diffusers
     import transformers
     install_geometry(monkeypatch)
     raw = assets_fixture(tmp_path)
     assets = h3.inspect_assets(raw,"a"*40)
-    derived = converted_fixture(tmp_path,assets)
+    derived = converted_fixture(tmp_path)
     adapter = h3.H3InferenceAdapter(raw,derived,assets,device="cpu")
     request = tiny_request(steps=3)
     calls, refs = [], []
@@ -476,7 +503,7 @@ def test_feed_forward_chunking_keeps_parameters_and_remainder():
 
 class FakeAdapter:
     """Only fake heavy compute; the real VisualRL loop still executes each step."""
-    assets = {"declared_revision":"a"*40,"assets_sha256":"b"*64}
+    assets = {"declared_revision":"a"*40}
     def __init__(self):
         self.calls = []
         self.active = False
@@ -581,7 +608,7 @@ def test_configs_preserve_original_scene_text_seed_geometry_and_explicit_new_bas
     assert diagnostic.prompt == scenes[0].prompt and diagnostic.seed == scenes[0].seed
 
 
-def test_preparation_streams_to_separate_atomic_derived_directory(monkeypatch,tmp_path):
+def test_preparation_streams_to_separate_atomic_derived_directory(monkeypatch,tmp_path,no_weight_reads):
     from scripts import prepare_h3_torch_assets as preparation
     raw = assets_fixture(tmp_path)
     assets = h3.inspect_assets(raw,"a"*40)
@@ -591,6 +618,7 @@ def test_preparation_streams_to_separate_atomic_derived_directory(monkeypatch,tm
     monkeypatch.setattr(preparation.shutil,"disk_usage",lambda _:SimpleNamespace(free=2**40))
     original_read = Path.read_text
     monkeypatch.setattr(Path,"read_text",lambda p,*a,**k:"MemAvailable: 104857600 kB\n" if str(p) == "/proc/meminfo" else original_read(p,*a,**k))
+    raw_stats = {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in raw.rglob("*") if p.is_file()}
     calls = []
     def weights(name,output):
         folder = Path(output)
@@ -607,11 +635,13 @@ def test_preparation_streams_to_separate_atomic_derived_directory(monkeypatch,tm
         write_scheduler_configs=lambda *_:None)
     monkeypatch.setattr(preparation,"load_converter",lambda _:converter)
     output = tmp_path / "converted"
-    receipt = preparation.convert(raw,output,"a"*40,tmp_path / "upstream")
-    assert calls == ["transformer","vae","audio_vae"] and len(receipt["files"]) == 6
-    assert not output.with_name("converted.partial").exists()
-    assert components.inspect_converted(output,assets) == json.loads((output / "conversion.json").read_text())
-    assert h3.inspect_assets(raw,"a"*40) == assets  # original raw bytes/code never changed
+    metadata = preparation.convert(raw,output,"a"*40,tmp_path / "upstream")
+    assert calls == ["transformer","vae","audio_vae"]
+    assert metadata == {"output": str(output), "declared_raw_revision": "a"*40, "diffusers_commit": h3.DIFFUSERS_SHA}
+    assert not output.with_name("converted.partial").exists() and not (output / "conversion.json").exists()
+    assert components.inspect_converted(output) is None
+    assert h3.inspect_assets(raw,"a"*40) == assets  # Same layout/size, not a byte-integrity assertion.
+    assert raw_stats == {p: (p.stat().st_size, p.stat().st_mtime_ns) for p in raw.rglob("*") if p.is_file()}
     with pytest.raises(FileExistsError,match="preserve"):
         preparation.convert(raw,output,"a"*40,tmp_path)
     def fail(*_):
@@ -669,12 +699,11 @@ def test_stage_admission_is_largest_live_component_not_asset_sum():
         components.stage_budget(62*1024**3,5*1024**3,{**sample,"gpu_free_gib":31})
 
 
-def test_cli_preflight_is_not_generation_and_full_fake_run_refuses_repeat(monkeypatch,tmp_path):
+def test_cli_preflight_is_not_generation_and_full_fake_run_refuses_repeat(monkeypatch,tmp_path,no_weight_reads):
     from visual_rl import infer_h3 as cli
     from scripts import launch_flash140 as utilities
     root = assets_fixture(tmp_path)
-    assets = h3.inspect_assets(root,"b"*40)
-    derived = converted_fixture(tmp_path,assets)
+    derived = converted_fixture(tmp_path)
     config = tmp_path / "one.json"
     config.write_text(json.dumps({"schema_version":1,"description":"CPU fake leaves","requests":[asdict(tiny_request(steps=3))]}))
     monkeypatch.setenv("HF_HUB_OFFLINE","1")
@@ -684,10 +713,32 @@ def test_cli_preflight_is_not_generation_and_full_fake_run_refuses_repeat(monkey
     monkeypatch.setattr(cli,"audit_runtime",lambda:{"torch":{"file":torch.__file__}})
     monkeypatch.setattr(utilities,"resource_sample",lambda _:dict(gpu_free_gib=75,host_available_gib=150,
         disk_free_gib=500,torch_peak_reserved_gib=1,process_peak_rss_gib=1))
+    inspections = []
+    raw_inspect, converted_inspect = h3.inspect_assets, components.inspect_converted
+    def inspect_raw(*args):
+        inspections.append("raw")
+        return raw_inspect(*args)
+    def inspect_derived(*args):
+        inspections.append("derived")
+        return converted_inspect(*args)
+    monkeypatch.setattr(h3, "inspect_assets", inspect_raw)
+    monkeypatch.setattr(cli, "inspect_assets", inspect_raw)
+    monkeypatch.setattr(components, "inspect_converted", inspect_derived)
+    monkeypatch.setattr(cli, "inspect_converted", inspect_derived)
+    monkeypatch.setattr(components, "audit_runtime", lambda: {})
+    monkeypatch.setattr(components, "release_memory", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     called = []
+    actual_load = cli.H3InferenceAdapter.load
     def load(**kwargs):
         called.append(kwargs)
-        return FakeAdapter()
+        # Execute real metadata-only initialization, fake only heavy sampling.
+        with actual_load(**kwargs) as adapter:
+            assert adapter.phase is None
+            result = FakeAdapter()
+            result.assets = adapter.assets
+        return result
     monkeypatch.setattr(cli.H3InferenceAdapter,"load",load)
     output = tmp_path / "run"
     args = ["--diagnostic",str(config),"--expected-sha","a"*40,"--converted-root",str(derived),"--model-root",str(root),
@@ -695,7 +746,14 @@ def test_cli_preflight_is_not_generation_and_full_fake_run_refuses_repeat(monkey
     with pytest.raises(ValueError,match="normal acceptance"):
         cli.main(args[1:])
     assert cli.main([*args,"--preflight"]) == 0 and not called and not output.exists()
+    assert inspections == ["raw", "derived"]
+    inspections.clear()
     assert cli.main(args) == 0 and len(called) == 1 and (output / "SUCCESS.json").is_file()
+    assert inspections == ["raw", "derived"]  # Once in load, no CLI duplicate.
+    preflight = json.loads((tmp_path / "run.preflight.json").read_text())
+    assert "files" not in preflight["assets"] and "conversion" not in preflight
+    receipt = json.loads(next(output.glob("*/receipt.json")).read_text())
+    assert "assets_sha256" not in receipt and receipt["model_revision_declared"] == "b"*40
     record = json.loads((tmp_path / "run.launch/result.json").read_text())
     assert record["status"] == "native_av_generated_and_decoded" and record["samples"] == 1
     assert record["no_serving_engines"] and record["diagnostic"] and not record["rl5_gpu_passed"]

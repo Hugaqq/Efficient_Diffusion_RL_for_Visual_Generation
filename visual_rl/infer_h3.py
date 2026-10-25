@@ -44,11 +44,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--converted-root", required=True, type=Path, help="separate verified Diffusers-derived components")
+    parser.add_argument("--converted-root", required=True, type=Path, help="separate Diffusers-derived component directory (no receipt required)")
     parser.add_argument("--model-root", required=True, type=Path, help="local official snapshot containing FL2VA/")
     parser.add_argument("--model-revision", required=True, help="full40-character HF revision used to download assets")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--preflight", action="store_true", help="hash/inspect assets and environment, never load a model")
+    parser.add_argument("--preflight", action="store_true", help="check layout/config, file-size resource budgets and source environment; never read weights or load a model")
     parser.add_argument("--diagnostic", action="store_true", help="clearly labeled384x224x107 capacity request, NOT final scenes")
     args = parser.parse_args(argv)
     from scripts.launch_flash140 import (
@@ -80,8 +80,10 @@ def main(argv=None):
         resources = resource_sample(output.parent)
         check_budget(resources)
         modules = audit_runtime()
-        assets = inspect_assets(args.model_root, args.model_revision)
-        converted = inspect_converted(args.converted_root, assets)
+        if args.preflight:
+            assets = inspect_assets(args.model_root, args.model_revision)
+            inspect_converted(args.converted_root)
+        # Normal initialization checks layout once in Adapter.load, not twice.
         stages = {}
         for name, folder in (("encoder", args.model_root / "FL2VA/text_encoder"),
                              ("denoiser", args.converted_root / "transformer"),
@@ -94,8 +96,7 @@ def main(argv=None):
                                        max(p.stat().st_size for p in files), resources)
         environment = {**owner, "modules": modules, "resources": resources, "stage_host_admission_gib": stages,
                        "config": str(args.config.resolve()), "model_root": str(args.model_root.resolve()),
-                       "model_revision_declared": args.model_revision, "converted_root": str(args.converted_root.resolve()),
-                       "conversion": converted}
+                       "model_revision_declared": args.model_revision, "converted_root": str(args.converted_root.resolve())}
         if args.preflight:
             publish(output.with_name(output.name + ".preflight.json"), {**environment, "assets": assets})
             print(json.dumps({"status": "preflight_only_not_generation", "stage_host_admission_gib": stages,
