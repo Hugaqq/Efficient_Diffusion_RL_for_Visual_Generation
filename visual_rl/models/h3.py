@@ -1,19 +1,15 @@
-"""H3 native joint AV generate capability; deliberately not an RL policy port.
+"""H3 asset/request contracts and staged PyTorch component adapter.
 
-Pinned vLLM-Omni owns encode -> packed joint video/audio denoise -> AV decode.
-VisualRL owns local assets, request/result validation and rollout artifacts.
-No HTTP/ComfyUI, optimizer, LoRA injection, reward or training checkpoint.
+The model owns encode/predict/decode, never a sampling loop. Raw official assets
+are immutable; the reviewed Diffusers conversion is stored separately.
 """
 from dataclasses import dataclass, field
 import hashlib
-import importlib
 import json
 from pathlib import Path
 import re
-import subprocess
-import time
 
-BACKEND_SHA = "0f79bd8b0e5ff9379a9a38e0c585db8f8335bf7c"
+DIFFUSERS_SHA = "aaf57d03a3edfbd9de457d2872417a92f149a91d"
 MODEL_REPO = "MiniMaxAI/MiniMax-H3"
 
 
@@ -23,19 +19,6 @@ def sha256_file(path):
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def verify_backend(root):
-    """Verify actual imported upstream source, not its package version alone."""
-    root = Path(root).resolve(strict=True)
-    def git(*args):
-        return subprocess.check_output(["git", "-C", str(root), *args], text=True, timeout=30).strip()
-    if git("rev-parse", "HEAD") != BACKEND_SHA or git("status", "--porcelain", "--untracked-files=normal"):
-        raise RuntimeError(f"H3 requires clean vLLM-Omni checkout {BACKEND_SHA}")
-    module = importlib.import_module("vllm_omni")
-    if Path(module.__file__).resolve().parent != root / "vllm_omni":
-        raise RuntimeError("H3 backend import is shadowed by another installation")
-    return root
 
 
 def _video_vae_weight_directory(component, config):
@@ -83,7 +66,7 @@ def inspect_assets(root, revision):
     index = json.loads((partition / "model_index.json").read_text())
     release = index.get("_minimax_h3", {})
     if release.get("partition") != "fl2va" or release.get("base_schedule") is not None:
-        raise ValueError("require native FL2VA with uniform base schedule for RES; no Turbo/DMD schedule")
+        raise ValueError("require native FL2VA uniform base schedule; no Turbo/DMD schedule")
     shifts = release.get("sigma_shift_scales", {"video": 12.0, "audio": 3.0})
     if shifts != {"video": 12.0, "audio": 3.0}:
         raise ValueError("unexpected H3 video/audio shift contract")
@@ -129,7 +112,7 @@ class H3Request:
     width: int = 1344
     height: int = 768
     frames: int = 124
-    steps: int = 20
+    steps: int = 40  # sigma grid points INCLUDING terminal zero: 39 Euler forwards
     task: str = "t2va"
     images: tuple[Path, ...] = ()
 
@@ -148,8 +131,10 @@ class H3Request:
             raise ValueError("H3 aspect ratio must be within [1:4,4:1]")
         if type(self.images) is not tuple or any(not isinstance(p, Path) or not p.is_file() for p in self.images):
             raise ValueError("H3 images must be explicit existing local Paths")
-        if self.task not in {"t2va", "fl2va"} or (self.task == "t2va" and self.images) or (self.task == "fl2va" and not 1 <= len(self.images) <= 2):
-            raise ValueError("T2VA has no images; FL2VA requires first and optionally last local image")
+        if self.task != "t2va" or self.images:
+            raise ValueError("this PyTorch release supports text-only T2VA; conditioned inference is not implemented")
+        if self.steps < 2:
+            raise ValueError("H3 steps counts sigma grid points, including terminal zero; require >=2")
 
 
 @dataclass(frozen=True)
@@ -180,95 +165,5 @@ class H3Result:
             raise ValueError("H3 audio length disagrees with the independent40Hz latent clock")
 
 
-class H3InferenceAdapter:
-    """Single-request native in-process session. H3 RL/logprob is unsupported."""
-
-    def __init__(self, engine, assets):
-        self._engine, self.assets = engine, assets
-
-    @classmethod
-    def load(cls, *, model_root, model_revision, backend_root, reviewed_model_code_sha256):
-        import os
-        if os.environ.get("HF_HUB_OFFLINE") != "1" or os.environ.get("TRANSFORMERS_OFFLINE") != "1":
-            raise RuntimeError("H3 native loading requires explicit offline environment")
-        verify_backend(backend_root)
-        assets = inspect_assets(model_root, model_revision)
-        if reviewed_model_code_sha256 != assets["model_code_review_sha256"]:
-            raise RuntimeError("review all listed local model Python sources and pass their exact review digest before execution")
-        import torch
-        from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
-        from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-            raise RuntimeError("native H3 uni requires exactly one visible CUDA GPU")
-        config = OmniDiffusionConfig.from_kwargs(
-            model=str(Path(model_root).resolve()), model_class_name="MiniMaxH3Pipeline",
-            task_type="fl2va", dtype="bfloat16", num_gpus=1,
-            distributed_executor_backend="uni", max_num_seqs=1,
-            enforce_eager=True, step_execution=False, cache_backend="none",
-            trust_remote_code=True,  # ONLY after explicit local-code digest approval
-            diffusion_attention_backend="TORCH_SDPA", vae_use_tiling=True,
-            diffusion_offload_config={"mode": "module", "components": ["dit", "text_encoder"], "pin_memory": False},
-        )
-        # Native root has partition subfolders, not a generic root transformer.
-        # Read exact local metadata; never fall back to a Hub model ID.
-        raw = json.loads((Path(model_root) / "FL2VA/transformer/config.json").read_text())
-        config.set_tf_model_config(TransformerConfig.from_dict(raw))
-        config.update_multimodal_support()
-        engine = DiffusionEngine(config)
-        return cls(engine, assets)
-
-    def generate(self, request: H3Request) -> H3Result:
-        if self._engine is None:
-            raise RuntimeError("H3 adapter is closed")
-        if not isinstance(request, H3Request):
-            raise TypeError("request must be H3Request")
-        import torch
-        from PIL import Image
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-        from vllm_omni.diffusion.request import OmniDiffusionRequest
-        prompt = {"prompt": request.prompt}
-        if request.images:
-            images = []
-            for path in request.images:
-                with Image.open(path) as image:
-                    images.append(image.convert("RGB").copy())
-            prompt["multi_modal_data"] = {"image": images}
-        sampling = OmniDiffusionSamplingParams(
-            seed=request.seed, width=request.width, height=request.height,
-            num_frames=request.frames, fps=24, num_inference_steps=request.steps,
-            num_outputs_per_prompt=1, guidance_scale=1.0, quality="lossless",
-            extra_args={"task": request.task, "sampler": "res_multistep",
-                        "flow_shift": 12.0, "audio_flow_shift": 3.0, "preencode_mp4": False},
-        )
-        started = time.monotonic()
-        with torch.inference_mode():
-            output = self._engine.add_req_and_wait_for_response(OmniDiffusionRequest(
-                prompt=prompt, sampling_params=sampling, request_id=request.sample_id))
-        if output.error or output.aborted or not output.finished:
-            raise RuntimeError(f"native H3 failed: {output.error or output.abort_message or 'incomplete output'}")
-        if not callable(output.post_process_func):
-            raise ValueError("native H3 must return its joint AV postprocessor, not an external file")
-        media = output.post_process_func(output.output, output_type="pt")
-        video, audio = media["video"], media["audio"]
-        if (not isinstance(video, torch.Tensor) or video.ndim != 5 or video.shape[0] != 1
-                or not isinstance(audio, torch.Tensor) or audio.ndim != 3 or audio.shape[0] != 1):
-            raise ValueError("native H3 requires B=1 joint video/audio tensor output")
-        return H3Result(request, video[0].detach().cpu().contiguous(),
-            audio[0].detach().to(device="cpu", dtype=torch.float32).contiguous(),
-            fps=media["fps"], sample_rate=media["audio_sample_rate"],
-            metrics={"generate_seconds": time.monotonic() - started,
-                     "backend_peak_memory_mb": output.peak_memory_mb,
-                     "stage_durations": output.stage_durations})
-
-    def close(self):
-        engine, self._engine = self._engine, None
-        if engine is not None:
-            engine.close()
-
-    def __enter__(self):
-        if self._engine is None:
-            raise RuntimeError("H3 adapter is closed")
-        return self
-
-    def __exit__(self, *_exc):
-        self.close()
+# Kept separate so importing value contracts does not import optional model code.
+from .h3_components import H3InferenceAdapter  # noqa: E402

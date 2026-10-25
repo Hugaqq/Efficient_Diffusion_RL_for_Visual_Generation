@@ -5,7 +5,6 @@ trainer. No HTTP server, external generator process, reward or optimizer.
 """
 import argparse
 from dataclasses import replace
-import importlib.metadata
 import json
 import logging
 import os
@@ -14,7 +13,8 @@ import signal
 import sys
 import time
 
-from visual_rl.models.h3 import H3InferenceAdapter, H3Request, inspect_assets, verify_backend
+from visual_rl.models.h3 import H3InferenceAdapter, H3Request, inspect_assets
+from visual_rl.models.h3_components import audit_runtime, inspect_converted, stage_budget
 from visual_rl.algorithms.rollout.h3 import run_h3_rollout
 
 
@@ -44,11 +44,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--backend-root", required=True, type=Path)
+    parser.add_argument("--converted-root", required=True, type=Path, help="separate verified Diffusers-derived components")
     parser.add_argument("--model-root", required=True, type=Path, help="local official snapshot containing FL2VA/")
     parser.add_argument("--model-revision", required=True, help="full40-character HF revision used to download assets")
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--reviewed-model-code-sha256", help="explicit approval after reading inventoried model Python files")
     parser.add_argument("--preflight", action="store_true", help="hash/inspect assets and environment, never load a model")
     parser.add_argument("--diagnostic", action="store_true", help="clearly labeled384x224x107 capacity request, NOT final scenes")
     args = parser.parse_args(argv)
@@ -68,6 +67,8 @@ def main(argv=None):
     if ROOT in output.parents or output == ROOT or any(p.is_symlink() for p in (output, *output.parents)):
         raise ValueError("native H3 outputs must be outside source, without symlink parents")
     requests = read_requests(args.config, diagnostic=args.diagnostic)
+    if not args.diagnostic and any((r.width, r.height, r.frames, r.steps) != (1344, 768, 124, 40) for r in requests):
+        raise ValueError("normal acceptance requires1344x768x124/40-point baseline; use --diagnostic for small probes")
     output.parent.mkdir(parents=True, exist_ok=True)
     launch = output.with_name(output.name + ".launch")
     owner = {"git_sha": sha, "pid": os.getpid(), "source": str(ROOT), "output": str(output),
@@ -78,22 +79,27 @@ def main(argv=None):
             raise FileExistsError("native H3 run/attempt already exists; preserve it, no automatic restart")
         resources = resource_sample(output.parent)
         check_budget(resources)
-        # Conservative host estimate: all source weights plus24GiB reserve.
-        # This is NOT a measured peak. Loading/offload copies may need more.
-        weights = sum(p.stat().st_size for p in (args.model_root / "FL2VA").rglob("*.safetensors"))
-        if resources["host_available_gib"] < weights / 1024 ** 3 + 24 or resources["gpu_free_gib"] < 68:
-            raise RuntimeError("H3 native BF16 budget blocked: require weights+24GiB host and68GiB GPU free; no silent quantized fallback")
-        verify_backend(args.backend_root)
-        versions = {name: importlib.metadata.version(name) for name in
-                    ("vllm-omni", "vllm", "torch", "diffusers", "transformers", "numpy", "safetensors")}
-        environment = {**owner, "versions": versions, "resources": resources,
+        modules = audit_runtime()
+        assets = inspect_assets(args.model_root, args.model_revision)
+        converted = inspect_converted(args.converted_root, assets)
+        stages = {}
+        for name, folder in (("encoder", args.model_root / "FL2VA/text_encoder"),
+                             ("denoiser", args.converted_root / "transformer"),
+                             ("video_decoder", args.converted_root / "vae"),
+                             ("audio_decoder", args.converted_root / "audio_vae")):
+            files = list(folder.rglob("*.safetensors"))
+            if not files:
+                raise ValueError(f"missing phase weights: {name}")
+            stages[name] = stage_budget(sum(p.stat().st_size for p in files),
+                                       max(p.stat().st_size for p in files), resources)
+        environment = {**owner, "modules": modules, "resources": resources, "stage_host_admission_gib": stages,
                        "config": str(args.config.resolve()), "model_root": str(args.model_root.resolve()),
-                       "model_revision_declared": args.model_revision, "backend_root": str(args.backend_root.resolve())}
+                       "model_revision_declared": args.model_revision, "converted_root": str(args.converted_root.resolve()),
+                       "conversion": converted}
         if args.preflight:
-            assets = inspect_assets(args.model_root, args.model_revision)
             publish(output.with_name(output.name + ".preflight.json"), {**environment, "assets": assets})
-            print(json.dumps({"status": "preflight_only_not_generation", "model_code_review_sha256": assets["model_code_review_sha256"],
-                              "model_python_files": assets["model_python_files"], "versions": versions}, sort_keys=True))
+            print(json.dumps({"status": "preflight_only_not_generation", "stage_host_admission_gib": stages,
+                              "modules": modules, "checkpoint_python_executed": False}, sort_keys=True))
             return 0
         launch.mkdir()
         publish(launch / "owner.json", environment)
@@ -106,12 +112,14 @@ def main(argv=None):
             monitor.sample()
             monitor.thread.start()
             with H3InferenceAdapter.load(model_root=args.model_root, model_revision=args.model_revision,
-                    backend_root=args.backend_root, reviewed_model_code_sha256=args.reviewed_model_code_sha256) as adapter:
+                    converted_root=args.converted_root, resource_probe=lambda: resource_sample(output.parent)) as adapter:
                 publish(launch / "assets.json", adapter.assets)
                 publish(launch / "load.json", {"load_seconds": time.monotonic() - started})
                 receipts = run_h3_rollout(adapter, requests, output, diagnostic=args.diagnostic)
             monitor.sample()
+            final_modules = audit_runtime()
             publish(launch / "result.json", {"status": "native_av_generated_and_decoded", "samples": len(receipts),
+                    "modules": final_modules, "no_serving_engines": True,
                     "elapsed_seconds": time.monotonic() - started, "rl5_gpu_passed": False,
                     "diagnostic": args.diagnostic, "resources_sampled_minima": monitor.minima, "peaks": monitor.peaks})
             # Overall SUCCESS only after native adapter.close and final resource
