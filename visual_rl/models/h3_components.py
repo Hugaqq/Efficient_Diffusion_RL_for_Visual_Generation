@@ -44,38 +44,24 @@ def audit_runtime():
     return modules
 
 
-def inspect_converted(root, assets):
-    """Separate derived files must have an atomic, byte-verified conversion receipt."""
-    from .h3 import sha256_file, DIFFUSERS_SHA
+def inspect_converted(root):
+    """Check loadable layout/config only; no receipt or weight-content reads."""
     root = Path(root).resolve(strict=True)
-    receipt = json.loads((root / "conversion.json").read_text())
-    if (receipt["diffusers_commit"] != DIFFUSERS_SHA
-            or receipt["converter_sha256"] != CONVERTER_SHA256
-            or receipt["raw_assets_sha256"] != assets["assets_sha256"]):
-        raise ValueError("conversion identity differs from the inspected official assets/source")
-    for relative, expected in receipt["files"].items():
-        path = root / relative
-        if Path(relative).is_absolute() or ".." in Path(relative).parts or path.is_symlink():
-            raise ValueError("unsafe converted asset path")
-        if path.stat().st_size != expected["bytes"] or sha256_file(path) != expected["sha256"]:
-            raise ValueError(f"converted asset hash mismatch: {relative}")
-    # Check completeness independently of the receipt, including every indexed shard.
     for name in ("transformer", "vae", "audio_vae"):
         folder = root / name
+        if folder.is_symlink():
+            raise ValueError("unsafe converted component directory")
         config = json.loads((folder / "config.json").read_text())
         if config.get("quantization_config"):
             raise ValueError("quantized converted assets are unsupported")
         weights = list(folder.glob("*.safetensors"))
-        if not weights:
+        if not weights or any(p.stat().st_size == 0 for p in weights):
             raise ValueError(f"missing converted component {name}")
         for index in folder.glob("*.safetensors.index.json"):
             for shard in json.loads(index.read_text())["weight_map"].values():
-                if Path(shard).name != shard or not (folder / shard).is_file():
+                if (Path(shard).name != shard or "\\" in shard or ":" in shard
+                        or not (folder / shard).is_file()):
                     raise ValueError("missing converted shard")
-        for path in [folder / "config.json", *weights, *folder.glob("*.index.json")]:
-            if path.relative_to(root).as_posix() not in receipt["files"]:
-                raise ValueError("unreceipted converted asset")
-    return receipt
 
 
 def stage_budget(weight_bytes, largest_shard_bytes, sample):
@@ -155,7 +141,7 @@ class H3InferenceAdapter:
         if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
             raise RuntimeError("H3 requires exactly one visible CUDA GPU")
         assets = inspect_assets(model_root, model_revision)
-        inspect_converted(converted_root, assets)
+        inspect_converted(converted_root)
         return cls(model_root, converted_root, assets, resource_probe=resource_probe)
 
     @contextmanager

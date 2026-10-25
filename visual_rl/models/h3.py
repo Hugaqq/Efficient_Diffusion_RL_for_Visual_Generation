@@ -53,11 +53,10 @@ def _video_vae_weight_directory(component, config):
 
 
 def inspect_assets(root, revision):
-    """Inventory the complete native FL2VA partition, including processor/code.
+    """Check native layout/config and stat weights for resource planning only.
 
-    Revision is caller-declared provenance; actual local bytes are independently
-    hashed. This does not authenticate a remote repository or audit model code.
-    Quantized/pruned ComfyUI/FastH3 formats are NOT accepted by this first path.
+    Revision is caller-declared provenance, not authentication of local bytes.
+    Weight contents and checkpoint-local Python are never read here.
     """
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("model revision must be an explicit full HF commit")
@@ -72,6 +71,7 @@ def inspect_assets(root, revision):
         raise ValueError("unexpected H3 video/audio shift contract")
     if any((root / name).exists() for name in ("fastvideo_inference.json", "provenance.json")):
         raise ValueError("FastH3/converted checkpoints are not supported by this native path")
+    weight_bytes = 0
     for name in ("transformer", "text_encoder", "video_vae", "audio_vae"):
         config = json.loads((partition / name / "config.json").read_text())
         if config.get("quantization_config"):
@@ -83,6 +83,7 @@ def inspect_assets(root, revision):
                 or any("nvfp4" in p.name.lower() or "pruned" in p.name.lower()
                        for p in component.rglob("*.safetensors"))):
             raise ValueError(f"missing native safetensors or unsupported format: {name}")
+        weight_bytes += sum(p.stat().st_size for p in weights)
         for shard_index in weight_directory.glob("*.safetensors.index.json"):
             shard_map = json.loads(shard_index.read_text())["weight_map"]
             for shard in set(shard_map.values()):
@@ -91,17 +92,8 @@ def inspect_assets(root, revision):
     for name in ("tokenizer", "processor"):
         if not (partition / name).is_dir() or not list((partition / name).glob("*.json")):
             raise ValueError(f"H3 requires the native {name}, not a Wan/Comfy replacement")
-    files = {}
-    for path in sorted(partition.rglob("*")):
-        if path.is_file():
-            relative = path.relative_to(root).as_posix()
-            files[relative] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
-    code = {name: v["sha256"] for name, v in files.items() if name.endswith(".py")}
-    code_hash = hashlib.sha256(json.dumps(code, sort_keys=True).encode()).hexdigest()
     return {"repo": MODEL_REPO, "declared_revision": revision, "root": str(root),
-            "files": files, "total_bytes": sum(v["bytes"] for v in files.values()),
-            "model_python_files": code, "model_code_review_sha256": code_hash,
-            "assets_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()}
+            "weight_bytes": weight_bytes}
 
 
 @dataclass(frozen=True)

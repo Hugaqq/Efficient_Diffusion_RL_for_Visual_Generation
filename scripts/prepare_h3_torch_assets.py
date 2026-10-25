@@ -1,4 +1,4 @@
-"""Convert verified raw FL2VA components without touching the original snapshot.
+"""Convert raw FL2VA components without touching the original snapshot.
 
 Executes ONLY the SHA-checked Apache-2.0 Diffusers conversion tool from its
 fixed clean Git checkout. No model checkpoint Python, downloads or engines.
@@ -43,7 +43,7 @@ def convert(raw_root, output, revision, source):
     output.parent.mkdir(parents=True, exist_ok=True)
     assets = inspect_assets(raw_root, revision)
     # Conservative disk bound includes both newly converted components and64GiB.
-    if shutil.disk_usage(output.parent).free < assets["total_bytes"] + 64 * 1024**3:
+    if shutil.disk_usage(output.parent).free < assets["weight_bytes"] + 64 * 1024**3:
         raise RuntimeError("insufficient disk for bounded conversion and64GiB reserve")
     available = int(dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())["MemAvailable"].split()[0]) * 1024
     if available < 48 * 1024**3:
@@ -64,16 +64,11 @@ def convert(raw_root, output, revision, source):
                                     diffusers.__version__, 2 * 1024**3)
         converter.convert_audio_vae(raw, str(staging / "audio_vae"), diffusers.__version__)
         converter.write_scheduler_configs(raw, str(staging), diffusers.__version__)
-        files = {p.relative_to(staging).as_posix(): {"bytes": p.stat().st_size, "sha256": sha256_file(p)}
-                 for p in sorted(staging.rglob("*")) if p.is_file()}
-        receipt = {"schema_version": 1, "diffusers_commit": DIFFUSERS_SHA, "converter_sha256": CONVERTER_SHA256,
-                   "raw_assets_sha256": assets["assets_sha256"], "raw_revision": revision, "files": files}
-        (staging / "conversion.json").write_text(json.dumps(receipt, sort_keys=True) + "\n")
         os.replace(staging, output)
     except BaseException as error:
         (staging / "FAILED.json").write_text(json.dumps({"error": str(error), "error_type": type(error).__name__}) + "\n")
         raise
-    return receipt
+    return {"output": str(output), "declared_raw_revision": revision, "diffusers_commit": DIFFUSERS_SHA}
 
 
 def main():
@@ -83,8 +78,8 @@ def main():
     parser.add_argument("--diffusers-source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    receipt = convert(args.model_root, args.output, args.model_revision, args.diffusers_source)
-    print(json.dumps({"status": "converted_not_generated", "files": len(receipt["files"])}), flush=True)
+    metadata = convert(args.model_root, args.output, args.model_revision, args.diffusers_source)
+    print(json.dumps({"status": "converted_not_generated", **metadata}), flush=True)
 
 
 if __name__ == "__main__":

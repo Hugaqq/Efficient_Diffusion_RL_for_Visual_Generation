@@ -213,7 +213,6 @@ def run_h3_rollout(adapter, requests, output_dir, *, diagnostic=False):
                        "conditioning_images": condition_images,
                        "implementation": "visualrl-pytorch-joint-loop", "diffusers_commit": DIFFUSERS_SHA,
                        "model_revision_declared": adapter.assets["declared_revision"],
-                       "assets_sha256": adapter.assets["assets_sha256"],
                        "sampler": "euler_eta0", "sigma_grid_points": request.steps,
                        "model_evaluations": request.steps - 1, "video_shift": 12.0, "audio_shift": 3.0,
                        "quality": "lossless", "turbo_lora": False, "rl_training_supported": False,
