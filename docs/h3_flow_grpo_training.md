@@ -5,6 +5,22 @@ The original successful inference source/results, Wan/SMALL40/RL5, reward servic
 and review snapshot are unchanged. No vLLM/SGLang/Comfy, weight-content inventories,
 mandatory conversion receipts, quantization, approximate cache or external trainer.
 
+## Current GPU policy — user override after the first real attempt
+
+**No GPU reserve on H3 training.** The training CLI, initial checks, event/15s
+heartbeat checks and every encoder/DiT/decoder stage use `gpu_memory_policy='oom'`.
+No16GiB free floor, no32GiB stage GPU admission, no max-reserved limit. Telemetry
+is real and retained; native CUDA OOM still fails with full evidence. Host-stage
+component+shard+24GiB admission, host24GiB/disk64GiB floors, locks and services
+remain protected. Wan/SMALL40 and H3 inference defaults are NOT changed.
+Owner/environment/SUCCESS/FAILED explicitly record `gpu_memory_policy='oom'`,
+`gpu_reserve_enabled=false`, `gpu_reserved_limit_gib=null`.
+
+Historical4cd18b8 diagnostic-one-001 loaded real encoder/DiT/PEFT but stopped at
+GPUfree15.963806GiB<16GiB during first rollout, zero updates. This was NOT CUDA OOM
+or backward acceptance. Preserve that output; this authorized policy change uses
+new `diagnostic-one-oom-001` and exactly the same diagnostic config.
+
 ## Read this call chain first
 
 ```
@@ -29,7 +45,8 @@ python -m visual_rl.train_h3
 Source map: `models/h3_training.py` owns model/trainable lifetime and identity;
 `algorithms/dynamics/h3_joint.py` owns paired sampling/evaluation math;
 `algorithms/trainer/h3.py` owns explicit joint records, group/reward/PPO/checkpoint.
-`models/h3_components.py` remains the unchanged inference implementation. No
+`models/h3_components.py` adds an explicit stage-policy seam; inference retains
+its original reserve default, while only the training subclass selects 'oom'. No
 packed AV is disguised as Wan's single-tensor `ModelInput`/trajectory contract.
 
 ## Exact prospective diagnostic (fixed BEFORE the first server attempt)
@@ -148,32 +165,32 @@ identity. Do not rerun Wan5/SMALL40/accepted inference or stop unrelated service
 ```bash
 export AGREED_SHA=REPLACE_WITH_FULL_TESTED_SHA
 SOURCE=/home/ubuntu/qifan/visualrl-h3-training-20261026/source
-# Existing repo is only a Git object donor; don't switch its active branch.
-git -C /home/ubuntu/qifan/visualrl-readable-h3-20261024/no-weight-integrity-source fetch origin h3-pytorch-training
-git -C /home/ubuntu/qifan/visualrl-readable-h3-20261024/no-weight-integrity-source worktree add --detach "$SOURCE" "$AGREED_SHA"
+# Existing TRAINING worktree only, after prior owned PIDs have exited and clean
+# status is verified. Do NOT switch the successful inference checkout.
+git -C "$SOURCE" status --short --branch
+git -C "$SOURCE" fetch origin h3-pytorch-training
+git -C "$SOURCE" switch --detach "$AGREED_SHA"
 git -C "$SOURCE" rev-parse HEAD
 git -C "$SOURCE" status --short --branch
 cd "$SOURCE"
 ```
 
-If the donor path differs, use its verified real path, never overwrite/create
-source by uploading local files. New environment only, reuse wheel/HF caches:
+The independent training environment already passed installation/pip check and
+PEFT0.18.1/CUDA import tests in the first attempt. **Reuse it unmodified: no
+reinstall, model download or reconversion.** Verify actual source/module paths:
 
 ```bash
 mkdir -p /mnt/data/qifan/runs/visualrl-h3-training-20261026
-python3.12 -m venv /mnt/data/qifan/envs/visualrl-h3-train
 PY=/mnt/data/qifan/envs/visualrl-h3-train/bin/python
-"$PY" -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
-"$PY" -m pip install -r configs/h3/requirements-training.txt
 "$PY" -m pip check
-"$PY" -m pip freeze > /mnt/data/qifan/runs/visualrl-h3-training-20261026/pip-freeze.txt
+"$PY" -m pip freeze > /mnt/data/qifan/runs/visualrl-h3-training-20261026/pip-freeze-no-gpu-reserve.txt
 export PYTHONPATH="$SOURCE" CUDA_VISIBLE_DEVICES=0
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
-"$PY" -c 'import torch,peft,visual_rl; from visual_rl.models.h3_components import audit_runtime; print(visual_rl.__file__,peft.__file__,audit_runtime()); print(torch.ones(2,device="cuda")*2)'
+"$PY" -c 'import torch,peft,visual_rl; from visual_rl.models.h3_components import audit_runtime; print(visual_rl.__file__,peft.__file__,audit_runtime()); print(torch.__version__)'
 RAW=/mnt/data/qifan/models/h3-native/hub-cache/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe
 DERIVED=/mnt/data/qifan/models/h3-torch/FL2VA-diffusers-aaf57d03
-OUT=/mnt/data/qifan/runs/visualrl-h3-training-20261026/diagnostic-one-001
+OUT=/mnt/data/qifan/runs/visualrl-h3-training-20261026/diagnostic-one-oom-001
 mkdir -p "$(dirname "$OUT")"
 export H3_RC="$OUT.rc"
 # A new log/RC wrapper; once only, record $!, child PID/cwd/argv and ownership.
@@ -187,23 +204,25 @@ nohup bash -c '"$@"; rc=$?; printf "%s\n" "$rc" > "${H3_RC}"; exit "$rc"' h3 \
 Do not literally execute placeholders. Record the actual background PID from
 `$!` immediately; a launched process is not training acceptance. Reuse existing raw/derived
 assets: **no download, conversion or content integrity scan**. Actual loading
-key/shape errors are propagated. New PEFT dependency resolution/import is not
-proven by Mac CPU tests; if pip/API fails preserve exact error and return it.
+key/shape errors are propagated. Prior real environment/model preparation is
+not backward/update proof; if API fails preserve exact error and return it.
 No server source/package monkeypatch. No automatic reinstallation on retry.
 
 Only after one real update acceptance and fresh resource checks, use a distinct
-`diagnostic-five-001` OUT/RC/log and exactly the same command with `--updates 5`.
+`diagnostic-five-oom-001` OUT/RC/log and exactly the same command with `--updates 5`.
 Do not pass `--resume` (unsupported), alter config, or claim the first run's
 checkpoint resumed. On bridge failure read existing PID/log first, never replay
 nohup. The global flock prevents coexistence with other owned Flash/H3 launches.
 
 ## Evidence / safety / limits
 
-- Full DiT GPU training residency is intentionally conservative and **unmeasured**.
-  Host admission uses largest live component + largest loading shard +24GiB, not
-  sum134GiB. Resource monitor retains GPU16GiB/host24GiB/disk64GiB floors at15s
-  and explicit stage boundaries. These sampled checks do not prove all transient
-  minima. No automatic precision/model/geometry changes or resource guard removal.
+- Full DiT GPU residency/model preparation was observed in the historical first
+  attempt; full rollout/backward/optimizer capacity remains **unverified**. Host
+  admission uses largest live component + loading shard +24GiB, not sum134GiB.
+  Training now has **no GPU reserve or max-reserved rejection**, per user override;
+  real telemetry and OOM propagation remain. Host24GiB/disk64GiB checks run at15s
+  and explicit stage boundaries; sampled checks do not prove transient minima.
+  No automatic precision/model/geometry change or host/disk guard removal.
 - Initial stage admission rejection is **not CUDA OOM**. Native OOM or host safety
   failure must immediately return config/phase/resource snapshots/traceback/RC
   and notify main/user. Keep the failed output, do not shrink and retry. No HPS
