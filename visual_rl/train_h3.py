@@ -48,7 +48,9 @@ def main(argv=None):
         raise ValueError("output must be external, with no symlink parents")
     output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    owner = {"source": str(ROOT), "git_sha": sha, "pid": os.getpid(), "output": str(output),
+    gpu_policy = H3TrainingAdapter.gpu_memory_policy
+    owner = {"gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None,
+             "source": str(ROOT), "git_sha": sha, "pid": os.getpid(), "output": str(output),
              "updates_requested": args.updates, "diagnostic": True, "config": asdict(config),
              "started_unix": time.time(), "resume_supported": False}
     with exclusive_launch(LOCK, owner):
@@ -56,7 +58,7 @@ def main(argv=None):
             raise FileExistsError("fresh output already exists; no resume/retry is supported")
         output.mkdir()
         publish(output / "owner.json", owner)
-        monitor = ResourceMonitor(output.parent, output / "resources.json")
+        monitor = ResourceMonitor(output.parent, output / "resources.json", gpu_memory_policy=gpu_policy)
         algorithm = adapter = reward = None
         started = time.monotonic()
         def abort_safety(*_):
@@ -64,15 +66,14 @@ def main(argv=None):
         previous = signal.signal(signal.SIGUSR1, abort_safety)
         try:
             initial = resource_sample(output.parent)
-            check_budget(initial)
+            check_budget(initial, gpu_memory_policy=gpu_policy)
             modules = audit_runtime()
             if (torch.__version__.split('+')[0] != "2.10.0"
                     or importlib.metadata.version("peft") != "0.18.1"
                     or importlib.metadata.version("transformers") != "5.19.0"):
                 raise RuntimeError("use the pinned isolated H3 training stack")
-            # Staged host admission, not a134GiB whole-asset sum. GPU DiT is
-            # fully resident with activations/checkpointing and a16GiB floor.
-            # No claim this unmeasured training workload fits an A10080GB.
+            # No GPU reserve on H3 training (user authorization). Staged host
+            # admission and real telemetry/OOM remain; no capacity promise.
             budgets = {}
             for name, folder in (("encoder", args.model_root / "FL2VA/text_encoder"),
                                  ("policy", args.converted_root / "transformer"),
@@ -82,14 +83,16 @@ def main(argv=None):
                 if not files:
                     raise ValueError(f"missing component layout: {name}")
                 budgets[name] = stage_budget(sum(p.stat().st_size for p in files),
-                                             max(p.stat().st_size for p in files), initial)
+                                             max(p.stat().st_size for p in files), initial,
+                                             gpu_memory_policy=gpu_policy)
             import peft
             modules["peft"] = {"version": importlib.metadata.version("peft"), "file": peft.__file__}
             publish(output / "environment.json", {"modules": modules, "initial_resources": initial,
                 "host_stage_admission_gib": budgets, "model_revision_declared": args.model_revision,
                 "model_root": str(args.model_root), "converted_root": str(args.converted_root),
                 "placement": "full_DiT_GPU_during_rollout_replay_backward_CPU_park_during_decode",
-                "checkpointing": "native_nonreentrant", "weight_integrity_scan": False})
+                "checkpointing": "native_nonreentrant", "weight_integrity_scan": False,
+                "gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None})
             monitor.sample()
             monitor.thread.start()
             random.seed(config.seed)
@@ -102,7 +105,8 @@ def main(argv=None):
             adapter = H3TrainingAdapter.load(model_root=args.model_root, converted_root=args.converted_root,
                         model_revision=args.model_revision, resource_probe=lambda: resource_sample(output.parent))
             algorithm = H3GRPODiagnostic(adapter, reward, config, output,
-                {"git_sha": sha, "model_revision_declared": args.model_revision, "source": str(ROOT)},
+                {"git_sha": sha, "model_revision_declared": args.model_revision, "source": str(ROOT),
+                 "gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False},
                 publish, monitor.sample)
             result = algorithm.run(args.updates)
             adapter.close()
@@ -112,6 +116,7 @@ def main(argv=None):
             monitor.sample()
             publish(output / "SUCCESS.json", {**result, "git_sha": sha, "seconds": time.monotonic()-started,
                 "sampled_minima": monitor.minima, "peaks": monitor.peaks,
+                "gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None,
                 "status": "real_H3_diagnostic_optimizer_updates_complete"})
         except BaseException as error:
             try:
@@ -123,7 +128,8 @@ def main(argv=None):
                             "host_memory_error" if isinstance(error, MemoryError) else
                             "safety_or_admission_blocked" if capacity else "code_or_external_error")
             publish(output / "FAILED.json", {"status": "capacity_or_safety_blocked" if capacity else "failed",
-                "failure_kind": failure_kind,
+                "failure_kind": failure_kind, "gpu_memory_policy": gpu_policy,
+                "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None,
                 "error_type": type(error).__name__, "error": str(error), "traceback": traceback.format_exc(),
                 "phase": algorithm.phase if algorithm else "environment_or_load",
                 "committed_steps": algorithm.committed_steps if algorithm else 0,

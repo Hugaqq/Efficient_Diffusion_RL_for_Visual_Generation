@@ -10,6 +10,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 from pathlib import Path
 import sys
 import time
@@ -64,15 +65,24 @@ def inspect_converted(root):
                     raise ValueError("missing converted shard")
 
 
-def stage_budget(weight_bytes, largest_shard_bytes, sample):
-    """One live CPU component + one loading shard + 24 GiB host reserve.
+def stage_budget(weight_bytes, largest_shard_bytes, sample, *, gpu_memory_policy="reserve"):
+    """Staged host admission; inference keeps its32GiB GPU admission default.
 
-    CPU/group offload bounds GPU weight residency; retain the existing 16 GiB
-    global GPU floor. Activations are monitored, not claimed to be measured here.
+    Training explicitly selects 'oom': no GPU reserve, real telemetry and native
+    CUDA OOM still propagate. Host component+loading-shard+24GiB is unchanged.
     """
+    if gpu_memory_policy not in {"reserve", "oom"}:
+        raise ValueError("unknown GPU memory policy")
+    gpu = sample["gpu_free_gib"]
+    if (not isinstance(gpu, (int, float)) or isinstance(gpu, bool)
+            or not math.isfinite(gpu) or gpu < 0):
+        raise RuntimeError("invalid GPU memory telemetry")
     needed = (weight_bytes + largest_shard_bytes) / 1024**3 + 24
-    if sample["host_available_gib"] < needed or sample["gpu_free_gib"] < 32:
-        raise RuntimeError(f"H3 stage admission requires host {needed:.3f}GiB and GPU 32GiB free")
+    host = sample["host_available_gib"]
+    if (not isinstance(host, (int, float)) or not math.isfinite(host) or host < needed
+            or (gpu_memory_policy == "reserve" and gpu < 32)):
+        gpu_requirement = " and GPU 32GiB free" if gpu_memory_policy == "reserve" else ""
+        raise RuntimeError(f"H3 stage admission requires host {needed:.3f}GiB{gpu_requirement}")
     return needed
 
 
@@ -120,6 +130,8 @@ class H3InferenceAdapter:
     Public numerical ports: encode, prepare_latents, predict, decode. Sampling
     and both sigma grids belong to algorithms.rollout.h3.sample_h3.
     """
+    gpu_memory_policy = "reserve"  # unchanged inference default; training explicitly overrides
+
     def __init__(self, raw_root, converted_root, assets, *, resource_probe=None, device="cuda"):
         import torch
         self.device = torch.device(device)
@@ -154,11 +166,13 @@ class H3InferenceAdapter:
             raise ValueError(f"missing phase weights: {name}")
         budget = None
         if self.resource_probe:
-            budget = stage_budget(sum(p.stat().st_size for p in files), max(p.stat().st_size for p in files), self.resource_probe())
+            budget = stage_budget(sum(p.stat().st_size for p in files), max(p.stat().st_size for p in files),
+                                  self.resource_probe(), gpu_memory_policy=self.gpu_memory_policy)
         self.phase = name
         started = time.monotonic()
         logging.info(json.dumps({"event": "h3_phase_start", "phase": name,
-            "host_admission_gib": budget, "resources": self._resource_snapshot()}))
+            "host_admission_gib": budget, "gpu_memory_policy": self.gpu_memory_policy,
+            "resources": self._resource_snapshot()}))
         try:
             yield
         finally:

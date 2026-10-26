@@ -372,7 +372,7 @@ def test_native_training_encoder_unwraps_inference_tensor_and_live_close_rejects
     assert tiny.root is None and tiny.optimizer is None and tiny.closed
 
 
-def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeypatch):
+def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeypatch, tmp_path):
     # API/control-path fake, NOT proof the real H3/PEFT/CUDA stack can train.
     import types
     import visual_rl.models.h3_training as model_module
@@ -408,7 +408,11 @@ def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeyp
     monkeypatch.setitem(sys.modules, 'diffusers', types.SimpleNamespace(MiniMaxH3Transformer3DModel=Native))
     monkeypatch.setitem(sys.modules, 'peft', types.SimpleNamespace(LoraConfig=lambda **kwargs: types.SimpleNamespace(**kwargs)))
     monkeypatch.setattr(model_module.importlib.metadata, 'version', lambda name: '0.18.1')
-    a = H3TrainingAdapter('/unused', '/unused', {}, device='cpu')
+    folder = tmp_path / 'transformer'
+    folder.mkdir()
+    (folder / 'model.safetensors').write_bytes(b'explicit fake weight; stat only')
+    a = H3TrainingAdapter('/unused', tmp_path, {}, device='cpu',
+                          resource_probe=lambda: {'gpu_free_gib': 0.1, 'host_available_gib': 128.})
     a.prepare_policy(rank=4, alpha=8, learning_rate=1e-4)
     assert isinstance(a.root, H3PreparedRoot) and len(a.trainables) == 4
     assert all('lora_' in n and p.dtype == torch.float32 and p.requires_grad for n, p in a.trainables)
@@ -441,3 +445,141 @@ def test_failure_no_durable_or_success_and_original_candidate_imports(tmp_path, 
         H3Diagnostic(width=1344, height=768)
     with pytest.raises(ValueError):
         H3Diagnostic(stochastic_indices=(0, 38))
+
+
+def test_no_training_gpu_reserve_in_stages_events_and_heartbeat(tmp_path, monkeypatch):
+    from visual_rl.models import h3_components as components
+    from scripts import launch_flash140 as launch
+    from visual_rl.models.h3_components import H3InferenceAdapter, stage_budget
+    assert H3TrainingAdapter.gpu_memory_policy == 'oom'
+    assert H3InferenceAdapter.gpu_memory_policy == 'reserve'
+    sample = {'gpu_free_gib': 0.1, 'host_available_gib': 128., 'disk_free_gib': 128.,
+              'torch_peak_reserved_gib': 10000., 'process_peak_rss_gib': 12.}
+    policy = H3TrainingAdapter.gpu_memory_policy
+    for gpu in (0., .1, 15.963806, 16., 31.99):
+        observed = {**sample, 'gpu_free_gib': gpu}
+        launch.check_budget(observed, gpu_memory_policy=policy)
+        assert stage_budget(1024, 1024, observed, gpu_memory_policy=policy) > 24
+        # Existing Wan/inference defaults still reject low GPU headroom.
+        if gpu < 16:
+            with pytest.raises(RuntimeError, match='gpu_free'):
+                launch.check_budget(observed)
+        with pytest.raises(RuntimeError, match='GPU 32'):
+            stage_budget(1024, 1024, observed)
+    for invalid in (-1., float('nan'), float('inf')):
+        with pytest.raises(RuntimeError, match='telemetry'):
+            launch.check_budget({**sample, 'gpu_free_gib': invalid}, gpu_memory_policy=policy)
+        with pytest.raises(RuntimeError, match='telemetry'):
+            stage_budget(1, 1, {**sample, 'gpu_free_gib': invalid}, gpu_memory_policy=policy)
+    for field in ('host_available_gib', 'disk_free_gib'):
+        with pytest.raises(RuntimeError, match=field):
+            launch.check_budget({**sample, field: 0.}, gpu_memory_policy=policy)
+    with pytest.raises(RuntimeError, match='host'):
+        stage_budget(1, 1, {**sample, 'host_available_gib': 24.}, gpu_memory_policy=policy)
+
+    # Inherited encoder/video-decoder/audio-decoder phase gates must use the
+    # training policy, not the inference default; no weight bytes are read.
+    folder = tmp_path/'component'
+    folder.mkdir()
+    (folder/'model.safetensors').write_bytes(b'explicit CPU fake asset')
+    monkeypatch.setattr(components, 'release_memory', lambda: None)
+    a = H3TrainingAdapter('/unused', '/unused', {}, device='cpu', resource_probe=lambda: dict(sample))
+    for phase in ('encoder', 'video_decoder', 'audio_decoder'):
+        with a._phase(phase, folder):
+            assert a.phase == phase
+        assert a.phase is None
+    inference = H3InferenceAdapter('/unused', '/unused', {}, device='cpu', resource_probe=lambda: dict(sample))
+    with pytest.raises(RuntimeError, match='GPU 32'):
+        with inference._phase('encoder', folder):
+            pytest.fail('inference default must still reject low GPU headroom')
+
+    monkeypatch.setattr(launch, 'resource_sample', lambda _: dict(sample))
+    monitor = launch.ResourceMonitor(tmp_path, tmp_path/'resources.json', gpu_memory_policy=policy,
+                                     gpu_reserved_limit=.01)
+    # Even an explicit low peak limit is inactive in existing 'oom' policy.
+    algorithm = H3GRPODiagnostic(a, None, H3Diagnostic(), tmp_path, {}, launch.publish, monitor.sample)
+    algorithm.event('replay_forward')  # same callback used at every real event
+    saved = json.loads((tmp_path/'resources.json').read_text())
+    assert saved['sample']['gpu_free_gib'] == .1  # measured telemetry never padded
+    assert saved['peaks']['torch_peak_reserved_gib'] == 10000.
+    class Once:
+        def __init__(self):
+            self.calls = 0
+        def wait(self, seconds):
+            self.calls += 1
+            return self.calls > 1
+        def is_set(self):
+            return False
+    monitor.stop = Once()
+    monkeypatch.setattr(launch.os, 'kill', lambda *args: pytest.fail('no low-GPU heartbeat signal allowed'))
+    monitor._run()  # real heartbeat path, bounded by explicit fake wait
+    assert monitor.error is None
+    sample['host_available_gib'] = 23.
+    with pytest.raises(RuntimeError, match='host_available'):
+        monitor.sample()
+
+
+def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monkeypatch):
+    # Actual CLI/monitor/algorithm/objective/checkpoint; heavy compute/HTTP/media
+    # and telemetry leaves are explicit CPU fakes. Injected OOM tests propagation,
+    # NOT an actual CUDA allocation failure or training capacity experiment.
+    import types
+    import importlib.metadata
+    from scripts import launch_flash140 as launch
+    from visual_rl import train_h3
+    from visual_rl.models import h3_components as components
+    import visual_rl.algorithms.trainer.h3 as trainer
+    from visual_rl.models.h3_training import H3TrainingAdapter
+    raw, converted = tmp_path/'raw', tmp_path/'converted'
+    for folder in (raw/'FL2VA/text_encoder', converted/'transformer', converted/'vae', converted/'audio_vae'):
+        folder.mkdir(parents=True)
+        (folder/'model.safetensors').write_bytes(b'explicit CPU fake asset; metadata only')
+    sample = {'gpu_free_gib': .1, 'host_available_gib': 128., 'disk_free_gib': 128.,
+              'torch_peak_reserved_gib': 10000., 'process_peak_rss_gib': 12.}
+    monkeypatch.setattr(launch, 'LOCK', tmp_path/'owned.lock')
+    monkeypatch.setattr(launch, 'git_identity', lambda sha: sha)
+    monkeypatch.setattr(launch, 'resource_sample', lambda _: dict(sample))
+    monkeypatch.setattr(components, 'audit_runtime', lambda: {'explicit_CPU_fake_modules': True})
+    monkeypatch.setattr(torch, '__version__', '2.10.0+cu128')
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, 'version', lambda name: {'peft': '0.18.1',
+        'transformers': '5.19.0'}.get(name) or original_version(name))
+    monkeypatch.setitem(sys.modules, 'peft', types.SimpleNamespace(__file__='explicit_CPU_fake_peft'))
+    monkeypatch.setattr(H3TrainingAdapter, 'load', classmethod(lambda cls, **kwargs: TinyAdapter()))
+    class FakeReward:
+        def __init__(self, *_):
+            pass
+        def __call__(self, result):
+            return float(result.request.seed % 2), {'explicit_CPU_fake_reward': True}
+        def close(self):
+            pass
+    monkeypatch.setattr(trainer, 'H3VideoReward', FakeReward)
+    monkeypatch.setattr(trainer, 'export_result', lambda *args: {'explicit_CPU_fake_encoder': True})
+    def args(out):
+        return ['--config', str(ROOT/'configs/h3/training-diagnostic.json'), '--expected-sha', 'a'*40,
+                '--model-root', str(raw), '--converted-root', str(converted), '--model-revision', 'b'*40,
+                '--output', str(out), '--updates', '1']
+    out = tmp_path/'one'
+    assert train_h3.main(args(out)) == 0
+    for name in ('owner.json', 'environment.json', 'SUCCESS.json'):
+        record = json.loads((out/name).read_text())
+        assert record['gpu_memory_policy'] == 'oom' and record['gpu_reserve_enabled'] is False
+        assert record['gpu_reserved_limit_gib'] is None
+    assert json.loads((out/'SUCCESS.json').read_text())['committed_steps'] == 1
+    assert json.loads((out/'resources.json').read_text())['sample']['gpu_free_gib'] == .1
+
+    original_predict = TinyAdapter.predict
+    def native_oom(self, *args, **kwargs):
+        if torch.is_grad_enabled():
+            raise torch.cuda.OutOfMemoryError('explicit CPU-injected native OOM during replay')
+        return original_predict(self, *args, **kwargs)
+    monkeypatch.setattr(TinyAdapter, 'predict', native_oom)
+    failed = tmp_path/'oom'
+    with pytest.raises(torch.cuda.OutOfMemoryError, match='native OOM'):
+        train_h3.main(args(failed))
+    record = json.loads((failed/'FAILED.json').read_text())
+    assert record['failure_kind'] == 'cuda_oom' and record['notify_user_capacity'] is True
+    assert record['gpu_memory_policy'] == 'oom' and not record['gpu_reserve_enabled']
+    assert record['phase'] == 'replay_forward' and record['committed_steps'] == 0
+    assert 'OutOfMemoryError' in record['traceback'] and record['resources']['gpu_free_gib'] == .1
+    assert not (failed/'SUCCESS.json').exists() and not (failed/'step-1').exists()

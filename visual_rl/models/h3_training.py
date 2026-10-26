@@ -28,6 +28,8 @@ class H3PreparedRoot(torch.nn.Module):
 
 
 class H3TrainingAdapter(H3InferenceAdapter):
+    gpu_memory_policy = "oom"  # user-authorized: no GPU reserve on H3 training
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.root = None
@@ -50,7 +52,8 @@ class H3TrainingAdapter(H3InferenceAdapter):
             raise RuntimeError("require peft==0.18.1 in the isolated training environment")
         files = list((self.converted_root / "transformer").glob("*.safetensors"))
         if self.resource_probe:
-            stage_budget(sum(p.stat().st_size for p in files), max(p.stat().st_size for p in files), self.resource_probe())
+            stage_budget(sum(p.stat().st_size for p in files), max(p.stat().st_size for p in files),
+                         self.resource_probe(), gpu_memory_policy=self.gpu_memory_policy)
         model = MiniMaxH3Transformer3DModel.from_pretrained(
             self.converted_root / "transformer", torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True, local_files_only=True, use_safetensors=True)
