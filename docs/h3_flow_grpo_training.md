@@ -1,6 +1,29 @@
-# H3 direct PyTorch joint Flow-GRPO diagnostic
+# H3 direct PyTorch joint Flow-GRPO capacity tests
 
-**Fresh-only, one then five real updates; NOT normal-resolution training capacity.**
+**Current authorized test: ONE fresh 768x512x124 / rank64-alpha128 update.**
+`configs/h3/training-rank64-512p.json` explicitly selects
+`profile="rank64-512p-capacity"`; group2/B1, same prompt/seed42000,
+40 sigma points/39 joint forwards, only stochastic index20/noise0.7,
+LR1e-4/clip0.001/maxgrad1/parity1e-4 and attention targets are unchanged.
+This is a bounded single-A10080GB **512p capacity test**, not a tiny debug run,
+not full1344x768 training, and not Flow-Factory's full recipe. Its fixed3dd5ca4d
+example labels512x768 unvalidated and uses8 processes/group16/CPS/noise0.8/
+multiple SDE steps/CLAP+ImageBind; we borrow only geometry/rank/alpha.
+
+The tiny96x64/rank4 JSON stays byte-for-byte unchanged (default profile
+`tiny-diagnostic`). Experimenter accepted its real1 and independent fresh5 on
+f4218dd (RC0, real HPS/parity/gradient/delta/checkpoints; no OOM). Preserve them;
+**do not rerun those baselines, and do not auto-expand the new512p test to5**.
+CLI and algorithm reject `--updates 5` for the512p profile before model loading.
+Neither baseline success nor this Mac change proves the new workload fits.
+
+Owner/environment/results, checkpoint, update and reward receipts carry the
+explicit profile/config (width/height/frames/rank/alpha), diagnostic/capacity flags
+and actual step counts. Tiny keeps diagnostic=true and its old success status;
+512p has diagnostic=false/capacity_probe=true and a distinct capacity success
+status. On completion `normal_capacity_verified` refers ONLY to the configured
+512p profile; `full_resolution_capacity_verified=false` always means1344x768
+training remains untested. No long-run, quality, multi-GPU or resume claim.
 The original successful inference source/results, Wan/SMALL40/RL5, reward service,
 and review snapshot are unchanged. No vLLM/SGLang/Comfy, weight-content inventories,
 mandatory conversion receipts, quantization, approximate cache or external trainer.
@@ -19,7 +42,9 @@ Owner/environment/SUCCESS/FAILED explicitly record `gpu_memory_policy='oom'`,
 Historical4cd18b8 diagnostic-one-001 loaded real encoder/DiT/PEFT but stopped at
 GPUfree15.963806GiB<16GiB during first rollout, zero updates. This was NOT CUDA OOM
 or backward acceptance. Preserve that output; this authorized policy change uses
-new `diagnostic-one-oom-001` and exactly the same diagnostic config.
+new `diagnostic-one-oom-001` and exactly the same diagnostic config. That run and
+its independent fresh5 subsequently passed; the next NEW output is
+`rank64-512p-one-001`, not a rerun or resume of either tiny run.
 
 ## Read this call chain first
 
@@ -55,7 +80,7 @@ packed AV is disguised as Wan's single-tensor `ModelInput`/trajectory contract.
 - width96 x height64, 124 frames, 24fps; native stereo32kHz, no reference/prefix.
   This is an extremely small **diagnostic**, not a normal sample/quality claim.
   Spatial32 multiples follow native patch/layout. Fixed upstream modular tests
-  exercise32x32/124; real pretrained96x64 encode/decode still needs GPU validation.
+  exercise32x32/124; real pretrained96x64 updates were accepted on f4218dd.
 - 40 sigma grid points including terminal zero =39 joint predictions per sample.
   video shift12, audio shift3; both full branches always retained.
 - One group of2 same-prompt samples per update, seeds42000/42001; next group's
@@ -81,11 +106,12 @@ packed AV is disguised as Wan's single-tensor `ModelInput`/trajectory contract.
   PyTorch accumulation, one optimizer call after both graphs; no double scaling.
   Current/collection both eval mode; grad enabled only for replay, never train().
 
-One fresh `--updates 1` must pass first. Only then, with resources safe, one fresh
-`--updates 5` at identical settings is allowed. This is NOT resume: the five-update
-run starts its own initial LoRA and explicitly collects five groups. No CLI knob
-silently reduces dimensions, audio, group, timesteps, weights or base model after
-a failure. Long training and normal1344x768 capacity are not implemented/claimed.
+The tiny profile historically required one fresh update before independent5;
+both are now accepted and must not be repeated. This was NOT resume: five started
+its own initial LoRA and collected five groups. The new512p profile permits ONE
+update only, even on success. No CLI knob silently reduces dimensions, audio,
+group, timesteps, weights or base model after a failure. Long training and
+full1344x768 capacity are not implemented/claimed.
 
 ## Probability definition (review before using the metrics)
 
@@ -110,8 +136,13 @@ steps only: `0<next_sigma<sigma<1`, positive finite noise/std. Endpoints/ODE hav
 no fake logprob0. T2VA packed layout must exactly partition text/video/audio;
 no condition/padding AV rows are accepted. Per-scalar bool masks/counts are saved;
 all AV scalars are generated/scored in this T2VA baseline; text never contributes.
-For this diagnostic: video37x2x3 packed rows x96 =21312 scalars; stereo audio
-414 rows x32 =13248 scalars. Actual runtime counts, not these constants, weight L.
+For tiny: video37x2x3 packed rows x96 =21312 scalars. For512p:
+video37x16x24 packed rows x96 =**1,363,968** scalars. Both retain stereo audio
+414 rows x32 =**13,248** scalars. The weights are therefore derived anew for the
+new geometry (video is64x tiny), not fixed21312 or0.5/0.5. Actual validated
+scalar-mask counts, not these documentation constants, weight L. CPU tests run
+production prepare_latents with pinned layout kernels at512p, count both masks,
+check fixed-action parity/RNG and gradients; heavy model/CUDA remains untested.
 
 Collection/replay call the SAME helper. Replay passes saved action and cannot
 sample RNG. Save detached oldLv/La/counts/aggregate, original B1 forward partition,
@@ -149,7 +180,7 @@ Preserve service identity
    finite top24-of81 aggregation. Store original/adapted shapes, source indices,
    interpolation, scorer frame indices/scores/selection and sample identity.
 
-This is a defined diagnostic video reward, probably poor at tiny resolution.
+This is a defined video reward for either profile, probably poor at tiny resolution.
 It drives the JOINT surrogate, but provides **no audio-specific quality reward**.
 Equal scores/nonfinite rewards cause honest failure before optimizer.step.
 No reward perturbations, dummy images, fallback score, service restarts or /device.
@@ -183,19 +214,22 @@ reinstall, model download or reconversion.** Verify actual source/module paths:
 mkdir -p /mnt/data/qifan/runs/visualrl-h3-training-20261026
 PY=/mnt/data/qifan/envs/visualrl-h3-train/bin/python
 "$PY" -m pip check
-"$PY" -m pip freeze > /mnt/data/qifan/runs/visualrl-h3-training-20261026/pip-freeze-no-gpu-reserve.txt
+"$PY" -m pip freeze  # read only; keep prior environment receipts unchanged
 export PYTHONPATH="$SOURCE" CUDA_VISIBLE_DEVICES=0
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
 "$PY" -c 'import torch,peft,visual_rl; from visual_rl.models.h3_components import audit_runtime; print(visual_rl.__file__,peft.__file__,audit_runtime()); print(torch.__version__)'
 RAW=/mnt/data/qifan/models/h3-native/hub-cache/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe
 DERIVED=/mnt/data/qifan/models/h3-torch/FL2VA-diffusers-aaf57d03
-OUT=/mnt/data/qifan/runs/visualrl-h3-training-20261026/diagnostic-one-oom-001
+OUT=/mnt/data/qifan/runs/visualrl-h3-training-20261026/rank64-512p-one-001
 mkdir -p "$(dirname "$OUT")"
 export H3_RC="$OUT.rc"
+# Freshness check only; also confirm no competing/owned training process above.
+"$PY" -c 'import pathlib,sys; p=sys.argv[1]; assert not any(pathlib.Path(p+s).exists() for s in ("", ".console.log", ".rc", ".submission.json", ".wrapper.pid")), "preserve existing attempt; inspect it, do not relaunch"' "$OUT"
 # A new log/RC wrapper; once only, record $!, child PID/cwd/argv and ownership.
 nohup bash -c '"$@"; rc=$?; printf "%s\n" "$rc" > "${H3_RC}"; exit "$rc"' h3 \
-  "$PY" -u -m visual_rl.train_h3 --expected-sha "$AGREED_SHA" \
+  "$PY" -u -m visual_rl.train_h3 --config configs/h3/training-rank64-512p.json \
+  --expected-sha "$AGREED_SHA" \
   --model-root "$RAW" --converted-root "$DERIVED" \
   --model-revision 42ed227ee7df40d41602854ae760620d6eb651fe \
   --output "$OUT" --updates 1 >"$OUT.console.log" 2>&1 < /dev/null &
@@ -208,16 +242,16 @@ key/shape errors are propagated. Prior real environment/model preparation is
 not backward/update proof; if API fails preserve exact error and return it.
 No server source/package monkeypatch. No automatic reinstallation on retry.
 
-Only after one real update acceptance and fresh resource checks, use a distinct
-`diagnostic-five-oom-001` OUT/RC/log and exactly the same command with `--updates 5`.
-Do not pass `--resume` (unsupported), alter config, or claim the first run's
-checkpoint resumed. On bridge failure read existing PID/log first, never replay
-nohup. The global flock prevents coexistence with other owned Flash/H3 launches.
+This new setting is authorized for **one update only**; report its capacity
+result, do not launch5 or long training. Do not pass `--resume` (unsupported),
+alter config after failure, or claim any tiny checkpoint resumed. On bridge
+failure read existing PID/log first, never replay nohup. The global flock
+prevents coexistence with other owned Flash/H3 launches.
 
 ## Evidence / safety / limits
 
-- Full DiT GPU residency/model preparation was observed in the historical first
-  attempt; full rollout/backward/optimizer capacity remains **unverified**. Host
+- Tiny full rollout/backward/optimizer1+5 were accepted by Experimenter onf4218dd;
+  **512p/rank64 capacity remains unverified** until the new real update. Host
   admission uses largest live component + loading shard +24GiB, not sum134GiB.
   Training now has **no GPU reserve or max-reserved rejection**, per user override;
   real telemetry and OOM propagation remain. Host24GiB/disk64GiB checks run at15s
@@ -245,7 +279,13 @@ nohup. The global flock prevents coexistence with other owned Flash/H3 launches.
 - Accept1 only if real pretrained joint rollouts, complete AV decode, matching
   per-modality+aggregate fixed-action density, distinct finite real rewards,
   nonzero finite selected LoRA gradients, actual finite nonzero Parameter delta,
-  durable checkpoint1, RC0/SUCCESS all exist. Then inspect five identical-setting
-  real commits/checkpoints1..5; no normal1344x768 training capacity/quality claim.
-- CPU tests use explicit fake heavy leaves and real small-tensor math/autograd;
+  durable checkpoint1, RC0/SUCCESS all exist. For the new512p/rank64 setting STOP
+  at that accepted one-update capacity result; no automatic5 and no full1344x768
+  training capacity or quality claim.
+- Mac rank64 profile gate in the actual `outputs/h3-training-coding` checkout:
+  original `tests/test_flash_collection_runtime.py`: **7 passed in14.60s**;
+  `tests/test_h3_training.py`: **26 passed in2.79s**;
+  `tests/test_h3_native_inference.py`: **20 passed in4.60s**;
+  `tests/test_readable_inference.py`: **10 passed in2.98s**. Original7 file unchanged.
+  CPU tests use explicit fake heavy leaves and real small-tensor math/autograd;
   they are NOT real model/PEFT CUDA/offload/reward/gradient-capacity evidence.

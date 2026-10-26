@@ -1,0 +1,18 @@
+{
+  "profile": "rank64-512p-capacity",
+  "prompt": "A cinematic wide shot of snowy mountain peaks under a clear blue sky.",
+  "width": 768,
+  "height": 512,
+  "frames": 124,
+  "points": 40,
+  "group_size": 2,
+  "seed": 42000,
+  "stochastic_indices": [20],
+  "noise": 0.7,
+  "rank": 64,
+  "alpha": 128,
+  "learning_rate": 0.0001,
+  "clip_range": 0.001,
+  "max_grad_norm": 1.0,
+  "parity_atol": 0.0001
+}

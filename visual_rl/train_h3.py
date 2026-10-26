@@ -1,11 +1,10 @@
-"""python -m visual_rl.train_h3: fresh-only real joint H3 LoRA diagnostic.
+"""python -m visual_rl.train_h3: fresh-only real joint H3 LoRA capacity tests.
 
 No inference engines, no automatic capacity fallback/retry or service changes.
 Keep stderr/stdout/RC outside the source. A failure after optimizer_start is
 fatal; never attempt to continue from an uncommitted in-memory policy.
 """
 import argparse
-from dataclasses import asdict
 import importlib.metadata
 import json
 import logging
@@ -43,6 +42,7 @@ def main(argv=None):
         raise RuntimeError("training imports do not match the candidate checkout")
     sha = git_identity(args.expected_sha)
     config = H3Diagnostic.read(args.config)
+    config.validate_updates(args.updates)  # reject rank64 --updates5 before any launch/resource acquisition
     output = args.output.absolute()
     if output == ROOT or ROOT in output.parents or any(p.is_symlink() for p in (output, *output.parents)):
         raise ValueError("output must be external, with no symlink parents")
@@ -51,7 +51,7 @@ def main(argv=None):
     gpu_policy = H3TrainingAdapter.gpu_memory_policy
     owner = {"gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None,
              "source": str(ROOT), "git_sha": sha, "pid": os.getpid(), "output": str(output),
-             "updates_requested": args.updates, "diagnostic": True, "config": asdict(config),
+             "updates_requested": args.updates, **config.metadata(),
              "started_unix": time.time(), "resume_supported": False}
     with exclusive_launch(LOCK, owner):
         if output.exists():
@@ -87,7 +87,7 @@ def main(argv=None):
                                              gpu_memory_policy=gpu_policy)
             import peft
             modules["peft"] = {"version": importlib.metadata.version("peft"), "file": peft.__file__}
-            publish(output / "environment.json", {"modules": modules, "initial_resources": initial,
+            publish(output / "environment.json", {**config.metadata(), "modules": modules, "initial_resources": initial,
                 "host_stage_admission_gib": budgets, "model_revision_declared": args.model_revision,
                 "model_root": str(args.model_root), "converted_root": str(args.converted_root),
                 "placement": "full_DiT_GPU_during_rollout_replay_backward_CPU_park_during_decode",
@@ -117,7 +117,8 @@ def main(argv=None):
             publish(output / "SUCCESS.json", {**result, "git_sha": sha, "seconds": time.monotonic()-started,
                 "sampled_minima": monitor.minima, "peaks": monitor.peaks,
                 "gpu_memory_policy": gpu_policy, "gpu_reserve_enabled": False, "gpu_reserved_limit_gib": None,
-                "status": "real_H3_diagnostic_optimizer_updates_complete"})
+                "status": ("real_H3_diagnostic_optimizer_updates_complete" if result["diagnostic"] else
+                           "real_H3_512p_rank64_capacity_update_complete")})
         except BaseException as error:
             try:
                 sample = resource_sample(output.parent)
@@ -135,7 +136,7 @@ def main(argv=None):
                 "committed_steps": algorithm.committed_steps if algorithm else 0,
                 "resources": sample, "torch_allocated_gib": torch.cuda.memory_allocated()/1024**3,
                 "torch_reserved_gib": torch.cuda.memory_reserved()/1024**3,
-                "config": asdict(config), "git_sha": sha, "diagnostic": True,
+                **config.metadata(), "git_sha": sha,
                 "notify_user_capacity": capacity, "automatic_retry": False})
             logging.exception("H3 training failed; preserve output and notify main immediately if capacity/safety")
             raise
