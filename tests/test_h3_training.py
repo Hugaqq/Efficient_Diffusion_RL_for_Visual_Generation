@@ -128,7 +128,8 @@ class TinyAdapter(H3TrainingAdapter):
             encoded = torch.ones(1, 2, 3)
         return encoded.clone()
 
-    def prepare_policy(self, **_):
+    def prepare_policy(self, **settings):
+        self.prepared_settings = settings  # explicit fake: observe real algorithm's LoRA arguments
         self.root = H3PreparedRoot(TinyJointLoRA()).eval()
         self.trainables = tuple((n, p) for n, p in self.root.named_parameters() if p.requires_grad)
         self.optimizer = torch.optim.AdamW([p for _, p in self.trainables], lr=.003, weight_decay=0)
@@ -372,7 +373,8 @@ def test_native_training_encoder_unwraps_inference_tensor_and_live_close_rejects
     assert tiny.root is None and tiny.optimizer is None and tiny.closed
 
 
-def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeypatch, tmp_path):
+@pytest.mark.parametrize('rank,alpha', [(4, 8), (64, 128)])
+def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeypatch, tmp_path, rank, alpha):
     # API/control-path fake, NOT proof the real H3/PEFT/CUDA stack can train.
     import types
     import visual_rl.models.h3_training as model_module
@@ -398,11 +400,11 @@ def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeyp
             assert kwargs['torch_dtype'] == torch.bfloat16
             return cls()
         def add_adapter(self, config):
-            assert config.r == 4 and config.lora_alpha == 8 and config.lora_dropout == 0
+            assert config.r == rank and config.lora_alpha == alpha and config.lora_dropout == 0
             assert config.target_modules == ['to_q', 'to_k', 'to_v', 'to_out.0']
             for block in [*self.transformer_blocks, *self.token_refiner.refiner_blocks]:
-                block.attn.to_q.lora_A = torch.nn.Parameter(torch.ones(1, 2, dtype=torch.bfloat16))
-                block.attn.to_q.lora_B = torch.nn.Parameter(torch.zeros(2, 1, dtype=torch.bfloat16))
+                block.attn.to_q.lora_A = torch.nn.Parameter(torch.ones(rank, 2, dtype=torch.bfloat16))
+                block.attn.to_q.lora_B = torch.nn.Parameter(torch.zeros(2, rank, dtype=torch.bfloat16))
         def enable_gradient_checkpointing(self):
             self.gradient_checkpointing = self.token_refiner.gradient_checkpointing = True
     monkeypatch.setitem(sys.modules, 'diffusers', types.SimpleNamespace(MiniMaxH3Transformer3DModel=Native))
@@ -413,8 +415,9 @@ def test_real_preparation_control_path_with_explicit_fake_diffusers_peft(monkeyp
     (folder / 'model.safetensors').write_bytes(b'explicit fake weight; stat only')
     a = H3TrainingAdapter('/unused', tmp_path, {}, device='cpu',
                           resource_probe=lambda: {'gpu_free_gib': 0.1, 'host_available_gib': 128.})
-    a.prepare_policy(rank=4, alpha=8, learning_rate=1e-4)
+    a.prepare_policy(rank=rank, alpha=alpha, learning_rate=1e-4)
     assert isinstance(a.root, H3PreparedRoot) and len(a.trainables) == 4
+    assert sum(p.numel() for _, p in a.trainables) == 8 * rank
     assert all('lora_' in n and p.dtype == torch.float32 and p.requires_grad for n, p in a.trainables)
     assert not a.root.dit.training and a.root.dit.gradient_checkpointing
     assert all(not p.requires_grad for n, p in a.root.named_parameters() if 'lora_' not in n)
@@ -519,7 +522,8 @@ def test_no_training_gpu_reserve_in_stages_events_and_heartbeat(tmp_path, monkey
         monitor.sample()
 
 
-def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize('config_file', ['training-diagnostic.json', 'training-rank64-512p.json'])
+def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monkeypatch, config_file):
     # Actual CLI/monitor/algorithm/objective/checkpoint; heavy compute/HTTP/media
     # and telemetry leaves are explicit CPU fakes. Injected OOM tests propagation,
     # NOT an actual CUDA allocation failure or training capacity experiment.
@@ -545,18 +549,26 @@ def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monk
     monkeypatch.setattr(importlib.metadata, 'version', lambda name: {'peft': '0.18.1',
         'transformers': '5.19.0'}.get(name) or original_version(name))
     monkeypatch.setitem(sys.modules, 'peft', types.SimpleNamespace(__file__='explicit_CPU_fake_peft'))
-    monkeypatch.setattr(H3TrainingAdapter, 'load', classmethod(lambda cls, **kwargs: TinyAdapter()))
+    config = H3Diagnostic.read(ROOT/'configs/h3'/config_file)
+    adapters = []
+    def load_fake(cls, **kwargs):
+        adapter = TinyAdapter()
+        adapters.append(adapter)
+        return adapter
+    monkeypatch.setattr(H3TrainingAdapter, 'load', classmethod(load_fake))
     class FakeReward:
         def __init__(self, *_):
             pass
         def __call__(self, result):
+            assert result.video.shape == (124, config.height, config.width, 3)
+            assert (result.request.width, result.request.height) == (config.width, config.height)
             return float(result.request.seed % 2), {'explicit_CPU_fake_reward': True}
         def close(self):
             pass
     monkeypatch.setattr(trainer, 'H3VideoReward', FakeReward)
     monkeypatch.setattr(trainer, 'export_result', lambda *args: {'explicit_CPU_fake_encoder': True})
     def args(out):
-        return ['--config', str(ROOT/'configs/h3/training-diagnostic.json'), '--expected-sha', 'a'*40,
+        return ['--config', str(ROOT/'configs/h3'/config_file), '--expected-sha', 'a'*40,
                 '--model-root', str(raw), '--converted-root', str(converted), '--model-revision', 'b'*40,
                 '--output', str(out), '--updates', '1']
     out = tmp_path/'one'
@@ -565,7 +577,26 @@ def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monk
         record = json.loads((out/name).read_text())
         assert record['gpu_memory_policy'] == 'oom' and record['gpu_reserve_enabled'] is False
         assert record['gpu_reserved_limit_gib'] is None
-    assert json.loads((out/'SUCCESS.json').read_text())['committed_steps'] == 1
+        for key, value in config.metadata().items():
+            assert record[key] == json.loads(json.dumps(value))
+    assert adapters[0].prepared_settings == {'rank': config.rank, 'alpha': config.alpha, 'learning_rate': 1e-4}
+    success = json.loads((out/'SUCCESS.json').read_text())
+    assert success['committed_steps'] == 1 and success['configured_workload_completed']
+    assert success['normal_capacity_verified'] == (config.profile == 'rank64-512p-capacity')
+    assert success['full_resolution_capacity_verified'] is False  # full1344x768 remains untested
+    assert success['status'] == ('real_H3_diagnostic_optimizer_updates_complete' if config.metadata()['diagnostic']
+                                 else 'real_H3_512p_rank64_capacity_update_complete')
+    checkpoint = torch.load(out/'step-1/training.pt', weights_only=False)
+    update = json.loads((out/'group-1/update.json').read_text())
+    receipts = json.loads((out/'group-1/rewards.json').read_text())
+    for record in (checkpoint, update, *receipts):
+        assert record['profile'] == config.profile and record['diagnostic'] == config.metadata()['diagnostic']
+        assert record['config']['width'] == config.width and record['config']['rank'] == config.rank
+    if config.profile == 'rank64-512p-capacity':
+        rejected = tmp_path/'five-not-authorized'
+        with pytest.raises(ValueError, match='no automatic expansion'):
+            train_h3.main(args(rejected)[:-1] + ['5'])
+        assert not rejected.exists() and len(adapters) == 1
     assert json.loads((out/'resources.json').read_text())['sample']['gpu_free_gib'] == .1
 
     original_predict = TinyAdapter.predict
@@ -579,7 +610,87 @@ def test_cli_uses_no_gpu_reserve_and_preserves_native_oom_failure(tmp_path, monk
         train_h3.main(args(failed))
     record = json.loads((failed/'FAILED.json').read_text())
     assert record['failure_kind'] == 'cuda_oom' and record['notify_user_capacity'] is True
+    assert record['profile'] == config.profile and record['diagnostic'] == config.metadata()['diagnostic']
+    assert record['config']['width'] == config.width and record['config']['rank'] == config.rank
     assert record['gpu_memory_policy'] == 'oom' and not record['gpu_reserve_enabled']
     assert record['phase'] == 'replay_forward' and record['committed_steps'] == 0
     assert 'OutOfMemoryError' in record['traceback'] and record['resources']['gpu_free_gib'] == .1
     assert not (failed/'SUCCESS.json').exists() and not (failed/'step-1').exists()
+
+
+def test_explicit_profiles_keep_tiny_config_and_mathematical_constraints():
+    from dataclasses import asdict
+    tiny_bytes = (ROOT/'configs/h3/training-diagnostic.json').read_bytes()
+    # Compare with the accepted baseline Git blob, not a rewritten test fixture.
+    baseline = subprocess.check_output(['git', 'show', 'f4218dd:configs/h3/training-diagnostic.json'], cwd=ROOT)
+    assert tiny_bytes == baseline
+    tiny = H3Diagnostic.read(ROOT/'configs/h3/training-diagnostic.json')
+    capacity = H3Diagnostic.read(ROOT/'configs/h3/training-rank64-512p.json')
+    assert tiny == H3Diagnostic()
+    assert (capacity.width, capacity.height, capacity.frames, capacity.rank, capacity.alpha) == (768, 512, 124, 64, 128)
+    changed = {k for k, v in asdict(tiny).items() if asdict(capacity)[k] != v}
+    assert changed == {'profile', 'width', 'height', 'rank', 'alpha'}
+    assert capacity.request(0, 1).seed == 42001
+    assert capacity.metadata()['diagnostic'] is False and capacity.metadata()['capacity_probe'] is True
+    tiny.validate_updates(5)
+    capacity.validate_updates(1)
+    with pytest.raises(ValueError, match='no automatic expansion'):
+        capacity.validate_updates(5)
+    for updates in (0, 2, True):
+        with pytest.raises(ValueError):
+            capacity.validate_updates(updates)
+    for changes in ({'width': 96, 'height': 64}, {'width': 769}, {'height': 0},
+                    {'frames': 123}, {'points': 2}, {'group_size': 1}, {'rank': 4},
+                    {'alpha': 8}, {'noise': 0.}, {'noise': float('nan')},
+                    {'stochastic_indices': (0,)}, {'stochastic_indices': (38,)},
+                    {'learning_rate': 0.}, {'parity_atol': 0.1}, {'profile': 'unknown'}):
+        with pytest.raises(ValueError):
+            replace(capacity, **changes)
+    with pytest.raises(ValueError):
+        replace(tiny, width=768, height=512, rank=64, alpha=128)  # explicit profile required
+
+
+def test_rank64_512p_native_geometry_counts_and_fixed_action_gradient_cpu(monkeypatch):
+    # Real component prepare_latents + pinned layout kernels, no heavy model,
+    # PEFT, CUDA, decoder or HTTP. This is NOT a memory/capacity acceptance.
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location('rank64_geometry_reference',
+                Path(__file__).with_name('h3_pinned_reference.py'))
+    reference = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference)
+    module = types.ModuleType('diffusers.modular_pipelines.minimax_h3.before_denoise')
+    module.MiniMaxH3PrepareLayoutStep = types.SimpleNamespace(build_packed_sequence=reference.build_packed_sequence)
+    module.patchify_video_latents = reference.patchify_video_latents
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    c = H3Diagnostic.read(ROOT/'configs/h3/training-rank64-512p.json')
+    adapter = H3TrainingAdapter('/unused', '/unused', {}, device='cpu')
+    prompt = torch.ones(1, 3, 8, dtype=torch.bfloat16)
+    state, layout, geometry = adapter.prepare_latents(c.request(0, 0), prompt)
+    assert geometry == (37, 32, 48, 207)
+    assert state['video'].shape == (1, 14208, 96)
+    assert state['audio'].shape == (1, 414, 32)
+    masks = validate_target_layout(state, prompt, layout)
+    v = {n: (x*.13).requires_grad_() for n, x in state.items()}
+    sigmas = {'video': .8, 'audio': .4}
+    following = {'video': .7, 'audio': .2}
+    maximum = {'video': .97, 'audio': .91}
+    generator = torch.Generator().manual_seed(7)
+    action, old = joint_transition(state, v, sigmas, following, maximum, masks, noise=c.noise, generator=generator)
+    rng = generator.get_state().clone()
+    _, current = joint_transition(state, v, sigmas, following, maximum, masks, noise=c.noise,
+                                  generator=generator, action=action)
+    assert torch.equal(rng, generator.get_state())
+    assert old.counts == current.counts == {'video': 1363968, 'audio': 13248}
+    assert torch.equal(old.aggregate, current.aggregate)
+    for n in NAMES:
+        assert torch.equal(old.component[n], current.component[n])
+    expected = (1363968*current.component['video'] + 13248*current.component['audio']) / 1377216
+    torch.testing.assert_close(current.aggregate, expected, rtol=0, atol=0)
+    current.aggregate.sum().backward()
+    assert all(x.grad is not None and torch.isfinite(x.grad).all() and (x.grad != 0).any() for x in v.values())
+    # The reward definition is unchanged; geometry comes from the request.
+    pixels = torch.zeros(124, c.height, c.width, 3, dtype=torch.uint8)
+    processed, receipt = hps_preprocess(pixels)
+    assert receipt['source_shape'] == [124, 512, 768, 3]
+    assert processed.shape == (81, 480, 832, 3) and receipt['audio_reward'] is False

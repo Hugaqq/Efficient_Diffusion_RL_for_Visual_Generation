@@ -1,4 +1,4 @@
-"""Small, explicit H3 joint Flow-GRPO diagnostic algorithm.
+"""Explicit H3 joint Flow-GRPO diagnostic and bounded capacity profiles.
 
 No second service scheduler or framework: H3-specific paired records bridge the
 concrete model root to VisualRL's existing canonical PPO objective. Fresh only;
@@ -39,19 +39,37 @@ class H3Diagnostic:
     clip_range: float = 0.001
     max_grad_norm: float = 1.0
     parity_atol: float = 1e-4
+    profile: str = "tiny-diagnostic"  # old JSON remains byte-for-byte unchanged
 
     def __post_init__(self):
-        # Deliberately ONE predeclared experiment, not a silent capacity fallback.
-        if (self.width, self.height, self.frames, self.points, self.group_size) != (96, 64, 124, 40, 2):
-            raise ValueError("only the declared 96x64x124/40-point/group2 DIAGNOSTIC is supported")
+        # Two explicit workloads, never an automatic capacity fallback. Keep the
+        # historical class name so existing tiny callers need no migration.
+        if self.profile == "tiny-diagnostic":
+            expected = (96, 64, 4, 8)
+        elif self.profile == "rank64-512p-capacity":
+            expected = (768, 512, 64, 128)
+        else:
+            raise ValueError("unknown H3 training profile")
+        if (any(type(v) is not int for v in (self.width, self.height, self.frames,
+                                             self.points, self.group_size, self.rank, self.alpha))
+                or (self.width, self.height, self.rank, self.alpha) != expected
+                or (self.frames, self.points, self.group_size) != (124, 40, 2)):
+            raise ValueError("geometry/rank/alpha must match the declared H3 training profile")
         if (type(self.stochastic_indices) is not tuple or self.stochastic_indices != (20,)
                 or any(type(i) is not int for i in self.stochastic_indices) or self.noise != 0.7):
-            raise ValueError("diagnostic trains interior stochastic transition20 at noise0.7 only")
-        if (type(self.rank) is not int or type(self.alpha) is not int
-                or (self.rank, self.alpha, self.learning_rate, self.clip_range, self.max_grad_norm, self.parity_atol) != (
-                    4, 8, 1e-4, 0.001, 1.0, 1e-4)):
-            raise ValueError("diagnostic optimization settings must match the declared workload")
-        H3Request("diagnostic", self.prompt, self.seed, self.width, self.height, self.frames, self.points)
+            raise ValueError("training profiles require interior stochastic transition20 at noise0.7 only")
+        if (self.learning_rate, self.clip_range, self.max_grad_norm, self.parity_atol) != (1e-4, 0.001, 1.0, 1e-4):
+            raise ValueError("optimization settings must match the declared workload")
+        H3Request("profile-check", self.prompt, self.seed, self.width, self.height, self.frames, self.points)
+
+    def validate_updates(self, updates):
+        allowed = (1, 5) if self.profile == "tiny-diagnostic" else (1,)
+        if type(updates) is not int or updates not in allowed:
+            raise ValueError(f"{self.profile} permits updates {allowed} only; no automatic expansion")
+
+    def metadata(self):
+        return {"profile": self.profile, "diagnostic": self.profile == "tiny-diagnostic",
+                "capacity_probe": self.profile == "rank64-512p-capacity", "config": asdict(self)}
 
     @classmethod
     def read(cls, path):
@@ -292,8 +310,8 @@ def atomic_checkpoint(adapter, output, step, config, audit, provenance):
     if folder.exists() or temporary.exists():
         raise FileExistsError("checkpoint already exists; preserve failed attempts")
     temporary.mkdir()
-    payload = {"schema_version": 1, "step": step, "diagnostic": True, "resume_supported": False,
-        "config": asdict(config), "provenance": provenance, "audit": audit,
+    payload = {"schema_version": 1, "step": step, **config.metadata(), "resume_supported": False,
+        "provenance": provenance, "audit": audit,
         "lora": {n: p.detach().cpu().clone() for n, p in adapter.trainables},
         "optimizer": adapter.optimizer.state_dict(), "lr": adapter.lr_scheduler.state_dict(),
         "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
@@ -323,14 +341,14 @@ class H3GRPODiagnostic:
     def event(self, phase, **fields):
         self.phase = phase
         self.safety()
-        record = {"event": phase, "committed_steps": self.committed_steps, **fields}
+        record = {"event": phase, "profile": self.config.profile,
+                  "committed_steps": self.committed_steps, **fields}
         logging.info(json.dumps(record, allow_nan=False))
         with (self.output / "events.jsonl").open("a") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
 
     def run(self, updates):
-        if updates not in (1, 5):
-            raise ValueError("only one or five fresh diagnostic updates authorized")
+        self.config.validate_updates(updates)
         a, c = self.adapter, self.config
         self.event("encode")
         a.encoded_prompt = a.encode(c.request(0, 0))
@@ -360,7 +378,7 @@ class H3GRPODiagnostic:
                 self.event("reward", sample_id=request.sample_id)
                 score, receipt = self.reward(result)
                 scores.append(score)
-                reward_receipts.append({"sample_id": request.sample_id, "reward": score,
+                reward_receipts.append({**c.metadata(), "sample_id": request.sample_id, "reward": score,
                                          "preprocessing_and_score": receipt, "media": media})
                 del result
             del finals
@@ -372,9 +390,12 @@ class H3GRPODiagnostic:
             self.event("checkpoint")
             checkpoint = atomic_checkpoint(a, self.output, step+1, c, audit, self.provenance)
             self.committed_steps = step+1
-            self.publish(folder / "update.json", {**audit, "checkpoint": str(checkpoint),
+            self.publish(folder / "update.json", {**audit, **c.metadata(), "checkpoint": str(checkpoint),
                                                    "committed_steps": self.committed_steps})
             self.event("optimizer_commit", trainable_after=audit["trainable_after"])
             del records
-        return {"committed_steps": self.committed_steps, "diagnostic": True, "normal_capacity_verified": False,
+        return {"committed_steps": self.committed_steps, **c.metadata(),
+                "configured_workload_completed": True,
+                "normal_capacity_verified": c.profile == "rank64-512p-capacity",
+                "full_resolution_capacity_verified": False,
                 "audio_quality_reward": False, "resume_supported": False}
