@@ -1,37 +1,31 @@
-# Assignment B — W4
+# Assignment B — W5
 
 - active: true
-- task_id: H3-M2b1-model-adapter
+- task_id: H3-M2b2-profile
 - pair: coding-b → simplifier-b
-- execution: parallel W4；decisions/wave-04.md
-- integration_parent: `7cf28dced4c8193ccf9321d62b5b2e479bd904f7`
-- dependencies: 已批准loader/forward/cache/decoder、现ModelAdapter与catalog；W3源码汇合5397c46662db30ef535afc0fb4b192df019c4d62。无changes。
+- execution: parallel W5；decisions/wave-05.md
+- integration_parent: `6f5e46fce212e00d547a3ca07fa5524018bef816`
+- dependencies: 注册H3Config/Adapter及既有stage/HPS/prepare已approved；W4代码汇合fb085fb35fb239cdd4c151d39decbd7fae268c9d。无changes。
 
-## 唯一目标
+## 单一功能/允许范围
 
-实现**可经现模型registry声明/构造的真实H3 ModelAdapter**，把已有模型域组件接成encode/初态/predict/decode端口；不再让runtime直接拼散落模型helper。只扩展H3封闭类型，不泛化整个框架、不接新controller/runner。
+实现供**现唯一RunController后续绑定**使用的固定H3 schema-v2 profile编译与本地前置事实检查；本项不假装已装配controller、不实现第二入口/Runner。只新 `visual_rl/composition/config/h3_profile.py`、新 `configs/v2/h3_t2va_mvp.yaml`、新 `tests/test_h3_mvp_cpu_profile.py`、W/coding-b/H3-M2b2-profile.md。旧compiler/registry/runtime/adapter/modeltypes/七项及其他tests只读；A/C同波新模块不import。
 
-## 允许文件
+## profile合同
 
-新 `visual_rl/models/implementations/h3.py`、新 `visual_rl/models/h3_config.py`、新 `visual_rl/models/h3_interface.py`；精确追加 `visual_rl/models/catalog.py` 的H3 descriptor（不改SD3/Wan）；仅H3必要类型扩展 `visual_rl/core/contracts/model.py`、`visual_rl/models/interface.py`。新 `tests/test_h3_mvp_cpu_adapter.py` 与W/coding-b/H3-M2b1-model-adapter.md。旧H3 helper、所有其他tests、runtime/recipe/compiler/checkpoint、A/C文件只读。若需额外文件先报最小范围，不顺手改公共合同。
-
-## 合同锁
-
-- 继承现ModelAdapter，真正实现describe/from_config/load_components/encode/prepare_latents/predict/decode及生命周期释放；不得实例化一个带NotImplemented/假媒体的伪adapter。配置/声明import-safe，重依赖仅现loader/decoder路径lazy。
-- 新明确TaskKind.T2VA、MediaKind.AUDIO、rank2 JOINT_AV_FLAT latent layout（命名可一致调整），不要借T2V/BCTHW伪装音频。ModelLatentSpec仅对新layout增加明确[batch,joint] rank2检查，旧PACKED_SEQUENCE rank>=3等约束原样保留，不全局放松。默认geometry256×384×124@24/guidance1、LoRA32/64、FP16状态/FP32 CPS scoring/块BF16岛FP32。
-- 现ModelInput只有单timestep：定义窄H3ModelInput（可继承ModelInput）增加独立audio_sigma，原timestep在此明确是video_sigma；检查双FP32 detached sigma/shape/device/range。不能拿index、平均sigma或改旧timestep语义蒙混。返回现ModelPrediction并沿用shape/identity验证；预测noise-ward两流符号转换只在已批准h3_forward一次。
-- 配置严格键集合与family几何/LoRA/缓存/预算字段；artifacts留逻辑refs，本地路径和expected cache身份从显式runtime_context取，不填假identity。只支持T2VA/B1/guidance1/LoRA，不承诺SP/TP/reference/EMA。未知覆盖早拒，不改Flash preset或算法语义。
-- load_components使用现ComponentLoadSession.register/freeze；实际调用build_h3_meta，不全模型CPU/GPU实参加载；暴露已有H3MetaModel只读给未来runtime prepare。Transformer注册INFERENCE/TRAINABLE，text cache/decoder为非prepared资源且lazy，不加载Qwen。禁止adapter创建PG/optimizer或提前绑定ParameterStateManager。后续prepare_h3_fsdp返回handle后由现bind接口绑定，单次predict始终通过prepared guard。
-- encode实际消费H3TextCache、明确train/eval coverage准入端口；返回owned detached CPU embeddings及准确cache/prompt identity，trimmed5120维。若现StackedSampleBatch尚无T2VA，定义最小typed prompt输入而不是伪造T2V媒体；不要修改数据域形成第二dataset框架。runtime/data装配下一项使用此端口。
-- prepare_latents用显式generator真实torch随机噪声给joint FP16状态，保留双流元素与独立模态流策略（若base方法单generator不足，可在H3 typed参数中明确给pair；不隐式用global RNG）。不实施去噪或rollout；初态生成版本要能进入后续checkpoint身份。
-- predict消费H3 typed输入及真实conditioning，调用已有h3_t2va_forward，传self的受控prepared callable；不unwrap raw model、整体autocast/cast或接算法ID。不import algorithms内CPS/stages；双schedule构造仍归算法。
-- decode必须返回已有H3CPUDecoder单条AV lease，包含video+audio，不塞进只支持单tensor的DecodedMediaBatch伪media。H3公开端口返回类型明确为AV lease，旧adapter返回仍不变；若需要annotation封闭union可最小扩展，不删旧校验。
-- 不制造假的Diffusers scheduler blueprint/Gaussian绑定或fake numerics receipt。此原子项交付必须清楚列出未来H3算法binder/G3还需的真实端口；不能宣称仅catalog新增就已能跑现默认runtime。对未声明能力明确拒绝，不承诺任意旧算法可组合。
+- 一个显式 `schema_version:2, recipe:h3_t2va_mvp_v1`，顶层沿现overrides/launch结构；未知键、重复YAML键、bool当int/NaN/inf、任意动态class路径严格拒绝，不接受宽松任意dict。用typed frozen profile保存已验证字段；配置引用全是本地路径，相对YAML目录解析，不下载/联网/创建输出目录。
+- 模型声明通过现Registry/DeclarationResolver真实h3-t2va descriptor/H3Config解析，不复制模型配置validator，不伪造单sigma/Gaussian blueprint或旧Dynamics receipt。profile的数值设置明确是joint CPS负MSE/元素权重、FP16 action、FP32 score、独立FP32 video shift12/audio shift3、eta.7、全N含q0、frozen replay old anchor、B1/chunk1/guidance1/beta0，无EMA/reference。
+- 默认256×384×124@24、WORLD8/SP1/TP1、每rank一个完整K8组、N10、一次collection一次optimizer，AdamW lr1e-4/betas(.9,.999)/eps1e-12/wd0、clip.005、norm1、constant LR；固定每run geometry/K/N，可允许明示有限小值供tiny测试/用户显式新profile，但不得隐式删音频/末步/改score。若只支持默认则明确拒绝覆盖，不偷偷继承Flash参数。
+- launch包含output_dir/resume_from、model/text_cache/train/eval/HPS manifest本地refs、完整expected cache身份与expected HPS service identity、loopback origin/timeout/response bound、seed/max_optimizer_steps/checkpoint cadence、显式host-weight/trajectory/media/decode/condition预算及8个获准UUID列表。具体字段命名可合理最小化，完整schema写在模块docstring/交付。禁默认物理0..7或假UUID，实际运行前必需用户填真实集合；样例中未提供资源用显式待填项并说明拒绝准入，不伪造存在权重/资源ready。
+- expected cache身份复用现reader合同，HPS manifest的all124/top37契约复用现protocol校验；profile明确h3_hpsv3_video_only_v1/weight1及audio质量不受该reward衡量。旧81帧HPS不兼容，禁止live health调用（该步骤后续runtime acquire）。
+- 提供compile与**只读本地preflight**清楚分工：编译验证结构/固定语义并解析路径；本地preflight检查真实train/eval bytes/hash、cache index/shards覆盖/身份、model/vae必要config/文件存在性、HPS本地manifest及预算可容纳最小工作量。复用现H3TextCache/H3Config/VideoContract等验证，不直接建H3模型或VAE，不用安装版本号替代API能力。过重模型权重全量hash可交后续既有artifact resolver，不在compile重复扫描数十GB；明确哪些身份当前仅声明、哪些来自真实读取。
+- 产生path-independent canonical semantic fingerprint（包含数据内容、模型/缓存/score/双schedule/采样流/训练数学，不能把本机output/path作为语义），launch执行位置/获准UUID/预算另有明确binding。只有实际内容才能产生对应identity，不填全0/占位receipt。默认路径输出不写入、不触碰运行目录。未经真实state绑定的G3数值证据不得伪造。
+- max steps/cadence/resume边界严格：只完整collection boundary、same topology；配置不得宣称支持mid-collection/elastic。profile编译结果供下一原子runtime绑prepare、data、stages与现manager；缺的schema接口准确列出，不添加NotImplemented runtime来假装能run。
 
 ## CPU验收
 
-通过现catalog/declaration resolver实际找到H3 descriptor/from_config，旧SD3/Wan声明不变；配置import不创建权重/HTTP/GPU。真实cache/geometry/loader meta/PEFT/decoder控制，仅重模型/VAE叶子tiny；有真实ComponentLoadSession生命周期、prepared guard、encode→独立初态→双sigma predict/backward→AV lease decode调用。验证双流、dtype/身份、未prepare/raw旁路/close拒绝、资源只关闭一次、非法单sigma/缺audio/cache miss与未知config拒绝。
+实际读tmp_path YAML和本地tiny configs/cache/safetensors/prompt/HPS manifests；真实模型declaration、typed配置、本地preflight和现cache/protocol校验执行，禁止mock整个compiler。重模型加载/HTTP/PG函数用失败spy保证compile/preflight不会调用。
 
-独立feature测试，不改原93项。最后源码编辑后跑plan Flash7与H3通配符，无skip/xfail/全量；报告branch/HEAD、命令/exit/数量/时间、diff/check与**实际注册接口和后续runtime所需端口**。若公共合同扩展过大，报告具体最小拆分，不把未实现端口写成生产success。
+正例验证默认数学与所有identity/path分离，移目录不改内容semantic ID，改prompt/cache/schedule/service声明等会更改或拒绝；unknown/duplicate YAML、非法预算/组合、缺train/eval/cache覆盖、错误HPS124、缺资源/不合法授权集合、resume拓扑约束负例。在允许的H3目标集内检查既有代表性Flash/SD3/Wan编译仍不变，不跑全量。
 
-Simplifier B重点审现ModelAdapter实际消费已有组件、typed双sigma/AV不能混入旧Gaussian、边界/guard/资源身份以及最小新增声明；changes回B。无服务器/GPU/下载/环境升级/push，GPU_PENDING。
+最后编辑后固定Flash7/H3通配符，原断言不动，无skip/xfail；报告branch/HEAD、命令/exit/数量/时间、diff/check和**下一步默认runtime需要消费的精确compiled字段/真实binding缺口**。Simplifier B审最小封闭profile、无假G3/资源身份、未造第二config框架/入口；changes回B。GPU_PENDING。
