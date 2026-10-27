@@ -312,12 +312,112 @@ def test_h3_binding_source_schedule_contract_and_post_tail_progress(tmp_path, mo
     with pytest.raises(RuntimeError, match='gradients'):
         b.checkpoint_boundary(stages, trainer)
     p.grad = None
-    request = h.source.reserve(1)
+    trainer.run_iteration(1)
+    progress2, proof2, data2, _ = b.checkpoint_boundary(stages, trainer)
+    assert trainer.next_optimizer_step == progress2.next_optimizer_step == proof2.committed_optimizer_step == 2
+    assert data2['cursor'] == 16 and data2['next_optimizer_step'] == 2
+    assert h.prepared.scheduler.last_epoch == 2 and h.prepared.scheduler._step_count == 3
+    assert h.prepared.scheduler.base_lrs == h.prepared.scheduler.get_last_lr() == [1e-4]
+    assert h.prepared.optimizer.param_groups[0]['lr'] == 1e-4
+    assert all(state['step'].item() == 2 for state in h.prepared.optimizer.state.values())
+    assert observed == ['rejected-before-tail', 'rejected-before-tail']
+    request = h.source.reserve(2)
     with pytest.raises(RuntimeError, match='boundary'):
         b.checkpoint_boundary(stages, trainer)
     h.source.abort(request)
     with pytest.raises(RuntimeError, match='boundary'):
         b.checkpoint_boundary(stages, trainer)
+    trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
+
+
+def test_h3_binding_initial_scheduler_ownership_and_constant_state_no_probe_steps(tmp_path, monkeypatch):
+    h = _fixture(tmp_path, monkeypatch, bind=False)
+    optimizer, scheduler = h.prepared.optimizer, h.prepared.scheduler
+    # Same exact parameter set is not ownership of the same optimizer object.
+    external = torch.optim.AdamW(optimizer.param_groups[0]['params'], lr=1e-4)
+    foreign = torch.optim.lr_scheduler.LambdaLR(external, lambda _: 1.)
+    calls = len(h.HeavyLeaf.calls)
+    def forbidden(*args, **kwargs):
+        pytest.fail('binding must not probe scheduler/optimizer.step')
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.optim.AdamW, 'step', forbidden)
+        patch.setattr(torch.optim.lr_scheduler.LambdaLR, 'step', forbidden)
+        patch.setattr(h.prepared, '_scheduler', foreign)
+        with pytest.raises(ValueError, match='scheduler.*prepared optimizer'):
+            H3RuntimeBinding(**h.kwargs)
+    for field, bad in (('base_lrs', [2e-4]), ('_last_lr', [2e-4]),
+                       ('last_epoch', 1), ('_step_count', 2)):
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.optim.AdamW, 'step', forbidden)
+            patch.setattr(torch.optim.lr_scheduler.LambdaLR, 'step', forbidden)
+            patch.setattr(scheduler, field, bad)
+            with pytest.raises(ValueError, match='scheduler'):
+                H3RuntimeBinding(**h.kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.optim.AdamW, 'step', forbidden)
+        patch.setattr(torch.optim.lr_scheduler.LambdaLR, 'step', forbidden)
+        h.binding = H3RuntimeBinding(**h.kwargs)
+        h.binding.validate_live()
+    assert len(h.HeavyLeaf.calls) == calls and not optimizer.state and not external.state
+    assert scheduler.last_epoch == 0 and scheduler._step_count == 1
+    h.binding.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
+
+
+def test_h3_binding_scheduler_drift_rejected_live_forward_and_post_tail(tmp_path, monkeypatch):
+    h = _fixture(tmp_path, monkeypatch)
+    b, optimizer, scheduler = h.binding, h.prepared.optimizer, h.prepared.scheduler
+    stages = H3IterationStages(data=h.source, prepared=h.prepared, predict=b.predict, decode=b.decode,
+        score_one=b.score_one, coordination_factory=b.coordination_factory,
+        process_group=h.pg, rank=0, device='cpu', read_behavior_id=h.source.read_behavior_id)
+    trainer = stages.trainer()
+    trainer.prepare_run(PrepareRunContext('scheduler-drift', 'h3', 0))
+    trainer.run_iteration(0)
+    boundary = b.checkpoint_boundary(stages, trainer)
+    external = torch.optim.AdamW(optimizer.param_groups[0]['params'], lr=1e-4)
+    replacement = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.)
+    replacement.load_state_dict(scheduler.state_dict())
+    # Even a replacement with identical state and correct optimizer must fail.
+    assert replacement.state_dict() == scheduler.state_dict()
+    mutations = [
+        (scheduler, 'optimizer', external), (h.prepared, '_scheduler', replacement),
+        (scheduler, 'base_lrs', [2e-4]), (scheduler, '_last_lr', [2e-4]),
+        (scheduler, 'last_epoch', 0), (scheduler, '_step_count', 1),
+        (optimizer.param_groups[0], 'initial_lr', 2e-4),
+        (optimizer.param_groups[0], 'lr', 2e-4),
+        (next(iter(optimizer.state.values())), 'step', torch.tensor(2.)),
+    ]
+    calls = len(h.HeavyLeaf.calls)
+    def forbidden(*args, **kwargs):
+        pytest.fail('validation/failed forward must not update optimizer or scheduler')
+    def mutate(patch, target, field, bad):
+        if isinstance(target, dict):
+            patch.setitem(target, field, bad)
+        else:
+            patch.setattr(target, field, bad)
+        patch.setattr(torch.optim.AdamW, 'step', forbidden)
+        patch.setattr(torch.optim.lr_scheduler.LambdaLR, 'step', forbidden)
+    for target, field, bad in mutations:
+        with monkeypatch.context() as patch:
+            mutate(patch, target, field, bad)
+            with pytest.raises(ValueError):
+                b.validate_live()
+            with pytest.raises(ValueError):
+                b.checkpoint_boundary(stages, trainer)
+            with pytest.raises(ValueError):
+                with b.scope(ExecutionMode.TRAIN):
+                    pytest.fail('invalid scheduler admitted into forward scope')
+        assert b.checkpoint_boundary(stages, trainer) == boundary
+    request = h.source.reserve(1)
+    for target, field, bad in mutations:
+        with monkeypatch.context() as patch:
+            mutate(patch, target, field, bad)
+            with pytest.raises(ValueError):
+                _predict(h, request)
+    assert len(h.HeavyLeaf.calls) == calls and not external.state
+    assert scheduler.last_epoch == 1 and scheduler._step_count == 2
+    assert optimizer.param_groups[0]['lr'] == 1e-4
+    assert all(state['step'].item() == 1 for state in optimizer.state.values())
+    h.source.abort(request)
     trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
 
 
