@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = (
     "AtomicCheckpointManager",
     "CheckpointInspection",
+    "CheckpointStaging",
     "CommittedCheckpoint",
 )
 
@@ -108,6 +109,14 @@ class CheckpointInspection:
         return self.committed
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class CheckpointStaging:
+    """Process-local capability; only its creating manager may publish it."""
+
+    path: Path
+    step: int
+
+
 class AtomicCheckpointManager:
     """Commit ``step-N.tmp-UUID`` to ``step-N`` before updating latest.json."""
 
@@ -118,6 +127,53 @@ class AtomicCheckpointManager:
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.root.is_dir() or self.root.is_symlink():
             raise ValueError("checkpoint root must be a real directory")
+        self._owned_staging: dict[Path, tuple[CheckpointStaging, int, int]] = {}
+
+    def create_staging(self, step: int) -> CheckpointStaging:
+        """Main writer creates a shared directory, without publishing anything."""
+        if type(step) is not int or step < 0:
+            raise ValueError("checkpoint step must be a non-negative integer")
+        final = self.root / f"step-{step}"
+        if final.exists() or final.is_symlink() or any(item[0].step == step for item in self._owned_staging.values()):
+            raise FileExistsError(f"checkpoint step already exists or is staged: {step}")
+        path = self.root / f"step-{step}.tmp-{uuid.uuid4().hex}"
+        path.mkdir(mode=0o700)
+        receipt = CheckpointStaging(path, step)
+        stat = path.stat()
+        self._owned_staging[path] = (receipt, stat.st_dev, stat.st_ino)
+        return receipt
+
+    def commit_existing(
+        self, staging: CheckpointStaging, contract: CheckpointContract, *,
+        progress: CheckpointProgress,
+        fault_injector: Callable[[str], None] | None = None,
+    ) -> CommittedCheckpoint:
+        """Pure-file publication after ALL ranks finish their shared-state IO.
+
+        No writer callback and no distributed/model calls belong in this method.
+        A copied/foreign receipt or replaced directory cannot acquire ownership.
+        """
+        if not isinstance(staging, CheckpointStaging):
+            raise TypeError("staging must be a manager-issued CheckpointStaging")
+        owned = self._owned_staging.get(staging.path)
+        if owned is None or owned[0] is not staging:
+            raise ValueError("unknown or consumed staging capability")
+        path = _direct_checkpoint_path(self.root, staging.path)
+        stat = path.stat()
+        if (stat.st_dev, stat.st_ino) != owned[1:]:
+            raise ValueError("owned staging directory was replaced")
+        if not isinstance(contract, CheckpointContract) or not isinstance(progress, CheckpointProgress):
+            raise TypeError("typed checkpoint contract/progress required")
+        if (progress.global_step != staging.step
+                or progress.execution_transform_plan_id != contract.execution_transform_plan_id):
+            raise ValueError("staging step/transform contract disagrees with progress")
+        if any((path / name).exists() or (path / name).is_symlink() for name in _RESERVED_FILES | {_LATEST_FILE}):
+            raise ValueError("staging already contains publication metadata")
+        final = self.root / f"step-{staging.step}"
+        if final.exists() or final.is_symlink():
+            raise FileExistsError(f"checkpoint already exists: {final}")
+        del self._owned_staging[path]  # once-only capability, including failed publication
+        return self._publish_staging(path, final, staging.step, contract, progress, fault_injector)
 
     def commit(
         self,
@@ -147,9 +203,23 @@ class AtomicCheckpointManager:
             raise FileExistsError(f"checkpoint already exists: {final}")
         temporary = self.root / f"step-{step}.tmp-{uuid.uuid4().hex}"
         temporary.mkdir(mode=0o700)
-        renamed = False
         try:
             writer(temporary)
+        except BaseException:
+            if temporary.exists() and not temporary.is_symlink():
+                shutil.rmtree(temporary)
+            raise
+        return self._publish_staging(temporary, final, step, contract, progress, fault_injector)
+
+    def _publish_staging(
+        self, temporary: Path, final: Path, step: int,
+        contract: CheckpointContract, progress: CheckpointProgress,
+        fault_injector: Callable[[str], None] | None,
+    ) -> CommittedCheckpoint:
+        # The legacy commit(writer) and shared-staging path use this ONE
+        # unchanged complete/tree/progress/rename/latest implementation.
+        renamed = False
+        try:
             _fault(fault_injector, "after_writer")
             state_tree = _build_state_tree(temporary)
             state_tree_id = _payload_digest(state_tree)
