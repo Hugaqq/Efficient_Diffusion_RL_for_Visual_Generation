@@ -2,7 +2,8 @@
 
 This directory records diagnostic runs on `10.130.140.73` before the final
 source/wheel freeze. It is not release evidence and must not be counted as the
-final A7/A8 gate in `Plan_8_2.md`.
+final A7/A8 gate in the archived
+[Plan_8_2.md snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/blob/00cee786df783f36cb254a9a666a48a5952dc0a3/Plan_8_2.md).
 
 ## Evidence boundary
 

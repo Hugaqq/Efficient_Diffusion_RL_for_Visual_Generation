@@ -92,7 +92,8 @@ resume、训练质量或 phase-boundary 已验证。
 
 ## 证据入口
 
-- 总计划与 gate：[Plan_8_2.md](../Plan_8_2.md)
+- v0.8 历史总计划与 gate（已归档，非当前开发计划）：
+  [Plan_8_2.md 固定快照](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/blob/00cee786df783f36cb254a9a666a48a5952dc0a3/Plan_8_2.md)
 - frozen A7 路线、收据和恢复策略：
   [v0.8 real-GPU evidence](../experiments/v08_modular_gpu_20260808/README.md)
 - v0.7 文档已从当前 docs 移除；历史 operational evidence 可在
