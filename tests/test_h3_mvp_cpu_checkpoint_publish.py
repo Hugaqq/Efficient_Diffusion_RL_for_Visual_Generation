@@ -422,6 +422,98 @@ def test_h3_restore_rechecks_complete_live_and_private_rank_identity(tmp_path, m
         model.close()
 
 
+def test_h3_rank_directory_fsync_after_all_attachments_before_publication(tmp_path, monkeypatch):
+    sim, owners, managers, models, contract, progress, _ = _setup(tmp_path, monkeypatch)
+    written, verified, events = [], [], []
+    real_write, real_verify = tx._write_rank, tx.H3CheckpointTransaction._validate_ranks
+    real_sync, real_json = manager_module._fsync_directory, manager_module._atomic_json
+
+    def write(path, payload):
+        descriptor = real_write(path, payload)  # real file write and fsync complete first
+        written.append(payload['rank'])
+        return descriptor
+
+    def verify(self, *args):
+        result = real_verify(self, *args)  # real full coverage/hash/identity validation
+        verified.append(self.rank)
+        return result
+
+    def sync(path):
+        if path.name == 'h3-ranks':
+            assert sim.tls.rank == 0
+            assert sorted(written) == sorted(verified) == list(range(8))
+            assert sorted(p.name for p in path.iterdir()) == [f'rank-{r}.pt' for r in range(8)]
+            assert not (path.parent / 'h3_transaction.json').exists()
+            assert not (path.parent / 'complete.json').exists()
+            assert not (managers[0].root / 'step-2').exists()
+            real_sync(path)  # execute the actual directory fsync, not a no-op spy
+            events.append('rank-dir-synced')
+        else:
+            real_sync(path)
+
+    def write_json(path, value):
+        if path.name in ('h3_transaction.json', 'complete.json'):
+            assert events.count('rank-dir-synced') == 1
+            events.append(path.name)
+        return real_json(path, value)
+
+    def fault(label):
+        if label in ('after_complete_marker', 'after_checkpoint_rename'):
+            events.append(label)
+
+    monkeypatch.setattr(tx, '_write_rank', write)
+    monkeypatch.setattr(tx.H3CheckpointTransaction, '_validate_ranks', verify)
+    monkeypatch.setattr(tx, '_fsync_directory', sync)
+    monkeypatch.setattr(manager_module, '_fsync_directory', sync)
+    monkeypatch.setattr(tx, '_atomic_json', write_json)
+    monkeypatch.setattr(manager_module, '_atomic_json', write_json)
+    results = _save(sim, owners, models, contract, progress, fault_injector=fault)
+    assert all(isinstance(result, CommittedCheckpoint) for result in results), results
+    assert events == ['rank-dir-synced', 'h3_transaction.json', 'complete.json',
+                      'after_complete_marker', 'after_checkpoint_rename']
+    managers[0].inspect_complete(results[0].path, expected_contract=contract)
+    for model in models:
+        model.close()
+
+
+def test_h3_rank_directory_fsync_failure_refuses_all_ranks_without_publication(tmp_path, monkeypatch):
+    sim, owners, managers, models, contract, progress, _ = _setup(tmp_path, monkeypatch)
+    real_sync = manager_module._fsync_directory
+    synced, failed = [], []
+    original = OSError('rank directory fsync failed')
+
+    def sync(path):
+        if path.name == 'h3-ranks':
+            assert sim.tls.rank == 0
+            assert sorted(p.name for p in path.iterdir()) == [f'rank-{r}.pt' for r in range(8)]
+            failed.append(path)
+            raise original
+        real_sync(path)
+        synced.append(path)
+
+    monkeypatch.setattr(tx, '_fsync_directory', sync)
+    monkeypatch.setattr(manager_module, '_fsync_directory', sync)
+    sync(tmp_path)  # non-target directory control: real fsync must still succeed
+    results = _save(sim, owners, models, contract, progress)
+    _all_failed(results)
+    assert results[0].__cause__ is original
+    assert all('rejected local input on ranks [0]' in str(result) for result in results)
+    assert all(owner._poisoned for owner in owners)
+    assert len(failed) == 1 and synced == [tmp_path]
+    staging = failed[0].parent
+    assert not (staging / 'h3_transaction.json').exists()
+    assert not list(managers[0].root.rglob('complete.json'))
+    assert not (managers[0].root / 'latest.json').exists()
+    assert not (managers[0].root / 'step-2').exists()
+    assert managers[0].latest_complete() is None
+    last = json.loads(sim.trace[-1][1][0])
+    assert last[1].endswith('/publish') and last[5] is False
+    _all_failed(_save(sim, owners, models, contract, progress))
+    assert sim.trace == [] and len(failed) == 1  # no retry or finally collective
+    for model in models:
+        model.close()
+
+
 def test_h3_publish_unsafe_data_and_midcollection_fail_before_codec(tmp_path, monkeypatch):
     sim, _, managers, models, contract, progress, calls = _setup(tmp_path, monkeypatch)
     for defect in ('reservation', 'tensor', 'cursor', 'content', 'behavior', 'cold-proof'):
