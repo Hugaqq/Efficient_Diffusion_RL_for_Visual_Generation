@@ -1,0 +1,73 @@
+# DECLARATION TEMPLATE ONLY. Null identities/paths/budget and [] UUIDs are
+# intentionally rejected. Fill verified LOCAL artifacts and the eight actually
+# authorized GPU UUIDs; this file is NOT resource/GPU/HPS-service approval.
+# compile_h3_profile + preflight_h3_profile are the current read-only ports.
+# Default python -m visual_rl.train routing is a subsequent integration task.
+schema_version: 2
+recipe: h3_t2va_mvp_v1
+
+overrides:
+  model:
+    params:
+      height: 256
+      width: 384
+      frames: 124
+      fps: 24
+      guidance_scale: 1.0
+      lora_rank: 32
+      lora_alpha: 64
+  training:
+    group_size: 8
+    num_steps: 10
+# Fixed: WORLD8/SP1/TP1, B1/chunk1, full-N joint AV CPS including q0,
+# video/audio shift12/3, eta.7, FP16 action/FP32 score, frozen replay old,
+# AdamW 1e-4/(.9,.999)/eps1e-12/wd0, PPO clip.005/beta0/norm1/constant LR.
+# Reward=h3_hpsv3_video_only_v1, weight1, all124/top37; NO audio-quality metric.
+launch:
+  output_dir: ../../runs/h3-mvp-new
+  resume_from: null
+  resume_policy: complete_collection_same_topology
+  seed: 42
+  max_optimizer_steps: 2
+  checkpoint_every_optimizer_steps: 1
+  execution:
+    world_size: 8
+    sp: 1
+    tp: 1
+    gpu_uuids: []  # Required ordered list of eight real authorized GPU-UUIDs.
+  artifacts:
+    model: null
+    text_cache: null
+    train: null
+    eval: null
+    hps_manifest: null
+  expected:
+    model_sha256: null  # Expected artifact identity, NOT verified by header preflight.
+    train_sha256: null
+    eval_sha256: null
+    hps_service_identity: null  # Must bind a genuine124-frame manifest, not old81.
+    cache_identity:
+      model_sha256: null
+      encoder_sha256: null
+      tokenizer_sha256: null
+      processor_sha256: null
+      template_sha256: null
+      truncation_sha256: null
+      target_layer: 50
+      normalized: false
+      add_special_tokens: false
+      feature_dim: 5120
+      dtype: bfloat16
+  budgets:
+    host_weight_bytes: null  # Explicit user resource budget required; no host RSS guarantee.
+    trajectory_bytes: 536870912
+    media_bytes: 268435456
+    decode_bytes: 1073741824
+    condition_bytes: 134217728
+    max_tokens: 512
+    embedding_bytes: 10485760
+    prompt_file_bytes: 16777216
+  hps:
+    origin: null  # Explicit authorized loopback origin: http://127.0.0.1:<port>.
+    timeout_s: 1800.0
+    max_response_bytes: 8388608
