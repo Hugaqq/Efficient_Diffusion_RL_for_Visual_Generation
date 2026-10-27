@@ -30,18 +30,21 @@ class _ValueEnum(str, Enum):
 class TaskKind(_ValueEnum):
     T2I = "t2i"
     T2V = "t2v"
+    T2VA = "t2va"
     I2V = "i2v"
 
 
 class MediaKind(_ValueEnum):
     IMAGE = "image"
     VIDEO = "video"
+    AUDIO = "audio"
 
 
 class LatentLayout(_ValueEnum):
     BCHW = "bchw"
     BCTHW = "bcthw"
     PACKED_SEQUENCE = "packed_sequence"
+    JOINT_AV_FLAT = "joint_av_flat"
 
 
 class PredictionType(_ValueEnum):
