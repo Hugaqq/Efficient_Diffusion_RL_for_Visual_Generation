@@ -172,7 +172,7 @@ class H3Adapter(ModelAdapter):
 
     def _prepared_forward(self, **kwargs):
         # Deliberately no root autocast: the H3 projections own FP32 alignment.
-        return self.prepared_components.forward("transformer", **kwargs)
+        return self._forward_prepared("transformer", **kwargs)
 
     def predict(self, model_input: H3ModelInput) -> ModelPrediction:
         self._require_loaded()
