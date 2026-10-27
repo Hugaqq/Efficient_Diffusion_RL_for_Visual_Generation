@@ -141,6 +141,7 @@ def test_h3_prepare_owner_order_final_optimizer_guard_and_real_bridge_step(tmp_p
     assert leaves.events == ['cuda', 'metadata', 'read', 'mesh', 'ac', 'shard', 'ac', 'shard',
                              'materialized/setter', 'optimizer']
     assert leaves.setter_keys == [set(meta.state_specs)] and len(leaves.meshes) == 1
+    assert prepared.reducer_divisor == h3_fsdp.H3_REDUCER_DIVISOR == 8.0
     final_params = dict(prepared.trainable_named_parameters())
     assert len(final_params) == len(meta.lora_names)
     assert all('._checkpoint_wrapped_module.' in n for n in final_params)
@@ -295,6 +296,36 @@ def test_h3_prepare_metadata_includes_seed_precision_and_adapter_scaling(tmp_pat
     layer = meta.model.get_submodule(meta.target_names[0])
     layer.scaling['default'] *= 2
     assert digest != h3_fsdp._metadata_digest(meta, 42, 10**8, options, False)
+
+
+def test_h3_fsdp_public_reducer_divisor_setter(monkeypatch):
+    import torch.distributed.fsdp as fsdp
+    from torch.distributed.fsdp import FSDPModule
+    assert hasattr(FSDPModule, 'set_gradient_divide_factor'), torch.__version__
+    group, other_group = SimpleNamespace(), SimpleNamespace()
+    state = SimpleNamespace(_fsdp_param_groups=[group, other_group])
+    carrier = SimpleNamespace(_get_fsdp_state=lambda: state)
+    # The real public setter, with only its non-collective state leaf replaced.
+    FSDPModule.set_gradient_divide_factor(carrier, 8.0)
+    assert group.gradient_divide_factor == 8.0
+    assert other_group.gradient_divide_factor == 8.0
+
+    class StateOnlyBlock(FSDPModule, torch.nn.Module):
+        def _get_fsdp_state(self):
+            return state
+    # Empty CPU state carrier, not a fake DTensor or actual sharded model.
+    # Exercise the production block leaf calling that same public setter.
+    group.gradient_divide_factor = other_group.gradient_divide_factor = None
+    with monkeypatch.context() as patch:
+        patch.setattr(fsdp, 'fully_shard', lambda *args, **kwargs: None)
+        block = object.__new__(StateOnlyBlock)  # bypass FSDPModule's dynamic-class factory
+        torch.nn.Module.__init__(block)
+        h3_fsdp._shard_block(block, object())
+    assert group.gradient_divide_factor == other_group.gradient_divide_factor == h3_fsdp.H3_REDUCER_DIVISOR
+    with monkeypatch.context() as patch:
+        patch.setattr(FSDPModule, 'set_gradient_divide_factor', None)
+        with pytest.raises(RuntimeError, match='no default-reduction guess'):
+            h3_fsdp._require_apis()
 
 
 def test_h3_prepare_real_leaf_options_and_fail_closed_sharding(monkeypatch):
