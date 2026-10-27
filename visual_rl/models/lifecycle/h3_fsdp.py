@@ -23,15 +23,23 @@ from visual_rl.models.lifecycle.prepared import (
 )
 
 
+# Explicitly installed on every block; never inferred from a default AVG op.
+H3_REDUCER_DIVISOR = 8.0
+
+
 def _require_apis():
     # Resolve before weight reads, wrapping, or heavy collectives. Do not fall
     # back to FSDP1/Accelerator or relax strict state loading on older versions.
-    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper, CheckpointImpl
 
-    required = ((fully_shard, {'mesh', 'reshard_after_forward', 'mp_policy'}),
+    divide = getattr(FSDPModule, 'set_gradient_divide_factor', None)
+    if not callable(divide):
+        raise RuntimeError('H3 requires FSDP2.set_gradient_divide_factor; no default-reduction guess')
+    required = ((divide, {'factor'}),
+                (fully_shard, {'mesh', 'reshard_after_forward', 'mp_policy'}),
                 (MixedPrecisionPolicy, {'param_dtype', 'reduce_dtype', 'cast_forward_inputs'}),
                 (StateDictOptions, {'full_state_dict', 'broadcast_from_rank0', 'strict'}),
                 (set_model_state_dict, {'model', 'model_state_dict', 'options'}),
@@ -145,6 +153,9 @@ def _shard_block(block, mesh):
                                                cast_forward_inputs=False))
     if not isinstance(block, FSDPModule) or any(not isinstance(p, DTensor) for p in block.parameters()):
         raise RuntimeError("FSDP2 did not shard every main-block parameter")
+    # Public replacement for deprecated set_reduce_scatter_divide_factor.
+    # One-dimensional WORLD sharding: sum of rank gradients divided by 8.
+    block.set_gradient_divide_factor(H3_REDUCER_DIVISOR)
 
 
 def _set_full_state(model, state):
@@ -189,6 +200,11 @@ class H3PreparedModel(PreparedComponentHandle):
 
     def trainable_named_parameters(self):
         return self.prepared_root.trainable_named_parameters()
+
+    @property
+    def reducer_divisor(self) -> float:
+        self._require_open()
+        return H3_REDUCER_DIVISOR
 
 
 def prepare_h3_fsdp(
