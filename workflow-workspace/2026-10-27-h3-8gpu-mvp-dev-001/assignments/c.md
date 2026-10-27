@@ -1,36 +1,40 @@
-# Assignment C — W1
+# Assignment C — W2
 
 - active: true
-- task_id: H3-M3a-prepare
+- task_id: H3-M3b1-world-credit
 - pair: coding-c → simplifier-c
-- execution: parallel W1；见decisions/wave-01.md
-- integration_parent: `b7f938506f16034ac5d2896ddfa44c16eb4af83d`
-- source_dependencies: loader snapshot `919b6abc7920f2dbcea764907152523882a09a59`、forward snapshot `edd5c874f10ffa917a71bd9f2fa9085247075a6e` 已approved；无待返工。
+- execution: parallel W2；decisions/wave-02.md
+- integration_parent: `47546f94e7490dafcc3fdbc2eb57279f0839899d`
+- dependencies: W1 prepare配对approved，源码汇合467c8fd929804aa291bf01a5fa7cda372cc507db；现objective/advantage稳定。无changes待修。
 
-## 唯一目标/文件
+## 唯一功能/允许文件
 
-实现**消费已批准loader的单节点WORLD8 FSDP2 prepare→全rank物化→最终参数optimizer** 窄生产入口，非新runner。仅写新 `visual_rl/models/lifecycle/h3_fsdp.py`、新 `tests/test_h3_mvp_cpu_prepare.py`、本目录 `coding-c/H3-M3a-prepare.md`。现loader/组件/PreparedModelBundle/ParameterStateManager/runtime/旧tests只读；不import A/B本波新模块。不直接接controller或改旧single路径。
+实现**固定等量rank工作量准入 + 完整world reward统计/credit与明确loss尺度**。不做整套phase scheduler或optimizer执行器。
 
-## 冻结输入/输出
+允许新 `visual_rl/algorithms/optimization/h3_world.py`、新 `tests/test_h3_mvp_cpu_world.py`；仅为固定/暴露真实FSDP reducer divisor可精确修改 `visual_rl/models/lifecycle/h3_fsdp.py` 与 `tests/test_h3_mvp_cpu_prepare.py` 相应断言（不删旧断言）。W/coding-c/H3-M3b1-world-credit.md。其余已批准模块/旧tests只读，不import A/B本波新模块。
 
-- 消费 `H3MetaModel`：model全参数meta、block_names、target_names、state_specs、base_to_model、lora_names、nonpersistent_buffers；调用真实 `load_h3_cpu_state` 生成rank0完整CPU输入。只在rank==0调用，其他rank空state参与同一setter，不相信外部is_init_owner标记代替真实rank检查。
-- 接收**调用者已初始化**的WORLD process group、当前CUDA device/逻辑rank及明确host预算/init seed/optimizer超参；此模块不init/destroy PG、不创建Accelerator。生产拒非WORLD8/非单节点rank布局/非CUDA/SP或TP不为1，以及已materialized/已prepare模型。不默认具体物理UUID；资源授权由后续launcher准入。
-- 真实lazy PyTorch FSDP2 API：单WORLD8 device mesh，按meta.block_names对主blocks fully_shard，reshard_after_forward=True、reduce FP32、forward parameter BF16、cast_forward_inputs=False。root不fully_shard，root/refiner保持冻结复制和既有FP32岛；全部可训练必须属于分片主blocks。若目标FSDP API不能支持当前BF16 frozen/FP32 master组合，报告证据与最小修正请求，不无声整体cast或用假DTensor冒充。
-- 一条外部nonreentrant block activation checkpoint路径，内部gradient_checkpointing必须关闭。包裹顺序明确，保持或显式映射state FQN，不因wrapper改名放宽strict。使用真实PyTorch checkpoint_wrapper/fully_shard，不搬UniRL完整backend；先读参考LICENSE与wrap/state并核对实际可用API。
-- **先wrap/meta分片再物化**；禁止任一GPU先装完整模型。使用真实DCP `set_model_state_dict` 等全rank API，full_state_dict/broadcast_from_rank0/strict选项准确，rank0输入完整base+LoRA，其他rank也调用。不能把load_state_dict(assign=True)当真实FSDP setter；那只能是CPU测试的明确leaf替身。未支持API必须早拒，不能NotImplemented占位。
-- 持久buffer随完整state；to_empty若破坏构造buffer，显式恢复loader的`rope.inv_freq`并核验dtype/shape/值，所有rank相同；不得空buffer。模型/LoRA初态统一，元数据（config/shape/dtype/LoRA初始seed/blocks）在潜在重collective前一致性准入；可用有界小表，不allgather全权重。此项只负责初始化一致性，整个训练phase计划以后单独实现。
-- 所有参数物化、精度/LoRA范围核验后才构造真实AdamW及可选constant scheduler，optimizer参数恰是最终trainable参数对象，没有旧metaParameter引用或重复；默认lr1e-4/betas(.9,.999)/eps1e-12/wd0，参数可显式锁定。不要先构造旧ParameterStateManager后删除其身份保护来兼容变更。
-- 复用现 `PreparedModelBundle` forward guard/单入口（可以在物化后构造bundle，优化器对象校验用现validate_optimizer_parameter_subset）；返回最小prepared结果，暴露一个模型callable和optimizer/最终参数信息，确保既有h3_t2va_forward可消费。优先复用现 `PreparedComponentHandle` 的可行部分，不强行调用accelerator.prepare第二次、不另实现复制guard框架。若旧handle要求accumulate适配，明确窄backend能力，不fake全Accelerator。
-- 模型eval但允许grad；close只释放本地guard/引用，不暗加collective或关调用者PG。失败不写checkpoint、不barrier补救，不尝试回滚已执行部分collective；上层负责整attempt失败。
+## 数据/通信合同
 
-## CPU验收与证据边界
+- 生产单节点WORLD8/SP1/TP1，使用调用者已初始化PG，不init/destroy。每rank相同正样本数、固定group_size K>=2、N policy步、rollout/replay B1、chunk1、guidance1/beta0与共同geometry/score profile；一次完整collection一次update。各rank sample metadata为有序 `(sample_id,group_id,member_index)`，group_id为prompt occurrence，local_complete组成员0..K-1恰齐。全world sample唯一，group不可跨rank拆散；不按重复prompt文本合组。
+- 公开小型plan/admission函数在任何模型调用前收集并验证全rank有界metadata：collection_id/behavior_id、rank/work量、N/geometry/score标识和样本键。空/uneven/重复/缺member/不一致schedule/profile先拒；不是仅检查sum除得尽。返回固定global sample顺序/索引或最小不可变plan，后续phase实际按此序执行；不传媒体、latent、tensor权重。
+- 本rank可协作预检失败要先编码为有限小错误receipt并参与同次健康汇合，让所有存活rank统一拒绝；不能某rank本地raise而其他开始model collective。死亡/collective内部失败仍由上层timeout退出，本模块不承诺救活。
+- reward输入为每个样本三元组+finite float reward，已由真实scorer按固定权重合成；汇合仅小表。绑定plan/collection/behavior，完整每条sample恰一次、identity吻合、valid全真；NaN/缺样/重复/换组/成员或非法rank拒绝，不能丢样重归一化或换reward。设置明确表大小/样本上限。
 
-不运行真实CUDA/NCCL/多进程网络。目标测试只替cuda admission、mesh/FSDP collective/state setter等不可本机执行的**叶子API**；生产默认真实API存在并lazy调用，不能有CPU伪分片作为生产fallback，不mock整个prepare函数。
+## 数学锁
 
-使用真实tiny loader/PEFT产物（可复用原目标模块只读helper或独立小fixture，不修改原test文件），验证准确事件顺序：rank0读取一次、非owner不读→AC/shard→物化/setter/真实buffer恢复→最终参数校验→optimizer构造。CPU leaf setter可显式用strict assign=True来模拟最终参数替换，证明Adam持有新的参数对象。真实torch优化器step、prepared guard和bridge forward/backward执行，拒raw旁路/二次prepare/非法topology/stray trainable/缺buffer或不完整state；失败时没有optimizer或隐藏collective cleanup。记录哪些leaf为fake，不把记录的8rank参数当真实多rank证据。
+- 组内mean，**完整唯一world collection** std（ddof0），CPU float64计算 `(reward-group_mean)/(global_std+1e-4)`，输出detached CPU FP32按sample_id对齐。无额外advantage clip，不继承旧±5。全相同reward输出精确零信用，不skip optimizer（本项不执行optimizer）。
+- 先查现 `GroupZScoreAdvantageProcessor` 数学：若可用真实身份/RewardResult窄适配复用则复用；不要为复用而制造假Trajectory/media/condition。若直接实现H3小表数学，保持极短单一实现并与现processor/独立手算交叉测试，不造第二通用normalizer框架或改变旧路径。
+- 每slot当前objective loss为local格mean，系数 `d * n_slot / N_world_cells`，`N_world_cells = world_unique_samples*N`，包括末步q0；不能只local分母、不能又除GA/world/J。正常一格时d8，K8,N10→1/80（经FSDP平均后每全局格1/640）。接口明确n_slot/global_count/reducer_divisor，严格positive/count边界。
+- d不能仅因为world=8猜测。核对实际公开FSDP2归约API，优先在现 `_shard_block` 显式设置支持的reduce-scatter divide factor8并检查能力，在prepared结果暴露锁定divisor给上层；不私自改变参数dtype/wrapping/AC。若仅依赖默认平均，需给实际API/实现证据及fail-closed版本/能力锁，不能凭CPU模拟声称真实GPU归约已验。接口不可实现时据实报告，不写恒定伪后端。
 
-测试独立写 `test_h3_mvp_cpu_prepare.py`，核验导入当前worktree。最后编辑后跑plan最新版固定Flash七项与H3通配符集，无skip/xfail/全量，记录exit/数量/时间/branch/HEAD及diff/check。若权限/API确实不足就报告blocked，不能为门禁通过关闭保护。
+## 真实CPU验收
+
+不创建真实PG/网络/GPU。只替collective/设备叶子，实际小表admission、排序/覆盖、归一化和系数实现不mock。8rank tiny表（可K2,N3）证明共享组身份、重复prompt不合并、global std与每rank std不同；local列顺序变换不改最终sample credit。模拟所有rank一次receipt汇合并对非法局部输入统一拒绝，model callback零次。
+
+用真实现 `ClippedSurrogateObjective` / `PolicyLossInputs` beta0、多个trainable tiny rank副本，所有loss格累积并按实际约定d做梯度平均，与单进程完整global cell mean的loss/grad/update容差对照；不复制PPO公式替代所测objective。对uneven/empty、missing/duplicate/invalid reward/合同错配、错误slot计数拒绝；全零优势仍产生图连接有限零梯度。真实reducer setter/选项在独立叶子测试核验，明确不是CUDA collective证据。
+
+最后源码编辑后跑plan固定Flash7项与完整H3通配符，原断言保留，无skip/xfail/全量。记录实际branch/HEAD、命令/exit/数量/时间、公共接口/后端divisor证据与diff/check；不手工commit/merge/push。
 
 ## 非目标
 
-本项不做world advantage/loss归约/global grad norm、rollout/评分/锚、data/tail、checkpoint或torchrun/controller接线。尤其不声称GPU/FSDP2实跑通过。后续在稳定prepared结果上接公共phase和world数学，C仍为owner。Simplifier C审真实生产API顺序、最终参数/buffer/精度/单owner、未重写runner以及CPU证据边界；changes回C修复两集重测。GPU_PENDING。
+不做实际RolloutStage/OptimizeStage/world阶段切换、全局grad norm/clip、optimizer/tail/checkpoint、媒体decode/reward服务或controller。下一项在本plan上接实际同序模型事件/健康门和global norm，不把此表准入当所有故障安全。Simplifier C重点审world归一化/d*n/N、完整group/身份、collective拒绝路径和后端divisor证据；changes回C。GPU_PENDING。

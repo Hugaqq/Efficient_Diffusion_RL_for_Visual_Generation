@@ -1,32 +1,37 @@
-# Assignment B — W1
+# Assignment B — W2
 
 - active: true
-- task_id: H3-M2a3a-text-cache
+- task_id: H3-M2a3b-decode
 - pair: coding-b → simplifier-b
-- execution: parallel W1；见decisions/wave-01.md
-- integration_parent: `b7f938506f16034ac5d2896ddfa44c16eb4af83d`
-- source_dependencies: forward `edd5c874f10ffa917a71bd9f2fa9085247075a6e`、loader `919b6abc7920f2dbcea764907152523882a09a59` 已approved。当前无changes；原loader不再修改。
+- execution: parallel W2；decisions/wave-02.md
+- integration_parent: `47546f94e7490dafcc3fdbc2eb57279f0839899d`
+- dependencies: 既有geometry/forward/loader及W1 text cache approved；源码汇合467c8fd929804aa291bf01a5fa7cda372cc507db。当前无changes。
 
-## 唯一目标/允许文件
+## 唯一目标/文件
 
-实现**严格本地离线H3 text embedding读取与训练/评估全覆盖准入**，供既有forward的trimmed `[1,L,5120]`输入。仅写新 `visual_rl/models/implementations/h3_text_cache.py`、新 `tests/test_h3_mvp_cpu_text_cache.py` 及本目录 `coding-b/H3-M2a3a-text-cache.md`。既有loader/forward/geometry/旧测试只读；不修改或import A/C本波新文件，无共享文件写入。
+实现**真实本地双VAE逐条CPU解码**，输出音视频联合媒体供后续reward消费；不实现reward、不造服务/runner。
 
-## 输入输出锁
+只写新 `visual_rl/models/implementations/h3_decode.py`、新 `tests/test_h3_mvp_cpu_decode.py`、W/coding-b/H3-M2a3b-decode.md。已批准geometry/joint/loader/cache/测试只读，不引用A/C本波新模块。
 
-- 窄 `H3TextCache` 类或等效reader，只接受本地目录与显式expected身份、max_tokens、max_embedding_bytes。没有Qwen/tokenizer加载、在线miss fallback、自动生成缓存或下载。missing train/eval prompt应在模型phase前拒绝。
-- 公开 `verify_coverage(train_prompts, eval_prompts)` 与 `get(prompt)`；coverage检查两集合每个精确字符串，不strip/normalize，不把组occurrence身份混进cache key。get返回拥有副本的CPU detached `[1,L,5120]`、保留显式存储dtype、无padding（存储本来为精确有效L）；不得猜零token为padding或返回占位全零向量。
-- 来源读 `reference/UniRL/LICENSE`、`offline_text_embed.py` 和 `text_embed.py`：H3层50、未加最终norm、feature5120、text-only无额外special tokens。这里只验证cache声明/身份，不冒称从embedding数值证明生成过程正确。
-- 定义一个最小显式版本化本地index+真实safetensors schema并写在模块docstring/交付中；优先沿上游layout，但必须补足模型/encoder权重、tokenizer/processor、模板/截断、层50/unnormalized、dtype等身份校验。expected身份由未来recipe/artifact绑定提供，不能自行填常量通过。若与上游raw index不兼容，应明确拒绝，不能声称任意UniRL cache直接兼容。无需本项实现writer或转换脚本。
-- 精确prompt SHA256键及shard/tensor键和完整file SHA256绑定；本地路径逃逸/重复JSON键/重复映射/缺失shard/hash漂移/metadata错配明确拒绝。避免无界打开shard handle或加载整个shard；每次只读一条，读取后关闭。header形状/dtype/token/bytes上限应先于payload访问，finite检查后才交付。合法零值不等于占位，可接受真实有限tensor，但不得生产常量embedding。
-- 不按每条记录重复存全模型身份/大manifest，不做通用resource cache平台。身份由reader拥有固定摘要，后续checkpoint可绑定；实际读文件需核验和所声明的hash一致，不能hash另一个路径。文件修改不能继续静默使用旧身份；使用现core/filesystem_identity工具或最小明确检查，不靠mtime单独替代内容。
-- feature_dim生产固定5120；tiny测试L可小但维度不需要缩成假H3。FP32/BF16/FP16支持范围明确并与expected dtype严格一致，不隐式cast。上层adapter将自行搬设备，本项不碰GPU。
+## 生产调用与数据合同
 
-## 实测验收
+- 本地artifact目录→真实lazy公开Diffusers `AutoencoderKLMiniMaxH3` / `AutoencoderKLMiniMaxH3Audio`（从已读vendor对应真实模块路径核对），`from_pretrained(...,subfolder='vae'/'audio_vae',torch_dtype=float32,local_files_only=True)`。只接受本地存在目录，路径逃逸/缺config/无API清楚拒绝；无下载、remote-code、reference导入或tiny fallback。缺可选依赖分支明确错误，不能硬编码返回假media。
+- 第一版固定**CPU**非prepared aux，无额外GPU；模型eval+requires_grad false，所有浮点参数/相关buffer保持FP32，不能把audio VAE BF16。每次只解一个sample，video VAE与audio VAE顺序加载/用完释放，不长期保存两套重模型或全collection媒体；上层未来负责rank-turn并发1。本项测试只替重量级类解析/模型叶子。
+- `decode_one(terminal, geometry, ...)` 接受既有 H3T2VAGeometry 和CPU detached FP16 `[1,packed_width]`；layout.unpack拆两流。使用真实unpatchify顺序将video `[V,96]`还原`[1,24,T_lat,H_lat,W_lat]`，audio channel-major `[2*A_lat,32]`还原`[2,32,A_lat]`。不删音频/伪造batch/dummy frame。
+- 读取VAE config中各24/32通道 `latents_mean/latents_std`，要求完整finite且std>0，FP32反归一化`latent*std+mean`；不能用scalar scaling_factor或缺配置默认0/1。调用真实decode(return_dict=False)。
+- video输出必须`[1,3,num_frames,height,width]`、有限；逆ImageNet pixel norm(mean .485/.456/.406,std .229/.224/.225)，clamp[0,1]后转CPU FP32 `[T,3,H,W]`。帧数必须与124等明确geometry精确一致，不改121/删尾帧。
+- audio decoder真实返回`[2,1,L]`，转CPU FP32 `[L,2]`；校验config sampling_rate=32000、模型hop_length=800，L=audio_latents*800，不能缺值默认一个采样率。保留真实幅度，不默默clip/删静音。audio rounding造成的时长与视频轻微不同要在媒体元数据实际记录，不暗trim/pad以假装严格相等。
+- 返回最小AV媒体结果，含video/audio、fps24/sample_rate32000及实际frame/sample count。可用context-managed单条lease，在消费者退出后释放owner引用并拒重入/第二条在途，禁止返回永久媒体列表。没有完整pool的decode循环。
+- 显式max_media_bytes及必要decode工作空间预算/单条在途上限；预估反归一化latent+输出/转换副本在load/decode之前检查，超过上限不能缩画布或改dtype。该估算不是VAE权重/内部workspace/总RSS保证，要清楚分列模型资源预算仍需实测。失败释放已载leaf引用且不产半套AV；不靠GC日志宣称GPU内存已回落。
 
-用tmp_path真实JSON/safetensors，不mock reader/hash/safetensors：两shard/多prompt、train和heldout覆盖、精确空白差异key、合法L和维度/dtype、输出detached拥有副本。缺train/eval项、错误层/norm/encoder/tokenizer/template身份、重复key、路径和symlink逃逸、hash/tensor篡改、非有限/错误shape/dtype、token/byte上限在payload读前拒绝。测试get结果实际进入既有h3_t2va_forward（tiny transformer叶子）而非只有reader自身assert；不需要C prepare或A锚。
+## 来源/验收
 
-仅新feature测试文件；原22项不动。最后源码编辑后运行plan最新版两条命令：原Flash七项和H3通配符 `tests/test_h3_mvp_cpu*.py`，无skip/xfail/全量。交付记录实际branch/HEAD、命令/exit/数量/时间、source diff/check与schema/下游接口。引擎提交隔离分支，不手动commit/merge/push。
+先读UniRL LICENSE和 `minimax_h3/vae.py`、vendor `packing.py` 的unpatchify/unpack、两个autoencoder的真实config/decode API及文件头。只独立实现必要数学/调用；若需复制非平凡源码及license路径扩大先报告，不整vendor。
+
+目标测试用真实geometry/packing/反归一化/输出转换与lazy调用控制，只重VAE叶子tiny：逐位置独立参考unpatchify，非均匀mean/std，stereo顺序、pixel反归一化，严格124帧/采样率/hop/actual lengths；leaf断言FP32 eval/no_grad/local_files_only。两leaf生命周期顺序及失败不返回半媒体、超限在load/decode前拒绝、第二lease拒绝、退出释放引用；非法dtype/shape/finite/config/输出长度明确拒绝。无恒定伪媒体作为生产实现；tiny输出依赖输入以证明路径真实。
+
+保持原44项及断言，独立feature文件核验worktree导入。最后编辑后跑plan固定Flash七项和H3通配符，无skip/xfail/全量；报告branch/HEAD、命令/exit/数量/时间、diff/check及精确下游接口。引擎commit，不自行操作Git发布。
 
 ## 非目标
 
-不做text生成、VAE decode/reward服务、loader修订、profile/registry/controller、FSDP/PG/checkpoint。VAE作为后续独立项，不将其偷省为未来优化。Simplifier B检查身份/层语义、严格覆盖和有界真实读取、可调用forward消费者与不必要平台化；changes回B修复重测。CPU不证明真实encoder产物/权重兼容或质量，GPU_PENDING。
+不改text cache、ModelAdapter/registry/controller、FSDP/world/pool，不执行ffmpeg/媒体写盘/真实reward。解码必须后续由RewardStage在完整rollout后调用，不能据本项称实际视频质量验证。Simplifier B只审本项数学/真实依赖/有界生命周期，changes回B重测。GPU_PENDING。
