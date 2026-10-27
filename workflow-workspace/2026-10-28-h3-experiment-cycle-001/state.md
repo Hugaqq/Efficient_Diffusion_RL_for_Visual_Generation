@@ -1,6 +1,12 @@
 # 当前状态 — 2026-10-28 / Experimenter首次推进
 
-阶段：repair-artifact-admission。下一owner=Coder，本角色返回repair。
+阶段：needs-input-ssh-connectivity。本轮返回needs_input，请求步骤边界暂停，用户/主会话确认固定SSH稳定后恢复；不是因正式步数缺失暂停。
+
+## 第二轮最新观察
+
+本地HEAD8f5b9db5d045668acb348272c80e84050f3d2773。Coder返回need_experiment，需完整converter/原生配置/安装源hash/既有转换产物。exp002-discovery-001只读SSH连接超时code255；第二次exp002-host-connectivity-002仅返回主机名与GPU0空闲后server not responding，code255。两次只读均有回执，无新mutating操作，不再继续重试。详见needs-input.md和experimenter/environment-002-connectivity.md。
+
+本轮未启动/停止job，未publish/deploy或运行CPU回归。以下首轮job退出与资源信息为最后成功观察，本轮无法刷新；H3-EXP-001仍open，Flow0/Flash0。恢复后先inspect，再继续材料收集。
 
 ## 已完成
 
@@ -21,7 +27,7 @@ probe exit1，真实`build_h3_meta`先因原HF blob symlink超出组件目录拒
 - PID765033/start_ticks71836860/created1793131214.535802；child765034。
 - started1793131214.577547 → ended1793131229.123795，exit1，running=false。
 - `/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/artifact-admission-probe-001/{spec.json,owner.json,child.json,heartbeat.json,exit.json,job.log}`保留。
-- 无活跃训练，无未知远端副作用；没有重放、stop或kill。
+- 首轮最后成功观察无活跃训练；本轮连接失败未刷新远端job状态。无新mutating操作/未知副作用；没有重放、stop或kill。
 
 ## 后续
 
