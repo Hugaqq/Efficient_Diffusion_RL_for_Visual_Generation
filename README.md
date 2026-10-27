@@ -43,6 +43,20 @@ score receipt，不是手写占位。最终 general/3D marker SHA-256 分别为 
 `a6c961fc…`。这些 identity 只证明本次冻结的 artifact/service 绑定；空目录、手写占位或
 另一次部署仍不构成可用 artifact，也不能继承本次 A7 结果。
 
+## 七项 CPU baseline
+
+在已安装训练依赖和 pytest 的环境中，从实际 checkout/worktree 根目录运行：
+
+```bash
+export VISUALRL_FLASH_AUTHOR_DATA=/absolute/path/to/Flash-GRPO/dataset/video
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider
+```
+
+数据目录必须包含原始 `train.txt`（19700行）和 `test.txt`（300行）；现有内容哈希与选择校验保留。
+不设置环境变量时，测试读取仓库内 `reference_code/flash_grpo/dataset/video/`，该目录已被 Git 忽略。
+独立 worktree 应通过环境变量复用原始数据，不依赖 checkout 的父目录层级。测试不下载数据，缺数据明确报错而不是跳过。
+这七项是 CPU fake-leaf 回归，不代表真实 GPU、HTTP、视频质量或 H3 分布式验证通过。
+
 ## schema-v2 配置
 
 | 配置 | 组合 | 定位 |

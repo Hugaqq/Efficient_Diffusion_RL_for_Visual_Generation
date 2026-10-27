@@ -1,5 +1,6 @@
 """CPU integration only: real controller/stages/kernel, fake model/reward leaves."""
 import json
+import os
 from pathlib import Path
 import weakref
 
@@ -11,6 +12,20 @@ import yaml
 from tests import test_default_composition_e2e as e2e
 from tests import test_v2_demo_default_composition as demo
 from visual_rl.runtime.composition import create_default_run_controller
+
+
+def _author_data_dir():
+    configured = os.environ.get("VISUALRL_FLASH_AUTHOR_DATA")
+    root = (Path(configured).expanduser() if configured else
+            Path(__file__).resolve().parents[1] / "reference_code/flash_grpo/dataset/video")
+    missing = [name for name in ("train.txt", "test.txt") if not (root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing Flash-GRPO author data at {root}: {', '.join(missing)}. "
+            "Set VISUALRL_FLASH_AUTHOR_DATA to the original dataset/video directory "
+            "or copy train.txt and test.txt to reference_code/flash_grpo/dataset/video."
+        )
+    return root
 
 
 def config(root, artifacts, output, *, resume=None, steps=2, rows=192):
@@ -426,7 +441,7 @@ def test_real_ode_evaluation_stage_runs300x50_and_reuses_durable_receipts(monkey
     from visual_rl.models.implementations.wan import WanT2VAdapter
     from visual_rl.algorithms.trainer.flash_presets import SMALL40
     from scripts.launch_flash140 import SMALL_CONFIG
-    author = Path(__file__).resolve().parents[3] / "dataset/video"
+    author = _author_data_dir()
     assert author.is_dir()  # task's local author data, not downloaded fixtures
     # Restore the actual loader used in production (the earlier300 case used synthetic prompts).
     monkeypatch.undo()
@@ -733,7 +748,7 @@ def test_approved140_manifest_counts():
     assert SMALL40.evaluation_steps == (0, 20, 40)
     assert SMALL40.prompt_count * len(SMALL40.evaluation_steps) == 48
     assert SMALL40.sampling_steps == 20 and SMALL40.save_videos
-    author = Path(__file__).resolve().parents[3] / "dataset/video"
+    author = _author_data_dir()
     selected = select_small40_prompts(load_evaluation_prompts(author / "test.txt"), author / "train.txt")
     assert len(set(selected)) == 16
     train = set((author / "train.txt").read_text().splitlines())
