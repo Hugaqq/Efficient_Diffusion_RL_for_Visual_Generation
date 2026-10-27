@@ -237,13 +237,28 @@ def prepare_h3_fsdp(
     model = meta.model
     model._h3_prepare_started = True
     state = {}
+    owner_error = None
     if rank == 0:
-        loaded = load_h3_cpu_state(meta, is_init_owner=True,
-                                   host_weight_limit_bytes=host_weight_limit_bytes, init_seed=init_seed)
-        state = loaded.state
-        if set(state) != set(meta.state_specs):
-            raise ValueError("incomplete owner initialization state")
-        del loaded  # state remains owned until the collective setter finishes
+        try:
+            loaded = load_h3_cpu_state(meta, is_init_owner=True,
+                                      host_weight_limit_bytes=host_weight_limit_bytes, init_seed=init_seed)
+            state = loaded.state
+            del loaded
+            if set(state) != set(meta.state_specs):
+                raise ValueError("incomplete owner initialization state")
+        except Exception as error:
+            owner_error = error
+            state = {}
+    # Every live rank reaches this gate before any mesh/wrapping/state collective.
+    status = hashlib.sha256(b"h3-init-ok" if owner_error is None else b"h3-init-failed").hexdigest()
+    try:
+        _agree_metadata(status, rank, process_group)
+    except BaseException as error:
+        if owner_error is not None:
+            raise owner_error from error
+        raise
+    if owner_error is not None:
+        raise owner_error
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper, CheckpointImpl
     mesh = _world_mesh(process_group)

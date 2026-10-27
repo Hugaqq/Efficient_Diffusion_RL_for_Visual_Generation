@@ -1,7 +1,7 @@
 """Controller prerequisite regression: cooperative prepare errors precede collectives.
 
-No controller implementation is claimed here. This intentionally exposes the
-W8 owner-boundary blocker; no skip/xfail and no real PG/CUDA/network is used.
+Regression for the W8 owner-boundary blocker; no skip/xfail and no real
+PG/CUDA/network is used. End-to-end entry tests live in test_h3_mvp_cpu_entry.py.
 """
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -82,7 +82,7 @@ def test_h3_controller_prepare_owner_read_failure_stops_all_ranks_before_mesh(tm
         futures = [executor.submit(prepare, rank) for rank in range(8)]
         errors = [future.result(timeout=20) for future in futures]
     assert isinstance(errors[0], ValueError) and 'nonfinite checkpoint tensor' in str(errors[0])
-    # Required W8 safety invariant. Currently fails: all seven peers reach mesh.
+    # Every peer must stop at the owner-read gate before entering mesh.
     assert entered_mesh == [], (
         'rank0 read failure is not cooperatively exchanged inside prepare; '
         f'peers entered mesh: {sorted(entered_mesh)}; '
