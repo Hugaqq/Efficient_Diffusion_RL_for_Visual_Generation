@@ -18,6 +18,8 @@ from visual_rl.models.scheduler import (
 )
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+    from visual_rl.models.implementations.h3_decode import H3AVMedia
     from visual_rl.data.media import DecodedMediaBatch
     from visual_rl.data.preprocess import PreprocessProducerSpec
     from visual_rl.models.lifecycle.components import (
@@ -171,6 +173,10 @@ class ModelLatentSpec:
             raise ModelPortError(f"{layout.value} requires axis_semantics={expected!r}")
         if layout is LatentLayout.PACKED_SEQUENCE and len(self.shape) < 3:
             raise ModelPortError("packed_sequence latent rank must be at least 3")
+        if layout is LatentLayout.JOINT_AV_FLAT and (
+            len(self.shape) != 2 or self.axis_semantics != ("batch", "joint")
+        ):
+            raise ModelPortError("joint_av_flat requires rank2 [batch,joint]")
         if not isinstance(self.dtype, torch.dtype):
             raise TypeError("latent dtype must be a torch.dtype")
         try:
@@ -609,7 +615,9 @@ class ModelAdapter(ABC):
         )
 
     @abstractmethod
-    def decode(self, latents: Any, latent_spec: ModelLatentSpec) -> DecodedMediaBatch:
-        """Decode final latents and report the model-owned media layout."""
+    def decode(
+        self, latents: Any, latent_spec: ModelLatentSpec,
+    ) -> DecodedMediaBatch | AbstractContextManager[H3AVMedia]:
+        """Decode final latents; H3 alone returns a bounded joint AV lease."""
 
         raise NotImplementedError
