@@ -10,11 +10,11 @@
 
 ## 当前轮更新
 
-W1三个原子项均获对应simplifier approved；代码汇合 `467c8fd929804aa291bf01a5fa7cda372cc507db`，含三审查记录的当前HEAD `47546f94e7490dafcc3fdbc2eb57279f0839899d`。Orchestrator已读三实现/交付/裁决，亲跑汇合Flash7/7（11.70s）、H3通配符44/44（3.09s），均exit0。原Flash完整历史diff仍为空。W1实现/CPU接收，不代表真实FSDP2/NCCL或MVP完成。
+W2三个原子项均获对应simplifier approved；代码汇合 `ced9a871df0ee6bfe8b560e90da03bc12d4dda0e`，当前HEAD `e436c192778a6bbf24e2bee7ebef777332138f9a`。Orchestrator读完整pool/decode/world与实际reducer接线、交付/裁决，亲跑Flash7/7（12.16s）、H3通配符65/65（3.46s），均exit0；原Flash完整历史diff仍为空。仅W2功能/CPU接受，不是完整MVP。
 
-**并行优先**继续实施W2：A真实CPS rollout有界CPU池、B双VAE逐条CPU解码、C等量world准入/credit和loss尺度；独立源码/feature测试，不依赖同波新代码。冻结数据交换见decisions/wave-02.md。W1记录保留，不能用暂存merge替代批准；具体分支/snapshot追踪见ledger。
+**W3实际阶段接线波**：A将现模块接原BaseTrainer六阶段（非新runner），B复用现HPSv3实现明确video-only reward，C实现必需阶段gate/aux轮转/global norm。窄scorer/coordinator接口在decisions/wave-03.md已冻结；A用必需结构接口，不import同波B/C文件，独立测试。汇合后要额外验证三对象实际兼容。
 
-W2后优先接现有stage/controller和真实reward，不继续以孤立helper堆数量代替闭环；global事件健康门/norm、完整tail与fresh checkpoint仍必须完成。完整candidate/GPU均未验收。
+明确首个reward profile=h3_hpsv3_video_only_v1（现all-124/top37 HPS，权重1）；不声称CLAP/ImageBind复现或音频质量，joint AV CPS元素权重不变。124帧服务资源尚未准入，不启动/访问旧81帧服务。task允许现有评分接口，这一选择避免另造平台或未核验许可下载。后续仍必须接ModelAdapter/recipe/唯一RunController与完整tail checkpoint/fresh恢复；不能把测试注入callback当生产装配已完成。
 
 ## 权限与完成边界
 
@@ -40,14 +40,15 @@ W2后优先接现有stage/controller和真实reward，不继续以孤立helper�
 | H3-M2a1-forward | B | 已实现真实T2VA几何、attention packing、双t与单次callable，连接CPS目标测试 | approved；snapshot edd5c87；目标17项，不称完整adapter |
 | H3-M2a2-loader | B | 已实现本地meta/LoRA/精度岛/严格CPU输入 | approved；snapshot919b6ab；H3目标22项 |
 | H3-M2a3a-text-cache | B | 已实现严格本地layer50 cache、覆盖、有界读取 | W1 approved；独立feature6项 |
-| H3-M2a3b-decode | B | 真实video/audio VAE逐条CPU decode与AV结果 | W2 active；双VAE FP32、严格真实长度/有界lease |
+| H3-M2a3b-decode | B | 已实现双VAE CPU真实调用与严格AV转换/lease | W2 approved；独立feature6项 |
+| H3-M2c-hps-reward | B | 现HPSv3真实评分adapter，显式video-only新profile | W3 active；不部署/访问服务、不改Flash |
 | H3-M2b-profile | B | H3 独立声明/recipe/registry 接入现 capability 与入口 | adapter 接口稳定；未知配置/不支持组合早拒，不改 Flash |
 | H3-M3a-prepare | C | 已实现WORLD8 prepare/最终optimizer及单guarded callable | W1 approved；独立feature10项；不是CUDA证据 |
-| H3-M3b1-world-credit | C | 等量计划准入、完整world reward/credit、显式d*n/N尺度 | W2 active；独立world测试，固定真实reducer合同 |
-| H3-M3b2-phase-norm | C | 实际同序阶段/健康门、唯一global gradient norm/clip | world plan稳定后接真实阶段；不以纯表检查代替 |
+| H3-M3b1-world-credit | C | 已实现world准入/完整credit/d*n/N及公开divisor8设置 | W2 approved；world8项+reducer1项 |
+| H3-M3b2-phase-norm | C | 同序健康gate/aux轮转/global唯一norm | W3 active；与A冻结必需接口，不是新runner |
 | H3-M4a1-anchor | A | 已实现一次性完整rank-local replay冻结锚 | W1 approved；独立feature6项；全rank阶段接线待完成 |
-| H3-M4a2-rollout-pool | A | 真实CPS采样→有界CPU轨迹/终态池、可信sample来源 | W2 active；只需既有CPS/forward/anchor，独立pool测试 |
-| H3-M4a3-stages | A | 现stages的pool→真实reward/credit→anchor→replay/更新整合 | W2输出稳定后优先接线，不另造runner |
+| H3-M4a2-rollout-pool | A | 已实现真实CPS采样→CPU轨迹/终态池 | W2 approved；独立feature6项 |
+| H3-M4a3-stages | A | 原BaseTrainer六stage实质接线/一次update及tail | W3 active；scorer/coordination强制注入，后续runtime提供真实对象 |
 | H3-M4b-tail-checkpoint | C | 完整 tail safe point，现 manager 的全rank codec/单writer，同拓扑 fresh optimizer 恢复 | 上述闭环稳定；模型/Adam/scheduler/data/RNG/语义覆盖，下一步对照 |
 | H3-M4c-production-integration | B | 补齐现 controller/唯一入口的生产装配、最小配置和 torchrun 说明 | 上述逐项 approved；tiny 端到端走真实控制链，不用 mock controller |
 | H3-M5-candidate | Orchestrator | 查全调用链/审核/边界，亲跑两集，final | 所有必须项批准后才 complete；引擎独立 candidate 再验证/安全发布 |
@@ -56,7 +57,7 @@ W2后优先接现有stage/controller和真实reward，不继续以孤立helper�
 
 ## 串并行与审查规则
 
-优先寻找并行小项；本轮W2三个配对均active，独立worktree及分离feature测试。原test_h3_mvp_cpu.py只读，不为拆分测试制造重构。只有实际未稳定接口才顺序/idle，并写明具体依赖。每次读取coding源码/diff/测试与对应simplifier，记录实际branch/前置HEAD/snapshot/裁决。run内暂存汇合不是批准；changes回同slot重测重审。汇合后亲跑完整H3通配符及Flash，不用各分支局部通过代替集成通过。
+优先寻找并行小项；本轮W3三个配对均active，独立worktree及分离feature测试。原test_h3_mvp_cpu.py只读，不为拆分测试制造重构。只有实际未稳定接口才顺序/idle，并写明具体依赖。每次读取coding源码/diff/测试与对应simplifier，记录实际branch/前置HEAD/snapshot/裁决。run内暂存汇合不是批准；changes回同slot重测重审。汇合后亲跑完整H3通配符及Flash，不用各分支局部通过代替集成通过。
 
 ## 固定 CPU 门禁
 
@@ -67,4 +68,4 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu*.py -q -p no:cacheprovider
 ```
 
-最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前44项目标集包含基础22+W1锚6/cache6/prepare10；仍未覆盖完整生产闭环/world数学/tail与fresh恢复。最终必须跑通配符集合（旧单文件命令仅保留可用，不作最终替代）。
+最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前65项目标集为W1 44+W2 pool6/decode6/world及reducer9；仍未覆盖六stage/完整controller、global norm/tail与fresh恢复。最终必须跑通配符集合（旧单文件命令仅保留可用，不作最终替代）。

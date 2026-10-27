@@ -1,37 +1,35 @@
-# Assignment B — W2
+# Assignment B — W3
 
 - active: true
-- task_id: H3-M2a3b-decode
+- task_id: H3-M2c-hps-reward
 - pair: coding-b → simplifier-b
-- execution: parallel W2；decisions/wave-02.md
-- integration_parent: `47546f94e7490dafcc3fdbc2eb57279f0839899d`
-- dependencies: 既有geometry/forward/loader及W1 text cache approved；源码汇合467c8fd929804aa291bf01a5fa7cda372cc507db。当前无changes。
+- execution: parallel W3；decisions/wave-03.md
+- integration_parent: `e436c192778a6bbf24e2bee7ebef777332138f9a`
+- dependencies: 既有Hpsv3VideoClient/flash_hpsv3协议；W2 decoder approved，代码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e。无changes。
 
-## 唯一目标/文件
+## 唯一功能/文件
 
-实现**真实本地双VAE逐条CPU解码**，输出音视频联合媒体供后续reward消费；不实现reward、不造服务/runner。
+把**现有真实HPSv3视频协议**接到H3单条AV lease，作为显式 `h3_hpsv3_video_only_v1` reward。只写新 `visual_rl/algorithms/rewards/h3_hps.py`、新 `tests/test_h3_mvp_cpu_hps.py`、W/coding-b/H3-M2c-hps-reward.md。旧client/protocol/resource factory/Flash配置/decoder/tests只读，不import A/C本波新模块。禁止实际HTTP/GPU/服务操作，只实现本地源码并用transport叶子测试。
 
-只写新 `visual_rl/models/implementations/h3_decode.py`、新 `tests/test_h3_mvp_cpu_decode.py`、W/coding-b/H3-M2a3b-decode.md。已批准geometry/joint/loader/cache/测试只读，不引用A/C本波新模块。
+## 决策与接口锁
 
-## 生产调用与数据合同
+先完整读wave-03 reward决策：单一HPS权重1，所有124帧走现协议top30%均值（现VideoContract是int(frames*.3)，124帧top37）；不是CLAP/ImageBind复现，不评分audio语义/AV对齐。**音频仍必须来自真实联合解码，不删除音频状态/CPS**，不声明音频质量。不改旧Flash任何frame/manifest或启动已有服务。
 
-- 本地artifact目录→真实lazy公开Diffusers `AutoencoderKLMiniMaxH3` / `AutoencoderKLMiniMaxH3Audio`（从已读vendor对应真实模块路径核对），`from_pretrained(...,subfolder='vae'/'audio_vae',torch_dtype=float32,local_files_only=True)`。只接受本地存在目录，路径逃逸/缺config/无API清楚拒绝；无下载、remote-code、reference导入或tiny fallback。缺可选依赖分支明确错误，不能硬编码返回假media。
-- 第一版固定**CPU**非prepared aux，无额外GPU；模型eval+requires_grad false，所有浮点参数/相关buffer保持FP32，不能把audio VAE BF16。每次只解一个sample，video VAE与audio VAE顺序加载/用完释放，不长期保存两套重模型或全collection媒体；上层未来负责rank-turn并发1。本项测试只替重量级类解析/模型叶子。
-- `decode_one(terminal, geometry, ...)` 接受既有 H3T2VAGeometry 和CPU detached FP16 `[1,packed_width]`；layout.unpack拆两流。使用真实unpatchify顺序将video `[V,96]`还原`[1,24,T_lat,H_lat,W_lat]`，audio channel-major `[2*A_lat,32]`还原`[2,32,A_lat]`。不删音频/伪造batch/dummy frame。
-- 读取VAE config中各24/32通道 `latents_mean/latents_std`，要求完整finite且std>0，FP32反归一化`latent*std+mean`；不能用scalar scaling_factor或缺配置默认0/1。调用真实decode(return_dict=False)。
-- video输出必须`[1,3,num_frames,height,width]`、有限；逆ImageNet pixel norm(mean .485/.456/.406,std .229/.224/.225)，clamp[0,1]后转CPU FP32 `[T,3,H,W]`。帧数必须与124等明确geometry精确一致，不改121/删尾帧。
-- audio decoder真实返回`[2,1,L]`，转CPU FP32 `[L,2]`；校验config sampling_rate=32000、模型hop_length=800，L=audio_latents*800，不能缺值默认一个采样率。保留真实幅度，不默默clip/删静音。audio rounding造成的时长与视频轻微不同要在媒体元数据实际记录，不暗trim/pad以假装严格相等。
-- 返回最小AV媒体结果，含video/audio、fps24/sample_rate32000及实际frame/sample count。可用context-managed单条lease，在消费者退出后释放owner引用并拒重入/第二条在途，禁止返回永久媒体列表。没有完整pool的decode循环。
-- 显式max_media_bytes及必要decode工作空间预算/单条在途上限；预估反归一化latent+输出/转换副本在load/decode之前检查，超过上限不能缩画布或改dtype。该估算不是VAE权重/内部workspace/总RSS保证，要清楚分列模型资源预算仍需实测。失败释放已载leaf引用且不产半套AV；不靠GC日志宣称GPU内存已回落。
+- 结构接口 `score_one(*, sample_id:str, prompt:str, media) -> float`，供A现stage调用。media有video/audio/metadata，与既有H3AVMedia结构一致；无需模型implementation import或继承第二套Reward服务框架。
+- 生产默认使用现 `Hpsv3VideoClient` / `jpeg_frames` / `VideoContract` / health与score validator，不能另写HTTP、topK、JPEG或不校验响应的快捷client。若包装已按现ResourceFactory取得的client，要明确constructor要求与所有权；同时提供可由未来runtime构造的真实本地artifact准入路径，不只测试工厂。
+- 本地HPS manifest + 显式expected service identity + loopback origin +明确geometry/timeout/response上限；必须校验本地artifact、对应VideoContract与live health一致再允许score。能复用现Hpsv3VideoResourceFactory就复用，不为便利削去identity；如果需要少量窄装配，仍调用原protocol校验。import/配置声明本身不联网，真正acquire才health。生产client失败不降级假reward。
+- 严格CPU detached video[T,3,H,W]与lease metadata匹配、音频[L,2] finite和sample rate/实际长度一致；frame contract124、H/W采用实际声明，超现协议128上限明确拒绝。不要把81帧历史服务当124帧ready。video原dtype/范围符合现jpeg编码，帧完整不抽样；音频只校验/保持，不发送并冒称它被HPS评分。
+- 调用原client.score_video(sample_id,prompt,frames_base64)，返回真实有限Python float；sample identity/selected indices/frame scores与service identity仍由原验证器严格校验，不信任远端单scalar。无自动POST重试/并发批媒体、无常量reward、无shadow/mock fallback。
+- 固定reward profile/version/service/contract identity以小不可变元数据暴露给未来plan/checkpoint；不增加每帧大artifact或在对象长期保留media/JPEG/响应。生命周期close幂等、借用或拥有client责任明确；A在decode lease内调用该端口，退出后无媒体引用。
 
-## 来源/验收
+## 真实CPU验证
 
-先读UniRL LICENSE和 `minimax_h3/vae.py`、vendor `packing.py` 的unpatchify/unpack、两个autoencoder的真实config/decode API及文件头。只独立实现必要数学/调用；若需复制非平凡源码及license路径扩大先报告，不整vendor。
+真实原Hpsv3VideoClient、JPEG编码、protocol health/score校验、wrapper执行；只HTTP transport leaf替身，不发真实请求。构造本地真实manifest和与媒体内容相关的有限frame score响应，所有帧与sample/prompt发送、124/top37结果和现protocol独立参考一致；至少两不同视频得到不同假服务叶子score，不能mock score_one或校验器。
 
-目标测试用真实geometry/packing/反归一化/输出转换与lazy调用控制，只重VAE叶子tiny：逐位置独立参考unpatchify，非均匀mean/std，stereo顺序、pixel反归一化，严格124帧/采样率/hop/actual lengths；leaf断言FP32 eval/no_grad/local_files_only。两leaf生命周期顺序及失败不返回半媒体、超限在load/decode前拒绝、第二lease拒绝、退出释放引用；非法dtype/shape/finite/config/输出长度明确拒绝。无恒定伪媒体作为生产实现；tiny输出依赖输入以证明路径真实。
+错误service/health contract/sample ID、缺帧/非有限/非法selected indices或topK总分、超响应/请求大小、非2xx/redirect、timeout/no retry、过期lease/非法audio元数据、close后调用拒绝。测试不同合法几何与不兼容81帧契约早拒，不修改原七项或旧protocol。明确tiny/transport结果不证明服务资源或质量。
 
-保持原44项及断言，独立feature文件核验worktree导入。最后编辑后跑plan固定Flash七项和H3通配符，无skip/xfail/全量；报告branch/HEAD、命令/exit/数量/时间、diff/check及精确下游接口。引擎commit，不自行操作Git发布。
+最后源码编辑后原样跑plan Flash七项+H3通配符，无skip/xfail/全量；写明branch/HEAD、命令/exit/数量/时间、diff/check及生产构造契约。Simplifier B重点审真正复用现已验证client、不丢identity/全帧规则及显式video-only限制；changes回B重测。
 
 ## 非目标
 
-不改text cache、ModelAdapter/registry/controller、FSDP/world/pool，不执行ffmpeg/媒体写盘/真实reward。解码必须后续由RewardStage在完整rollout后调用，不能据本项称实际视频质量验证。Simplifier B只审本项数学/真实依赖/有界生命周期，changes回B重测。GPU_PENDING。
+不部署新服务、不联系历史HPS、不装CLAP/ImageBind/下载模型，不改profile registry/controller或同波stage/coordinator。完整生产recipe绑定下一项，当前不能称新HPS服务ready。GPU_PENDING。
