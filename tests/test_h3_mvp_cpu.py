@@ -13,7 +13,7 @@ from visual_rl.algorithms.dynamics.h3_cps import H3CPSDynamics, H3CPSRecord
 from visual_rl.models import h3_joint
 from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
 from visual_rl.models.h3_joint import H3JointLayout
-from visual_rl.models.implementations import h3_forward, h3_geometry
+from visual_rl.models.implementations import h3_forward, h3_geometry, h3_loading
 from visual_rl.models.implementations.h3_forward import h3_t2va_forward
 from visual_rl.models.implementations.h3_geometry import H3T2VAGeometry
 
@@ -26,6 +26,7 @@ def test_h3_imports_are_from_this_worktree():
     assert Path(h3_cps.__file__).resolve() == checkout / "visual_rl/algorithms/dynamics/h3_cps.py"
     assert Path(h3_geometry.__file__).resolve() == checkout / "visual_rl/models/implementations/h3_geometry.py"
     assert Path(h3_forward.__file__).resolve() == checkout / "visual_rl/models/implementations/h3_forward.py"
+    assert Path(h3_loading.__file__).resolve() == checkout / "visual_rl/models/implementations/h3_loading.py"
 
 
 def test_joint_roundtrip_batch_order_dtype_and_gradients():
@@ -538,3 +539,317 @@ def test_h3_forward_rejects_malformed_inputs_before_call_and_bad_outputs():
                     (torch.full_like(v, float("nan")), a), (v, torch.full_like(a, float("inf")))):
         with pytest.raises((ValueError, TypeError)):
             h3_t2va_forward(lambda **kwargs: outputs, **case)
+
+
+def _tiny_loading_class():
+    # Only heavy class resolution is replaced. ConfigMixin, Accelerate, PEFT,
+    # safetensors, meta construction, mapping and initialization are all real.
+    from diffusers.configuration_utils import ConfigMixin, register_to_config
+
+    class Block(torch.nn.Module):
+        def __init__(self, width):
+            super().__init__()
+            self.attn = torch.nn.Module()
+            for name in ("to_q", "to_k", "to_v"):
+                setattr(self.attn, name, torch.nn.Linear(width, width))
+            self.attn.to_out = torch.nn.ModuleList([torch.nn.Linear(width, width)])
+            proj = torch.nn.Module()
+            proj.proj = torch.nn.Linear(width, width)
+            self.ff = torch.nn.Module()
+            self.ff.net = torch.nn.ModuleList([proj, torch.nn.Identity(), torch.nn.Linear(width, width)])
+            self.gradient_checkpointing = True
+
+        def forward(self, x):
+            y = self.attn.to_q(x) + self.attn.to_k(x) + self.attn.to_v(x)
+            y = self.attn.to_out[0](y)
+            return x + y + self.ff.net[2](torch.nn.functional.silu(self.ff.net[0].proj(x)))
+
+    class TinyH3(torch.nn.Module, ConfigMixin):
+        config_name = "config.json"
+        _keep_in_fp32_modules = ["proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out", "rope"]
+        constructed_on_meta = []
+
+        @register_to_config
+        def __init__(self, in_channels=24, audio_in_channels=32, patch_size=(1, 2, 2),
+                     text_dim=4, hidden_size=4, num_layers=2):
+            super().__init__()
+            self.proj_in = torch.nn.Linear(in_channels * math.prod(patch_size), hidden_size)
+            self.audio_proj_in = torch.nn.Linear(audio_in_channels, hidden_size)
+            self.context_embedder = torch.nn.Linear(text_dim, hidden_size)
+            self.time_embedder = torch.nn.Linear(hidden_size, hidden_size)
+            self.time_embedder.register_buffer("scale", torch.tensor(.123456789))
+            self.proj_out = torch.nn.Linear(hidden_size, 96)
+            self.audio_proj_out = torch.nn.Linear(hidden_size, 32)
+            self.rope = torch.nn.Module()
+            self.rope.register_buffer("inv_freq", 1 / (10000. ** (torch.arange(4).float() / 4)), persistent=False)
+            self.transformer_blocks = torch.nn.ModuleList([Block(hidden_size) for _ in range(num_layers)])
+            self.token_refiner = Block(hidden_size)
+            self.gradient_checkpointing = True
+            type(self).constructed_on_meta.append(all(p.is_meta for p in self.parameters()))
+
+        def forward(self, video, audio):
+            def run(x, proj, out):
+                h = proj(x.float()).bfloat16()
+                h = self.token_refiner(h)
+                for block in self.transformer_blocks:
+                    h = block(h)
+                return out(h.float())
+            return run(video, self.proj_in, self.proj_out), run(audio, self.audio_proj_in, self.audio_proj_out)
+
+    return TinyH3
+
+
+def _loading_fixture(tmp_path, monkeypatch):
+    import json
+    from safetensors.torch import save_file
+
+    cls = _tiny_loading_class()
+    directory = tmp_path / "transformer"
+    directory.mkdir()
+    config = dict(_class_name="MiniMaxH3Transformer3DModel", in_channels=24, audio_in_channels=32,
+                  patch_size=[1, 2, 2], text_dim=4, hidden_size=4, num_layers=2)
+    (directory / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(h3_loading, "_resolve_h3_class", lambda: cls)
+    rng = torch.random.get_rng_state().clone()
+    meta = h3_loading.build_h3_meta(tmp_path, rank=2, alpha=4)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert cls.constructed_on_meta == [True]
+    generator = torch.Generator().manual_seed(778)
+    source = {name: torch.randn(meta.state_specs[target].shape, generator=generator) * .1
+              for name, target in meta.base_to_model.items()}
+    save_file(source, str(directory / "diffusion_pytorch_model.safetensors"))
+    return meta, source, cls
+
+
+def _load_cpu(meta, **kwargs):
+    return h3_loading.load_h3_cpu_state(meta, **(dict(is_init_owner=True, host_weight_limit_bytes=10**8,
+                                                    init_seed=42) | kwargs))
+
+
+def test_h3_loader_real_meta_peft_scope_precision_and_cpu_backward(tmp_path, monkeypatch):
+    meta, source, _ = _loading_fixture(tmp_path, monkeypatch)
+    model = meta.model
+    assert meta.block_names == ("transformer_blocks.0", "transformer_blocks.1")
+    assert len(meta.target_names) == 12 and len(meta.lora_names) == 24
+    assert all(p.is_meta for p in model.parameters())
+    assert not any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
+    for name, p in model.named_parameters():
+        assert p.requires_grad == (name in meta.lora_names)
+        assert p.dtype == (torch.float32 if name in meta.lora_names or name.split('.')[0] in
+                           {"proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out"} else torch.bfloat16)
+    assert not hasattr(model.token_refiner.attn.to_q, "lora_A")
+    rope = torch.tensor([1., .1, .01, .001])
+    torch.testing.assert_close(model.rope.inv_freq, rope, rtol=0, atol=0)
+    assert model.rope.inv_freq.dtype == torch.float32 and not model.rope.inv_freq.is_meta
+    assert set(meta.nonpersistent_buffers) == {"rope.inv_freq"}
+    assert "time_embedder.scale" in meta.base_to_model
+    rng = torch.random.get_rng_state().clone()
+    loaded, repeated, different = _load_cpu(meta), _load_cpu(meta), _load_cpu(meta, init_seed=43)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert set(loaded.state) == set(model.state_dict()) == set(meta.state_specs)
+    assert set(loaded.file_sha256) == {"config.json", "diffusion_pytorch_model.safetensors"}
+    for name, value in loaded.state.items():
+        assert value.device.type == "cpu" and value.shape == meta.state_specs[name].shape
+        assert value.dtype == meta.state_specs[name].dtype and not value.requires_grad
+        assert torch.equal(value, repeated.state[name])
+        if name in meta.lora_names:
+            if ".lora_A." in name:
+                assert bool(value.ne(0).any()) and not torch.equal(value, different.state[name])
+                assert value.abs().max() <= 1 / math.sqrt(value.shape[1])
+            else:
+                assert not bool(value.any())
+        else:
+            original = next(key for key, target in meta.base_to_model.items() if target == name)
+            assert torch.equal(value, source[original].to(value.dtype))
+    # CPU-only materialization, NOT an FSDP setter. assign preserves module
+    # requires_grad and retains real constructor buffers without to_empty.
+    model.load_state_dict(loaded.state, strict=True, assign=True)
+    assert all(not p.is_meta for p in model.parameters())
+    v, a = model(torch.ones(1, 2, 96), torch.ones(1, 3, 32))
+    assert torch.isfinite(v).all() and torch.isfinite(a).all()
+    for output in (v, a):
+        model.zero_grad(set_to_none=True)
+        output.square().mean().backward(retain_graph=True)
+        assert any(p.grad is not None and bool(p.grad.ne(0).any()) for n, p in model.named_parameters() if '.lora_B.' in n)
+        assert all(p.grad is None for n, p in model.named_parameters() if n not in meta.lora_names)
+    assert torch.equal(model.rope.inv_freq, loaded.nonpersistent_buffers["rope.inv_freq"])
+
+
+def test_h3_loader_two_shards_and_strict_keys_shapes_dtypes(tmp_path, monkeypatch):
+    import json
+    from safetensors.torch import save_file
+
+    meta, source, _ = _loading_fixture(tmp_path, monkeypatch)
+    directory = meta.transformer_dir
+    single = directory / "diffusion_pytorch_model.safetensors"
+    reference = _load_cpu(meta)
+    single.unlink()
+    keys = list(source)
+    pieces = [dict((key, source[key]) for key in keys[::2]), dict((key, source[key]) for key in keys[1::2])]
+    index = directory / "diffusion_pytorch_model.safetensors.index.json"
+    mapping = {key: f"part{i}.safetensors" for i, part in enumerate(pieces) for key in part}
+    index.write_text(json.dumps(dict(weight_map=mapping)))
+    for i, part in enumerate(pieces):
+        save_file(part, str(directory / f"part{i}.safetensors"))
+    loaded = _load_cpu(meta)
+    assert all(torch.equal(value, loaded.state[name]) for name, value in reference.state.items())
+    # Each failure goes through real safetensors files and strict loader parsing.
+    first = keys[0]
+    for changed in (pieces[0] | {"unknown": torch.ones(1)},
+                    {k: v for k, v in pieces[0].items() if k != first},
+                    pieces[0] | {first: torch.ones(1)},
+                    pieces[0] | {first: source[first].double()},
+                    pieces[0] | {first: torch.full_like(source[first], float('nan'))},
+                    pieces[0] | {keys[1]: source[keys[1]]}):
+        save_file(changed, str(directory / "part0.safetensors"))
+        with pytest.raises(ValueError):
+            _load_cpu(meta)
+    save_file(pieces[0], str(directory / "part0.safetensors"))
+    for changed in (mapping | {first: "../outside.safetensors"}, mapping | {first: "/abs.safetensors"},
+                    mapping | {first: "missing.safetensors"}, mapping | {first: "part1.safetensors"}):
+        index.write_text(json.dumps(dict(weight_map=changed)))
+        with pytest.raises(ValueError):
+            _load_cpu(meta)
+    index.write_text('{"weight_map":{},"weight_map":{}}')
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        _load_cpu(meta)
+    index.write_text(json.dumps(dict(weight_map=mapping)))
+    (directory / "part0.safetensors").unlink()
+    with pytest.raises(ValueError, match="missing"):
+        _load_cpu(meta)
+
+
+def test_h3_loader_owner_budget_and_duplicate_header_admission(tmp_path, monkeypatch):
+    import json
+    import safetensors
+
+    meta, _, _ = _loading_fixture(tmp_path, monkeypatch)
+    original = safetensors.safe_open
+    reads = []
+
+    class MetadataOnly:
+        def __init__(self, *args, **kwargs):
+            self.handle = original(*args, **kwargs)
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+        def keys(self):
+            return self.handle.keys()
+        def get_slice(self, key):
+            return self.handle.get_slice(key)
+        def get_tensor(self, key):
+            reads.append(key)
+            raise AssertionError("budget rejection must precede tensor payload access")
+
+    monkeypatch.setattr(safetensors, "safe_open", MetadataOnly)
+    with pytest.raises(PermissionError, match="owner"):
+        _load_cpu(meta, is_init_owner=False)
+    for limit in (0, -1, True, 1):
+        with pytest.raises(ValueError, match="host"):
+            _load_cpu(meta, host_weight_limit_bytes=limit)
+    assert reads == []
+    # Duplicate safetensors JSON keys must not be hidden by the Rust parser.
+    file = meta.transformer_dir / "diffusion_pytorch_model.safetensors"
+    entry = json.dumps(dict(dtype="F32", shape=[1], data_offsets=[0, 4]))
+    header = ('{"x":' + entry + ',"x":' + entry + '}').encode()
+    file.write_bytes(len(header).to_bytes(8, 'little') + header + b'\0' * 4)
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        _load_cpu(meta)
+
+
+def test_h3_loader_config_scope_path_and_dependency_rejections(tmp_path, monkeypatch):
+    import json
+
+    # Real default resolver is an optional dependency, never a reference import.
+    resolver = h3_loading._resolve_h3_class
+    try:
+        actual = resolver()
+    except ImportError as error:
+        assert "diffusers.models.transformers.transformer_minimax_h3" in str(error)
+    else:
+        assert actual.__name__ == "MiniMaxH3Transformer3DModel"
+    meta, _, cls = _loading_fixture(tmp_path, monkeypatch)
+    config_path = meta.transformer_dir / "config.json"
+    original_config = config_path.read_text()
+    with pytest.raises(ValueError, match="local"):
+        h3_loading.build_h3_meta(tmp_path / 'missing-repo')
+    for change in (dict(_class_name="Wan"), dict(in_channels=16), dict(audio_in_channels=2),
+                   dict(patch_size=[1, 1, 1]), dict(text_dim=0), dict(num_layers=True)):
+        config_path.write_text(json.dumps(json.loads(original_config) | change))
+        with pytest.raises(ValueError, match="config|patch"):
+            h3_loading.build_h3_meta(tmp_path)
+    with pytest.raises(ValueError, match="config changed"):
+        _load_cpu(meta)
+    config_path.write_text('{"text_dim":4,"text_dim":8}')
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        h3_loading.build_h3_meta(tmp_path)
+    config_path.write_text(original_config)
+    for change in (dict(rank=0), dict(alpha=True), dict(alpha=float('inf'))):
+        with pytest.raises(ValueError, match="LoRA"):
+            h3_loading.build_h3_meta(tmp_path, **change)
+    from_config = cls.from_config
+    for defect in ('nonlinear', 'alias', 'precision', 'projection', 'missing'):
+        def broken(config, defect=defect):
+            model = from_config(config)
+            if defect == 'nonlinear':
+                model.transformer_blocks[0].attn.to_q = torch.nn.Identity()
+            elif defect == 'alias':
+                model.transformer_blocks[0].attn.to_k = model.transformer_blocks[0].attn.to_q
+            elif defect == 'precision':
+                model.rope.inv_freq = model.rope.inv_freq.bfloat16()
+            elif defect == 'missing':
+                del model.transformer_blocks[0].attn.to_v
+            else:
+                model.proj_in = torch.nn.Linear(1, 4)
+            return model
+        monkeypatch.setattr(cls, 'from_config', broken)
+        with pytest.raises(ValueError):
+            h3_loading.build_h3_meta(tmp_path)
+    monkeypatch.setattr(cls, 'from_config', from_config)
+    monkeypatch.setattr(h3_loading, '_resolve_h3_class', resolver)
+    real_import = h3_loading.importlib.import_module
+
+    def missing_h3(name, *args, **kwargs):
+        if name == 'diffusers.models.transformers.transformer_minimax_h3':
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(h3_loading.importlib, 'import_module', missing_h3)
+    with pytest.raises(ImportError, match="H3 requires optional.*no reference/fake fallback"):
+        h3_loading.build_h3_meta(tmp_path)
+
+
+def test_h3_loader_single_file_missing_extra_format_and_symlink_rejections(tmp_path, monkeypatch):
+    import json
+    from safetensors.torch import save_file
+
+    meta, source, _ = _loading_fixture(tmp_path, monkeypatch)
+    directory = meta.transformer_dir
+    single = directory / "diffusion_pytorch_model.safetensors"
+    key = next(iter(source))
+    for changed in ({k: v for k, v in source.items() if k != key}, source | {'extra': torch.ones(1)}):
+        save_file(changed, str(single))
+        with pytest.raises(ValueError, match="exactly cover"):
+            _load_cpu(meta)
+    for seed in (True, -1, 2**63, .5):
+        with pytest.raises(ValueError, match="init_seed"):
+            _load_cpu(meta, init_seed=seed)
+    single.unlink()
+    # Outside transformer but still within pytest tmp_path: never access any
+    # external artifact. Resolve-before-read rejects this symlink escape.
+    outside = tmp_path / 'outside.safetensors'
+    save_file(source, str(outside))
+    single.symlink_to(outside)
+    with pytest.raises(ValueError, match="escape"):
+        _load_cpu(meta)
+    single.unlink()
+    (directory / 'diffusion_pytorch_model.bin').write_bytes(b'not a pickle fallback')
+    with pytest.raises(ValueError, match="no bin fallback"):
+        _load_cpu(meta)
+    save_file(source, str(single))
+    index = directory / 'diffusion_pytorch_model.safetensors.index.json'
+    index.write_text(json.dumps(dict(weight_map={key: single.name})))
+    with pytest.raises(ValueError, match="exactly one"):
+        _load_cpu(meta)
