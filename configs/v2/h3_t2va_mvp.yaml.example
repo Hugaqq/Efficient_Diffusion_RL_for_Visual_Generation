@@ -1,0 +1,66 @@
+# Structure only: replace every REPLACE value with real, verified inputs.
+# Do not run unchanged. See docs/h3_mvp.md. CPU-tested, GPU acceptance pending.
+schema_version: 2
+recipe: h3_t2va_mvp_v1
+overrides:
+  model:
+    params:
+      height: 64
+      width: 96
+      frames: 124
+      fps: 24
+      guidance_scale: 1.0
+      lora_rank: 4
+      lora_alpha: 8
+  training:
+    group_size: 2
+    num_steps: 2
+launch:
+  output_dir: /REPLACE/new-owned-output
+  resume_from: null
+  artifacts:
+    model: /REPLACE/diffusers-h3-artifact
+    text_cache: /REPLACE/visualrl-h3-text-cache
+    train: /REPLACE/train.txt
+    eval: /REPLACE/eval.txt
+    hps_manifest: /REPLACE/hpsv3-124-frame-manifest.json
+  expected:
+    model_sha256: REPLACE_FULL_MODEL_CONTENT_SHA256
+    train_sha256: REPLACE_TRAIN_FILE_SHA256
+    eval_sha256: REPLACE_EVAL_FILE_SHA256
+    hps_service_identity: REPLACE_HPS_SERVICE_IDENTITY
+    cache_identity:
+      model_sha256: REPLACE_FULL_MODEL_CONTENT_SHA256
+      encoder_sha256: REPLACE_ENCODER_SHA256
+      tokenizer_sha256: REPLACE_TOKENIZER_SHA256
+      processor_sha256: REPLACE_PROCESSOR_SHA256
+      template_sha256: REPLACE_TEMPLATE_SHA256
+      truncation_sha256: REPLACE_TRUNCATION_SHA256
+      target_layer: 50
+      normalized: false
+      add_special_tokens: false
+      feature_dim: 5120
+      dtype: float32
+  execution:
+    world_size: 8
+    sp: 1
+    tp: 1
+    gpu_uuids: [REPLACE_UUID_0, REPLACE_UUID_1, REPLACE_UUID_2, REPLACE_UUID_3, REPLACE_UUID_4, REPLACE_UUID_5, REPLACE_UUID_6, REPLACE_UUID_7]
+  seed: 42
+  max_optimizer_steps: 2
+  checkpoint_every_optimizer_steps: 1
+  resume_policy: complete_collection_same_topology
+  # Explicit byte budgets must be measured for the actual host/artifact/canvas.
+  budgets:
+    host_weight_bytes: REPLACE_POSITIVE_INTEGER
+    trajectory_bytes: REPLACE_POSITIVE_INTEGER
+    media_bytes: REPLACE_POSITIVE_INTEGER
+    decode_bytes: REPLACE_POSITIVE_INTEGER
+    condition_bytes: REPLACE_POSITIVE_INTEGER
+    max_tokens: REPLACE_POSITIVE_INTEGER
+    embedding_bytes: REPLACE_POSITIVE_INTEGER
+    prompt_file_bytes: REPLACE_POSITIVE_INTEGER
+  hps:
+    origin: http://127.0.0.1:REPLACE_PORT
+    timeout_s: 120
+    max_response_bytes: 65536
