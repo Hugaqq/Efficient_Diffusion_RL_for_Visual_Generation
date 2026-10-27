@@ -1,0 +1,5 @@
+{
+  "stage": "environment-setup",
+  "jobs": [],
+  "last_observation": "Not started; first action must inspect actual server."
+}
