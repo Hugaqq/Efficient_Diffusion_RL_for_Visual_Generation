@@ -1,4 +1,8 @@
-# 当前交接：repair — H3-EXP-001
+# 当前交接：H3-EXP-001 open；网络恢复后先补环境材料
+
+第二轮：Coder已核查既有分支并返回need_experiment（coder/H3-EXP-001.md）。Experimenter补材料时固定SSH连续两次code255，现请求needs_input暂停，详见needs-input.md及experimenter/environment-002-connectivity.md。没有新的源码失败或修复验收；不重复派Coder在缺相同材料时盲改。网络恢复后先只读核查，再补完整converter/原生配置/安装源hash/既有converted根信息。
+
+以下为首轮修复请求，保持有效：
 
 请Coder先读task.md及`issues/H3-EXP-001-artifact-admission.md`，修复/提供最小原生H3 artifact适配准备路径。真实GPU环境probe已执行，生产build_h3_meta对原缓存报`artifact file missing or path escape: config.json`；原文件是HF blob链接，且实读旧schema/融合QKV键与当前新类严格loader不同，不能仅解引用或改类名冒称兼容。
 
