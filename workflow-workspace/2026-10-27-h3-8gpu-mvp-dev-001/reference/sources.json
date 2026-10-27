@@ -1,0 +1,38 @@
+[
+  {
+    "name": "verl-omni",
+    "commit": "ffaa9e959faba3a24d6aa282278b5f084b6457ba",
+    "included_paths": [
+      "verl_omni/pipelines/minimax_h3_flow_grpo",
+      "verl_omni/pipelines/minimax_h3_diffusion_nft/common.py",
+      "examples/flowgrpo_trainer/minimax_h3"
+    ],
+    "purpose": "read-only reference, not implementation or installed dependency"
+  },
+  {
+    "name": "UniRL",
+    "commit": "8cfbac17765004afb68fef08a4e011a4c8daf555",
+    "included_paths": [
+      "unirl/models/minimax_h3",
+      "unirl/sde/kernels.py",
+      "unirl/algorithms/flowgrpo.py",
+      "unirl/train/backend/fsdp",
+      "unirl/train/configs.py",
+      "unirl/rollout/engine/trainside/engine.py",
+      "examples/diffusion/minimax_h3"
+    ],
+    "purpose": "read-only reference, not implementation or installed dependency"
+  },
+  {
+    "name": "Flow-Factory",
+    "commit": "3dd5ca4dff396c1db9b59c16dceaaca7836c6ed1",
+    "included_paths": [
+      "src/flow_factory/models/minimax_h3",
+      "src/flow_factory/scheduler/minimax_h3.py",
+      "src/flow_factory/trainers/rl/grpo.py",
+      "examples/grpo/lora/minimax_h3_t2va",
+      "config/accelerate_configs/fsdp2.yaml"
+    ],
+    "purpose": "read-only reference, not implementation or installed dependency"
+  }
+]

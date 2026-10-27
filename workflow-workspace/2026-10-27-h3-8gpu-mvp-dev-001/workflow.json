@@ -1,0 +1,429 @@
+{
+  "version": 1,
+  "id": "wf-2026-10-27-h3-8gpu-mvp-dev-001",
+  "name": "H3八卡MVP 原子开发-简化-整合",
+  "goal": "由orchestrator调度三组coding/simplifier，交付H3单节点8卡最小真实实现和CPU门禁，不扩展HSDP/SP/双引擎，不冒称真实GPU验收。",
+  "completion": "MVP生产调用链无占位，所有任务对应simplifier通过；原七项CPU与H3目标CPU在最终candidate真实通过；由引擎安全发布本地main，final明确GPU未验证。",
+  "principles": [
+    "只在真实framecode仓库启动；唯一总需求是workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md。禁止修改外层历史快照、用户主checkout或其他角色工作区。",
+    "三个coding与三个simplifier一一配对，可idle；顺序默认，orchestrator确认文件与接口独立才并行。持久session复用，禁止delegate增加角色。",
+    "每项只做一小步原子修改，先真实CPU门禁后交付；引擎自动提交在隔离分支，不自己reset/rebase/force/push。run内暂存合并不等于审核批准。",
+    "simplifier只审不改，changes必须回同coding修复并重测；orchestrator控制是否完整满足总需求，不能用大量文件或文档冒充可运行实现。",
+    "保留原七项FlashCPU测试与断言；新增H3目标CPU集单独记录，不替换、不跑全量、不用skip/xfail掩盖。CPU不证明GPU/FSDP/NCCL/权重或视频质量。",
+    "仅单节点8卡，无NVLink、双NUMA、64GiB/卡来自用户历史观测，具体空闲8UUID未获准；所有服务器/GPU/网络部署/模型下载/环境升级均禁止。",
+    "引用的设计不是要求实现完整泛化框架，优先最小闭环；读取上游许可再移植，不能全量vendor未核验代码。",
+    "不修改task/reference/AGENTS/.gitignore和工作流定义；若范围或允许命令不够，报告blocked由主会话核查。"
+  ],
+  "roles": {
+    "orchestrator": {
+      "name": "Orchestrator",
+      "responsibility": "负责真实源码任务划分/接口和文件边界、配对派工、串并行选择、原子提交追踪及最终整合验收；不直接写功能源码，不用旧CPU门禁替代H3正确性或GPU证据。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/plan.md",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/assignments/**",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/merge-ledger.md",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/decisions/**",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/final.md"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "coding-a": {
+      "name": "Coding A",
+      "responsibility": "只实现orchestrator分配给a的当前原子任务；在指定Git工作区完成源码和真实CPU门禁后交对应Simplifier；无任务idle，不额外造功能。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "visual_rl/**",
+        "tests/**",
+        "configs/**",
+        "scripts/**",
+        "services/**",
+        "pyproject.toml",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "docs/h3_mvp.md",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-a/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "simplifier-a": {
+      "name": "Simplifier A",
+      "responsibility": "仅审核Coding A的交付；对照task和assignment查实现/边界/测试证据与过度开发，不直接改源码。无问题批准，有问题退给原coding修复并重测。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-a/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "coding-b": {
+      "name": "Coding B",
+      "responsibility": "只实现orchestrator分配给b的当前原子任务；在指定Git工作区完成源码和真实CPU门禁后交对应Simplifier；无任务idle，不额外造功能。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "visual_rl/**",
+        "tests/**",
+        "configs/**",
+        "scripts/**",
+        "services/**",
+        "pyproject.toml",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "docs/h3_mvp.md",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-b/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "simplifier-b": {
+      "name": "Simplifier B",
+      "responsibility": "仅审核Coding B的交付；对照task和assignment查实现/边界/测试证据与过度开发，不直接改源码。无问题批准，有问题退给原coding修复并重测。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-b/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "coding-c": {
+      "name": "Coding C",
+      "responsibility": "只实现orchestrator分配给c的当前原子任务；在指定Git工作区完成源码和真实CPU门禁后交对应Simplifier；无任务idle，不额外造功能。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "visual_rl/**",
+        "tests/**",
+        "configs/**",
+        "scripts/**",
+        "services/**",
+        "pyproject.toml",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "docs/h3_mvp.md",
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-c/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "simplifier-c": {
+      "name": "Simplifier C",
+      "responsibility": "仅审核Coding C的交付；对照task和assignment查实现/边界/测试证据与过度开发，不直接改源码。无问题批准，有问题退给原coding修复并重测。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-c/**"
+      ],
+      "allowedCommands": [
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+        "git diff --check",
+        "git status --short --branch",
+        "git diff --stat",
+        "git diff",
+        "git log -12 --oneline",
+        "git rev-parse HEAD",
+        "git branch --show-current"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    }
+  },
+  "start": "orchestrator",
+  "steps": {
+    "orchestrator": {
+      "type": "agent",
+      "role": "orchestrator",
+      "instruction": "先读workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、reference中的硬件/拓扑/设计，再查真实visual_rl源码；首次真实跑原七项baseline，写plan和三个assignment。每次处理上一轮coding/simplifier证据，更新merge-ledger。一次派一个小原子任务，只有文件/接口完全独立才派parallel-wave；各assignment必须写active/idle、唯一任务ID、依赖提交、允许文件、验收与非目标。查看未批准任务及测试失败，返工给原coding而不是新建角色。引擎负责各步骤真实snapshot和run内暂存合并，尚未批准不等于发布main。分支来自引擎，不能自行切换或修改用户主checkout。返回a/b/c派相应配对；返回parallel派三任务并行（可idle）。全部实现、配对审核和CPU门禁成功后亲自重跑baseline与H3目标集，写final.md，明确GPU_PENDING，再返回complete触发真正candidate验证/merge。必须的功能未实现不能返回complete；不能解决的阻塞写明证据返回blocked。不得将文档/伪代码/恒定reward/隐含mock当作生产实现。",
+      "outcomes": {
+        "a": "coding-a",
+        "b": "coding-b",
+        "c": "coding-c",
+        "parallel": "parallel-code",
+        "complete": "$complete",
+        "blocked": "$failed"
+      }
+    },
+    "coding-a": {
+      "type": "agent",
+      "role": "coding-a",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md和assignments/a.md以及simplifier-a对当前任务的反馈。只实现此原子任务，记录实际git branch/HEAD，不换分支。active=false则idle返回done，不改源码；active=true完成最小实现后必须真实跑原七项CPU测试，存在相关H3目标测试时也运行，不修改/skip原断言。失败继续修复；无法完成则明确blocked。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-a/<task-id>.md记录准确改动、测试和风险。返回done才交对应simplifier；引擎随后snapshot为原子提交，不自行git add/commit/push/merge。",
+      "outcomes": {
+        "done": "simplifier-a",
+        "blocked": "$failed"
+      }
+    },
+    "simplifier-a": {
+      "type": "agent",
+      "role": "simplifier-a",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan和assignments/a.md、对应coding交付并核对实际源码及测试。不要直接改源码。只检查当前任务及其回归影响，写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-a/<task-id>.md，列具体文件位置、过度实现/重复逻辑/无用抽象及最小修复；不可破坏旧锚、联合音视频、梯度归约和原子恢复语义。active=false时如实idle并返回approved；真正符合总需求/分配且测试证据有效返回approved交orchestrator；需修改返回changes给原coding重做；不可解决的阻塞返回blocked。",
+      "outcomes": {
+        "approved": "orchestrator",
+        "changes": "coding-a",
+        "blocked": "$failed"
+      }
+    },
+    "coding-b": {
+      "type": "agent",
+      "role": "coding-b",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md和assignments/b.md以及simplifier-b对当前任务的反馈。只实现此原子任务，记录实际git branch/HEAD，不换分支。active=false则idle返回done，不改源码；active=true完成最小实现后必须真实跑原七项CPU测试，存在相关H3目标测试时也运行，不修改/skip原断言。失败继续修复；无法完成则明确blocked。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-b/<task-id>.md记录准确改动、测试和风险。返回done才交对应simplifier；引擎随后snapshot为原子提交，不自行git add/commit/push/merge。",
+      "outcomes": {
+        "done": "simplifier-b",
+        "blocked": "$failed"
+      }
+    },
+    "simplifier-b": {
+      "type": "agent",
+      "role": "simplifier-b",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan和assignments/b.md、对应coding交付并核对实际源码及测试。不要直接改源码。只检查当前任务及其回归影响，写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-b/<task-id>.md，列具体文件位置、过度实现/重复逻辑/无用抽象及最小修复；不可破坏旧锚、联合音视频、梯度归约和原子恢复语义。active=false时如实idle并返回approved；真正符合总需求/分配且测试证据有效返回approved交orchestrator；需修改返回changes给原coding重做；不可解决的阻塞返回blocked。",
+      "outcomes": {
+        "approved": "orchestrator",
+        "changes": "coding-b",
+        "blocked": "$failed"
+      }
+    },
+    "coding-c": {
+      "type": "agent",
+      "role": "coding-c",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md和assignments/c.md以及simplifier-c对当前任务的反馈。只实现此原子任务，记录实际git branch/HEAD，不换分支。active=false则idle返回done，不改源码；active=true完成最小实现后必须真实跑原七项CPU测试，存在相关H3目标测试时也运行，不修改/skip原断言。失败继续修复；无法完成则明确blocked。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-c/<task-id>.md记录准确改动、测试和风险。返回done才交对应simplifier；引擎随后snapshot为原子提交，不自行git add/commit/push/merge。",
+      "outcomes": {
+        "done": "simplifier-c",
+        "blocked": "$failed"
+      }
+    },
+    "simplifier-c": {
+      "type": "agent",
+      "role": "simplifier-c",
+      "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan和assignments/c.md、对应coding交付并核对实际源码及测试。不要直接改源码。只检查当前任务及其回归影响，写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-c/<task-id>.md，列具体文件位置、过度实现/重复逻辑/无用抽象及最小修复；不可破坏旧锚、联合音视频、梯度归约和原子恢复语义。active=false时如实idle并返回approved；真正符合总需求/分配且测试证据有效返回approved交orchestrator；需修改返回changes给原coding重做；不可解决的阻塞返回blocked。",
+      "outcomes": {
+        "approved": "orchestrator",
+        "changes": "coding-c",
+        "blocked": "$failed"
+      }
+    },
+    "parallel-code": {
+      "type": "parallel",
+      "tasks": [
+        {
+          "role": "coding-a",
+          "instruction": "先读workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/a.md和已有本配对反馈。只在引擎给本分支的worktree实现当前原子任务，不改其他配对的文件或分支。active=false返回done并明确idle，无改动无测试。active=true完成后真实跑固定七项CPU和已有相关H3目标CPU集，写coding-a/<task-id>.md，包含实际分支/基线/文件/真实结果和implementation_ready判定。测试失败不得标ready，必须在本会话修复；不能完成则报告blocked，不冒称测试通过。返回角色结果后引擎形成隔离snapshot并汇入run暂存区；这不是orchestrator批准或main发布。"
+        },
+        {
+          "role": "coding-b",
+          "instruction": "先读workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/b.md和已有本配对反馈。只在引擎给本分支的worktree实现当前原子任务，不改其他配对的文件或分支。active=false返回done并明确idle，无改动无测试。active=true完成后真实跑固定七项CPU和已有相关H3目标CPU集，写coding-b/<task-id>.md，包含实际分支/基线/文件/真实结果和implementation_ready判定。测试失败不得标ready，必须在本会话修复；不能完成则报告blocked，不冒称测试通过。返回角色结果后引擎形成隔离snapshot并汇入run暂存区；这不是orchestrator批准或main发布。"
+        },
+        {
+          "role": "coding-c",
+          "instruction": "先读workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/c.md和已有本配对反馈。只在引擎给本分支的worktree实现当前原子任务，不改其他配对的文件或分支。active=false返回done并明确idle，无改动无测试。active=true完成后真实跑固定七项CPU和已有相关H3目标CPU集，写coding-c/<task-id>.md，包含实际分支/基线/文件/真实结果和implementation_ready判定。测试失败不得标ready，必须在本会话修复；不能完成则报告blocked，不冒称测试通过。返回角色结果后引擎形成隔离snapshot并汇入run暂存区；这不是orchestrator批准或main发布。"
+        }
+      ],
+      "next": "parallel-review"
+    },
+    "parallel-review": {
+      "type": "parallel",
+      "tasks": [
+        {
+          "role": "simplifier-a",
+          "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/a.md及本配对coding交付，在实际暂存汇合代码上审查本任务、依赖和回归，不改源码或他人报告。inactive任务明确idle。无法证明测试/实现的任务不得approved。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-a/<task-id>.md，显式verdict=approved/changes/blocked/idle，列证据与定位明确的返工清单；必要时独立重跑允许CPU命令。以outcome done表示本次review步骤结束，不表示代码获批；orchestrator读取verdict后决定返工或接受。"
+        },
+        {
+          "role": "simplifier-b",
+          "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/b.md及本配对coding交付，在实际暂存汇合代码上审查本任务、依赖和回归，不改源码或他人报告。inactive任务明确idle。无法证明测试/实现的任务不得approved。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-b/<task-id>.md，显式verdict=approved/changes/blocked/idle，列证据与定位明确的返工清单；必要时独立重跑允许CPU命令。以outcome done表示本次review步骤结束，不表示代码获批；orchestrator读取verdict后决定返工或接受。"
+        },
+        {
+          "role": "simplifier-c",
+          "instruction": "读取workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/task.md、plan.md、assignments/c.md及本配对coding交付，在实际暂存汇合代码上审查本任务、依赖和回归，不改源码或他人报告。inactive任务明确idle。无法证明测试/实现的任务不得approved。写workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/simplifier-c/<task-id>.md，显式verdict=approved/changes/blocked/idle，列证据与定位明确的返工清单；必要时独立重跑允许CPU命令。以outcome done表示本次review步骤结束，不表示代码获批；orchestrator读取verdict后决定返工或接受。"
+        }
+      ],
+      "next": "orchestrator"
+    }
+  },
+  "integration": {
+    "validationCommands": [
+      "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider",
+      "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider",
+      "git diff --check"
+    ],
+    "timeoutSeconds": 600
+  },
+  "budget": {
+    "maxSteps": 80,
+    "maxMinutes": 360,
+    "maxRoleTurns": 90,
+    "maxChecks": 0
+  }
+}
