@@ -138,7 +138,7 @@ def test_h3_prepare_owner_order_final_optimizer_guard_and_real_bridge_step(tmp_p
     monkeypatch.setattr(cls, 'forward', forward)
     leaves = _cpu_leaves(meta, monkeypatch)
     prepared = h3_fsdp.prepare_h3_fsdp(meta, **leaves.args, constant_scheduler=True)
-    assert leaves.events == ['cuda', 'metadata', 'read', 'mesh', 'ac', 'shard', 'ac', 'shard',
+    assert leaves.events == ['cuda', 'metadata', 'read', 'metadata', 'mesh', 'ac', 'shard', 'ac', 'shard',
                              'materialized/setter', 'optimizer']
     assert leaves.setter_keys == [set(meta.state_specs)] and len(leaves.meshes) == 1
     assert prepared.reducer_divisor == h3_fsdp.H3_REDUCER_DIVISOR == 8.0
@@ -187,7 +187,7 @@ def test_h3_prepare_nonowner_empty_setter_and_same_buffer(tmp_path, monkeypatch)
     owner = _load_cpu(meta)
     leaves = _cpu_leaves(meta, monkeypatch, rank=1, broadcast_state=owner.state)
     prepared = h3_fsdp.prepare_h3_fsdp(meta, **leaves.args)
-    assert leaves.events == ['cuda', 'metadata', 'mesh', 'ac', 'shard', 'ac', 'shard',
+    assert leaves.events == ['cuda', 'metadata', 'metadata', 'mesh', 'ac', 'shard', 'ac', 'shard',
                              'materialized/setter', 'optimizer']
     assert leaves.setter_keys == [set()] and prepared.scheduler is None
     assert torch.equal(meta.model.rope.inv_freq, owner.nonpersistent_buffers['rope.inv_freq'])
@@ -272,7 +272,7 @@ def test_h3_prepare_failed_setter_has_no_optimizer_or_cleanup_collective(tmp_pat
     assert not meta.model._forward_pre_hooks
     with pytest.raises(ValueError, match='already prepared'):
         h3_fsdp.prepare_h3_fsdp(meta, **leaves.args)
-    assert leaves.events.count('metadata') == 1
+    assert leaves.events.count('metadata') == 2  # metadata + owner-read gate, none after setter failure
 
 
 def test_h3_prepare_owner_missing_state_fails_before_wrap(tmp_path, monkeypatch):
@@ -283,7 +283,7 @@ def test_h3_prepare_owner_missing_state_fails_before_wrap(tmp_path, monkeypatch)
     save_file(source, str(meta.transformer_dir / 'diffusion_pytorch_model.safetensors'))
     with pytest.raises(ValueError, match='exactly cover'):
         h3_fsdp.prepare_h3_fsdp(meta, **leaves.args)
-    assert leaves.events == ['cuda', 'metadata', 'read']
+    assert leaves.events == ['cuda', 'metadata', 'read', 'metadata']
     assert not leaves.optimizers and all(p.is_meta for p in meta.model.parameters())
 
 
