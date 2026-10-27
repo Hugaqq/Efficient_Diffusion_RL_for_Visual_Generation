@@ -10,9 +10,9 @@
 
 ## 当前轮更新
 
-W4三项均获对应simplifier approved；代码汇合 `fb085fb35fb239cdd4c151d39decbd7fae268c9d`，当前HEAD `6f5e46fce212e00d547a3ca07fa5524018bef816`。Orchestrator读实际adapter/types、DCP codec、组合测试/三审查，亲跑Flash7/7（13.79s）、H3通配符108/108（8.54s，9条no-dist/损坏fixture warnings保留），均exit0；原Flash历史完整diff仍为空。**正式关闭W3三真实对象CPU组合证据缺口**；该仿真仍不证明GPU或默认RunController装配。
+W5 A数据/B profile各原子approved；C publisher为 **changes：C-PUBLISH-01**（附件文件fsync后缺h3-ranks目录fsync），不能把暂存合并或126项通过当作批准。源码汇合230696472b735966d3ac17102120a444f4ff8697，当前HEAD a54d296a7635fe3d552b0fe9beb03717e34249a2；本轮Flash7/7（12.15s）、H3通配符126/126（11.97s，16warnings保留）均exit0，原七项历史完整diff为空。没有断电实验或数据丢失复现声明。
 
-**W5并行**：A真实本地data reserve/commit/边界恢复，B单一H3 profile编译/本地事实准入，C现AtomicCheckpointManager共同staging/全rank codec+rank RNG/data/单writer发布恢复。三项接口/文件独立，见decisions/wave-05.md。结果批准后优先实际唯一RunController默认装配，不另造Runner或用raw DCP目录当完整checkpoint。
+**W6并行**：C同配对只修C-PUBLISH-01并重测复审；B统一profile与真实source的BOM/16MiB/parse-stream版本（B-PROFILE-01组合准入）；A构造真实H3 runtime绑定/numerics/checkpoint合同，不造假G3 receipt。文件/接口独立见decisions/wave-06.md。C修复获批、A真实绑定稳定后下一项直接唯一RunController默认生命周期装配；当前不称MVP完成。
 
 明确首个reward profile=h3_hpsv3_video_only_v1（现all-124/top37 HPS，权重1）；不声称CLAP/ImageBind复现或音频质量，joint AV CPS元素权重不变。124帧服务资源尚未准入，不启动/访问旧81帧服务。task允许现有评分接口，这一选择避免另造平台或未核验许可下载。后续仍必须接ModelAdapter/recipe/唯一RunController与完整tail checkpoint/fresh恢复；不能把测试注入callback当生产装配已完成。
 
@@ -43,7 +43,8 @@ W4三项均获对应simplifier approved；代码汇合 `fb085fb35fb239cdd4c151d3
 | H3-M2a3b-decode | B | 已实现双VAE CPU真实调用与严格AV转换/lease | W2 approved；独立feature6项 |
 | H3-M2c-hps-reward | B | 已实现原HPS factory/client/JPEG验证链适配 | approved；W4同stage真实对象CPU组合已通过 |
 | H3-M2b1-model-adapter | B | 已注册ModelAdapter，真实模型域端口及封闭类型 | W4 approved；4项目标；G3/runtime仍待绑定 |
-| H3-M2b2-profile | B | 固定H3 schema2 profile编译/本地前置事实检查 | W5 active；不假造runtime/G3 success |
+| H3-M2b2-profile | B | 已实现固定profile编译/本地预检 | W5原子approved；组合边界B-PROFILE-01待对齐 |
+| H3-M2b2-profile-align | B | 复用真实source解析/cap/版本并交叉验收 | W6 active；不改公共profile结构或A数据实现 |
 | H3-M3a-prepare | C | 已实现WORLD8 prepare/最终optimizer及单guarded callable | W1 approved；独立feature10项；不是CUDA证据 |
 | H3-M3b1-world-credit | C | 已实现world准入/完整credit/d*n/N及公开divisor8设置 | W2 approved；world8项+reducer1项 |
 | H3-M3b2-phase-norm | C | 已实现同序gate/aux轮转/global唯一norm | approved；W4同stage真实对象CPU组合已通过 |
@@ -51,17 +52,19 @@ W4三项均获对应simplifier approved；代码汇合 `fb085fb35fb239cdd4c151d3
 | H3-M4a2-rollout-pool | A | 已实现真实CPS采样→CPU轨迹/终态池 | W2 approved；独立feature6项 |
 | H3-M4a3-stages | A | 已复用原BaseTrainer六stage与tail | W3原子approved；无默认noop，尚无RunController绑定 |
 | H3-M4a4-object-integration | A | 已验证真实stages+HPS+Coordination八线程同链 | W4 approved；4cases，CPU非GPU |
-| H3-M4a5-data-source | A | 实际本地prompt/cache请求、预留提交、确定流与边界恢复 | W5 active；不再用测试Data充当生产源 |
+| H3-M4a5-data-source | A | 已实现真实prompt/cache请求、确定流及预留/边界恢复 | W5原子approved；6项目标 |
 | H3-M4b1-state-codec | C | 已实现allrank DCP model/Adam/scheduler/buffer及fresh空Adam恢复 | W4 approved；7项，未publish complete |
-| H3-M4b2-checkpoint-publish | C | 现manager共享staging/纯writer、rank RNG/data与两阶段恢复 | W5 active；不造第二manager |
-| H3-M4c-production-integration | B | 补齐现 controller/唯一入口的生产装配、最小配置和 torchrun 说明 | 上述逐项 approved；tiny 端到端走真实控制链，不用 mock controller |
+| H3-M4b2-checkpoint-publish | C | shared staging/全rank codec/rank附件与原manager发布 | changes C-PUBLISH-01，未批准 |
+| H3-M4b2-checkpoint-publish-r1 | C | h3-ranks父目录fsync顺序及失败共同拒绝 | W6 active，回同Coding C/同simplifier-c |
+| H3-M4c1-runtime-binding | A | 真实对象/参数/资源/numerics/CheckpointContract与tail envelope绑定 | W6 active；不伪造receipt，不调用未批准publisher |
+| H3-M4c2-controller | B | 默认唯一RunController闭生命周期/entry接线及tiny fresh整run | 依赖真实binding与publisher复审，下一项优先，不新Runner |
 | H3-M5-candidate | Orchestrator | 查全调用链/审核/边界，亲跑两集，final | 所有必须项批准后才 complete；引擎独立 candidate 再验证/安全发布 |
 
 表中是依赖规划，不是一次大授权。每配对每轮只派一个小项；实现暴露必要拆分时先更新 assignment，不顺手写整套架构。无消费者基础合同只能暂时存在于队列前置，最终不允许未消费接口冒充闭环。
 
 ## 串并行与审查规则
 
-优先寻找并行小项；本轮W5三个配对均active，独立worktree及分离feature测试。原test_h3_mvp_cpu.py只读，不为拆分测试制造重构。只有实际未稳定接口才顺序/idle，并写明具体依赖。每次读取coding源码/diff/测试与对应simplifier，记录实际branch/前置HEAD/snapshot/裁决。run内暂存汇合不是批准；changes回同slot重测重审。汇合后亲跑完整H3通配符及Flash，不用各分支局部通过代替集成通过。
+优先寻找并行小项；本轮W6三个配对均active（含C必须返工），独立worktree及分离feature测试。原test_h3_mvp_cpu.py只读，不为拆分测试制造重构。只有实际未稳定接口才顺序/idle，并写明具体依赖。每次读取coding源码/diff/测试与对应simplifier，记录实际branch/前置HEAD/snapshot/裁决。run内暂存汇合不是批准；changes回同slot重测重审。汇合后亲跑完整H3通配符及Flash，不用各分支局部通过代替集成通过。
 
 ## 固定 CPU 门禁
 
@@ -72,4 +75,4 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu*.py -q -p no:cacheprovider
 ```
 
-最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前108项目标集为此前93+W4组合4/adapter4/statecodec7；含三对象CPU同链和fresh模型/Adam磁盘恢复，仍缺唯一controller/data/profile/完整checkpoint发布与整run恢复。最终必须跑通配符集合（旧单文件命令仅保留可用，不作最终替代）。
+最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前126项目标集为此前108+W5三组各6；测试通过不覆盖C-PUBLISH-01目录持久性缺口，仍缺真实runtime绑定/默认controller及整run恢复验收。最终必须跑通配符集合（旧单文件命令仅保留可用，不作最终替代）。
