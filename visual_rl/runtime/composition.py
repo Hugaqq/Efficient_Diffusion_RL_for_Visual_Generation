@@ -106,7 +106,7 @@ def create_default_run_controller(
         preprocess_identity_provider=DefaultPreprocessIdentityProvider(),
     )
     finalizer = CoordinatorRunFinalizer()
-    return create_run_controller(
+    controller = create_run_controller(
         artifact_resolver=FilesystemArtifactIdentityResolver(code_root),
         runtime_factory=runtime_factory,
         runtime_context_provider=DefaultRuntimeContextProvider(),
@@ -116,3 +116,6 @@ def create_default_run_controller(
         restore_service=CoordinatorRestoreService(finalizer=finalizer),
         dynamics_projection_registry=dynamics_projection_registry,
     )
+    from visual_rl.runtime.h3_lifecycle import RecipeLifecycleBackend
+    controller._backend = RecipeLifecycleBackend(controller._backend, code_root=code_root)
+    return controller
