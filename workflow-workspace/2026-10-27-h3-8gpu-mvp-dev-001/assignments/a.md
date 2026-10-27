@@ -2,45 +2,69 @@
 
 - active: true
 - status: assigned
-- task_id: H3-M1a-joint-schedule
+- task_id: H3-M1b-cps
 - pair: coding-a → simplifier-a
-- execution: sequential; 本轮 B/C idle
-- source_dependency_commit: `076635a61263ffd5e7c5be4cc64d77ef99242c51`
-- coordination_parent: 引擎将包含本轮 plan/assignment 的 snapshot 交给你；先核验实际 branch/HEAD 并记录，不自行切分支。无前置已批准功能提交。
+- execution: sequential; B/C idle
+- source_dependency_commit: `7b29f4bf8d990794d4b9bc826a82bd390861d530`（M1a coding snapshot，配对 approved）
+- integration_parent: `8a6763cf3defcb07415dfeda501204e630b42f5a`（含 M1a 审查记录）；接收后记录引擎实际 branch/HEAD，不自行切分支或提交。
+- previous_task: H3-M1a-joint-schedule approved，无 changes、无失败测试待返工。旧交付/审查记录保留，不覆盖。
 
 ## 唯一目标
 
-实现可被下一项 CPS 和真实 H3 adapter 消费的 **generated joint state packing + 精确双 schedule** 最小合同。只做这一项，不实现整个 H3、更不顺手改旧 Gaussian 或 runtime。
+一个原子功能：基于已实现 `H3JointLayout` / `H3ScheduleSnapshot` 的 **joint CPS 采样与固定 action replay 评分**。这是后续 rollout/replay 使用的真实数值内核，不是训练 loop；不改旧 Gaussian ABI。
 
 ## 允许写入
 
-1. 新 `visual_rl/models/h3_joint.py`
-2. 新 `visual_rl/algorithms/dynamics/h3_schedule.py`
-3. 新 `tests/test_h3_mvp_cpu.py`
-4. `workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-a/H3-M1a-joint-schedule.md`
+1. 新 `visual_rl/algorithms/dynamics/h3_cps.py`
+2. `tests/test_h3_mvp_cpu.py`：保留已有六项及断言，新增 CPS 目标测试和导入身份核验。
+3. `workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-a/H3-M1b-cps.md`
 
-除此不改；尤其不改原七项、task/reference/AGENTS/.gitignore/workflow、旧配置。需要扩大范围先报告，不在本项顺手改。引擎负责源码 snapshot，不手工 git commit。
+已批准 `h3_joint.py` / `h3_schedule.py` 此项只读；如真实接口问题需要改动，先报告最小扩大范围。不改原七项、旧 Dynamics、runtime、registry、recipe、task/reference/AGENTS/.gitignore/workflow。引擎负责原子 snapshot。
 
-## 输入/输出接口锁
+## 数学锁（选定 UniRL 语义，非 Gaussian）
 
-- `models/h3_joint.py` 定义窄 `H3JointLayout`（命名若有更小明确方案在交付说明）。它描述正整数 video rows/channels 与 audio rows/channels；video/audio 两者都必须存在。输入分别 `[B,V,Cv]`、`[B,A,Ca]`，输出 `[B,V*Cv+A*Ca]`，**video first, audio second**；unpack 返回原两流形状，不改变 dtype/device、数值或梯度。真实 H3 模型的 text/audio/video attention token 排列与这个轨迹 storage packing 不是同一概念，禁止混同。
-- 范围是 T2VA generated rows，无 condition/padding 冒充生成元素。不要为未来 FL2VA/SP 造 mask 框架；不支持的几何/行数必须明确拒绝。B1 是生产微批，CPU 可用 B>1 检查 batch 维不混样。不在 layout 中持有模型或状态张量，不加入模型→算法 import。
-- `algorithms/dynamics/h3_schedule.py` 定义窄 `H3ScheduleSnapshot`：两套精确 FP32 sigma 数组、共同 transition count、按显式 index 取 `(video_s, video_u, audio_s, audio_u)`，无可变 cursor。N 次 model evaluation 对应 N+1 grid points，双 grid 同长，有限、[0,1] 内、严格递减、起1终0，不能平均成一条 dt。
-- 提供 build 默认 video shift12/audio shift3 的 N-step grids：CPU float32 linspace(1,0,N+1)，`shift*s/(1+(shift-1)*s)`；有限正 shift。若 float32 碰撞导致非严格递减，拒绝，不能偷偷改变 N。提供精确 snapshot 输入构造/读取即可，不造通用 scheduler registry。
-- 拥有输入数组的快照，外部修改原数组或读取结果不得静默改 replay schedule；可以用简单不可变表示/防御复制。不要为这一步新造多层 hash/manifest 框架。index 越界/非法类型拒绝。不得把 sigma、模型 t=1-sigma 与 index 混用。
-- 本项不新增 CPS score 或把 snapshot 塞进旧 Gaussian ABI；下一项 H3-M1b 将明确消费此合同，生产接线尚未完成必须如实标注。
+对两个模态分别使用 M1a snapshot 的 `(s,u)`，输入预测必须已经是 **noise-ward**，此内核不再翻符号。FP32 中：
 
-## 必读来源/许可
+```
+q = u * sin(eta*pi/2)
+x0 = x - s*v
+e_hat = x + (1-s)*v
+mu = (1-u)*x0 + sqrt(u*u-q*q)*e_hat
+action = FP16(mu + q*z)
+score_m = -mean((stopgrad(action).float() - mu.float())**2)
+score = (Dv*score_video + Da*score_audio)/(Dv+Da)
+```
 
-读当前实际相关源码与本目录 task/plan。参考 UniRL `8cfbac17765004afb68fef08a4e011a4c8daf555`：`unirl/models/minimax_h3/diffusion.py::pack_dual_streams/unpack_dual_streams`、`packing.py`、`vendor/scheduling_minimax_h3.py`。先读 `reference/UniRL/LICENSE` 及文件头（Apache-2.0）。本项自行实现窄合同与数学，不整体复制 vendor、不 import reference。源码 docstring 标明所选语义来源；如确需移植实质源码及新增许可文件，先请求扩大路径并明确来源，不遗漏 notices。
+- `Dv`/`Da` 来自 layout 的 generated 元素数，不是 0.5/0.5、不平均两模态 q、不加 Gaussian `1/(2q²)` 或 log(q)。结果明确命名/标记 CPS proxy score，不宣称 exact likelihood/KL。
+- eta 默认0.7，首版限定有限 `0 < eta <= 1`，拒绝 bool/NaN/inf/0/负值/越界；eta0 ODE 不在此 policy 接口。方差/q 不加 epsilon，不用 clamp 吞掉异常。仅 snapshot 最后 transition 可 q=0；全部 N 步可评分，末步不删、不改计数。非末步 float32 下溢导致 q=0 应拒绝。
+- 两流 mean/q/score 都按 FP32；存储 x/action 明确 FP16。输入预测允许已说明的浮点精度，先 FP32 运算；形状/设备与 packed state 匹配，不能静默广播错行。不要改 layout 的通用 dtype 行为，有限浮点/存储约束由 CPS 边界负责。
 
-## 验收
+## 最小调用合同
 
-- 目标测试用真实新合同实现，不 mock packing/schedule；含不等 V/Cv/A/Ca 的逐元素 pack/unpack，batch 不串行、两模态均有梯度、无意 dtype/device 转换负例。
-- 对默认10步检查11点、独立 shift12/3 的手算参考/中间点不同、按 index 末步双 u=0、准确 FP32 保持；非法 shape/宽度/空音频/nonfinite/不递减/不等长度/错误端点/越界拒绝；输入和返回值 mutation 不污染 snapshot。
-- 新测试核验导入的 `visual_rl` 和新模块路径在当前 worktree，不把主 checkout 当被测代码。只用 tiny CPU tensors，无 GPU/网络/模型下载。
-- 原样运行 plan.md 两条 CPU 命令；原七项仍7/7，H3目标集全部实跑无 skip/xfail；`git diff --check`。报告命令/exit/真实结果、允许文件 diff、当前 branch/HEAD。引擎结束后 snapshot SHA 未知就记 pending，不能伪造。
+实现一个窄 `H3CPSDynamics`（或同等简单显式函数组），绑定 layout、精确双 schedule 与 eta，提供 sampling 与 evaluate。不要继承 Gaussian `Dynamics` 并放松其校验。可定义最少所需的 stats/record 类型，命名和签名在交付中固定供下游使用：
 
-## 非目标与审查重点
+- stats 由唯一数学函数产生，sample 与 evaluate 共用；暴露足够 mean/q/双 dt 信息供诊断测试，不复制两份公式。
+- sample 接收 detached FP16 joint x、noise-ward joint prediction、显式 transition index、显式 video/audio `torch.Generator`（与目标 device 兼容）；不依赖全局 RNG。两模态各画一份 FP32 noise，固定 video 后 audio 的调用顺序；**末步 q0 也消费两份 noise**。允许 CPU 测试 tiny B>1；生产仍 B1。
+- sample 返回 detached 的紧凑转移/record，至少拥有 layout/schedule/index/eta/score-family/quantization 合同及 x/action（不保模型/Generator/计算图）。action 就是本 T2VA 无 conditioner 情况下的 next state。可带 detached rollout score 诊断，但不得把它冒称已冻结 replay old anchor。
+- evaluate 用 record 的精确合同与存储 action，加当前模型预测重新计算 FP32 score `[B]`；梯度只经过当前 prediction→mean→score，固定 action 与 x 不留图。不得重新抽 noise 或从 current mean 重新生成 action；若 dynamics 与 record 配置冲突须拒绝，不能悄悄换 schedule/layout/eta。
+- sample/record 不得因调用方后续修改原 x/action 缓冲而漂移；简单拥有副本和受控读取即可，不造哈希/池/序列化框架。CPS score 的 finite 检查和 FP16 quantization overflow 检查要保留。
+- 本项**不实现 old-policy anchor**；更新前冻结 replay anchor 依旧是后续真实阶段任务。固定 action 的所有权不等于旧策略锚已完成。
 
-无 model loading/LoRA/FSDP2/registry/recipe/reward/anchor/checkpoint/训练 loop；不因本项通过宣称 MVP 完成。Simplifier A 检查这是最小可用合同而非通用多模态框架，存储顺序/双 schedule/所有权与数值边界正确，原七项未改。返回 approved 或具体 changes；changes 必须回 Coding A 修复后两集重测。
+## 必须的目标 CPU 测试
+
+实际消费 M1a 两合同和新内核，禁止 mock 所测数学：
+
+1. 不等 AV 元素数、非相同双 schedule，手算 FP32 `mu/q/score`；证明 joint 元素权重，不是模态等权或 Gaussian。测试不只用零输入/零预测。
+2. 显式 generator 可复现 sample、FP16 action roundtrip；更换 video/audio RNG 分别影响相应模态；不污染全局 RNG；末步 generator state 证明仍消费两个 noise draw。
+3. sample 固定 action 后 evaluate 初始分数一致，修改当前预测产生正确非零梯度/分数变化；action/x 不带图，输入和读取 mutation 不改变 record 的固定内容。evaluate 不消费 RNG。
+4. 末步双 q0 仍得到合法 finite CPS score、FP16 量化残差下可有非零梯度；选非精确 FP16 数值并对照解析梯度，不能用全零例掩盖。所有 N index 可评分。
+5. 在本 H3 目标测试中直接使用当前真实 `TransitionMeanStd.validate_against`（或真实旧 Dynamics 公共端口）证明 Gaussian q0 仍被拒绝；正 q 的 Gaussian 与 CPS 数值不同。不得修改旧代码/断言使它通过。
+6. shape/dtype/device、nonfinite prediction/state/action、非法 eta/index、合同不匹配、FP16 overflow 等负例；不得靠 epsilon/删 finite 检查修复。
+
+原样执行 plan.md 两条 CPU 命令，Flash仍7/7、H3目标集无 skip/xfail；不跑全量。记录实际命令/exit/时间/数量，最后源码编辑后重测。记录当前 `git diff`（本轮既有测试改动）及新增文件、`git diff --check` 和 branch/HEAD；未获引擎 snapshot SHA 写 pending。
+
+## 来源、许可及非目标
+
+先读当前真实两合同与旧 Gaussian 代码；重读 reference/UniRL/LICENSE 和固定 `8cfbac17765004afb68fef08a4e011a4c8daf555` 的 `unirl/sde/kernels.py`（CPSSDEStrategy及量化 finalize）、`unirl/models/minimax_h3/diffusion.py` 的双流路径。独立实现给定数学并保留语义来源说明，不 import reference、不复制上游通用 registry/训练框架。若需实质复制及额外许可文件，先请求明确范围。
+
+不实现 adapter/权重/LoRA/FSDP2/生产装配/评分服务/advantage/旧锚/optimizer/checkpoint。Simplifier A 重点审 action detach、精度/双 schedule、q0 与 RNG、AV 权重、Gaussian 严格边界、重复公式/过度 artifact 及未来消费者接口；changes 回 A 修复并两集重测。本项通过只证明数值合同，不能称 MVP、GPU 或质量通过。
