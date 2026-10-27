@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Made the original seven Flash CPU tests independent of checkout depth. Author
+  data comes from `VISUALRL_FLASH_AUTHOR_DATA` or the ignored local
+  `reference_code/flash_grpo/dataset/video/` directory; existing hash checks remain.
+- Removed obsolete v0.7 guides and the old Python-API deterministic-runtime guide
+  from current `docs/`; historical references now point to a fixed Git snapshot.
+
 - Removed the unused Phase-A evidence framework, retired v0.7 rollout/reward
   DTOs, migration shims, and their structural test suites. The retained tests
   focus on configuration, model/algorithm binding, rollout, reward, update,
@@ -86,5 +92,6 @@ claims remain outside this release evidence.
 - Added fixed source preparation and a standard-library wheel checker for the
   v0.7 experiment envelope.
 
-The v0.7 files under `docs/V0_7_*` and `experiments/v0_7/` are retained only as
-historical records; they are not v0.8 usage or support contracts.
+The v0.7 experiment files under `experiments/v0_7/` remain historical records,
+not v0.8 usage or support contracts. The removed `docs/V0_7_*` guides remain
+available in the [pre-cleanup Git snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/00cee786df783f36cb254a9a666a48a5952dc0a3/docs).

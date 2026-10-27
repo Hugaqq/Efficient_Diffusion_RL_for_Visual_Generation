@@ -51,9 +51,11 @@ v0.8 使用指南或源码路径索引。
 详细职责、扩展步骤和永久门禁见
 [Model–Algorithm boundary](MODEL_ALGORITHM_BOUNDARY.md)。
 
-## 当前六条 route
+## 六条 route 的历史验证快照
 
-| 配置 | Model × Algorithm/integration | 当前 frozen A7 状态 |
+以下是 2026-08-09 的记录，不是当前运行状态，也不能作为当前提交的 GPU 验收证明。
+
+| 配置 | Model × Algorithm/integration | 当时 frozen A7 状态 |
 | --- | --- | --- |
 | `flow_grpo_sd3.yaml` | SD3.5 × Flow-GRPO | 20/20 accepted；峰值 24,892 MiB |
 | `flow_grpo_wan.yaml` | Wan2.1 T2V × Flow-GRPO | 20/20 accepted；峰值 17,568 MiB |
@@ -93,6 +95,7 @@ resume、训练质量或 phase-boundary 已验证。
 - 总计划与 gate：[Plan_8_2.md](../Plan_8_2.md)
 - frozen A7 路线、收据和恢复策略：
   [v0.8 real-GPU evidence](../experiments/v08_modular_gpu_20260808/README.md)
-- v0.7 历史 operational evidence：[V0_7_OPERATIONAL_EVIDENCE.md](V0_7_OPERATIONAL_EVIDENCE.md)
+- v0.7 文档已从当前 docs 移除；历史 operational evidence 可在
+  [固定 Git 快照](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/blob/00cee786df783f36cb254a9a666a48a5952dc0a3/docs/V0_7_OPERATIONAL_EVIDENCE.md)查阅。
 
 版本变化见 [CHANGELOG](../CHANGELOG.md)。
