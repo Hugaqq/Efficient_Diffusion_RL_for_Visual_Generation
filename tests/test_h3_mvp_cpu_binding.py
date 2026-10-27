@@ -207,8 +207,23 @@ def test_h3_binding_full_content_scope_precision_and_parameter_drift_fail_closed
         H3RuntimeBinding(**(h.kwargs | dict(gpu_uuids=tuple(reversed(h.profile.launch.gpu_uuids)))))
     with pytest.raises(ValueError, match='local facts'):
         H3RuntimeBinding(**(h.kwargs | dict(facts=replace(h.facts, model_weights_verified=True))))
+    scale = h.adapter.meta_model.model.time_embedder.scale
+    h.adapter.meta_model.model.time_embedder.scale = scale.half()
+    with pytest.raises(ValueError, match='persistent buffer'):
+        H3RuntimeBinding(**h.kwargs)
+    h.adapter.meta_model.model.time_embedder.scale = scale
     h.binding = H3RuntimeBinding(**h.kwargs)
     original_live = h.binding.validate_live()
+    group = h.prepared.optimizer.param_groups[0]
+    group['maximize'] = True
+    with pytest.raises(ValueError, match='numerical mode'):
+        h.binding.validate_live()
+    group['maximize'] = False
+    previous_foreach = group['foreach']
+    group['foreach'] = True
+    with pytest.raises(ValueError, match='hyperparameter'):
+        h.binding.validate_live()
+    group['foreach'] = previous_foreach
     p = next(iter(h.prepared.trainable_named_parameters()))[1]
     original_dtype = p.dtype
     p.data = p.data.to(torch.bfloat16)
@@ -251,8 +266,13 @@ def test_h3_binding_source_schedule_contract_and_post_tail_progress(tmp_path, mo
     foreign = H3PromptSource(**(h.source_args | dict(dynamics=H3CPSDynamics(h.dynamics.layout, h.dynamics.schedule, eta=.5))))
     with pytest.raises(ValueError, match='identity mismatch'):
         H3RuntimeBinding(**(h.kwargs | dict(source=foreign)))
+    foreign = H3PromptSource(**(h.source_args | dict(max_cells=5)))
+    with pytest.raises(ValueError, match='identity mismatch'):
+        H3RuntimeBinding(**(h.kwargs | dict(source=foreign)))
     b = H3RuntimeBinding(**h.kwargs)
     assert isinstance(b.contract, CheckpointContract)
+    from visual_rl.artifacts.checkpoint.protocol import CHECKPOINT_PROGRESS_SCHEMA_VERSION
+    assert b.contract.progress_state_schema == f'checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}'
     assert b.contract.prepared_projection().model_execution_numerics_id == b.numerics.execution_numerics_id
     assert b.state_identity.model_id == b.validate_live()['model']
     stages = H3IterationStages(data=h.source, prepared=h.prepared, predict=b.predict, decode=b.decode,
@@ -299,3 +319,30 @@ def test_h3_binding_source_schedule_contract_and_post_tail_progress(tmp_path, mo
     with pytest.raises(RuntimeError, match='boundary'):
         b.checkpoint_boundary(stages, trainer)
     trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
+
+
+def test_h3_binding_real_block_policy_observer_rejects_wrong_precision():
+    from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+
+    state = FSDPState()
+    assert hasattr(state, '_fsdp_param_groups')
+    class ObservedBlock(FSDPModule, torch.nn.Module):
+        def _get_fsdp_state(self):
+            return state
+    # No sharding/mesh/PG: the FSDP state leaf holds real policy objects only.
+    # Mixed parameter dtypes can occupy multiple groups; check every group.
+    state._fsdp_param_groups = [SimpleNamespace(mp_policy=MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False), gradient_divide_factor=8)
+        for _ in range(2)]
+    block = object.__new__(ObservedBlock)
+    torch.nn.Module.__init__(block)
+    expected = dict(param_dtype='bfloat16', reduce_dtype='float32', cast_forward_inputs=False, divisor=8)
+    assert binding_module._block_policy(block) == expected
+    for changes in (dict(param_dtype=torch.float16), dict(reduce_dtype=torch.bfloat16), dict(cast_forward_inputs=True)):
+        state._fsdp_param_groups[-1].mp_policy = MixedPrecisionPolicy(**(
+            dict(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False) | changes))
+        with pytest.raises(ValueError, match='mixed precision'):
+            binding_module._block_policy(block)
+    with pytest.raises(ValueError, match='FSDP2'):
+        binding_module._block_policy(torch.nn.Linear(1, 1))
