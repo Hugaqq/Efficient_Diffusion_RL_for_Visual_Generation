@@ -100,6 +100,7 @@ class H3RolloutPool:
         collection_id: str, behavior_id: str, device: torch.device | str,
         predict: Callable[[str, torch.Tensor, int], torch.Tensor],
         read_behavior_id: Callable[[], str],
+        status_hook: Callable[..., None] | None = None,
     ) -> None:
         """Validate all samples before the first forward, then publish atomically.
 
@@ -155,13 +156,25 @@ class H3RolloutPool:
                     x = initial.pop(sid).to(device)
                     video_rng, audio_rng = streams[sid]
                     for index in range(self._dynamics.schedule.num_steps):
+                        ordinal = len(pending_records)
+                        if status_hook is not None:
+                            status_hook(f"cell/{ordinal}/forward", local_error=False)
+                        # Raw forward failure must tear down the attempt, not
+                        # enter a possibly unmatched recovery collective.
                         prediction = predict(sid, x.clone(), index)
-                        record = self._dynamics.sample(
-                            x, prediction, index, video_generator=video_rng, audio_generator=audio_rng,
-                        )
-                        cpu_record = H3CPSRecord(
-                            self._dynamics, index, record.x.cpu(), record.action.cpu(), record.rollout_score.cpu(),
-                        )
+                        try:
+                            record = self._dynamics.sample(
+                                x, prediction, index, video_generator=video_rng, audio_generator=audio_rng,
+                            )
+                            cpu_record = H3CPSRecord(
+                                self._dynamics, index, record.x.cpu(), record.action.cpu(), record.rollout_score.cpu(),
+                            )
+                        except Exception:
+                            if status_hook is not None:
+                                status_hook(f"cell/{ordinal}/result", local_error=True)
+                            raise
+                        if status_hook is not None:
+                            status_hook(f"cell/{ordinal}/result", local_error=False)
                         pending_records.append((sid, cpu_record))
                         x = record.action
                         del record, prediction, cpu_record
