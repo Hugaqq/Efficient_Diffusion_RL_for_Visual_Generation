@@ -372,6 +372,22 @@ class H3IterationStages:
                 raise ValueError("abort identity mismatch")
             self.data.abort(self._active.request)
 
+    def checkpoint_boundary(self, trainer):
+        """Read-only post-tail check; optimize completion alone is not sufficient."""
+        if (getattr(trainer, "_prelude", None) is not self or self._active is not None
+                or self._poisoned or self._last_collection is None):
+            raise RuntimeError("checkpoint requires this trainer's complete unpoisoned tail")
+        step = trainer.next_optimizer_step
+        state = self.data.state_dict()
+        if (type(step) is not int or step <= 0 or state["next_optimizer_step"] != step
+                or state["global_cursor"] != step * 8
+                or state["behavior_id"] != self.data.read_behavior_id()
+                or state["behavior_id"] != self._expected_behavior):
+            raise RuntimeError("trainer/data/behavior boundary mismatch")
+        if any(p.grad is not None for _, p in self.prepared.trainable_named_parameters()):
+            raise RuntimeError("checkpoint requires cleared optimizer gradients")
+        return state
+
     def close(self):
         if self._active is not None:
             self._active.pool.release()
