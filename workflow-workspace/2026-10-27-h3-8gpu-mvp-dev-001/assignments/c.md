@@ -1,39 +1,36 @@
-# Assignment C — W3
+# Assignment C — W4
 
 - active: true
-- task_id: H3-M3b2-phase-norm
+- task_id: H3-M4b1-state-codec
 - pair: coding-c → simplifier-c
-- execution: parallel W3；冻结接口见decisions/wave-03.md
-- integration_parent: `e436c192778a6bbf24e2bee7ebef777332138f9a`
-- dependencies: W1 prepare与W2 world/reducer已配对approved，W2源码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e。无changes。
+- execution: parallel W4；decisions/wave-04.md
+- integration_parent: `7cf28dced4c8193ccf9321d62b5b2e479bd904f7`
+- dependencies: 现H3PreparedModel/coordination与W3六阶段已配对approved，代码汇合5397c46662db30ef535afc0fb4b192df019c4d62；不依赖B新adapter或A组合测试。
 
-## 唯一功能/允许文件
+## 单一目标/范围
 
-实现**现WORLD8已初始化运行的阶段健康/aux轮转与唯一global grad norm**能力，供A六阶段结构接口调用，不是新训练runner或PG owner。
+实现**H3已prepare模型/Adam/scheduler/必要buffer的全rank DCP state codec及fresh optimizer恢复**，给现checkpoint manager下一项整合使用。它只写调用者提供的共同staging内状态，**不自己发布complete/latest/终态、不造第二checkpoint manager**。
 
-仅新 `visual_rl/models/lifecycle/h3_coordination.py`、新 `tests/test_h3_mvp_cpu_coordination.py` 与W/coding-c/H3-M3b2-phase-norm.md。现prepare/world/helper/旧tests只读；不import A/B同波新模块。接口与A已冻结，不按自己偏好改名；确有必要回报orchestrator。
+仅新 `visual_rl/artifacts/checkpoint/h3_state.py`、新 `tests/test_h3_mvp_cpu_checkpoint_state.py`、W/coding-c/H3-M4b1-state-codec.md。旧manager/protocol/transaction/state/RNG、prepare/coordination/旧tests/A/B模块只读。若必须修旧API先给具体请求，不能自造备用manager或整段vendor。
 
-## 公共能力（必须全部真实可调用）
+## 真实codec合同
 
-`H3Coordination(plan, *, process_group, device)`或等价最小类，绑定现H3WorldPlan、实际NCCL WORLD8/当前rank CUDA及共同plan identity，不创建/销毁PG或Accelerator；不访问资源UUID。方法：
+- 生产仅调用者已初始化NCCL WORLD8、same topology；prepared是实际H3PreparedModel、最终Adam对象/参数集合严格匹配。使用真实公开 `torch.distributed.checkpoint` save/load 与model/optimizer state_dict API，lazy能力检查。全rank都进入getter/save/load/set，不能把潜在collective藏在rank0 writer callback。
+- 接收共同staging路径、明确expected topology/模型/语义身份以及现CheckpointSafePoint/CheckpointProgress或同样严格的已有proof；验证完整committed step>0、无open data reservation/dynamics/reward、非poison、GA0/梯度已清，safePoint与progress一致。scope只模型状态，caller后续必须在原BaseTrainer整轮返回/next-step推进后供真实proof；不能凭optimizer.step已调用就声称完整tail安全。
+- **cold save必须在任何可能有副作用的optimizer helper之前拒绝**：每一个期望trainable Adam state都已有有限step>0/exp_avg/exp_avg_sq及正确全局shape/dtype/参数组。部分缺state/错误FQN/旧参数对象/未清梯度拒绝；不得人工零梯度step填moments，不strict=False或跳过missing。
+- 保存完整model state（含冻结base和持久buffer）作为最小正确版本，不为节约空间引入LoRA-only恢复。分片保留分片，不allgather成完整每rankCPU/GPU权重。非持久rope.inv_freq必须单独保存/核验或绑定可靠重建值，不漏；scheduler state与None-schema精确区分。
+- capture/getter必须无训练副作用：参数、Adam moments/step/组超参、scheduler、梯度以及RNG不因snapshot改变。同步DCP写完后才返回小codec receipt；不把DTensor塞普通torch.save来冒充DCP。返回receipt/元数据只供外层现manager做树hash与complete，raw staging不能直接称可恢复checkpoint。
+- **fresh load是独立强门**：新prepare模型+真正空state新Adam，读取保存的非零moments/step，严格恢复每个FQN、param groups/lr/scheduler/model/buffer，下一优化步应与不中断对照一致。不能用已热optimizer.load来代替fresh；不得调用dummy optimizer.step或把零state“先初始化后伪称恢复”掩盖API缺口。
+- 注意PyTorch某些get_optimizer_state_dict在cold optimizer会初始化/step；不能未经检查在fresh load前调用。选择支持真实fresh materialization的公开DCP路径或明确构造目标state容器（不step、不改权重），记录精确API依据。若当前API无法在权限内实现，报告blocked和复现，不改环境或写stub。
+- 本项不还原全局训练RNG/data cursor/behavior，但接口必须不抢先restore RNG；外层bound恢复门最后恢复现RankRNGSnapshot。checkpoint完整进度/资源/双schedule/缓存/拓扑contract由后续manager/runtime绑定。本codec的模型恢复测试不是整个run恢复完成。
+- 兼容/路径/metadata/shape错误在潜在state collective前通过有界健康receipt让全部存活rank统一拒绝；getter/collective内部死亡仍由launcher退出，不在失败finally补collective或回滚已写complete。读取严格绑定same-world/topology/model schema；不支持弹性/mid-collection。
 
-1. `gate(event: str, *, local_error: bool=False) -> None`：每次交换有界小receipt（共同plan/collection/behavior、序号、event、rank、status）；不传模型/轨迹。所有存活rank相同event/sequence并且status全成功才返回，否则统一失败并poison本attempt，禁止继续调用训练门。event须有界且不包含rank-specific sample ID，A使用local cell ordinal。非法本地event/status先编码错误receipt共同拒绝，不先本地throw让peer挂住。PG死亡/collective内部错误不承诺协作恢复，也不在finally多加barrier。
-2. `aux_turns(work: Callable[[], T]) -> T`：logical rank0..7固定顺序；每轮共同begin/end gate，只有轮到本rank才调用自己的work（其内部逐条decode/score）；其他rank等待，节点heavy并发1。只保留本rank小结果，不gather媒体或跨rank传AV。不允许rank先进入下一模型阶段。可协作work异常转换同轮失败status，让存活rank共同终止；保留本地原异常链，不重试/换样。死亡/中断仍由上层退出。不要把此实现扩展通用actor/异步服务平台。
-3. `clip_grad_norm(prepared, *, max_norm: float) -> float`：消费现H3PreparedModel的最终trainable_named_parameters。预检唯一param对象、所有预期trainable且梯度非None，必须实际WORLD8 1D shard DTensor（当前root/refiner冻结，无复制trainable）；不接受未同步普通Tensor或其他mesh/placement冒充。只处理真正local shard元素，不对global DTensor值再重复统计；empty local shard可以合法，None不可当零。
-   - local finite/覆盖错误先共同gate或有限status归约，全部成功再执行norm collective。每rankFP64 sum(local_grad²)，WORLD SUM一次，sqrt得到**唯一参数元素global norm**，不再除world8、不mean各rank norm；验证aggregate finite。
-   - scale=1当norm0，否则min(1,max_norm/norm)（明确合法max_norm>0）；同一scale原地施加各local grad。零梯度合法且返回0，None/NaN/inf明确失败；不偷注入epsilon、删梯度覆盖或require-nonzero。
-   - 该梯度已经由FSDP公开gradient divide factor8正常backward同步，不再额外平均gradient或no_sync。不执行optimizer/zero_grad/scheduler。返回Python float norm，供A日志与一次commit前验收。
+## CPU验证
 
-模型内部forward/AC/backward失败可能不能到门；本能力不得许诺救活这种collective。A只在model成功返回后对local score/有限性错误使用gate。close若提供仅释放本地引用，无collective/PG teardown。要避免norm中临时保留计算图或复制完整参数。
+实际tiny loader/PEFT/guarded prepared与真实Adam训练至少一步形成非零moments；**真实磁盘DCP保存/读取与公开state APIs**在CPU测试执行，只有CUDA/PG/分片传输叶子替换或明确no-dist测试包装。不mock整个codec/save/load为内存dict；不运行真实PG/网络/GPU。
 
-## 真实CPU验证
+保存前后比较全部状态与RNG/grad不变；cold/部分Adam状态/未清grad/unsafe proof提前拒绝且getter/optimizer.step计数为0。保存至tmp_path真实DCP文件，再新建模型+空state Adam+新scheduler，fresh load后逐FQN state/value/shape/dtype/step/group/lr/buffer严格检查，固定下一步数据对照不中断结果。spy证明save/load没有额外optimizer.step。损坏/缺文件、wrong topology/model/schema/shape/scheduler及部分state拒绝。
 
-不执行GPU、PG初始化或网络。只替WORLD/CUDA/collective/DTensor-local-shard观测等叶子，实际gate/轮转/norm控制与数学不mock。模拟8rank receipts验证event/序号/plan不一致及本地错误统一拒绝/poison；work只在owned turn运行一次、错误后无后续turn或model事件、无媒体gather。
+测试中CPU参数不称DTensor；生产依然真实DCP allrank入口。明确哪些proof/collective为测试leaf，所有被测控制/数学/文件代码实际执行。最后源码编辑后跑plan固定Flash7/H3通配符，无skip/xfail/全量；报告branch/HEAD、命令/exit/数量/时间、diff/check与给现manager的精确staging接口。
 
-真实CPU tensors模拟8份**不同**local shards，独立单全局向量参考比较SUM-of-squares与clip后值，证明不是平均norm/重复参数；含不等local shard长度、empty local shard、有限零梯度、缺grad/nonfinite/复制trainable/错误mesh/duplicate对象等拒绝。production DTensor检查必须真实存在；fake只用于测试不可运行分布式叶子，不提供生产CPU fallback。测试A冻结签名可用，但不导入同波A新module。
-
-最后源码编辑后跑plan固定Flash7/H3通配符，无skip/xfail/全量；记录branch/HEAD、命令/exit/数量/时间、diff/check、实际公共方法与替身范围。Simplifier C审单owner/同序错误传播/aux并发和global唯一norm，changes回C修复重测。
-
-## 非目标
-
-不改world credit或prepare，不建训练loop/optimizer/tail/checkpoint，不实现controller/资源launcher。该协调能力仍须在A真实stage逐格调用并在后续runtime配置真实PG，不能把8rank CPU模拟当NCCL验收。GPU_PENDING。
+Simplifier C重点审cold getter纯度、fresh空Adam物化、state完整覆盖、全rank参与/非持久buffer及不伪造完整checkpoint；changes回C重测。无服务器/GPU/下载/升级/push，GPU_PENDING。
