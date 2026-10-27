@@ -51,7 +51,9 @@ Use the last complete authoritative checkpoint on optimizer/post-commit failure;
 Required seven-core gate in the actual candidate clone (not the historical full suite):
 
 ```
-cd outputs/flash140-coding && /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q
+# From the actual checkout/worktree root with the training Python environment:
+export VISUALRL_FLASH_AUTHOR_DATA=/absolute/path/to/Flash-GRPO/dataset/video
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider
 ```
 
 `tests/test_flash_collection_runtime.py` uses explicit fake model/reward leaves with the real compiler/controller/stages/Dynamics/update kernel/checkpoint owners. It covers384->192+192, full384 standard deviation with chunk-varying scores, nonunit second-update ratios, exact continuous-vs-odd-checkpoint model/optimizer/RNG/sampler/EMA continuation, interrupted collection chunk reuse, 48 normal row4 replay slots per commit without a prepass, changed-weight cache rejection, step0 finite probability mismatch rejection plus media release, resumed step1 ratio/clipfrac beyond initial tolerances with finite nonzero gradients, later NaN rejection, interval8 EMA and exception restoration/Parameter identity, schema2 roundtrip and old schema1 rejection in owner/decoder, invalid cursor/pool rejection,300x50 ODE evaluation calls with interrupted receipt reuse and exact RNG restoration, typed candidate compilation, and140 manifest quantities. These tests do not prove GPU accuracy, capacity, real HPS scoring or learning quality.

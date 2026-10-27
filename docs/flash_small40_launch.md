@@ -174,8 +174,9 @@ Run only the original seven test functions (extended subcases), not a substitute
 full suite or parameterized expansion:
 
 ```bash
-cd outputs/flash140-coding
-/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q
+# Run from the actual checkout/worktree root with the training Python environment.
+export VISUALRL_FLASH_AUTHOR_DATA=/absolute/path/to/Flash-GRPO/dataset/video
+PYTHONDONTWRITEBYTECODE=1 python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider
 ```
 
 The SMALL40 integration uses actual task-local author `Flash-GRPO/dataset/video`
