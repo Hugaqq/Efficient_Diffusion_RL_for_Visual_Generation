@@ -370,6 +370,12 @@ MODEL_CATALOG_FRAGMENT = CatalogFragment(
                 "transformers",
             ),
         ),
+        ComponentDescriptor(
+            alias="h3-t2va",
+            implementation_class_path="visual_rl.models.implementations.h3:H3Adapter",
+            declaration_provider_path="visual_rl.models.h3_config:H3DeclarationProvider",
+            optional_dependencies=("accelerate", "diffusers", "peft", "safetensors", "torch"),
+        ),
     ),
 )
 
