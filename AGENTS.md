@@ -10,6 +10,12 @@
 - Do not overwrite unknown dirty server/local changes. Preserve and reconcile them explicitly before deploying.
 - Progress inquiries do not cancel, pause or restart work. Only an explicit stop instruction or a real safety/failure condition warrants stopping.
 
+## Current repair: resume original SMALL40 run-002 step2 (supersedes fresh-only below)
+
+- User explicitly requests repair and continuation, not a new run. Historical owner/source is `00cee786df783f36cb254a9a666a48a5952dc0a3`, output `/mnt/data/qifan/runs/flash-small40-20261022/run-002`, durable latest `checkpoints/step-2`. Keep `--gpu-memory-policy oom`; do not restore launcher GPU headroom aborts, reset steps, edit checkpoints or disable independent HPS safety.
+- `docs/flash_small40_repair.md` is the current deployment mandate. Launcher-only owned HPS adapter uses the supported resource factory seam to release unused CUDA cache after rollout-context exit and before genuine scoring, with real before/after allocated/reserved/cardfree telemetry. Runtime `visual_rl/`, all config and data bytes remain unchanged. Explicit old-SHA upgrade is limited to this exact output/step2 with ancestry/path/tree/config proof atomically stored in owner; real recipe/prepared/full checkpoint checks remain mandatory. No forged identities or conversion. SMALL40 now permits explicit same-owner latest even-checkpoint resume; retry-without-checkpoint and validate still reject.
+- Same original seven CPU tests are extended, not replaced. First repair run was6 passed/1 failed because the new rejection assertion expected the wrong exception class; it correctly raised `ResumeError` on changed recipe. Corrected assertion and rerun:7 passed in14.00s; next run after owner UID guard/docs:7 passed in14.09s. Rerun after final changes before commit/push. These tests are not evidence that real CUDA cache was released or HTTP503 fixed. Deployment alone fetches tested SHA, resumes original step2, and observes real finite HPS completion/cache telemetry before handing back a live background process. No server source patch, service change or progress-triggered stop.
+
 ## Current approved experiment: SMALL40 (supersedes immediate140)
 
 - User approved stopping the old run, adapting locally and starting SMALL40. Main reports owned PID704136 was verified and stopped; private HPS18820 is still ready. Do not repeat stop commands or disturb any service. Preserve the old validation output.
