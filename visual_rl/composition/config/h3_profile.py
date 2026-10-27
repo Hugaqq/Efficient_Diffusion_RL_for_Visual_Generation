@@ -10,6 +10,7 @@ Expected: model_sha256,train_sha256,eval_sha256,cache_identity,hps_service_ident
 Execution: world_size:8,sp:1,tp:1,gpu_uuids (eight ordered distinct GPU UUIDs).
 Budgets: host_weight_bytes,trajectory_bytes,media_bytes,decode_bytes,condition_bytes,
   max_tokens,embedding_bytes,prompt_file_bytes (positive integers, explicit).
+  Prompt reads use min(prompt_file_bytes, H3PromptSource's hard file limit).
 Hps: origin,timeout_s,max_response_bytes. Resume policy must be
   complete_collection_same_topology; null resume_from means a fresh run.
 
@@ -89,6 +90,8 @@ class H3Training:
             raise ValueError("num_steps must be an integer in [1,100]")
 
     def payload(self):
+        from visual_rl.data import h3_source
+
         return dict(group_size=self.group_size, num_steps=self.num_steps,
             groups_per_rank=1, world_size=8, sp=1, tp=1, microbatch=1, chunk_size=1,
             optimizer_updates_per_collection=1, score="cps_proxy_negative_mse", av_weighting="generated_element_mean",
@@ -99,8 +102,8 @@ class H3Training:
             policy_steps="all_including_terminal_q0", old_policy="frozen_replay", beta=0., ema=False, reference=False,
             optimizer="adamw", lr=1e-4, betas=(.9, .999), eps=1e-12, weight_decay=0., clip_range=.005,
             max_grad_norm=1., lr_schedule="constant", initial_state_version=H3_INITIAL_STATE_VERSION,
-            sampling="ordered_train_cyclic_global_occurrence_step8_plus_rank",
-            random_streams="sha256_63bit_sample_member_initial_rollout_video_audio_independent",
+            sampling=h3_source.SAMPLING_VERSION,
+            random_streams=h3_source.STREAM_VERSION,
             reward="h3_hpsv3_video_only_v1", reward_weight=1., audio_quality_scored=False)
 
 
@@ -238,22 +241,22 @@ def _read(path: Path, limit: int) -> bytes:
 
 
 def _prompts(path, expected, limit, minimum):
-    raw = _read(path, limit)
+    from visual_rl.data import h3_source
+
+    raw = _read(path, min(limit, h3_source._FILE_LIMIT))
     observed = hashlib.sha256(raw).hexdigest()
     if observed != expected:
         raise ValueError("prompt file SHA256 mismatch")
-    text = raw.decode("utf-8", errors="strict")
-    lines = text.replace("\r\n", "\n").split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    if len(lines) < minimum or any(not line or "\r" in line for line in lines):
-        raise ValueError("prompt files require nonempty UTF8 LF/CRLF lines and enough rows")
-    return tuple(lines), observed
+    prompts = h3_source._prompts(raw)  # One authority for BOM/CR/empty/exact text rules.
+    if len(prompts) < minimum:
+        raise ValueError("prompt files require enough rows")
+    return prompts, observed
 
 
 def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
     """Read-only local content check; no model construction, acquire or checkpoint restore."""
     from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+    from visual_rl.data import h3_source
     from visual_rl.core.protocols.flash_hpsv3 import MAX_HEALTH_BYTES, VideoContract, decode_json, validate_health
     from visual_rl.models.implementations.h3_decode import H3CPUDecoder
     from visual_rl.models.implementations.h3_loading import _weight_headers, _TARGETS
@@ -326,7 +329,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
         model_settings.pop(key)
     payload = FrozenMapping(dict(recipe=_RECIPE, model=model_settings, math=training.payload(),
         seed=launch.seed, max_optimizer_steps=launch.max_optimizer_steps,
-        data=dict(train_sha256=train_hash, eval_sha256=eval_hash, parse="utf8_lf_crlf_preserve_no_empty.v1"),
+        data=dict(train_sha256=train_hash, eval_sha256=eval_hash, parse=h3_source.PARSE_VERSION),
         declared_model_sha256=expected["model_sha256"], model_config_hashes=configs,
         weight_header_ids={component: canonical_identity("h3.weight-headers.v1",
             {name: {"shape": header["shape"], "dtype": header["dtype"]} for name, header in headers.items()})

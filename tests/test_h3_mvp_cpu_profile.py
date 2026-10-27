@@ -288,3 +288,163 @@ def test_h3_profile_existing_sd3_wan_flash_static_compilers_unchanged():
         assert first.definition_id == definition and first.model.declaration.alias == model
         assert first.resolved_fingerprint == second.resolved_fingerprint
         assert first.model.declaration.declared_contract.model.declares_scheduler_binding
+
+
+_CROSS_TRAIN = (' cat ', '猫', 'cat\t', 'dog', ' ', 'é', 'e\u0301', 'tail  ')
+_CROSS_EVAL = ('  测试  ', '猫 ')
+
+
+def _profile_source_fixture(root, monkeypatch):
+    from tests.test_h3_mvp_cpu import _tiny_loading_class
+    from visual_rl.models.implementations import h3_loading
+    from visual_rl.models.implementations.h3 import H3Adapter
+    from visual_rl.models.lifecycle.components import ComponentManager
+
+    _, raw = _fixture(root)
+    raw['overrides'] = dict(model=dict(params=dict(height=32, width=32, lora_rank=2, lora_alpha=4)),
+                            training=dict(group_size=2, num_steps=2))
+    health = _health(VideoContract(124, 32, 32))
+    (root / 'hps.json').write_bytes(canonical_json(health))
+    raw['launch']['expected']['hps_service_identity'] = health['service_identity']
+    # Cache even the BOM-prefixed prompt: BOM rejection must be the common
+    # parser's decision, not an incidental cache miss masking the old mismatch.
+    texts = (*_CROSS_TRAIN, *_CROSS_EVAL, '\ufeff' + _CROSS_TRAIN[0])
+    tensors = {_key(text): torch.full((2, 5120), (i+1)/100) for i, text in enumerate(texts)}
+    cache = root / 'cache'
+    identity = raw['launch']['expected']['cache_identity']
+    shard = cache / 'cross.safetensors'
+    save_file(tensors, str(shard), metadata=_metadata(identity))
+    (cache / 'index.json').write_text(json.dumps(dict(schema_version='visual_rl.h3-text-cache.v1', identity=identity,
+        shards={shard.name: _sha(shard.read_bytes())}, entries={key: dict(shard=shard.name, tensor=key, tokens=2)
+                                                            for key in tensors})))
+    _cross_files(root, raw, ('\n'.join(_CROSS_TRAIN) + '\n').encode(), '\r\n'.join(_CROSS_EVAL).encode())
+    profile = compile_h3_profile(root / 'profile.yaml')
+    monkeypatch.setattr(h3_loading, '_resolve_h3_class', lambda: _tiny_loading_class())
+    adapter = H3Adapter.from_config(profile.model.config, runtime_context=dict(
+        artifact_paths={'h3-model': profile.launch.model, 'h3-text': profile.launch.text_cache},
+        expected_cache_identity=profile.expected['cache_identity']))
+    manager = ComponentManager(adapter, execution_device='cpu')
+    manager.load()  # Real meta/PEFT, only heavy class resolution replaced.
+    return raw, adapter, manager
+
+
+def _cross_files(root, raw, train, evaluation):
+    for name, content in (('train', train), ('eval', evaluation)):
+        (root / f'{name}.txt').write_bytes(content)
+        raw['launch']['expected'][f'{name}_sha256'] = _sha(content)
+    return _save(root, raw)
+
+
+def _source_from_profile(profile, adapter, *, rank=1):
+    from visual_rl.algorithms.dynamics.h3_cps import H3CPSDynamics
+    from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+    from visual_rl.data.h3_source import H3PromptSource
+
+    k, n = profile.training.group_size, profile.training.num_steps
+    return H3PromptSource(train_path=profile.launch.train, eval_path=profile.launch.eval,
+        train_sha256=profile.expected['train_sha256'], eval_sha256=profile.expected['eval_sha256'],
+        adapter=adapter, dynamics=H3CPSDynamics(adapter.geometry.joint_layout, H3ScheduleSnapshot.build(n)),
+        rank=rank, world_size=8, group_size=k, base_seed=profile.launch.seed, device='cpu',
+        max_samples=k, max_cells=k*n, max_trajectory_bytes=profile.launch.budgets.trajectory_bytes)
+
+
+def test_h3_profile_source_exact_text_versions_and_real_reserve_commit(tmp_path, monkeypatch):
+    from visual_rl.data import h3_source
+
+    raw, adapter, manager = _profile_source_fixture(tmp_path, monkeypatch)
+    try:
+        # These spies run AFTER the one explicit tiny adapter load. Neither
+        # preflight nor the real source constructor/reserve may load again.
+        with monkeypatch.context() as scoped:
+            _fail_heavy(scoped)
+            for separator, final in (('\n', ''), ('\r\n', '\r\n'), ('\n', '\n')):
+                train = (separator.join(_CROSS_TRAIN) + final).encode('utf-8')
+                evaluation = (separator.join(_CROSS_EVAL) + final).encode('utf-8')
+                profile = compile_h3_profile(_cross_files(tmp_path, raw, train, evaluation))
+                facts = preflight_h3_profile(profile)
+                source = _source_from_profile(profile, adapter)
+                assert source._train == _CROSS_TRAIN and source._eval == _CROSS_EVAL
+                state = source.state_dict()
+                assert facts.semantic_payload['data']['parse'] == state['binding']['parse'] == h3_source.PARSE_VERSION
+                assert facts.semantic_payload['math']['sampling'] == state['binding']['sampling'] == h3_source.SAMPLING_VERSION
+                assert facts.semantic_payload['math']['random_streams'] == state['binding']['stream'] == h3_source.STREAM_VERSION
+                assert facts.semantic_payload['math']['initial_state_version'] == state['binding']['geometry']['initial_state_version'] == adapter.initial_state_version
+                assert facts.train_sha256 == _sha(train) and facts.eval_sha256 == _sha(evaluation)
+                request = source.reserve(0)
+                assert list(request.prompts.values()) == ['猫'] * profile.training.group_size
+                assert all(condition.shape == (1, 2, 5120) for condition in request.conditions.values())
+                assert source.read_behavior_id() == request.behavior_id
+                source.commit(request)
+                assert source.state_dict()['next_optimizer_step'] == 1
+                assert source.state_dict()['global_cursor'] == 8
+                assert source.read_behavior_id() == request.next_behavior_id
+    finally:
+        adapter.close(); manager.close()
+
+
+def test_h3_profile_source_reject_same_bom_cr_empty_and_encoding_files(tmp_path, monkeypatch):
+    raw, adapter, manager = _profile_source_fixture(tmp_path, monkeypatch)
+    train = ('\n'.join(_CROSS_TRAIN) + '\n').encode()
+    evaluation = '\n'.join(_CROSS_EVAL).encode()
+    try:
+        with monkeypatch.context() as scoped:
+            _fail_heavy(scoped)
+            for bad_train, bad_eval, message in (
+                (b'\xef\xbb\xbf' + train, evaluation, 'BOM'),
+                (train, b'\xef\xbb\xbf' + evaluation, 'BOM'),
+                (train.replace(b'\n', b'\r', 1), evaluation, 'lone CR'),
+                (train, evaluation + b'\r', 'lone CR'),
+                (train + b'\n', evaluation, 'empty prompt'),
+                (train, b'', 'empty prompt'),
+            ):
+                profile = compile_h3_profile(_cross_files(tmp_path, raw, bad_train, bad_eval))
+                with pytest.raises(ValueError, match=message):
+                    preflight_h3_profile(profile)
+                with pytest.raises(ValueError, match=message):
+                    _source_from_profile(profile, adapter)
+            profile = compile_h3_profile(_cross_files(tmp_path, raw, train, b'\xff\n'))
+            with pytest.raises(UnicodeDecodeError):
+                preflight_h3_profile(profile)
+            with pytest.raises(UnicodeDecodeError):
+                _source_from_profile(profile, adapter)
+    finally:
+        adapter.close(); manager.close()
+
+
+def test_h3_profile_source_hard_file_cap_and_smaller_explicit_budget(tmp_path, monkeypatch):
+    from visual_rl.data import h3_source
+
+    raw, adapter, manager = _profile_source_fixture(tmp_path, monkeypatch)
+    train = (tmp_path / 'train.txt').read_bytes()
+    evaluation = (tmp_path / 'eval.txt').read_bytes()
+    assert h3_source._FILE_LIMIT == 16 * 1024 * 1024
+    try:
+        with monkeypatch.context() as scoped:
+            _fail_heavy(scoped)
+            raw['launch']['budgets']['prompt_file_bytes'] = 2 * h3_source._FILE_LIMIT
+            # Real >16MiB input and true SHA, no patched global cap or hash.
+            oversized = b'cat\n' * (h3_source._FILE_LIMIT // 4 + 1)
+            for big_train, big_eval in ((oversized, evaluation), (train, oversized)):
+                profile = compile_h3_profile(_cross_files(tmp_path, raw, big_train, big_eval))
+                with pytest.raises(ValueError, match='byte budget'):
+                    preflight_h3_profile(profile)
+                with pytest.raises(ValueError, match='byte limit'):
+                    _source_from_profile(profile, adapter)
+            profile = compile_h3_profile(_cross_files(tmp_path, raw, train, evaluation))
+            large_budget = preflight_h3_profile(profile)
+            raw['launch']['budgets']['prompt_file_bytes'] = max(len(train), len(evaluation))
+            profile = compile_h3_profile(_save(tmp_path, raw))
+            small_budget = preflight_h3_profile(profile)
+            assert small_budget.semantic_id == large_budget.semantic_id
+            assert small_budget.binding_id != large_budget.binding_id
+            raw['launch']['budgets']['prompt_file_bytes'] = min(len(train), len(evaluation)) - 1
+            profile = compile_h3_profile(_save(tmp_path, raw))
+            with pytest.raises(ValueError, match='byte budget'):
+                preflight_h3_profile(profile)
+            # An explicitly smaller profile budget is an intentional additional
+            # restriction, not a relaxation of the source's fixed hard limit.
+            source = _source_from_profile(profile, adapter)
+            source.commit(source.reserve(0))
+            assert source.state_dict()['next_optimizer_step'] == 1
+    finally:
+        adapter.close(); manager.close()
