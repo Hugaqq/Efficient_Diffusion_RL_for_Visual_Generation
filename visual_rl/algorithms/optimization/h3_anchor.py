@@ -109,6 +109,7 @@ class H3ReplayAnchor:
         collection_id: str, behavior_id: str, device: torch.device | str,
         predict: Callable[[H3CPSRecord], torch.Tensor],
         read_behavior_id: Callable[[], str],
+        status_hook: Callable[..., None] | None = None,
     ) -> None:
         """Replay every cell in the supplied order; publish only after success.
 
@@ -133,16 +134,26 @@ class H3ReplayAnchor:
         with torch.no_grad():
             if read_behavior_id() != self._behavior_id:
                 raise ValueError("behavior version changed before capture")
-            for sample_id, record in records:
+            for ordinal, (sample_id, record) in enumerate(records):
                 device_record = H3CPSRecord(
                     record.dynamics, record.index, record.x.to(device),
                     record.action.to(device), record.rollout_score.to(device),
                 )
+                if status_hook is not None:
+                    status_hook(f"cell/{ordinal}/forward", local_error=False)
+                # Do not add collectives after a raw forward/AC failure.
                 prediction = predict(device_record)
-                score = self._dynamics.evaluate(device_record, prediction)
-                if score.shape != (1,) or score.dtype != torch.float32 or not bool(torch.isfinite(score).all()):
-                    raise ValueError("replay score must be finite FP32 [1]")
-                pending[(sample_id, record.index)] = score.detach().cpu().clone()
+                try:
+                    score = self._dynamics.evaluate(device_record, prediction)
+                    if score.shape != (1,) or score.dtype != torch.float32 or not bool(torch.isfinite(score).all()):
+                        raise ValueError("replay score must be finite FP32 [1]")
+                    pending[(sample_id, record.index)] = score.detach().cpu().clone()
+                except Exception:
+                    if status_hook is not None:
+                        status_hook(f"cell/{ordinal}/result", local_error=True)
+                    raise
+                if status_hook is not None:
+                    status_hook(f"cell/{ordinal}/result", local_error=False)
                 # Free each temporary record before allocating the next one.
                 del device_record, prediction, score
             if read_behavior_id() != self._behavior_id:
