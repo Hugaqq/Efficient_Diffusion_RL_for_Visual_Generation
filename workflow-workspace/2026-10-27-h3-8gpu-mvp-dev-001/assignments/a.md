@@ -1,35 +1,30 @@
-# Assignment A — W3
+# Assignment A — W4
 
 - active: true
-- task_id: H3-M4a3-stages
+- task_id: H3-M4a4-object-integration
 - pair: coding-a → simplifier-a
-- execution: parallel W3；先读decisions/wave-03.md冻结接口
-- integration_parent: `e436c192778a6bbf24e2bee7ebef777332138f9a`
-- dependencies: W2 pool/decode/world配对approved，代码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e；W1锚/cache/prepare approved。无changes。
+- execution: parallel W4；decisions/wave-04.md
+- integration_parent: `7cf28dced4c8193ccf9321d62b5b2e479bd904f7`
+- dependencies: W3 stages/HPS/coordination分别approved，代码汇合5397c46662db30ef535afc0fb4b192df019c4d62；真实对象组合仍待验。
 
-## 单一功能：现六阶段H3迭代接线
+## 唯一目标/写边界
 
-本项必须把现pool/decoder端口/world credit/anchor/objective/prepared optimizer实际接入 **原BaseTrainer/GRPOTrainer**，不是再新增独立helper或第二训练loop。不做controller/config/checkpoint，先得到可由现controller binding构造的真实六阶段对象。
+**补齐W3三真实对象同链CPU验收**。只新增 `tests/test_h3_mvp_cpu_integration.py` 与W/coding-a/H3-M4a4-object-integration.md；现所有生产源码/测试只读。发现真实缺陷先报告具体文件、复现与最小修正，回原owner再测，不在本项更高层mock掉问题、不改兄弟源码。不得修改现93项或原七项。
 
-允许新 `visual_rl/algorithms/trainer/h3_stages.py`、新 `tests/test_h3_mvp_cpu_stages.py`；仅为每格协作状态hook精确扩展你拥有的 `h3_pool.py`/`h3_anchor.py`及对应pool/anchor feature测试。W/coding-a/H3-M4a3-stages.md。原grpo.py/stages.py/runtime/旧tests及B/C文件只读；若范围过大先报拆分，不越界重写。
+## 必须实际执行
 
-## 输入/输出锁
+- 原GRPOTrainer/BaseTrainer与H3IterationStages，真实H3RolloutPool/H3ReplayAnchor/H3WorldPlan、真实world credit、ClippedSurrogateObjective、真实Adam及data tail。
+- **真实 H3HPSReward** acquire/score_one/close，沿现factory/client/JPEG/health+score validator；只HTTP transport leaf替身，根据实际提交JPEG内容返回有限可变frame scores，严格all124/top37。不能用lambda reward替wrapper。
+- **真实 H3Coordination** init/gate/aux_turns/clip_grad_norm。不得继续用_CoordinationLeaf、本地clip_grad_norm_替换整个协调器。可复用只读feature helper的MemoryWorld或独立有界8线程内存通信leaf；禁止真实PG/网络/GPU。
+- 重H3/两个VAE叶子tiny；CUDA admission、FSDP通信/DTensor local-shard观测叶子可明确替换，但stage/coordination/统计/norm控制本身实际执行。prepared用现真实guarded H3PreparedModel、最终Adam参数检查。若使用CPU local shard仿真，准确说明它不是实际DTensor或CUDA归约，不凭它声称真正FSDP数值等价；已有world/norm独立数学对照不能丢。
+- 每个模拟rank完整K>=2、N>=2步，至少两次完整iteration；真实计划、不同rank样本、版本/condition绑定，确保不是把rank0回执复制8份然后跳过其他work。线程通信要有有限超时且失配明确失败，不能死等或吞异常。避免在每rank模型构造中改全局线程数/共享环境。
 
-- 复用现IterationIdentity/StageValue/BaseTrainer；所有stage保留同一identity对象。输入一次真实iteration request（source/collection/behavior、local sample三元组、prompt/condition关联、精确dynamics、initial states/显式RNG及预算）；数据与版本由调用者显式给，不产生dummy trajectory/media或假dataset。
-- 必需注入已有prepared对象（含optimizer/scheduler/reducer_divisor）、model prediction callable、单样本decode lease callable、score_one、`coordination_factory(plan)`、真实数据commit/abort能力。Prelude取得共同plan后调用factory得到该轮coordinator；未来runtime用真实H3Coordination(plan,PG,device)，不在admission前伪造plan。没有默认常量reward/no-op coordinator/假optimizer；算法不import具体H3模型实现或B/C同波模块。冻结scorer/coordination签名见wave-03。
-- Prelude验证请求并调用真实admit_h3_world，绑定准确geometry/schedule/score id与集合；本地预检失败要以local_error参与共同拒绝，模型零调用。stage内返回真实plan/pool上下文，不借Flash collection schema。
-- Rollout调用现H3RolloutPool.collect，prepared EVAL、固定behavior，全部N步同rank调用量。可增加小的逐格status hook：pre-forward gate、model返回后CPS local结果gate；需要在local sample/score finite失败时通知其他rank，不能在一rank失败时其他继续下一模型调用。raw forward/AC/backward内部失败不假定能共同到门，不在异常finally新增collective，令上层attempt失败。
-- Reward在**完整rollout后**coordinator.aux_turns中逐sample取terminal、进入decoder lease、score_one(sample_id,prompt,media)，离开即释放；不收集全批媒体、不进入下一rank模型阶段。实际结果组装为 `(sample_id,group_id,member_index,float_reward,True)`，无重试/换seed补样。
-- Advantage真实gather_h3_credit；Credit将本rank信用映射到所有N格，beta0、algorithm_weight1、无额外clip。仍通过独立advantage/credit stage返回StageValue，不把两stage替成生产占位。
-- Optimize先现H3ReplayAnchor.capture一次，完整成功且共同gate后才能current replay；每个B1/index格当前prepared预测→CPS.evaluate→既有ClippedSurrogateObjective(clip.005,beta0)→按plan.loss_scale(n_slot=1,reducer_divisor=prepared.reducer_divisor)立即backward，不能保N个图。旧锚不再刷新、不得直接rollout_score；全N含q0、同序格数，与pool有序样本条件准确关联。
-- 每格local score/objective有限性结果在backward前共同gate；backward正常FSDP同步，不no_sync。不另写PPO或再除world/GA/N。全部格完成才coordinator.clip_grad_norm(max_norm=1)，**一次**真实Adam step、一次scheduler、zero_grad。全零信用走图连接backward与普通commit，norm0合法，None梯度仍由coordinator拒绝。
-- 通过现trainer已有commit_iteration tail挂接真实data commit、behavior/collection进度更新、pool.release，next_optimizer_step继续由BaseTrainer唯一维护；任一失败不就地重试，不伪rollback optimizer。仅在trainer整轮返回后可成为后续checkpoint候选；不要在optimize末尾冒充完整safe point。首次/后续迭代标识严格连续。
-- 引入上下文/结果类型限必要字段，不复制通用runner、执行事务框架或Flash多update/EMA逻辑。controller/数据采样装配后续补齐，不本项绕过现入口。
+## 验收断言
 
-## 验收
+1. 8rank相同event/sequence推进；完整rollout后逐rank aux；实际work最大并发1，媒体无跨rankgather，HPS每sample一次真实protocol POST，all124帧；端口构造/acquire/close所有权明确。
+2. 每rank旧锚完整冻结后才current，N含末格；正常同步语义的每格backward/唯一norm、一次Adam/scheduler、data/behavior/trainer next-step连续两次；pool在完整tail后release。保存足够事件日志证明顺序，而不是只assert次数。
+3. 不同媒体fake transport分数驱动非零信用/参数变化；零信用另例仍真实backward与普通commit。校验阶段输出与独立数学参考的界限，不用tiny参数变化冒充完整同模型8卡证据。
+4. 至少一个单rank aux/评分协议错误与一个post-forward finite错误让所有存活rank共同停止、无optimizer/data tail、poison后不可重试；没有失败finally补救collective。raw forward/backward不可到门失败只可说明需launcher退出，测试不制造无限挂起。
+5. 当前worktree导入身份、无真实HTTP/PG/GPU；禁止skip/xfail。目标若失败不可删断言或简化为只核静态签名；交具体接口/事件缺陷给orchestrator。
 
-实际BaseTrainer.run_iteration走全部六stage，真实pool/CPS/anchor/world表校验/objective/Adam，至少两次更新；tiny仅替重model/VAE、score transport和CUDA/collective叶子。W3同波B/C未在分支出现时，可给明确测试叶子实现冻结能力，不导入其未完成源码；不得mock整trainer、stage、pool或目标函数。
-
-记录精确call序列、完整含末格、评分在所有rollout后、anchor在首current前、有限非零双流梯度/参数变化、data/版本/next-step每轮恰一次、pool只在tail释放；全相同reward也真实普通step。preflight/评分/old/current finite失败不得step/tail，部分step/tail失败poison不再次更新。原七项与原feature断言保持。
-
-最后编辑后跑plan两条固定命令（Flash7/H3通配符），无skip/xfail/全量；交付branch/HEAD、命令/exit/数量/时间、diff/check、新增hook与后续runtime接口。Simplifier A重点审是否真实复用六stage、旧锚/归一化/每格图释放/全tail及失败边界，changes回A。CPU tiny不证明真实GPU或整个RunController装配完成，GPU_PENDING。
+最后编辑后原样跑plan Flash七项和完整H3通配符，记录真实branch/HEAD、命令/exit/数量/时间、所有替身叶子与diff/check。新增测试不计作生产controller装配。Simplifier A重点审三真实对象是否确实组合、没有高层mock遮蔽和collective失败语义；通过后才关闭W3组合待办。MVP仍缺注册runtime/controller与checkpoint，GPU_PENDING。
