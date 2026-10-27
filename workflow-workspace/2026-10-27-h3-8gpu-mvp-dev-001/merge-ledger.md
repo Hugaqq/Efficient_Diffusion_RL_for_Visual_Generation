@@ -2,9 +2,9 @@
 
 ## 当前集成事实
 
-- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`47546f94e7490dafcc3fdbc2eb57279f0839899d`。
+- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`e436c192778a6bbf24e2bee7ebef777332138f9a`。
 - 实际分支：`pi-workflow/3ceaec6a-2451-4a1b-9fe8-ede829ee5dcc/main`
-- 接收时status干净。基础四项与W1三项均已读实际代码、交付及配对approved；本轮读完整anchor/text-cache/prepare、三份review与coding记录，核对目标测试与汇合门禁。无changes或未解决失败门禁。
+- 接收时status干净。本轮读W2完整pool/decode/world、reducer接线及三份coding/三份配对review，均approved；当前无changes或遗留失败门禁。
 - 引擎历史由 `git log -12 --oneline` 核对：`f8e4d0e`（首轮协调）→ `7b29f4b`（M1a coding）→ `8a6763c`（M1a审查）→ `42a11a8`（第二轮协调）→ `725f48f`（M1b coding）→ `8ed954f`（M1b审查）→ `f8f83f7`（第三轮协调）→ `edd5c87`（M2a1 coding）→ `63fe34c`（M2a1审查）→ `282dd4a`（第四轮协调）→ `919b6ab`（M2a2 coding）→ `b7f9385`（M2a2审查）；其后W1分支与汇合链见本轮W1段。角色阶段由交付/审查HEAD和顺序结果支持；本轮新增授权的累计范围diff另见下。
 - Orchestrator 本轮仍只改协调文件；不自行提交。当前原子项功能及 CPU 审核接受不等于最终 candidate 或用户 main 已发布。
 
@@ -18,9 +18,12 @@
 | H3-M4a1-anchor | W1分支task-d89f7883-d6ab-414c-8b71-0ba4187b0aa0；起点44918392c5903cf54c9d8af389317814b60d3e04；代码汇合467c8fd929804aa291bf01a5fa7cda372cc507db | approved；review task-20b11ec1-66a8-45bb-9e7c-b990f96a8f83，纳入当前HEAD | coding Flash7/12.83s H3局部28/2.84s；review Flash7/11.96s H3汇合44/2.71s | W1功能/配对/汇合CPU接受，stage消费者未接 |
 | H3-M2a3a-text-cache | W1分支task-e8cc81cc-68a4-48b2-ba77-835297ad76f1；同起点/代码汇合 | approved；review task-6d21d12a-8ed7-43d3-9526-6c197e967eb4，纳入当前HEAD | coding Flash7/11.85s H3局部28/3.94s；review Flash7/11.93s H3汇合44/3.28s | W1功能/配对/汇合CPU接受，真实encoder产物未验 |
 | H3-M3a-prepare | W1分支task-3bc7567a-9042-4d85-a3c3-9f22a1647954；同起点/代码汇合 | approved；review task-49386bc3-79aa-41ed-9651-40cfbef318e5，纳入当前HEAD | coding Flash7/12.32s H3局部32/2.74s；review Flash7/12.08s H3汇合44/2.37s | W1功能/配对/汇合CPU接受，CUDA collective未验 |
-| H3-M4a2-rollout-pool | W2-A；当前集成基线47546f94e7490dafcc3fdbc2eb57279f0839899d；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
-| H3-M2a3b-decode | W2-B；同基线；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
-| H3-M3b1-world-credit | W2-C；同基线；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
+| H3-M4a2-rollout-pool | W2-A分支task-b3628d4a-b90b-4ad2-8eae-d93f7a30b47f；起点8e674e8894c2af61188f7523933cff585a6812d6；代码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e | approved；review task-add54f4b-0fbd-4165-a0a9-a8973ccd54d8，纳入当前HEAD | coding Flash7/12.07s H3局部50/3.13s；review Flash7/13.74s H3汇合65/3.20s | W2功能/配对/汇合CPU接受 |
+| H3-M2a3b-decode | W2-B分支task-f234ad70-77ae-4489-b4e7-27a97c6218c8；同起点/代码汇合 | approved；review task-8a86fa45-e9cc-467c-aa62-f6a5cc01c567，纳入当前HEAD | coding Flash7/13.09s H3局部50/3.58s；review Flash7/12.59s H3汇合65/3.83s | W2功能/配对/汇合CPU接受 |
+| H3-M3b1-world-credit | W2-C分支task-b7d33a5a-3bad-4618-a835-5d982eddc4cb；同起点/代码汇合 | approved；review task-6d50ea27-b5d2-4bcc-bf26-636b1386a9b8，纳入当前HEAD | coding Flash7/13.09s H3局部53/5.25s；review Flash7/12.88s H3汇合65/3.45s | W2功能/配对/汇合CPU接受 |
+| H3-M4a3-stages | W3-A；基线e436c192778a6bbf24e2bee7ebef777332138f9a；分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel |
+| H3-M2c-hps-reward | W3-B；同基线；分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel |
+| H3-M3b2-phase-norm | W3-C；同基线；分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel |
 
 ## 首轮 baseline 命令（历史记录）
 
@@ -75,7 +78,7 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 
 本轮直接读 `reference/UniRL/unirl/models/minimax_h3/vendor/VENDOR_COMMIT.txt` 成功，记录源Diffusers PR14355 commit `abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc`，vendored 2026-08-03。前轮仅find无结果就推定缺失不成立，本轮修正；不推断文件何时出现。该文档的draft/导入验证为历史事实，且明确没有numerical parity；不能覆盖当前公开依赖准入与GPU_PENDING。无移植/参考修改。
 
-## 本轮W1汇合接收
+## W1汇合接收历史
 
 - 三个配对文件分别显式verdict=approved，均无必修changes；parallel-review的done不被单独视为批准。本轮已读取这三份文件及三生产模块/交付，确认scope相符。
 - 当前HEAD亲跑Flash固定七项：`7 passed in 11.70s`；H3完整通配符：`44 passed in 3.09s`，全exit0。组成基础22+A6+B6+C10，不用coding分支28/28/32代替汇合证据。
@@ -86,8 +89,23 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 
 实际git log显示coding snapshot集合 `d328669d63f84c5f241ec09d0f008ab8fe8bb64b`、`a97cb1389d523e52ca8838020045b739b49ae257`、`e4dce5ee16cd00a2c13d849e99b3120dec93292a`，逐个暂存merge到 `467c8fd929804aa291bf01a5fa7cda372cc507db`。review snapshot集合 `749f65f26f5b62786141a30d40b2725cc2bfdd5a`、`efcb9152adf8204558e764b69eca0a36522bc6e6`、`f53c8d5453795d6cdfb982d452ba5e27dcc9cd01`，纳入当前 `47546f94e7490dafcc3fdbc2eb57279f0839899d`。已知每组实际branch/起点/汇合代码HEAD见表。允许的log没有逐snapshot文件列表，交付生成时SHA为pending，故不凭merge顺序猜测这三个SHA各属于A/B/C；精确branch→原子snapshot归属待引擎提供。这不妨碍当前实际汇合代码的配对/测试接收，但最终追踪不能伪造。
 
-## W2派工
+## W2派工历史
 
 A只做CPS rollout与CPU池；B只做双VAE CPU逐条解码；C只做等量world计划/完整credit/loss尺度（必要时精确锁定prepare divisor）。各自独立源码/feature测试，无同波相互import；共同sample三元组与terminal格式由decisions/wave-02.md冻结。三个active，返回parallel；后续优先现stage/controller接线、真实reward及tail恢复，不把孤立helper和文档数量冒充MVP。
+
+## 本轮W2汇合接收
+
+- 三配对review均显式approved，本轮源代码读回确认真实CPS池、双VAE CPU路径、world完整小表/归一化及FSDP公开set_gradient_divide_factor(8)接线；没有把done本身当批准。
+- 当前HEAD亲跑Flash固定七项 `7 passed in 12.16s`；H3完整通配符 `65 passed in 3.46s`，均exit0。组成W1 44+pool6+decode6+world8+reducer1，非分支50/50/53代替。
+- 原Flash完整文件相对d818b8a历史diff仍为空(exit0)。C交付的API探查fixture问题在最后53项/各review65项/本轮65项实跑关闭，无skip/xfail修绿。
+- 实际git log记录W2 coding snapshot集合：`ed4fe8e4f544222acdc8e23b386916a926179ddc`、`674bbe29a70b20c52b46de5c9e7cd7fa46d15a67`、`14d8b6b4f5c7521394f8bd7137170d7f0078831c`；代码merge汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e。review snapshot集合：`bf8cae16559c2b56d97c010b7b88245cf5c8d0a0`、`86ca98ff6ac768fb772ef4a22b8cb938d702a2ac`、`cfdc589a2e9e5e10e56629abbc9fce52affdaa07`，汇合e436c192778a6bbf24e2bee7ebef777332138f9a。各任务实际branch与起点见表；逐branch→原子SHA仍未由引擎显式提供，不凭merge顺序猜归属。
+
+## W3接线决策
+
+A接原BaseTrainer六阶段与一次更新/tail，B复用现Hpsv3VideoClient生产评分，C阶段gate/aux轮转/global norm；冻结结构接口/独立文件见decisions/wave-03.md。A不import同波B/C，用必需注入接口；汇合后必须验证真实对象兼容，后续runtime不得注入noop。
+
+首个明确MVP reward选择 `h3_hpsv3_video_only_v1`：124全帧现top30%（top37）HPS权重1，**不评分audio语义/AV对齐，不宣称音频质量或UniRL reward复现**；joint AV CPS不变。理由是task允许现有评分接口，避免新CLAP/ImageBind平台/许可与下载；旧Flash配方和现81帧服务完全不改、不访问，124帧服务真实资源另行准入。
+
+本轮只写协调文件；无服务器/GPU/HTTP/下载/升级/push。读ledger时offset100超出94行，已按实际末段改读70并获得内容，不是项目阻塞。
 
 状态：MVP 未完成；GPU_PENDING。

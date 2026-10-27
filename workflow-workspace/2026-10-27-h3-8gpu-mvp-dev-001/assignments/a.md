@@ -1,31 +1,35 @@
-# Assignment A — W2
+# Assignment A — W3
 
 - active: true
-- task_id: H3-M4a2-rollout-pool
+- task_id: H3-M4a3-stages
 - pair: coding-a → simplifier-a
-- execution: parallel W2；decisions/wave-02.md
-- integration_parent: `47546f94e7490dafcc3fdbc2eb57279f0839899d`
-- dependencies: M1a/M1b、W1 anchor approved；W1源码汇合 `467c8fd929804aa291bf01a5fa7cda372cc507db`。无changes；实际新分支/HEAD由引擎提供。
+- execution: parallel W3；先读decisions/wave-03.md冻结接口
+- integration_parent: `e436c192778a6bbf24e2bee7ebef777332138f9a`
+- dependencies: W2 pool/decode/world配对approved，代码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e；W1锚/cache/prepare approved。无changes。
 
-## 唯一目标/文件
+## 单一功能：现六阶段H3迭代接线
 
-实现**rank-local真实CPS rollout→有界CPU latent-only池**，为后续现RolloutStage/RewardStage提供实际轨迹，不另造训练runner。
+本项必须把现pool/decoder端口/world credit/anchor/objective/prepared optimizer实际接入 **原BaseTrainer/GRPOTrainer**，不是再新增独立helper或第二训练loop。不做controller/config/checkpoint，先得到可由现controller binding构造的真实六阶段对象。
 
-只写新 `visual_rl/algorithms/trainer/h3_pool.py`、新 `tests/test_h3_mvp_cpu_pool.py`、W/coding-a/H3-M4a2-rollout-pool.md。已有anchor/CPS/forward/tests只读，不import或修改B/C本波文件。
+允许新 `visual_rl/algorithms/trainer/h3_stages.py`、新 `tests/test_h3_mvp_cpu_stages.py`；仅为每格协作状态hook精确扩展你拥有的 `h3_pool.py`/`h3_anchor.py`及对应pool/anchor feature测试。W/coding-a/H3-M4a3-stages.md。原grpo.py/stages.py/runtime/旧tests及B/C文件只读；若范围过大先报拆分，不越界重写。
 
-## 最小合同
+## 输入/输出锁
 
-- 单collection、一个固定behavior；显式给定有序样本三元组 `(sample_id, group_id, member_index)`。唯一sample、组内唯一非负member、完整固定K成员（K>=2）、局部完整group，ID不从prompt文本生成。绑定精确CPS合同、明确max_samples/max_cells/max_trajectory_bytes，预估完整N步x/action/score+terminal存储容量，任何model调用前拒超预算。
-- rollout输入每个sample的detached CPU FP16初态、显式独立video/audio generators，以及 `predict(sample_id, x_on_device, transition_index) -> noise_ward_prediction` callback、target device、read_behavior_id。初始噪声由上层显式提供，不能全零代替真实采样或重新seed补失败样本。预检全部样本shape/finite/身份/数量/合同，在进入循环前失败；输入会被拥有或受控复制，不能让调用方mutation改已收集轨迹。
-- 单次collect，在no_grad/EVAL由caller保证固定behavior，按sample-major再index0..N-1固定顺序：同模型callback一次，现 `H3CPSDynamics.sample` 一次，使用action作为下一x；两流完整演化，包含q0末格，沿用CPS显式RNG消费。每步仅当前设备状态/record，立即保存拥有的CPU FP16 x/action及FP32诊断record，不累计设备轨迹、图、媒体或模型引用。不要复制CPS数学、不要强制decode/构造假media。
-- 输出完整有序 `tuple[(sample_id,H3CPSRecord),...]` 或等效受控视图，以及按sample_id查CPU FP16终态的拥有副本、原sample元数据。record由现CPS public接口构造，不用内部buffer，不另造record格式。池是可信sample/collection/behavior来源，reader核对这些身份，终态必须恰等于最后stored action；记录旧rollout diagnostic并不等于replay anchor。
-- 失败不可公开部分可训练pool、不可局部重试/换seed补样；捕获前后行为版本漂移拒绝。状态最小new→ready/failed→released即可，不建通用事务框架。`release`幂等释放引用；真实调用必须在完整trainer tail后由未来owner执行，本项不假装optimizer/data tail已经提交。
-- 不做reward/credit/anchor捕获或更新loop。目标测试可把池输出传现H3ReplayAnchor，`predict(record)`所需sample条件通过**明确有序闭包**映射（先核对key/index），无需改anchor公共签名；未来stage如需新接口单独协调。
+- 复用现IterationIdentity/StageValue/BaseTrainer；所有stage保留同一identity对象。输入一次真实iteration request（source/collection/behavior、local sample三元组、prompt/condition关联、精确dynamics、initial states/显式RNG及预算）；数据与版本由调用者显式给，不产生dummy trajectory/media或假dataset。
+- 必需注入已有prepared对象（含optimizer/scheduler/reducer_divisor）、model prediction callable、单样本decode lease callable、score_one、`coordination_factory(plan)`、真实数据commit/abort能力。Prelude取得共同plan后调用factory得到该轮coordinator；未来runtime用真实H3Coordination(plan,PG,device)，不在admission前伪造plan。没有默认常量reward/no-op coordinator/假optimizer；算法不import具体H3模型实现或B/C同波模块。冻结scorer/coordination签名见wave-03。
+- Prelude验证请求并调用真实admit_h3_world，绑定准确geometry/schedule/score id与集合；本地预检失败要以local_error参与共同拒绝，模型零调用。stage内返回真实plan/pool上下文，不借Flash collection schema。
+- Rollout调用现H3RolloutPool.collect，prepared EVAL、固定behavior，全部N步同rank调用量。可增加小的逐格status hook：pre-forward gate、model返回后CPS local结果gate；需要在local sample/score finite失败时通知其他rank，不能在一rank失败时其他继续下一模型调用。raw forward/AC/backward内部失败不假定能共同到门，不在异常finally新增collective，令上层attempt失败。
+- Reward在**完整rollout后**coordinator.aux_turns中逐sample取terminal、进入decoder lease、score_one(sample_id,prompt,media)，离开即释放；不收集全批媒体、不进入下一rank模型阶段。实际结果组装为 `(sample_id,group_id,member_index,float_reward,True)`，无重试/换seed补样。
+- Advantage真实gather_h3_credit；Credit将本rank信用映射到所有N格，beta0、algorithm_weight1、无额外clip。仍通过独立advantage/credit stage返回StageValue，不把两stage替成生产占位。
+- Optimize先现H3ReplayAnchor.capture一次，完整成功且共同gate后才能current replay；每个B1/index格当前prepared预测→CPS.evaluate→既有ClippedSurrogateObjective(clip.005,beta0)→按plan.loss_scale(n_slot=1,reducer_divisor=prepared.reducer_divisor)立即backward，不能保N个图。旧锚不再刷新、不得直接rollout_score；全N含q0、同序格数，与pool有序样本条件准确关联。
+- 每格local score/objective有限性结果在backward前共同gate；backward正常FSDP同步，不no_sync。不另写PPO或再除world/GA/N。全部格完成才coordinator.clip_grad_norm(max_norm=1)，**一次**真实Adam step、一次scheduler、zero_grad。全零信用走图连接backward与普通commit，norm0合法，None梯度仍由coordinator拒绝。
+- 通过现trainer已有commit_iteration tail挂接真实data commit、behavior/collection进度更新、pool.release，next_optimizer_step继续由BaseTrainer唯一维护；任一失败不就地重试，不伪rollback optimizer。仅在trainer整轮返回后可成为后续checkpoint候选；不要在optimize末尾冒充完整safe point。首次/后续迭代标识严格连续。
+- 引入上下文/结果类型限必要字段，不复制通用runner、执行事务框架或Flash多update/EMA逻辑。controller/数据采样装配后续补齐，不本项绕过现入口。
 
 ## 验收
 
-真实tiny trainable模型叶子+已有H3 forward/CPS完成多sample多步采样；准确call顺序、N步全保存、双模态链连续、所有stored tensors CPU detached、terminal等最后action、同seed一致/不同seed有变化、无全局RNG污染。有限显式容量在第一个predict前拒绝；重复/不完整组/非法初态/版本漂移/中途非有限无部分ready池，失败不能重试。外部输入/读结果mutation不污染池、release后读拒绝且不保callback/model。
+实际BaseTrainer.run_iteration走全部六stage，真实pool/CPS/anchor/world表校验/objective/Adam，至少两次更新；tiny仅替重model/VAE、score transport和CUDA/collective叶子。W3同波B/C未在分支出现时，可给明确测试叶子实现冻结能力，不导入其未完成源码；不得mock整trainer、stage、pool或目标函数。
 
-实际池→现anchor capture→既有objective replay/backward示例测试（tiny叶子），证明不是无消费者结构；精确记录这不是controller或全rank闭环。不得缩减已有断言。
+记录精确call序列、完整含末格、评分在所有rollout后、anchor在首current前、有限非零双流梯度/参数变化、data/版本/next-step每轮恰一次、pool只在tail释放；全相同reward也真实普通step。preflight/评分/old/current finite失败不得step/tail，部分step/tail失败poison不再次更新。原七项与原feature断言保持。
 
-最后编辑后原样跑plan两命令：Flash七项与tests/test_h3_mvp_cpu*.py；无skip/xfail/全量。交付命令/exit/数量/时间、实际branch/HEAD、diff/check与接口；不手工commit/merge。Simplifier A审有界性/状态链/身份/失败原子性/无重复数学或训练runner，changes回A。GPU_PENDING。
+最后编辑后跑plan两条固定命令（Flash7/H3通配符），无skip/xfail/全量；交付branch/HEAD、命令/exit/数量/时间、diff/check、新增hook与后续runtime接口。Simplifier A重点审是否真实复用六stage、旧锚/归一化/每格图释放/全tail及失败边界，changes回A。CPU tiny不证明真实GPU或整个RunController装配完成，GPU_PENDING。
