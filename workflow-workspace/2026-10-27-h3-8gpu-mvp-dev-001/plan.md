@@ -10,9 +10,11 @@
 
 ## 当前轮更新
 
-M1a/M1b与M2a1均已配对approved；forward coding snapshot `edd5c874f10ffa917a71bd9f2fa9085247075a6e`，本轮HEAD `63fe34c99f96a115ef3cb743965aa4338e3653d6`。Orchestrator读geometry/forward、对应五项新测试与交付/审查，并独立复跑Flash7/7（12.27s）、H3十七项（0.91s），均exit0。tiny forward已串CPS；无真实权重/生产controller/FSDP证据。
+M1a/M1b/M2a1/M2a2均已配对approved；loader coding snapshot `919b6abc7920f2dbcea764907152523882a09a59`，本轮HEAD `b7f938506f16034ac5d2896ddfa44c16eb4af83d`。Orchestrator读完整loader、五项新增测试与交付/审查，实跑Flash7/7（13.05s）及H3通配符22项（3.36s），均exit0。尚无真实权重/生产controller/FSDP证据。
 
-本轮唯一active为B/H3-M2a2-loader；A/C idle。任务是本地artifact→meta/FP32岛/限定LoRA→严格CPU输入，给C提供明确blocks/FQN/初态。无optimizer/PG/fully_shard；C待该接口稳定再接prepare。原M2a完整adapter分为forward、loader、AV decode/cache，防止一次大提交。完整链、GPU 与最终 candidate 均未通过。历史 snapshot diff 目前不在命令白名单内，精确历史范围审计待主会话/引擎材料补足，见 merge-ledger；不能以 clean 工作区替代。
+**采用用户最新主动并行化指令**：覆盖task旧顺序默认与H3必须集中单文件的描述，不改task本体。本轮实际派parallel W1：A冻结replay锚、B离线text cache、C FSDP2 prepare；每组独立源码与feature测试文件，依赖现有已批准合同，互不引用同波新模块。边界与接收顺序见decisions/wave-01.md。完整链与最终candidate均未通过。
+
+新授权历史diff已执行：原七项文件相对d818b8a完整diff为空；net源码只新增6个H3模块与目标测试，旧源码/配置无改动。历史范围审计在当前HEAD取得实证，最终仍须再跑；不把参考资料新增计作实现。详见merge-ledger。
 
 ## 权限与完成边界
 
@@ -36,21 +38,23 @@ M1a/M1b与M2a1均已配对approved；forward coding snapshot `edd5c874f10ffa917a
 | H3-M1a-joint-schedule | A | 已实现 `models/h3_joint.py` generated AV packing；`algorithms/dynamics/h3_schedule.py` 精确双 sigma；六项目标测试 | approved；coding snapshot7b29f4b；仅前置合同 |
 | H3-M1b-cps | A | 已实现 CPS sample/evaluate/record，消费 M1a；Gaussian未放松 | approved；coding snapshot725f48f；H3目标12项 |
 | H3-M2a1-forward | B | 已实现真实T2VA几何、attention packing、双t与单次callable，连接CPS目标测试 | approved；snapshot edd5c87；目标17项，不称完整adapter |
-| H3-M2a2-loader | B | 本地artifact/API准入、meta构造/精度岛/主blocks LoRA及严格CPU输入，给C准备FQN | 本轮唯一active；依赖forward；真实公开lazy依赖，无安装下载或全模型上GPU |
-| H3-M2a3-aux | B | 严格离线text cache消费、真实video/audio VAE decode与AV结果 | loader和forward稳定；双VAE FP32、有界逐条媒体；如仍过大再拆，不造服务平台 |
+| H3-M2a2-loader | B | 已实现本地meta/LoRA/精度岛/严格CPU输入 | approved；snapshot919b6ab；H3目标22项 |
+| H3-M2a3a-text-cache | B | 严格本地layer50 cache、train/eval覆盖、有界单条读取 | W1 active，独立test_h3_mvp_cpu_text_cache.py；不依赖A/C新代码 |
+| H3-M2a3b-decode | B | 真实video/audio VAE decode与AV结果 | 后续独立项；双VAE FP32、有界逐条媒体，不造服务平台 |
 | H3-M2b-profile | B | H3 独立声明/recipe/registry 接入现 capability 与入口 | adapter 接口稳定；未知配置/不支持组合早拒，不改 Flash |
-| H3-M3a-prepare | C | 单 owner WORLD8 FSDP2 prepare/最终参数绑定，再 optimizer；真实 lazy API | 模型 block/FQN 合同稳定；tiny 验证调用顺序、严格加载覆盖；CPU 不证明 CUDA |
+| H3-M3a-prepare | C | 消费稳定loader，WORLD8 block-FSDP2/物化/buffer恢复，最终参数再optimizer | W1 active，独立test_h3_mvp_cpu_prepare.py；CPU只替重collective叶子，不证明CUDA |
 | H3-M3b-world | C | 固定同序 phase、全局 reward/advantage 与 d*n/N loss、global norm | prepare 合同稳定；不等/空 rank 模型前拒绝，数学与事件序列 CPU 验证 |
-| H3-M4a-pool | A | 现 stages 的 latent-only bounded AV collection，真实评分接口与冻结旧锚 | adapter/数学/phase 稳定；资源上界、实际锚消费者；必要时拆 decode/reward 与 anchor 两项 |
+| H3-M4a1-anchor | A | 一次性rank-local完整replay冻结锚，消费现CPS，接既有objective测试 | W1 active，独立test_h3_mvp_cpu_anchor.py；不依赖B/C新代码 |
+| H3-M4a2-pool | A | 现stages latent-only bounded AV collection/评分与锚接线 | 依赖decoder/phase稳定，另派小项，不把纯锚当完整collection |
 | H3-M4b-tail-checkpoint | C | 完整 tail safe point，现 manager 的全rank codec/单writer，同拓扑 fresh optimizer 恢复 | 上述闭环稳定；模型/Adam/scheduler/data/RNG/语义覆盖，下一步对照 |
 | H3-M4c-production-integration | B | 补齐现 controller/唯一入口的生产装配、最小配置和 torchrun 说明 | 上述逐项 approved；tiny 端到端走真实控制链，不用 mock controller |
 | H3-M5-candidate | Orchestrator | 查全调用链/审核/边界，亲跑两集，final | 所有必须项批准后才 complete；引擎独立 candidate 再验证/安全发布 |
 
-表中是依赖规划，不是一次大授权。每轮只派一个小项；实现暴露必要拆分时先更新 assignment，不顺手写整套架构。无消费者基础合同只能暂时存在于队列前置，最终不允许未消费接口冒充闭环。
+表中是依赖规划，不是一次大授权。每配对每轮只派一个小项；实现暴露必要拆分时先更新 assignment，不顺手写整套架构。无消费者基础合同只能暂时存在于队列前置，最终不允许未消费接口冒充闭环。
 
 ## 串并行与审查规则
 
-本轮顺序 B；A/C idle。所有新增 H3 CPU 测试集中同一文件，因此当前不存在完全独立的并行写边界。后续只有确认文件和输入输出合同均独立才 parallel。每次读取 coding 实际 diff/测试与对应 simplifier，记录 branch/前置HEAD/引擎 snapshot SHA/裁决/集成基线；未获真实 SHA 就 pending，不编造。changes 回同 slot 并重测重审。
+优先寻找并行小项；本轮W1三个配对均active，独立worktree及分离feature测试。原test_h3_mvp_cpu.py只读，不为拆分测试制造重构。只有实际未稳定接口才顺序/idle，并写明具体依赖。每次读取coding源码/diff/测试与对应simplifier，记录实际branch/前置HEAD/snapshot/裁决。run内暂存汇合不是批准；changes回同slot重测重审。汇合后亲跑完整H3通配符及Flash，不用各分支局部通过代替集成通过。
 
 ## 固定 CPU 门禁
 
@@ -58,7 +62,7 @@ M1a/M1b与M2a1均已配对approved；forward coding snapshot `edd5c874f10ffa917a
 
 ```bash
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_flash_collection_runtime.py -q -p no:cacheprovider
-env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider
+env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu*.py -q -p no:cacheprovider
 ```
 
-最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前十七项目标集只证明joint/双schedule/CPS及tiny单次forward桥接，尚未覆盖全部完成条件。
+最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前22项目标集只证明joint/双schedule/CPS/tiny forward及本地loader，尚未覆盖全部完成条件。最终必须跑通配符集合（旧单文件命令仅保留可用，不作最终替代）。
