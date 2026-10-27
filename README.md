@@ -174,9 +174,17 @@ checkpoints/step-N/
 `resolved_recipe.json` 则是 terminal checkpoint/finalizer 保留的历史终态快照；两者不是同一文件的
 重复别名。fresh retry 必须逐字节一致，resume 只允许 source locator/`resume_from` 的声明性差异。
 
+## H3 单节点八卡实验入口
+
+新增固定 `h3_t2va_mvp_v1` profile，通过同一个 `python -m visual_rl.train` 和
+`RunController` 接入 WORLD8 FSDP2 的同步音视频 RL、checkpoint 与同拓扑恢复。
+[使用说明与证据边界](docs/h3_mvp.md)及[配置结构模板](configs/v2/h3_t2va_mvp.yaml.example)。
+该路径已做 CPU tiny/transport-leaf 验证，**尚未取得真实 H3 八卡 GPU 验收**；
+不能原样运行含占位值的模板，也不代表任意模型/算法组合或多节点支持。
+
 ## 当前支持边界
 
-当前实现只承诺 single-process、单设备、`gradient_accumulation_steps: 1` 的装配路径。
+以下原六条配方的实现只承诺 single-process、单设备、`gradient_accumulation_steps: 1` 的装配路径。
 它不承诺 DDP、多节点、FSDP、DeepSpeed、异步 reward 或任意模型与任意算法自由组合。
 
 自动化测试集中覆盖 strict schema-v2 compile、六配置默认 composition、fake one-update、
