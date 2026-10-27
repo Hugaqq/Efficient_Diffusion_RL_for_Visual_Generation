@@ -26,6 +26,7 @@ from visual_rl.artifacts.checkpoint.coordination import CheckpointSafePoint
 from visual_rl.artifacts.checkpoint.h3_state import H3StateIdentity
 from visual_rl.artifacts.checkpoint.protocol import (
     CheckpointContract, CheckpointProgress, ComponentContractRef, ParameterContract, OptimizerGroupContract,
+    CHECKPOINT_PROGRESS_SCHEMA_VERSION,
 )
 from visual_rl.artifacts.checkpoint.state import RankRNGSnapshot
 from visual_rl.composition.config.h3_profile import H3Profile, H3LocalFacts, preflight_h3_profile
@@ -80,11 +81,14 @@ def _block_policy(block):
     from torch.distributed.fsdp import FSDPModule
     if not isinstance(block, FSDPModule):
         raise ValueError("main transformer block is not FSDP2 prepared")
-    group = block._get_fsdp_state()._fsdp_param_group
-    policy = group.mp_policy
-    if (policy.param_dtype != torch.bfloat16 or policy.reduce_dtype != torch.float32
-            or policy.cast_forward_inputs or group.gradient_divide_factor != 8):
-        raise ValueError("H3 block mixed precision/reducer drift")
+    groups = block._get_fsdp_state()._fsdp_param_groups
+    if not groups:
+        raise ValueError("H3 block has no prepared parameter groups")
+    for group in groups:
+        policy = group.mp_policy
+        if (policy.param_dtype != torch.bfloat16 or policy.reduce_dtype != torch.float32
+                or policy.cast_forward_inputs or group.gradient_divide_factor != 8):
+            raise ValueError("H3 block mixed precision/reducer drift")
     return dict(param_dtype="bfloat16", reduce_dtype="float32", cast_forward_inputs=False, divisor=8)
 
 
@@ -188,6 +192,8 @@ class H3RuntimeBinding:
                 or state["rank"] != self.rank or state["device"] != str(self.device)
                 or binding["world_size"] != 8 or binding["base_seed"] != launch.seed
                 or binding["group_size"] != self.profile.training.group_size
+                or binding["budgets"] != [self.profile.training.group_size,
+                    self.profile.training.group_size * self.profile.training.num_steps, launch.budgets.trajectory_bytes]
                 or binding["train_sha256"] != self.facts.train_sha256 or binding["eval_sha256"] != self.facts.eval_sha256
                 or binding["geometry"]["cache_identity"] != self.facts.cache_identity
                 or binding["parse"] != PARSE_VERSION or binding["sampling"] != SAMPLING_VERSION
@@ -203,6 +209,12 @@ class H3RuntimeBinding:
         if type(self.prepared.optimizer) is not torch.optim.AdamW or len(self.prepared.optimizer.param_groups) != 1:
             raise ValueError("single-group final AdamW required")
         group = self.prepared.optimizer.param_groups[0]
+        if any(group.get(key, False) for key in ("maximize", "amsgrad", "capturable", "differentiable", "fused")):
+            raise ValueError("unsupported AdamW numerical mode")
+        optimizer_spec = _hash({key: value for key, value in group.items() if key != "params"})
+        if hasattr(self, "_optimizer_spec") and optimizer_spec != self._optimizer_spec:
+            raise ValueError("optimizer hyperparameter contract drift")
+        self._optimizer_spec = optimizer_spec
         for key, expected in dict(lr=1e-4, betas=(.9, .999), eps=1e-12, weight_decay=0.).items():
             if group[key] != expected:
                 raise ValueError(f"optimizer {key} differs from fixed H3 profile")
@@ -221,9 +233,27 @@ class H3RuntimeBinding:
             actual = meta.model.get_buffer(name)
             if actual.dtype != saved.dtype or actual.shape != saved.shape or not torch.equal(actual.detach().cpu(), saved):
                 raise ValueError("constructor/rope buffer changed")
-        # All live buffers must retain the prepared precision/identity as well.
-        if any(b.is_meta or b.device != self.device for _, b in buffers):
-            raise ValueError("buffer materialization/device mismatch")
+        # Validate persistent buffer metadata at initial bind too, not merely
+        # against the subsequently captured object inventory.
+        persistent = set()
+        for name, buffer in buffers:
+            canonical = name
+            for block in meta.block_names:
+                prefix = block + '._checkpoint_wrapped_module.'
+                if name.startswith(prefix):
+                    canonical = block + '.' + name[len(prefix):]
+                    break
+            if buffer.is_meta or buffer.device != self.device:
+                raise ValueError("buffer materialization/device mismatch")
+            if canonical in meta.state_specs:
+                persistent.add(canonical)
+                spec = meta.state_specs[canonical]
+                if buffer.dtype != spec.dtype or tuple(buffer.shape) != spec.shape:
+                    raise ValueError("persistent buffer precision/shape mismatch")
+            elif canonical not in meta.nonpersistent_buffers:
+                raise ValueError("unexpected model buffer")
+        if set(params) | persistent != set(meta.state_specs):
+            raise ValueError("final model parameter/buffer coverage mismatch")
         inventory = tuple((name, id(p), tuple(p.shape), str(p.dtype), p.requires_grad)
                           for name, p in meta.model.named_parameters())
         inventory += tuple((name, id(b), tuple(b.shape), str(b.dtype), False) for name, b in buffers)
@@ -310,6 +340,10 @@ class H3RuntimeBinding:
     def validate_live(self):
         if self._closed:
             raise RuntimeError("H3 binding closed")
+        if (_world_rank(self.process_group) != self.rank
+                or _cuda_device(torch.device(f"cuda:{self.rank}")) != self.device
+                or self.topology["gpu_uuids"] != list(self.profile.launch.gpu_uuids)):
+            raise ValueError("live rank/device/topology changed")
         if verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256) != self.content:
             raise ValueError("artifact content identity changed")
         self._check_resources()
@@ -347,14 +381,14 @@ class H3RuntimeBinding:
             components=(component,), model_state_projection=projection, model_state_projection_id=projection.projection_id,
             model_execution_numerics=self.numerics, model_execution_numerics_id=self.numerics.execution_numerics_id,
             trainable_parameters=tuple(ParameterContract(p.name, tuple(p.parameter.shape), str(p.parameter.dtype)) for p in params),
-            optimizer_groups=(OptimizerGroupContract("adamw", tuple(p.name for p in params), _hash(
-                {k: self.prepared.optimizer.param_groups[0][k] for k in ("lr", "betas", "eps", "weight_decay")})),),
+            optimizer_groups=(OptimizerGroupContract("adamw", tuple(p.name for p in params), self._optimizer_spec),),
             scaler_schema="none", lr_scheduler_schema="h3.constant.v1", precision="bf16-blocks-fp32-islands-lora",
             preprocess_identity=_hash(dict(cache=live["cache"], geometry=self.source.geometry_id)),
             preprocess_requirement_set_id=_hash(dict(layer=50, width=5120, trimmed=True, guidance=1)),
             group_size=self.profile.training.group_size, global_batch_size=8*self.profile.training.group_size,
             gradient_accumulation_steps=1, data_sharding_version=SAMPLING_VERSION, sampler_state_schema="h3.prompt-source.v1",
-            rng_policy=STREAM_VERSION, dynamics_state_schema="h3.cps-dual-all-n.v1", progress_state_schema="checkpoint-progress.v1",
+            rng_policy=STREAM_VERSION, dynamics_state_schema="h3.cps-dual-all-n.v1",
+            progress_state_schema=f"checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}",
             ema_state_schema="none", reference_state_schema="none", execution_transform_plan_id=transform_id,
             execution_transform_chain=(("h3.world8-ac-fsdp2.v1", transform_id),), world_size=8, world_size_policy="strict",
             state_schema_versions=(("model", 2), ("optimizer", 1), ("data", 1), ("rng", 1)),
