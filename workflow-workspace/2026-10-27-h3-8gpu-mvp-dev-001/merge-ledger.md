@@ -2,9 +2,9 @@
 
 ## 当前集成事实
 
-- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`7cf28dced4c8193ccf9321d62b5b2e479bd904f7`。
+- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`6f5e46fce212e00d547a3ca07fa5524018bef816`。
 - 实际分支：`pi-workflow/3ceaec6a-2451-4a1b-9fe8-ede829ee5dcc/main`
-- 接收时status干净。本轮读W3完整stages/HPS/coordination、实际旧controller/模型与checkpoint边界及三份coding/三份review，均原子approved；无changes/失败门禁，但三对象同链证据仍是明确未完成项。
+- 接收时status干净。本轮读W4实际adapter/config/interface、state codec及integration测试和三份配对报告，均approved；三对象CPU同链缺口在本轮关闭。无changes/遗留失败门禁，整run/controller和完整checkpoint仍未完成。
 - 引擎历史由 `git log -12 --oneline` 核对：`f8e4d0e`（首轮协调）→ `7b29f4b`（M1a coding）→ `8a6763c`（M1a审查）→ `42a11a8`（第二轮协调）→ `725f48f`（M1b coding）→ `8ed954f`（M1b审查）→ `f8f83f7`（第三轮协调）→ `edd5c87`（M2a1 coding）→ `63fe34c`（M2a1审查）→ `282dd4a`（第四轮协调）→ `919b6ab`（M2a2 coding）→ `b7f9385`（M2a2审查）；其后W1分支与汇合链见本轮W1段。角色阶段由交付/审查HEAD和顺序结果支持；本轮新增授权的累计范围diff另见下。
 - Orchestrator 本轮仍只改协调文件；不自行提交。当前原子项功能及 CPU 审核接受不等于最终 candidate 或用户 main 已发布。
 
@@ -15,18 +15,21 @@
 | H3-M1b-cps | 同上述分支；前置42a11a8c3fc6473aa52238473e20bc002e66db4c；coding snapshot725f48f4d67c67d90c60cc3536f4bc40f12802f2 | approved；记录snapshot8ed954f2562cf9d1f5432a7bb84ada181cdae6a9 | coding Flash7/12.12s、H3十二项/1.13s；simplifier Flash7/12.35s、H3十二项/1.03s；orchestrator Flash7/12.78s、H3十二项/0.88s，全exit0 | 功能/配对/CPU接受；非旧锚、非生产闭环 |
 | H3-M2a1-forward | 同上述分支；前置f8f83f7064f121a00526241048e68ceda83eb4b1；coding snapshot edd5c874f10ffa917a71bd9f2fa9085247075a6e | approved；记录snapshot63fe34c99f96a115ef3cb743965aa4338e3653d6 | coding Flash7/12.78s、H3十七项/1.41s；simplifier Flash7/13.10s、H3十七项/1.20s；orchestrator Flash7/12.27s、H3十七项/0.91s，全exit0 | 功能/配对/CPU接受；tiny叶子桥接，不是权重/完整adapter |
 | H3-M2a2-loader | 同上述分支；前置282dd4ad05bbabb8bdb8ddf301e11b057d6b0846；coding snapshot919b6abc7920f2dbcea764907152523882a09a59 | approved；审查snapshot b7f938506f16034ac5d2896ddfa44c16eb4af83d | coding Flash7/12.12s、H3二十二项/3.12s；simplifier Flash7/12.95s、H3二十二项/3.55s；orchestrator Flash7/13.05s、H3通配符22/3.36s，全exit0 | 功能/配对/CPU接受；非真实H3/FSDP证据 |
-| H3-M4a1-anchor | W1分支task-d89f7883-d6ab-414c-8b71-0ba4187b0aa0；起点44918392c5903cf54c9d8af389317814b60d3e04；代码汇合467c8fd929804aa291bf01a5fa7cda372cc507db | approved；review task-20b11ec1-66a8-45bb-9e7c-b990f96a8f83，纳入当前HEAD | coding Flash7/12.83s H3局部28/2.84s；review Flash7/11.96s H3汇合44/2.71s | W1功能/配对/汇合CPU接受，stage消费者未接 |
+| H3-M4a1-anchor | W1分支task-d89f7883-d6ab-414c-8b71-0ba4187b0aa0；起点44918392c5903cf54c9d8af389317814b60d3e04；代码汇合467c8fd929804aa291bf01a5fa7cda372cc507db | approved；review task-20b11ec1-66a8-45bb-9e7c-b990f96a8f83，纳入当前HEAD | coding Flash7/12.83s H3局部28/2.84s；review Flash7/11.96s H3汇合44/2.71s | W1功能/配对/汇合CPU接受，W3已增加stage消费者 |
 | H3-M2a3a-text-cache | W1分支task-e8cc81cc-68a4-48b2-ba77-835297ad76f1；同起点/代码汇合 | approved；review task-6d21d12a-8ed7-43d3-9526-6c197e967eb4，纳入当前HEAD | coding Flash7/11.85s H3局部28/3.94s；review Flash7/11.93s H3汇合44/3.28s | W1功能/配对/汇合CPU接受，真实encoder产物未验 |
 | H3-M3a-prepare | W1分支task-3bc7567a-9042-4d85-a3c3-9f22a1647954；同起点/代码汇合 | approved；review task-49386bc3-79aa-41ed-9651-40cfbef318e5，纳入当前HEAD | coding Flash7/12.32s H3局部32/2.74s；review Flash7/12.08s H3汇合44/2.37s | W1功能/配对/汇合CPU接受，CUDA collective未验 |
 | H3-M4a2-rollout-pool | W2-A分支task-b3628d4a-b90b-4ad2-8eae-d93f7a30b47f；起点8e674e8894c2af61188f7523933cff585a6812d6；代码汇合ced9a871df0ee6bfe8b560e90da03bc12d4dda0e | approved；review task-add54f4b-0fbd-4165-a0a9-a8973ccd54d8，纳入当前HEAD | coding Flash7/12.07s H3局部50/3.13s；review Flash7/13.74s H3汇合65/3.20s | W2功能/配对/汇合CPU接受 |
 | H3-M2a3b-decode | W2-B分支task-f234ad70-77ae-4489-b4e7-27a97c6218c8；同起点/代码汇合 | approved；review task-8a86fa45-e9cc-467c-aa62-f6a5cc01c567，纳入当前HEAD | coding Flash7/13.09s H3局部50/3.58s；review Flash7/12.59s H3汇合65/3.83s | W2功能/配对/汇合CPU接受 |
 | H3-M3b1-world-credit | W2-C分支task-b7d33a5a-3bad-4618-a835-5d982eddc4cb；同起点/代码汇合 | approved；review task-6d50ea27-b5d2-4bcc-bf26-636b1386a9b8，纳入当前HEAD | coding Flash7/13.09s H3局部53/5.25s；review Flash7/12.88s H3汇合65/3.45s | W2功能/配对/汇合CPU接受 |
-| H3-M4a3-stages | W3分支task-264dad1a-fc45-4b29-83f5-fa37bb012962；起点282539fa94c9ca2ec7fda8602e2cc2980ada6d62；代码汇合5397c46662db30ef535afc0fb4b192df019c4d62 | approved；review task-02e82c02-70c2-4da0-89bd-345cab93ca57 | coding Flash7/12.97s H3局部79/4.55s；review Flash7/13.27s H3汇合93/4.26s | 原子项接受；真实B/C联合装配未验 |
+| H3-M4a3-stages | W3分支task-264dad1a-fc45-4b29-83f5-fa37bb012962；起点282539fa94c9ca2ec7fda8602e2cc2980ada6d62；代码汇合5397c46662db30ef535afc0fb4b192df019c4d62 | approved；review task-02e82c02-70c2-4da0-89bd-345cab93ca57 | coding Flash7/12.97s H3局部79/4.55s；review Flash7/13.27s H3汇合93/4.26s | 原子项接受；W4已补真实对象CPU组合，默认runtime未接 |
 | H3-M2c-hps-reward | W3分支task-1284df45-1db9-4ed4-a142-65c9f14c87ee；同起点/代码汇合 | approved；review task-5a01be5f-31c4-45a7-87be-029c9f464945 | coding Flash7/11.99s H3局部71/3.63s；review Flash7/13.90s H3汇合93/4.67s | 原子项接受；没有真实HTTP证据 |
-| H3-M3b2-phase-norm | W3分支task-fe15678f-3a80-47ac-9511-ee893a0d0607；同起点/代码汇合 | approved；review task-547d9e5f-26b8-473b-abd2-6c9ed12d3b30 | coding Flash7/12.31s H3局部73/3.60s；review Flash7/12.48s H3汇合93/5.25s | 原子项接受；同stage组合/真实CUDA未验 |
-| H3-M4a4-object-integration | W4-A；基线7cf28dced4c8193ccf9321d62b5b2e479bd904f7；分支/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
-| H3-M2b1-model-adapter | W4-B；同基线；分支/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
-| H3-M4b1-state-codec | W4-C；同基线；分支/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
+| H3-M3b2-phase-norm | W3分支task-fe15678f-3a80-47ac-9511-ee893a0d0607；同起点/代码汇合 | approved；review task-547d9e5f-26b8-473b-abd2-6c9ed12d3b30 | coding Flash7/12.31s H3局部73/3.60s；review Flash7/12.48s H3汇合93/5.25s | 原子项接受；W4已补同stage CPU组合，真实CUDA未验 |
+| H3-M4a4-object-integration | W4分支task-4b0c636a-c9a4-48a8-adb5-46a41a065fd6；起点477325141c0911aeb3cdd8a85937a6843532be87；代码汇合fb085fb35fb239cdd4c151d39decbd7fae268c9d | approved；review task-daf8a51f-8100-46ae-8769-51eb2030e7e8 | coding Flash7/12.58s H3局部97/8.31s；review Flash7/12.54s H3汇合108/6.94s | 接受，W3三对象CPU组合缺口关闭 |
+| H3-M2b1-model-adapter | W4分支task-1e054adc-e263-4ffb-aa31-859832636c18；同起点/代码汇合 | approved；review task-355e2e9e-3aa8-49cd-a127-0f57345bb806 | coding Flash7/12.50s H3局部97/5.62s；review Flash7/12.56s H3汇合108/7.38s | 接受；注册端口非默认runtime |
+| H3-M4b1-state-codec | W4分支task-5dfce464-611a-49d3-b174-e07b3c2246c5；同起点/代码汇合 | approved；review task-29df6a46-e199-4bd7-a9cf-6a9aa0b3d761 | coding Flash7/12.28s H3局部100/4.39s；review Flash7/12.68s H3汇合108/7.23s；DCP9warnings保留 | 接受；raw codec非完整checkpoint |
+| H3-M4a5-data-source | W5-A；基线6f5e46fce212e00d547a3ca07fa5524018bef816；新branch/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
+| H3-M2b2-profile | W5-B；同基线；新branch/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
+| H3-M4b2-checkpoint-publish | W5-C；同基线；新branch/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
 
 ## 首轮 baseline 命令（历史记录）
 
@@ -111,7 +114,7 @@ A接原BaseTrainer六阶段与一次更新/tail，B复用现Hpsv3VideoClient生�
 
 本轮只写协调文件；无服务器/GPU/HTTP/下载/升级/push。读ledger时offset100超出94行，已按实际末段改读70并获得内容，不是项目阻塞。
 
-## 本轮W3原子项接收与组合证据缺口
+## W3原子项接收与当时组合证据缺口
 
 - 三review均显式approved且无返工要求；本轮读取对应生产模块/交付、stages测试与MemoryWorld测试叶子，确认现阶段测试仍用_CoordinationLeaf/评分叶子，不同时实例化真实H3HPSReward+H3Coordination。**93项不关闭wave-03要求的真实对象组合验收**。
 - 当前HEAD亲跑固定Flash：`7 passed in 13.35s`；H3完整通配符：`93 passed in 4.84s`，均exit0。原Flash完整历史diff相对d818b8a再次为空，未改原七项断言。
@@ -124,5 +127,21 @@ A独立新增组合测试，实际执行原六stage+真实HPS对象+真实Coordi
 本轮已读旧ModelInput单timestep、PACKED_SEQUENCE rank>=3、单tensor DecodedMediaBatch、默认runtime optimizer-before-prepare以及AtomicCheckpointManager writer边界，故这些不能简单删guard作为H3接入。后续仍需真实data/recipe/runtime绑定及现manager共同staging/完整RNG/data恢复，不用raw DCP目录冒称完整checkpoint。
 
 本轮仅协调文档；无GPU/服务器/HTTP/PG/下载/升级/push。
+
+## 本轮W4接收
+
+- 三配对review显式approved；实际integration测试八worker同时执行原BaseTrainer/H3Stages、真实HPS owner、真实Coordination及真实数学/optimizer；仅重模型/VAE/通信/HTTP/DTensor观测叶子仿真。本轮正式关闭W3三真实对象CPU组合缺口，但不把仿真称实际H3 FSDP/NCCL或默认controller运行。
+- 实际注册H3Adapter把现meta/cache/初态/双sigma guarded predict/AV lease连接；新增T2VA/AUDIO/JOINT_AV_FLAT封闭类型，旧packed限制保留。G3/双schedule binder/默认runtime仍须实装，不填假receipt。
+- state codec真实磁盘DCP save/load/fresh空Adam恢复及下一步对照有证据；原DCP optimizer setter会dummy step的探查失败已通过独立目标容器+公开AdamW.load_state_dict修正，并由禁止step spy验证，不靠skip/xfail。codec不恢复RNG、不发布complete，原manager接入仍是W5必须项。
+- 当前HEAD亲跑Flash7项 `7 passed in 13.79s`；H3通配符 `108 passed, 9 warnings in 8.54s`，全exit0。9warnings实际为公开DCP单进程save/load和损坏fixture重写提示，未隐藏。原Flash完整历史diff相对d818b8a仍为空。
+- W4 git log的coding snapshot集合：`943a32001d496aa1ff888c45f58d6d97e38625bb`、`0602bd6565818a7f54c600eac2314cffa58f2a54`、`ce20764d9de6959092830d534c514802beae41d2`，汇合fb085fb35fb239cdd4c151d39decbd7fae268c9d；review集合：`2fa83b45ff8c59a1ec783098f061d4ebab4e60b7`、`e7f8ceaafdc0d1d83f7bee763fa2afe98b8d9a75`、`cccd14d771384b5d6a945772edc5ab35dbe0a065`，纳入6f5e46fce212e00d547a3ca07fa5524018bef816。实际分支/起点见表，逐branch→原子SHA仍待引擎明确，不按顺序猜测。
+
+## W5派工与真实剩余路径
+
+A本地prompt/cache数据预留、明确derived RNG流、commit/abort和fresh边界状态；B固定H3 profile编译/本地事实准入（不建假runtime）；C原AtomicCheckpointManager共同staging/全rank codec+rank RNG/data/纯writer发布与两恢复门。文件独立、同波无相互import，接口见wave-05。
+
+本轮检查旧CheckpointProgress.rng_state_id与manager.commit：旧writer是主进程回调，不能把DCP隐藏其中；需要先共同staging再commit-existing，global progress须绑定8rank RNG表摘要。配方/data/完整发布稳定后，下一轮优先现唯一RunController真实装配、G3数值/数据/资源与default entry，不以helper数量称MVP。
+
+本轮仅协调文档；无GPU/服务器/HTTP/PG初始化/下载/升级/push。
 
 状态：MVP 未完成；GPU_PENDING。

@@ -1,36 +1,36 @@
-# Assignment C — W4
+# Assignment C — W5
 
 - active: true
-- task_id: H3-M4b1-state-codec
+- task_id: H3-M4b2-checkpoint-publish
 - pair: coding-c → simplifier-c
-- execution: parallel W4；decisions/wave-04.md
-- integration_parent: `7cf28dced4c8193ccf9321d62b5b2e479bd904f7`
-- dependencies: 现H3PreparedModel/coordination与W3六阶段已配对approved，代码汇合5397c46662db30ef535afc0fb4b192df019c4d62；不依赖B新adapter或A组合测试。
+- execution: parallel W5；decisions/wave-05.md
+- integration_parent: `6f5e46fce212e00d547a3ca07fa5524018bef816`
+- dependencies: W4真实DCP state codec approved；现AtomicCheckpointManager/CheckpointContract/Progress/SafePoint/RankRNGSnapshot只依赖稳定类型；代码汇合fb085fb35fb239cdd4c151d39decbd7fae268c9d。
 
-## 单一目标/范围
+## 单一目标/允许写入
 
-实现**H3已prepare模型/Adam/scheduler/必要buffer的全rank DCP state codec及fresh optimizer恢复**，给现checkpoint manager下一项整合使用。它只写调用者提供的共同staging内状态，**不自己发布complete/latest/终态、不造第二checkpoint manager**。
+让现**AtomicCheckpointManager发布allrank H3完整状态**，补齐shared staging、rank RNG/data附属状态及分阶段恢复。不能另造第二checkpoint manager/publisher。
 
-仅新 `visual_rl/artifacts/checkpoint/h3_state.py`、新 `tests/test_h3_mvp_cpu_checkpoint_state.py`、W/coding-c/H3-M4b1-state-codec.md。旧manager/protocol/transaction/state/RNG、prepare/coordination/旧tests/A/B模块只读。若必须修旧API先给具体请求，不能自造备用manager或整段vendor。
+允许精确扩展 `visual_rl/artifacts/checkpoint/manager.py` 共享staging创建/commit-existing窄入口（旧commit语义/断言保持）；新 `visual_rl/artifacts/checkpoint/h3_transaction.py`、新 `tests/test_h3_mvp_cpu_checkpoint_publish.py`、W/coding-c/H3-M4b2-checkpoint-publish.md。现h3_state.py/旧protocol/state/RNG/transaction/runtime及其他tests只读；A/B本波新data/profile不import。若需改codec缺陷先报告给本orchestrator，不能顺手混大改。
 
-## 真实codec合同
+## 冻结整合合同
 
-- 生产仅调用者已初始化NCCL WORLD8、same topology；prepared是实际H3PreparedModel、最终Adam对象/参数集合严格匹配。使用真实公开 `torch.distributed.checkpoint` save/load 与model/optimizer state_dict API，lazy能力检查。全rank都进入getter/save/load/set，不能把潜在collective藏在rank0 writer callback。
-- 接收共同staging路径、明确expected topology/模型/语义身份以及现CheckpointSafePoint/CheckpointProgress或同样严格的已有proof；验证完整committed step>0、无open data reservation/dynamics/reward、非poison、GA0/梯度已清，safePoint与progress一致。scope只模型状态，caller后续必须在原BaseTrainer整轮返回/next-step推进后供真实proof；不能凭optimizer.step已调用就声称完整tail安全。
-- **cold save必须在任何可能有副作用的optimizer helper之前拒绝**：每一个期望trainable Adam state都已有有限step>0/exp_avg/exp_avg_sq及正确全局shape/dtype/参数组。部分缺state/错误FQN/旧参数对象/未清梯度拒绝；不得人工零梯度step填moments，不strict=False或跳过missing。
-- 保存完整model state（含冻结base和持久buffer）作为最小正确版本，不为节约空间引入LoRA-only恢复。分片保留分片，不allgather成完整每rankCPU/GPU权重。非持久rope.inv_freq必须单独保存/核验或绑定可靠重建值，不漏；scheduler state与None-schema精确区分。
-- capture/getter必须无训练副作用：参数、Adam moments/step/组超参、scheduler、梯度以及RNG不因snapshot改变。同步DCP写完后才返回小codec receipt；不把DTensor塞普通torch.save来冒充DCP。返回receipt/元数据只供外层现manager做树hash与complete，raw staging不能直接称可恢复checkpoint。
-- **fresh load是独立强门**：新prepare模型+真正空state新Adam，读取保存的非零moments/step，严格恢复每个FQN、param groups/lr/scheduler/model/buffer，下一优化步应与不中断对照一致。不能用已热optimizer.load来代替fresh；不得调用dummy optimizer.step或把零state“先初始化后伪称恢复”掩盖API缺口。
-- 注意PyTorch某些get_optimizer_state_dict在cold optimizer会初始化/step；不能未经检查在fresh load前调用。选择支持真实fresh materialization的公开DCP路径或明确构造目标state容器（不step、不改权重），记录精确API依据。若当前API无法在权限内实现，报告blocked和复现，不改环境或写stub。
-- 本项不还原全局训练RNG/data cursor/behavior，但接口必须不抢先restore RNG；外层bound恢复门最后恢复现RankRNGSnapshot。checkpoint完整进度/资源/双schedule/缓存/拓扑contract由后续manager/runtime绑定。本codec的模型恢复测试不是整个run恢复完成。
-- 兼容/路径/metadata/shape错误在潜在state collective前通过有界健康receipt让全部存活rank统一拒绝；getter/collective内部死亡仍由launcher退出，不在失败finally补collective或回滚已写complete。读取严格绑定same-world/topology/model schema；不支持弹性/mid-collection。
+- 接受实际H3PreparedModel、现CheckpointContract/Progress/SafePoint/H3StateIdentity、既有已初始化WORLD8、调用者真正完整tail后的小rank data/behavior状态。data payload要求JSON-safe有限小schema和显式content identity，不能包含Generator、tensor轨迹、model或活跃reservation；C不伪造真实data cursor，未来runtime从A的state_dict传入。
+- **主writer创建共同staging**，广播相同路径/step/身份，所有rank检查位于自己的声明checkpoint root。所有rank在writer callback以外调用真实save_h3_state，然后各写自己的rank附属文件（RankRNGSnapshot现capture/codec复用、data/behavior、rank/topology与state摘要）。模型get/save/load/set必须全rank，不藏在manager单writer里。
+- Manager增加最小 `create_staging`/`commit_existing`等功能，复用原complete/state_tree/progress/rename/latest实现，不复制完整发布逻辑。严查receipt由本manager创建、step/root/路径/无symlink/未complete与现final不存在；禁止接管未知临时目录。旧commit(writer)可复用内部helper但原异常/文件格式/故障注入语义不变；不要改变Flash旧checkpoint布局。
+- 全rank成功、预期8rank附属状态恰齐且内容hash一致后，只有rank0对完整DCP文件树+rank状态调用现manager纯文件发布。返回现CommittedCheckpoint或可解析的小broadcast receipt。rename后latest失败保留合法complete，不倒删已发布目录；rank死亡/collective内部失败不finally barrier补checkpoint，不把半staging作为恢复来源。
+- global progress跨rank相同：`rng_state_id`应为**有序8rank RNG身份表的全局摘要**，不能要求8个各自rng hash相同、也不能直接删RNG身份。rank私有RNG在对应文件严格校验；data的共同cursor/next_global_batch_id保持全局含义，局部样本状态保各rank。小表含rank、rng/data身份、同topology/schema即可，不gather整个RNG tensor或媒体。
+- proof仍必须来自原BaseTrainer完整tail返回后（含data/behavior/pool/next-step）；保存拒step0/cold/mid-collection/poison/未清梯度。不能以caller传True就跳过现SafePoint.assert_ready及codec强门。本模块不声称自己执行trainer tail，future runtime须给真实proof。
+- **restore_prepared**：先manager.inspect_complete验证整个树/expected contract/same-topology和rank附件，再各rank真实load_h3_state到fresh空Adam；返回待bound处理的rank state/RNG，不立即restore RNG，不读raw staging冒充complete。
+- **restore_bound**：重新核验实际complete树与caller提供的live资源/data/缓存/score/双schedule/模型/topology绑定（不能只复用prepared阶段的旧hash）；调用必需data恢复callback，校验behavior/cursor；最后用现RankRNGSnapshot.restore_current恢复本rankPython/NumPy/TorchCPU/CUDA状态。两阶段恢复各自只可一次，部分失败poison不就地重载。当前API不需import同波A/B，只接受实际序列化payload与外部验证/恢复能力，不提供noop默认值。
+- 本步骤保存完整codec+rank RNG/data/behavior；最终run是否completed和统一继续分支由未来RunController处理，不让rank0单独提前退出。保留code/model/score/schema身份，拒elastic/world重编号，禁止把LoRA export当恢复。
 
-## CPU验证
+## 真实CPU验收
 
-实际tiny loader/PEFT/guarded prepared与真实Adam训练至少一步形成非零moments；**真实磁盘DCP保存/读取与公开state APIs**在CPU测试执行，只有CUDA/PG/分片传输叶子替换或明确no-dist测试包装。不mock整个codec/save/load为内存dict；不运行真实PG/网络/GPU。
+真实AtomicCheckpointManager完整目录/manifest/tree hash/complete/latest和真实h3_state/DCP磁盘路径执行；8rank控制可用有界内存collective叶子或单进程明确transport包装，生产逻辑不mock。重模型/CUDA/PG/DCP通信叶子明确标注，禁止真实PG/网络/GPU。已有fixture可只读复用。
 
-保存前后比较全部状态与RNG/grad不变；cold/部分Adam状态/未清grad/unsafe proof提前拒绝且getter/optimizer.step计数为0。保存至tmp_path真实DCP文件，再新建模型+空state Adam+新scheduler，fresh load后逐FQN state/value/shape/dtype/step/group/lr/buffer严格检查，固定下一步数据对照不中断结果。spy证明save/load没有额外optimizer.step。损坏/缺文件、wrong topology/model/schema/shape/scheduler及部分state拒绝。
+证明model getter/save所有rank在单writer外，rank私有RNG不同仍产生相同global progress，预期rank文件覆盖；检查完整checkpoint可被原manager.inspect_complete读取。真实fresh模型/空Adam及新data对象恢复，data/behavior/scheduler/各RNG与下一随机数/下一固定更新对照不中断。spy证明RNG最后恢复、两gate各刷新文件/live身份；损坏DCP/缺rank文件/错误合同/私有rank/topology/data身份/midcollection提前拒绝，无optimizer dummy step。
 
-测试中CPU参数不称DTensor；生产依然真实DCP allrank入口。明确哪些proof/collective为测试leaf，所有被测控制/数学/文件代码实际执行。最后源码编辑后跑plan固定Flash7/H3通配符，无skip/xfail/全量；报告branch/HEAD、命令/exit/数量/时间、diff/check与给现manager的精确staging接口。
+故障覆盖写附件/DCP失败不发布、rename后latest失败不倒删合法complete、未知staging/重复step拒绝；原Flash七项实际回归确认旧manager语义未变。最后编辑后跑plan Flash7/H3通配符，无skip/xfail/全量/warning过滤；记录branch/HEAD、命令/exit/数量/时间、diff/check和future runtime精确方法。
 
-Simplifier C重点审cold getter纯度、fresh空Adam物化、state完整覆盖、全rank参与/非持久buffer及不伪造完整checkpoint；changes回C重测。无服务器/GPU/下载/升级/push，GPU_PENDING。
+Simplifier C审是否真正复用原manager、allrank codec/纯writer、全局与rank身份层次、两恢复门/RNG最后和fresh对照，changes回C。CPU no-dist不是CUDA DCP/NCCL证据；整run controller装配仍后续，GPU_PENDING。
