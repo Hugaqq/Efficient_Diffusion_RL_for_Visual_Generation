@@ -218,8 +218,9 @@ class H3RuntimeBinding:
         for key, expected in dict(lr=1e-4, betas=(.9, .999), eps=1e-12, weight_decay=0.).items():
             if group[key] != expected:
                 raise ValueError(f"optimizer {key} differs from fixed H3 profile")
-        if type(self.prepared.scheduler) is not torch.optim.lr_scheduler.LambdaLR or self.prepared.reducer_divisor != 8:
-            raise ValueError("constant scheduler/explicit reducer required")
+        self._observe_scheduler(group)
+        if self.prepared.reducer_divisor != 8:
+            raise ValueError("explicit reducer required")
         params = _canonical_parameter_names(meta.model, meta.block_names)
         if {name for name, p in params.items() if p.requires_grad} != set(meta.lora_names):
             raise ValueError("final LoRA parameter scope changed")
@@ -261,6 +262,35 @@ class H3RuntimeBinding:
             raise ValueError("prepared parameter/buffer object identity or precision drift")
         self.block_policies = tuple(policies)
         return inventory
+
+    def _observe_scheduler(self, group):
+        optimizer, scheduler = self.prepared.optimizer, self.prepared.scheduler
+        if (type(scheduler) is not torch.optim.lr_scheduler.LambdaLR
+                or scheduler.optimizer is not optimizer):
+            raise ValueError("constant scheduler must own the prepared optimizer")
+        if hasattr(self, "_scheduler") and (scheduler is not self._scheduler or optimizer is not self._optimizer):
+            raise ValueError("bound scheduler/optimizer instance changed")
+        # Observe the existing prepare/codec constant-LambdaLR representation;
+        # never invoke its callable or step either object as a validation probe.
+        state = scheduler.state_dict()
+        epoch = state["last_epoch"]
+        if (type(epoch) is not int or epoch < 0 or type(state["_step_count"]) is not int
+                or state["_step_count"] != epoch + 1 or state["base_lrs"] != [1e-4]
+                or state["_last_lr"] != [1e-4] or group.get("initial_lr") != 1e-4
+                or group["lr"] != 1e-4 or state["lr_lambdas"] != [None]):
+            raise ValueError("constant scheduler learning rate/counter state drift")
+        if not optimizer.state:
+            if epoch != 0:
+                raise ValueError("scheduler position differs from cold Adam")
+        else:
+            if set(optimizer.state) != set(group["params"]):
+                raise ValueError("scheduler requires complete Adam counters")
+            for saved in optimizer.state.values():
+                counter = saved.get("step")
+                if (not isinstance(counter, torch.Tensor) or counter.shape != ()
+                        or not bool(torch.isfinite(counter)) or counter.item() != epoch or epoch <= 0):
+                    raise ValueError("scheduler position differs from Adam step")
+        self._scheduler, self._optimizer = scheduler, optimizer
 
     def _policy(self):
         if self._closed:
