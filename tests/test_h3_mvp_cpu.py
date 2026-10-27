@@ -1,13 +1,15 @@
 """H3 contract CPU tests; no model weights, GPU, or distributed claims."""
 
 from dataclasses import FrozenInstanceError
+import math
 from pathlib import Path
 
 import pytest
 import torch
 
 import visual_rl
-from visual_rl.algorithms.dynamics import h3_schedule
+from visual_rl.algorithms.dynamics import h3_cps, h3_schedule
+from visual_rl.algorithms.dynamics.h3_cps import H3CPSDynamics, H3CPSRecord
 from visual_rl.models import h3_joint
 from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
 from visual_rl.models.h3_joint import H3JointLayout
@@ -18,6 +20,7 @@ def test_h3_imports_are_from_this_worktree():
     assert Path(visual_rl.__file__).resolve().parent == checkout / "visual_rl"
     assert Path(h3_joint.__file__).resolve() == checkout / "visual_rl/models/h3_joint.py"
     assert Path(h3_schedule.__file__).resolve() == checkout / "visual_rl/algorithms/dynamics/h3_schedule.py"
+    assert Path(h3_cps.__file__).resolve() == checkout / "visual_rl/algorithms/dynamics/h3_cps.py"
 
 
 def test_joint_roundtrip_batch_order_dtype_and_gradients():
@@ -162,3 +165,213 @@ def test_schedule_rejects_invalid_grids_counts_shifts_and_indices():
     for bad in (True, 0.0, 0.5, "0", torch.tensor(0)):
         with pytest.raises(TypeError, match="index"):
             schedule.transition(bad)
+
+
+def _cps_case():
+    layout = H3JointLayout(1, 2, 1, 3)
+    schedule = H3ScheduleSnapshot(torch.tensor([1., .8, .4, 0.]), torch.tensor([1., .6, .1, 0.]))
+    dynamics = H3CPSDynamics(layout, schedule)
+    x = (torch.arange(10).reshape(2, 5) / 7 - .3).half()
+    prediction = torch.linspace(-.7, .9, 10).reshape(2, 5)
+    return dynamics, x, prediction
+
+
+def _generators(video_seed=123, audio_seed=456):
+    return dict(video_generator=torch.Generator().manual_seed(video_seed),
+                audio_generator=torch.Generator().manual_seed(audio_seed))
+
+
+def test_cps_fp32_math_element_weighted_proxy_and_quantized_sampling():
+    dynamics, x, prediction = _cps_case()
+    stats = dynamics.stats(x, prediction, 1)
+    means, qs = [], []
+    # Hand-specified independent grids at index 1, not extracted from stats.
+    for columns, s, u in ((slice(0, 2), .8, .4), (slice(2, 5), .6, .1)):
+        s, u = torch.tensor(s), torch.tensor(u)
+        q = u * math.sin(.7 * math.pi / 2)
+        state, pred = x[:, columns].float(), prediction[:, columns]
+        means.append((1 - u) * (state - s * pred) + torch.sqrt(u*u - q*q) * (state + (1-s)*pred))
+        qs.append(q)
+    expected_mean = torch.cat(means, dim=1)
+    assert torch.equal(stats.mean, expected_mean)
+    assert stats.mean.dtype == stats.video_q.dtype == stats.audio_q.dtype == torch.float32
+    assert torch.equal(stats.video_q, qs[0]) and torch.equal(stats.audio_q, qs[1])
+    assert stats.video_q != stats.audio_q
+    torch.testing.assert_close(stats.video_dt, torch.tensor(-.4))
+    torch.testing.assert_close(stats.audio_dt, torch.tensor(-.5))
+    generators = _generators()
+    record = dynamics.sample(x, prediction, 1, **generators)
+    reference_rng = _generators()
+    zv = torch.randn(2, 1, 2, generator=reference_rng['video_generator']).flatten(1)
+    za = torch.randn(2, 1, 3, generator=reference_rng['audio_generator']).flatten(1)
+    expected_action = torch.cat((means[0] + qs[0]*zv, means[1] + qs[1]*za), dim=1).half()
+    assert torch.equal(record.action, expected_action)
+    assert record.score_family == "cps_proxy_negative_mse" and record.quantization == "fp16"
+    residual = record.action.float() - expected_mean
+    video_score, audio_score = -residual[:, :2].square().mean(1), -residual[:, 2:].square().mean(1)
+    expected_score = (2 * video_score + 3 * audio_score) / 5
+    score = dynamics.evaluate(record, prediction)
+    torch.testing.assert_close(score, expected_score)
+    assert torch.equal(score, record.rollout_score)
+    assert not torch.allclose(score, (video_score + audio_score) / 2)
+    q = torch.cat((qs[0].expand(2), qs[1].expand(3)))
+    gaussian = (-residual.square() / (2*q.square()) - q.log() - .5*math.log(2*math.pi)).mean(1)
+    assert not torch.allclose(score, gaussian)
+    for dtype in (torch.float16, torch.bfloat16, torch.float64):
+        low = prediction.to(dtype)
+        assert torch.equal(dynamics.stats(x, low, 1).mean, dynamics.stats(x, low.float(), 1).mean)
+
+
+def test_cps_explicit_rng_reproducibility_modality_isolation_and_terminal_draws():
+    dynamics, x, prediction = _cps_case()
+    global_before = torch.random.get_rng_state().clone()
+    first = dynamics.sample(x, prediction, 1, **_generators())
+    repeated = dynamics.sample(x, prediction, 1, **_generators())
+    assert torch.equal(first.action, repeated.action)
+    changed_video = dynamics.sample(x, prediction, 1, **_generators(video_seed=789))
+    changed_audio = dynamics.sample(x, prediction, 1, **_generators(audio_seed=789))
+    assert not torch.equal(first.action[:, :2], changed_video.action[:, :2])
+    assert torch.equal(first.action[:, 2:], changed_video.action[:, 2:])
+    assert torch.equal(first.action[:, :2], changed_audio.action[:, :2])
+    assert not torch.equal(first.action[:, 2:], changed_audio.action[:, 2:])
+    for index in range(dynamics.schedule.num_steps):
+        generators, reference_rng = _generators(), _generators()
+        before = [g.get_state().clone() for g in generators.values()]
+        record = dynamics.sample(x, prediction, index, **generators)
+        torch.randn(2, 1, 2, generator=reference_rng['video_generator'])
+        torch.randn(2, 1, 3, generator=reference_rng['audio_generator'])
+        for old, actual, expected in zip(before, generators.values(), reference_rng.values()):
+            assert not torch.equal(old, actual.get_state())
+            assert torch.equal(actual.get_state(), expected.get_state())
+        after = [g.get_state().clone() for g in generators.values()]
+        assert torch.isfinite(dynamics.evaluate(record, prediction)).all()
+        assert all(torch.equal(g.get_state(), state) for g, state in zip(generators.values(), after))
+    # Sharing an explicitly supplied stream also pins video-before-audio draw order.
+    shared, ref = torch.Generator().manual_seed(42), torch.Generator().manual_seed(42)
+    record = dynamics.sample(x, prediction, 1, video_generator=shared, audio_generator=shared)
+    stats = dynamics.stats(x, prediction, 1)
+    expected_v = stats.mean[:, :2] + stats.video_q * torch.randn(2, 1, 2, generator=ref).flatten(1)
+    expected_a = stats.mean[:, 2:] + stats.audio_q * torch.randn(2, 1, 3, generator=ref).flatten(1)
+    assert torch.equal(record.action, torch.cat((expected_v, expected_a), dim=1).half())
+    assert torch.equal(torch.random.get_rng_state(), global_before)
+
+
+def test_cps_fixed_record_ownership_and_current_prediction_only_gradients():
+    dynamics, x, prediction = _cps_case()
+    prediction.requires_grad_()
+    record = dynamics.sample(x, prediction, 1, **_generators())
+    stored_x, stored_action, stored_score = record.x, record.action, record.rollout_score
+    assert all(not t.requires_grad and t.grad_fn is None for t in (stored_x, stored_action, stored_score))
+    assert prediction.grad is None
+    # Constructor and readers both own copies, including externally supplied action.
+    reconstructed = H3CPSRecord(dynamics, 1, stored_x, stored_action, stored_score)
+    x.fill_(9)
+    for tensor in (stored_x, stored_action, stored_score, record.x, record.action, record.rollout_score):
+        tensor.fill_(9)
+    assert torch.equal(record.x, reconstructed.x)
+    assert torch.equal(record.action, reconstructed.action)
+    assert torch.equal(record.rollout_score, reconstructed.rollout_score)
+    with pytest.raises(FrozenInstanceError):
+        record.index = 0
+    current = (prediction.detach() + .17).requires_grad_()
+    rng = torch.random.get_rng_state().clone()
+    score = dynamics.evaluate(record, current)
+    assert torch.equal(rng, torch.random.get_rng_state())
+    assert not torch.equal(score.detach(), record.rollout_score)
+    stats = dynamics.stats(record.x, current, 1)
+    coefficients = []
+    for s, u in ((.8, .4), (.6, .1)):
+        s, u = torch.tensor(s), torch.tensor(u)
+        q = u * math.sin(.7 * math.pi / 2)
+        coefficients.append(-(1-u)*s + torch.sqrt(u*u-q*q)*(1-s))
+    coefficient = torch.cat((coefficients[0].expand(2), coefficients[1].expand(3)))
+    expected_gradient = 2 * (record.action.float() - stats.mean.detach()) * coefficient / 5
+    score.sum().backward()
+    torch.testing.assert_close(current.grad, expected_gradient)
+    assert bool((current.grad[:, :2] != 0).any()) and bool((current.grad[:, 2:] != 0).any())
+    assert prediction.grad is None
+
+
+def test_cps_terminal_q0_quantization_residual_has_analytic_gradient():
+    dynamics, x, prediction = _cps_case()
+    # Non-FP16-exact predictions leave quantization residual even without noise.
+    current = (prediction + .01234567).requires_grad_()
+    index = dynamics.schedule.num_steps - 1
+    stats = dynamics.stats(x, current, index)
+    assert stats.video_q.item() == stats.audio_q.item() == 0
+    record = dynamics.sample(x, current, index, **_generators())
+    assert torch.equal(record.action, stats.mean.detach().half())
+    score = dynamics.evaluate(record, current)
+    residual = record.action.float() - stats.mean.detach()
+    assert bool((residual != 0).any()) and bool((score < 0).all())
+    s = torch.tensor([.4, .4, .1, .1, .1])
+    expected_gradient = -2 * residual * s / 5
+    score.sum().backward()
+    torch.testing.assert_close(current.grad, expected_gradient)
+    assert bool((current.grad[:, :2] != 0).any()) and bool((current.grad[:, 2:] != 0).any())
+    assert torch.isfinite(current.grad).all()
+
+
+def test_cps_does_not_relax_real_gaussian_positive_variance_contract():
+    from visual_rl.algorithms.dynamics.interface import DynamicsContractError, TransitionInput, TransitionMeanStd
+
+    dynamics, x, prediction = _cps_case()
+    transition = TransitionInput(
+        x_t=x.float(), model_prediction=prediction, t=torch.ones(2), t_next=torch.zeros(2),
+        mask=torch.ones(2, dtype=torch.bool), transition_index=torch.zeros(2, dtype=torch.int64),
+        condition_identity=("c", "c"), guidance_identity=("g", "g"),
+        storage_dtype_identity=("torch.float32", "torch.float32"), quantization_identity=("fp32", "fp32"),
+    )
+    terminal = dynamics.stats(x, prediction, 2)
+    with pytest.raises(DynamicsContractError, match="strictly positive"):
+        TransitionMeanStd(terminal.mean, torch.zeros_like(terminal.mean), torch.full((2,), -.1)).validate_against(transition)
+    positive = dynamics.stats(x, prediction, 1)
+    std = torch.cat((positive.video_q.expand(2), positive.audio_q.expand(3))).expand(2, -1)
+    TransitionMeanStd(positive.mean, std, torch.full((2,), -.1)).validate_against(transition)
+
+
+def test_cps_rejects_invalid_inputs_contracts_underflow_and_overflow():
+    dynamics, x, prediction = _cps_case()
+    for eta in (True, 0, -1, 1.1, float('nan'), float('inf'), '0.7'):
+        with pytest.raises(ValueError, match="eta"):
+            H3CPSDynamics(dynamics.layout, dynamics.schedule, eta)
+    assert torch.isfinite(H3CPSDynamics(dynamics.layout, dynamics.schedule, 1).stats(x, prediction, 1).mean).all()
+    for index in (-1, 3, True, 1.0, torch.tensor(1)):
+        with pytest.raises((IndexError, TypeError)):
+            dynamics.sample(x, prediction, index, **_generators())
+    for bad in (x.float(), x.clone().requires_grad_(), x[:, :-1], x[:0], x.to('meta'),
+                torch.full_like(x, float('nan')), torch.full_like(x, float('inf'))):
+        with pytest.raises(ValueError):
+            dynamics.stats(bad, prediction, 1)
+    for bad in (prediction[:, :1], prediction[:1], prediction.to('meta'), prediction.int(),
+                torch.full_like(prediction, float('nan')), torch.full_like(prediction, float('inf'))):
+        with pytest.raises(ValueError):
+            dynamics.stats(x, bad, 1)
+    with pytest.raises(TypeError):
+        dynamics.stats(x, None, 1)
+    with pytest.raises(TypeError, match="Generator"):
+        dynamics.sample(x, prediction, 1, video_generator=None, audio_generator=torch.Generator())
+    record = dynamics.sample(x, prediction, 1, **_generators())
+    conflicts = (
+        H3CPSDynamics(dynamics.layout, dynamics.schedule, .5),
+        H3CPSDynamics(H3JointLayout(1, 3, 1, 2), dynamics.schedule),
+        H3CPSDynamics(dynamics.layout, H3ScheduleSnapshot.build(3)),
+    )
+    for conflict in conflicts:
+        with pytest.raises(ValueError, match="contract mismatch"):
+            conflict.evaluate(record, prediction)
+    for bad in (record.action.float(), record.action.requires_grad_(), record.action[:, :-1],
+                record.action[:1], record.action.to('meta'), torch.full_like(x, float('nan')),
+                torch.full_like(x, float('inf'))):
+        with pytest.raises(ValueError):
+            H3CPSRecord(dynamics, 1, x, bad, record.rollout_score)
+    with pytest.raises(ValueError, match="rollout_score"):
+        H3CPSRecord(dynamics, 1, x, record.action, torch.tensor([float('nan'), 0.]))
+    with pytest.raises(ValueError, match="underflow"):
+        H3CPSDynamics(dynamics.layout, dynamics.schedule, 1e-50).stats(x, prediction, 1)
+    with pytest.raises(ValueError, match="quantization overflow"):
+        dynamics.sample(x, torch.full_like(prediction, 1e6), 1, **_generators())
+    with pytest.raises(ValueError, match="prediction in FP32"):
+        dynamics.stats(x, torch.full(prediction.shape, 1e100, dtype=torch.float64), 2)
+    with pytest.raises(ValueError, match="CPS proxy score"):
+        dynamics.evaluate(record, torch.full_like(prediction, 1e20))
