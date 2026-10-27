@@ -1,34 +1,31 @@
-# Assignment A — W1
+# Assignment A — W2
 
 - active: true
-- task_id: H3-M4a1-anchor
+- task_id: H3-M4a2-rollout-pool
 - pair: coding-a → simplifier-a
-- execution: parallel W1；见decisions/wave-01.md
-- integration_parent: `b7f938506f16034ac5d2896ddfa44c16eb4af83d`
-- source_dependencies: M1a `7b29f4bf8d990794d4b9bc826a82bd390861d530`、M1b `725f48f4d67c67d90c60cc3536f4bc40f12802f2`，均approved；无待返工issue。
+- execution: parallel W2；decisions/wave-02.md
+- integration_parent: `47546f94e7490dafcc3fdbc2eb57279f0839899d`
+- dependencies: M1a/M1b、W1 anchor approved；W1源码汇合 `467c8fd929804aa291bf01a5fa7cda372cc507db`。无changes；实际新分支/HEAD由引擎提供。
 
-## 唯一目标与文件
+## 唯一目标/文件
 
-实现**rank-local完整collection的一次性冻结replay旧锚**，真实调用现CPS evaluate，不是保存rollout_score别名。
+实现**rank-local真实CPS rollout→有界CPU latent-only池**，为后续现RolloutStage/RewardStage提供实际轨迹，不另造训练runner。
 
-仅允许新 `visual_rl/algorithms/optimization/h3_anchor.py`、新 `tests/test_h3_mvp_cpu_anchor.py`、`workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/coding-a/H3-M4a1-anchor.md`。现CPS/joint/schedule、objective、旧tests、trainer/runtime均只读；不import或修改B/C本波新模块。
+只写新 `visual_rl/algorithms/trainer/h3_pool.py`、新 `tests/test_h3_mvp_cpu_pool.py`、W/coding-a/H3-M4a2-rollout-pool.md。已有anchor/CPS/forward/tests只读，不import或修改B/C本波文件。
 
-## 冻结合同
+## 最小合同
 
-- 输入是明确有序 `(sample_id, H3CPSRecord)` 单格序列，B1，所有样本完整覆盖同一N步（含q0），同layout/schedule/eta/score/quantization、同collection_id/behavior_id。先在**任何模型调用前**验证唯一sample/index覆盖、无空/缺格/重复、显式最大格数/输入轨迹bytes上限；不同sample不按prompt文本合并。IDs由未来pool给，不自己造data sampler。
-- 最小一次性owner绑定collection/behavior，`capture`只允许成功一次；失败不公布部分scores且该owner不能悄悄重新capture。没有re-anchor/update后刷新API。可提供最小冻结结果类型；不另造pool/runner/manifest。
-- `capture`接收 `predict(record_on_device) -> joint_noise_ward_prediction` callback、明确device及输入records；逐格搬运detached x/action/诊断值到指定设备，通过原CPS record构造和`evaluate`重算。一次最多一格临时设备record；不要改原h3_cps加to方法，不缓存GPU轨迹或图。输入CPU记录的tensor所有权保持；不读取内部下划线buffer。
-- capture在no_grad内按输入固定顺序调用callback一次/格，将真正replay score冻结为CPU FP32。有意篡改rollout_score的测试仍必须捕获正确evaluate值。只能返回有限完整结果，不做epsilon/补值/丢样；不删末步。
-- 模型EVAL/behavior参数固定/credit已完成是上层阶段前置；此owner不持有模型、optimizer或旧权重。可用明确version验证callback在capture前后读取behavior标识并拒变更；不要hash巨大基座或复制权重。不得声称本项已经实现全rank冻结门。
-- 读取scores必须核对collection/behavior和sample/index，返回detached副本、固定映射；外部mutation不改owner。存储只保小scores/合同/键，不保predict callback或模型引用。current预测变化后，old值不变。
-- 下游使用既有 `ClippedSurrogateObjective` / `PolicyLossInputs`（beta0），不得重写PPO。此项不改该objective，仅测试真实old锚如何进入它。
+- 单collection、一个固定behavior；显式给定有序样本三元组 `(sample_id, group_id, member_index)`。唯一sample、组内唯一非负member、完整固定K成员（K>=2）、局部完整group，ID不从prompt文本生成。绑定精确CPS合同、明确max_samples/max_cells/max_trajectory_bytes，预估完整N步x/action/score+terminal存储容量，任何model调用前拒超预算。
+- rollout输入每个sample的detached CPU FP16初态、显式独立video/audio generators，以及 `predict(sample_id, x_on_device, transition_index) -> noise_ward_prediction` callback、target device、read_behavior_id。初始噪声由上层显式提供，不能全零代替真实采样或重新seed补失败样本。预检全部样本shape/finite/身份/数量/合同，在进入循环前失败；输入会被拥有或受控复制，不能让调用方mutation改已收集轨迹。
+- 单次collect，在no_grad/EVAL由caller保证固定behavior，按sample-major再index0..N-1固定顺序：同模型callback一次，现 `H3CPSDynamics.sample` 一次，使用action作为下一x；两流完整演化，包含q0末格，沿用CPS显式RNG消费。每步仅当前设备状态/record，立即保存拥有的CPU FP16 x/action及FP32诊断record，不累计设备轨迹、图、媒体或模型引用。不要复制CPS数学、不要强制decode/构造假media。
+- 输出完整有序 `tuple[(sample_id,H3CPSRecord),...]` 或等效受控视图，以及按sample_id查CPU FP16终态的拥有副本、原sample元数据。record由现CPS public接口构造，不用内部buffer，不另造record格式。池是可信sample/collection/behavior来源，reader核对这些身份，终态必须恰等于最后stored action；记录旧rollout diagnostic并不等于replay anchor。
+- 失败不可公开部分可训练pool、不可局部重试/换seed补样；捕获前后行为版本漂移拒绝。状态最小new→ready/failed→released即可，不建通用事务框架。`release`幂等释放引用；真实调用必须在完整trainer tail后由未来owner执行，本项不假装optimizer/data tail已经提交。
+- 不做reward/credit/anchor捕获或更新loop。目标测试可把池输出传现H3ReplayAnchor，`predict(record)`所需sample条件通过**明确有序闭包**映射（先核对key/index），无需改anchor公共签名；未来stage如需新接口单独协调。
 
 ## 验收
 
-真实CPS+tiny trainable预测叶子：capture恰N*rows次、no_grad、全覆盖包括末步；读取old与逐格参考evaluate一致；rollout_score不能冒充锚；模型更新后old保持不变而current改变，实际既有objective/backward使用冻结old可得到有限梯度。测试输入缺格/重复/合同冲突在callback前拒绝、非有限callback中途失败无部分结果、二次capture拒绝、版本错误、输入/读取mutation保护及上限提前拒绝。明确局部算法证据不是controller/world门已实现。
+真实tiny trainable模型叶子+已有H3 forward/CPS完成多sample多步采样；准确call顺序、N步全保存、双模态链连续、所有stored tensors CPU detached、terminal等最后action、同seed一致/不同seed有变化、无全局RNG污染。有限显式容量在第一个predict前拒绝；重复/不完整组/非法初态/版本漂移/中途非有限无部分ready池，失败不能重试。外部输入/读结果mutation不污染池、release后读拒绝且不保callback/model。
 
-测试只写新feature文件，核验当前worktree导入路径；无需移动原22项。真实运行plan最新版Flash固定七项与 `tests/test_h3_mvp_cpu*.py` 通配符命令，禁止skip/xfail/全量测试，最后源码编辑后重测，记录命令/exit/数量/时间、实际branch/HEAD和diff/check。分支由引擎提供，不手工Git提交/合并。
+实际池→现anchor capture→既有objective replay/backward示例测试（tiny叶子），证明不是无消费者结构；精确记录这不是controller或全rank闭环。不得缩减已有断言。
 
-## 非目标
-
-不做rollout/reward/advantage/pool消费、world计划、FSDP/PG、checkpoint、controller接线。本项代码必须可被后续OptimizeStage调用但不提前改stage。若现合同不足报告原owner接口问题，不越界修别组。简化器A重点看真正replay、固定action/旧锚、顺序/上限/失败原子性及非重复PPO；changes回A重测重审。GPU_PENDING。
+最后编辑后原样跑plan两命令：Flash七项与tests/test_h3_mvp_cpu*.py；无skip/xfail/全量。交付命令/exit/数量/时间、实际branch/HEAD、diff/check与接口；不手工commit/merge。Simplifier A审有界性/状态链/身份/失败原子性/无重复数学或训练runner，changes回A。GPU_PENDING。

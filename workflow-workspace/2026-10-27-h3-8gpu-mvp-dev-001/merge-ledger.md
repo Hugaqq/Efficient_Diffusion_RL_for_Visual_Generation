@@ -2,10 +2,10 @@
 
 ## 当前集成事实
 
-- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`b7f938506f16034ac5d2896ddfa44c16eb4af83d`。
+- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 集成基线：`47546f94e7490dafcc3fdbc2eb57279f0839899d`。
 - 实际分支：`pi-workflow/3ceaec6a-2451-4a1b-9fe8-ede829ee5dcc/main`
-- 初次及本轮接收时status均干净。M1a/M1b/M2a1/M2a2均已读实际代码、交付及配对approved；本轮核对完整loader和五项新增测试。无changes、无失败门禁待返工。
-- 引擎历史由 `git log -12 --oneline` 核对：`f8e4d0e`（首轮协调）→ `7b29f4b`（M1a coding）→ `8a6763c`（M1a审查）→ `42a11a8`（第二轮协调）→ `725f48f`（M1b coding）→ `8ed954f`（M1b审查）→ `f8f83f7`（第三轮协调）→ `edd5c87`（M2a1 coding）→ `63fe34c`（M2a1审查）→ `282dd4a`（第四轮协调）→ `919b6ab`（M2a2 coding）→ `b7f9385`（M2a2审查，当前HEAD）。角色阶段由交付/审查HEAD和顺序结果支持；本轮新增授权的累计范围diff另见下。
+- 接收时status干净。基础四项与W1三项均已读实际代码、交付及配对approved；本轮读完整anchor/text-cache/prepare、三份review与coding记录，核对目标测试与汇合门禁。无changes或未解决失败门禁。
+- 引擎历史由 `git log -12 --oneline` 核对：`f8e4d0e`（首轮协调）→ `7b29f4b`（M1a coding）→ `8a6763c`（M1a审查）→ `42a11a8`（第二轮协调）→ `725f48f`（M1b coding）→ `8ed954f`（M1b审查）→ `f8f83f7`（第三轮协调）→ `edd5c87`（M2a1 coding）→ `63fe34c`（M2a1审查）→ `282dd4a`（第四轮协调）→ `919b6ab`（M2a2 coding）→ `b7f9385`（M2a2审查）；其后W1分支与汇合链见本轮W1段。角色阶段由交付/审查HEAD和顺序结果支持；本轮新增授权的累计范围diff另见下。
 - Orchestrator 本轮仍只改协调文件；不自行提交。当前原子项功能及 CPU 审核接受不等于最终 candidate 或用户 main 已发布。
 
 | 任务 | Coding branch / snapshot | Simplifier | 测试/审查证据 | 集成/批准状态 |
@@ -15,9 +15,12 @@
 | H3-M1b-cps | 同上述分支；前置42a11a8c3fc6473aa52238473e20bc002e66db4c；coding snapshot725f48f4d67c67d90c60cc3536f4bc40f12802f2 | approved；记录snapshot8ed954f2562cf9d1f5432a7bb84ada181cdae6a9 | coding Flash7/12.12s、H3十二项/1.13s；simplifier Flash7/12.35s、H3十二项/1.03s；orchestrator Flash7/12.78s、H3十二项/0.88s，全exit0 | 功能/配对/CPU接受；非旧锚、非生产闭环 |
 | H3-M2a1-forward | 同上述分支；前置f8f83f7064f121a00526241048e68ceda83eb4b1；coding snapshot edd5c874f10ffa917a71bd9f2fa9085247075a6e | approved；记录snapshot63fe34c99f96a115ef3cb743965aa4338e3653d6 | coding Flash7/12.78s、H3十七项/1.41s；simplifier Flash7/13.10s、H3十七项/1.20s；orchestrator Flash7/12.27s、H3十七项/0.91s，全exit0 | 功能/配对/CPU接受；tiny叶子桥接，不是权重/完整adapter |
 | H3-M2a2-loader | 同上述分支；前置282dd4ad05bbabb8bdb8ddf301e11b057d6b0846；coding snapshot919b6abc7920f2dbcea764907152523882a09a59 | approved；审查snapshot b7f938506f16034ac5d2896ddfa44c16eb4af83d | coding Flash7/12.12s、H3二十二项/3.12s；simplifier Flash7/12.95s、H3二十二项/3.55s；orchestrator Flash7/13.05s、H3通配符22/3.36s，全exit0 | 功能/配对/CPU接受；非真实H3/FSDP证据 |
-| H3-M4a1-anchor | W1-A；依赖现CPS；共同基线b7f938506f16034ac5d2896ddfa44c16eb4af83d；实际分支/SHA待引擎 | simplifier-a待审 | 未实现/测试 | active parallel，未批准 |
-| H3-M2a3a-text-cache | W1-B；依赖现forward；共同基线同上；实际分支/SHA待引擎 | simplifier-b待审 | 未实现/测试 | active parallel，未批准 |
-| H3-M3a-prepare | W1-C；依赖已批准loader；共同基线同上；实际分支/SHA待引擎 | simplifier-c待审 | 未实现/测试 | active parallel，未批准 |
+| H3-M4a1-anchor | W1分支task-d89f7883-d6ab-414c-8b71-0ba4187b0aa0；起点44918392c5903cf54c9d8af389317814b60d3e04；代码汇合467c8fd929804aa291bf01a5fa7cda372cc507db | approved；review task-20b11ec1-66a8-45bb-9e7c-b990f96a8f83，纳入当前HEAD | coding Flash7/12.83s H3局部28/2.84s；review Flash7/11.96s H3汇合44/2.71s | W1功能/配对/汇合CPU接受，stage消费者未接 |
+| H3-M2a3a-text-cache | W1分支task-e8cc81cc-68a4-48b2-ba77-835297ad76f1；同起点/代码汇合 | approved；review task-6d21d12a-8ed7-43d3-9526-6c197e967eb4，纳入当前HEAD | coding Flash7/11.85s H3局部28/3.94s；review Flash7/11.93s H3汇合44/3.28s | W1功能/配对/汇合CPU接受，真实encoder产物未验 |
+| H3-M3a-prepare | W1分支task-3bc7567a-9042-4d85-a3c3-9f22a1647954；同起点/代码汇合 | approved；review task-49386bc3-79aa-41ed-9651-40cfbef318e5，纳入当前HEAD | coding Flash7/12.32s H3局部32/2.74s；review Flash7/12.08s H3汇合44/2.37s | W1功能/配对/汇合CPU接受，CUDA collective未验 |
+| H3-M4a2-rollout-pool | W2-A；当前集成基线47546f94e7490dafcc3fdbc2eb57279f0839899d；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
+| H3-M2a3b-decode | W2-B；同基线；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
+| H3-M3b1-world-credit | W2-C；同基线；新分支/snapshot待引擎 | 待审 | 未实现/测试 | assigned parallel，未批准 |
 
 ## 首轮 baseline 命令（历史记录）
 
@@ -55,7 +58,7 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 - 本轮查读实际 `common_diffusers.py::apply_peft_lora`（旧helper为suffix/gaussian）、`ParameterStateManager`（立即绑定Parameter身份）及上游真实transformer精度岛/构造buffer。故B不修改旧helper、不提前绑定参数；后续C须在最终分片物化后构造optimizer。
 - A/C idle，B独占目标测试；无并行派工。未做环境升级/服务器/GPU/下载/push。真实H3可选依赖、模型资源与8UUID仍未验证。
 
-## 本轮M2a2接收与W1并行
+## M2a2接收与W1派工历史
 
 - 已读完整 `h3_loading.py`、五项loader测试及coding-b/simplifier-b的M2a2记录。实际meta/PEFT限定范围、FP32岛/非持久buffer、owner CPU全覆盖与预算实现符合本项；无返工issue。C必须恢复to_empty后的rope并最终绑定optimizer，不据bool owner声明推定分布式已实现。
 - 独立真实门禁：Flash固定7项 `7 passed in 13.05s`；新通配符H3 `22 passed in 3.36s`，均exit0。目标尚只有原文件，W1后将扩展三个feature模块；最终必须通配符，不跑全量。
@@ -71,5 +74,20 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 ## 参考材料修正
 
 本轮直接读 `reference/UniRL/unirl/models/minimax_h3/vendor/VENDOR_COMMIT.txt` 成功，记录源Diffusers PR14355 commit `abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc`，vendored 2026-08-03。前轮仅find无结果就推定缺失不成立，本轮修正；不推断文件何时出现。该文档的draft/导入验证为历史事实，且明确没有numerical parity；不能覆盖当前公开依赖准入与GPU_PENDING。无移植/参考修改。
+
+## 本轮W1汇合接收
+
+- 三个配对文件分别显式verdict=approved，均无必修changes；parallel-review的done不被单独视为批准。本轮已读取这三份文件及三生产模块/交付，确认scope相符。
+- 当前HEAD亲跑Flash固定七项：`7 passed in 11.70s`；H3完整通配符：`44 passed in 3.09s`，全exit0。组成基础22+A6+B6+C10，不用coding分支28/28/32代替汇合证据。
+- 原Flash文件相对d818b8a完整diff再次为空（exit0），原断言不变。未跑全量，未写功能源码，未进行服务器/GPU/下载/升级/push。
+- C交付中曾有dtype-probe fixture失败（22pass/1fail），随后修正fixture并最后32项/各review44项/本轮44项实跑通过；无遗留失败，不以skip/xfail关闭。该CPU metadata probe不证明CUDA混合精度或真实FSDP。
+
+### W1原子提交追踪边界
+
+实际git log显示coding snapshot集合 `d328669d63f84c5f241ec09d0f008ab8fe8bb64b`、`a97cb1389d523e52ca8838020045b739b49ae257`、`e4dce5ee16cd00a2c13d849e99b3120dec93292a`，逐个暂存merge到 `467c8fd929804aa291bf01a5fa7cda372cc507db`。review snapshot集合 `749f65f26f5b62786141a30d40b2725cc2bfdd5a`、`efcb9152adf8204558e764b69eca0a36522bc6e6`、`f53c8d5453795d6cdfb982d452ba5e27dcc9cd01`，纳入当前 `47546f94e7490dafcc3fdbc2eb57279f0839899d`。已知每组实际branch/起点/汇合代码HEAD见表。允许的log没有逐snapshot文件列表，交付生成时SHA为pending，故不凭merge顺序猜测这三个SHA各属于A/B/C；精确branch→原子snapshot归属待引擎提供。这不妨碍当前实际汇合代码的配对/测试接收，但最终追踪不能伪造。
+
+## W2派工
+
+A只做CPS rollout与CPU池；B只做双VAE CPU逐条解码；C只做等量world计划/完整credit/loss尺度（必要时精确锁定prepare divisor）。各自独立源码/feature测试，无同波相互import；共同sample三元组与terminal格式由decisions/wave-02.md冻结。三个active，返回parallel；后续优先现stage/controller接线、真实reward及tail恢复，不把孤立helper和文档数量冒充MVP。
 
 状态：MVP 未完成；GPU_PENDING。
