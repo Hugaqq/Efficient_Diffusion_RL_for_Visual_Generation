@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "id": "wf-2026-10-28-h3-experiment-cycle-001",
+  "name": "H3真实实验与报错修复闭环",
+  "goal": "完成授权服务器环境，真实Flow-GRPO与Flash-GRPO各5次更新；反馈修复直到通过，再执行用户确认的正式Flash实验。主会话后台监视，未知执行不重放。",
+  "completion": "两条真实5步及用户确认的正式实验都有可复查成功退出和完整checkpoint，代码身份一致；独立只读GPU证据验证通过后本地整合，CPU或纯环境probe不算完成。",
+  "principles": [
+    "唯一总需求workflow-workspace/2026-10-28-h3-experiment-cycle-001/task.md；用户最新授权SSH到固定train170hx及GPU实验，跳过追加CPU回归；不继承旧Flash只用OpenCLI限制。",
+    "Experimenter唯一远端操作owner，不改算法源码；Coder只在本地隔离分支修复，不操作服务器。代码只能Git提交推实验分支、远端Git部署，禁止服务器hotfix。",
+    "两种算法各5次真实optimizer更新；Flash必须真实single-step，不允许仅改标签或fake模型/reward/成功标记。",
+    "先推进环境和两个smoke。formal-plan更新次数未确认只在正式阶段请求输入，不能擅自补40或缩改正式batch。",
+    "长任务使用有界后台owned job并记录PID/启动时刻/日志/退出；进度询问不停止任务。对SSH未知副作用先核查，不自动重放、不杀其他进程。",
+    "已知源码失败repair给Coder，环境/资源问题由Experimenter处理；需要用户输入请求pause，不走failed出口。保留所有失败证据。",
+    "不修改操作脚本、监视器、task、reference、formal-plan或Git忽略规则；如工具功能缺口请主会话处理，不绕过白名单。",
+    "最终代码变化必须由真实GPU反馈和证据核验支撑，默认不开CPU全套；不将结构检查/语法检查当训练验证。"
+  ],
+  "roles": {
+    "experimenter": {
+      "name": "Experimenter",
+      "responsibility": "完成环境/部署/真实实验、状态观察和验收；把具体源码问题交Coder，独立确认修复效果；不修改算法源码。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/state.md",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/state.json",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/request.json",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/issues/**",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/experimenter/**",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/runtime-configs/**",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/needs-input.md",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/evidence.json",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/final.md"
+      ],
+      "allowedCommands": [
+        "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py",
+        "git status --short --branch",
+        "git rev-parse HEAD",
+        "git diff --check",
+        "git diff --stat",
+        "git diff",
+        "git log -8 --oneline"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "coder": {
+      "name": "Coder",
+      "responsibility": "依据真实错误和缺失能力最小修复本地源码，保持真实Flow/Flash语义与原子提交，再交Experimenter到GPU复验。",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "write",
+        "edit",
+        "bash"
+      ],
+      "writePaths": [
+        "visual_rl/**",
+        "scripts/**",
+        "configs/**",
+        "tests/**",
+        "services/**",
+        "pyproject.toml",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "docs/h3_mvp.md",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/coder/**",
+        "workflow-workspace/2026-10-28-h3-experiment-cycle-001/coder-request.json"
+      ],
+      "allowedCommands": [
+        "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py --syntax",
+        "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py --reference",
+        "git status --short --branch",
+        "git rev-parse HEAD",
+        "git diff --check",
+        "git diff --stat",
+        "git diff",
+        "git log -8 --oneline"
+      ],
+      "lifecycle": "persistent",
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6-astra"
+      },
+      "thinking": "high",
+      "canDelegate": false,
+      "auxiliary": {
+        "enabled": false
+      }
+    }
+  },
+  "start": "experimenter",
+  "steps": {
+    "experimenter": {
+      "type": "agent",
+      "role": "experimenter",
+      "instruction": "先读workflow-workspace/2026-10-28-h3-experiment-cycle-001/task.md、formal-plan和reference及已有state/issue/coder报告。按当前真实状态推进环境、Flow5、Flash5、正式实验，先两个smoke不因正式步数缺失提前暂停。只用固定operations.py入口进行远端/发布部署；每次请求唯一id并核对JSON code/uncertain。长GPUjob存在时先inspect，不重复launch；写state.json的当前jobs供监视。每次完成一个阶段或取得明确错误就交接：源码缺口写issues/current.md及不可变issue报告返回repair；job仍运行返回waiting（command步骤最多等待10分钟、每分钟只读探查）；缺授权/正式目标/无法安全判断写needs-input.md返回needs_input；所有真实目标完整验收后写evidence.json和final.md返回done。不能用CPU/假数据/纯生成冒充五步，不能仅看SUCCESS而不看exit和实际更新。连续网络不可达应保留未知操作并请求输入，不无限重复。",
+      "outcomes": {
+        "repair": "coder",
+        "waiting": "wait-for-job",
+        "needs_input": "pause-for-input",
+        "done": "$complete",
+        "blocked": "pause-for-input"
+      }
+    },
+    "coder": {
+      "type": "agent",
+      "role": "coder",
+      "instruction": "读取workflow-workspace/2026-10-28-h3-experiment-cycle-001/task.md、issues/current.md、实际源码和远端错误证据。只做当前最小修复/缺失算法，优先只读查询既有H3单卡分支的参数映射，不盲改权重标签。无服务器权限，不跑CPU回归全套；可执行语法检查。写coder/<issue-id>.md列出实际diff、所选数学/格式/许可与GPU复验步骤。返回retest交Experimenter；缺环境信息返回need_experiment并写明确问题；需用户授权/数学方案决定返回needs_input。引擎生成原子snapshot，不自行git提交/合并/push。不能写占位或删除真实失败断言使其假通过。",
+      "outcomes": {
+        "retest": "experimenter",
+        "need_experiment": "experimenter",
+        "needs_input": "pause-for-input",
+        "blocked": "experimenter"
+      }
+    },
+    "wait-for-job": {
+      "type": "command",
+      "command": "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py --wait",
+      "timeoutSeconds": 900,
+      "outcomes": {
+        "success": "experimenter",
+        "failure": "experimenter"
+      }
+    },
+    "pause-for-input": {
+      "type": "command",
+      "command": "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py --pause",
+      "timeoutSeconds": 60,
+      "outcomes": {
+        "success": "experimenter",
+        "failure": "experimenter"
+      }
+    }
+  },
+  "integration": {
+    "validationCommands": [
+      "python3 workflow-workspace/2026-10-28-h3-experiment-cycle-001/operations.py --validate-evidence",
+      "git diff --check"
+    ],
+    "timeoutSeconds": 600
+  },
+  "budget": {
+    "maxSteps": 200,
+    "maxMinutes": 1440,
+    "maxRoleTurns": 70,
+    "maxChecks": 0
+  }
+}

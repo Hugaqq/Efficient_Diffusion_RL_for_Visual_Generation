@@ -1,0 +1,20 @@
+{
+  "status": "update_target_needs_user_confirmation",
+  "algorithm": "flash-grpo",
+  "height": 256,
+  "width": 384,
+  "frames": 124,
+  "fps": 24,
+  "global_prompts": 4,
+  "samples_per_prompt": 8,
+  "global_batch": 32,
+  "forward_microbatch": 1,
+  "optimizer_updates_per_collection": 1,
+  "lora_rank": 32,
+  "lora_alpha": 64,
+  "num_inference_steps": 10,
+  "reward": "hpsv3_video_only_all124_top37",
+  "primary_dataset": "Flash-GRPO original video train19700/test300; recheck actual files",
+  "max_optimizer_steps": null,
+  "note": "Both Flow-GRPO and Flash-GRPO must first pass independent real 5-update tests. Prior 40-update pilot suggestion is not a confirmed large-experiment target. Roles must not fill missing target without user approval."
+}
