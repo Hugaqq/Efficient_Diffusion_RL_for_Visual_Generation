@@ -22,7 +22,7 @@ from visual_rl.artifacts.checkpoint.coordination import CheckpointSafePoint
 from visual_rl.artifacts.checkpoint.h3_state import H3StateIdentity, save_h3_state, load_h3_state, _receipt as _codec_receipt
 from visual_rl.artifacts.checkpoint.manager import (
     AtomicCheckpointManager, CommittedCheckpoint, _atomic_json, _direct_checkpoint_path,
-    _payload_digest, _read_exact_json,
+    _payload_digest, _read_exact_json, _fsync_directory,
 )
 from visual_rl.artifacts.checkpoint.protocol import CheckpointContract, CheckpointProgress
 from visual_rl.artifacts.checkpoint.state import RankRNGSnapshot
@@ -280,6 +280,9 @@ class H3CheckpointTransaction:
             def publish():
                 if self.rank != 0:
                     return None
+                # File fsync does not persist the eight new directory entries.
+                # Run once after all-rank validation, inside the failure phase.
+                _fsync_directory(path / _RANKS)
                 _atomic_json(path / _MANIFEST, manifest)
                 committed = self.manager.commit_existing(staging, contract, progress=progress,
                                                           fault_injector=fault_injector)
