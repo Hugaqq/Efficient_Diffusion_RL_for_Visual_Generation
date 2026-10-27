@@ -2,9 +2,9 @@
 
 ## 当前集成事实
 
-- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 暂存集成基线：`a54d296a7635fe3d552b0fe9beb03717e34249a2`（含未批准C publisher）。
+- 实际起点：`076635a61263ffd5e7c5be4cc64d77ef99242c51`；本轮实际HEAD / 暂存集成基线：`d7c75b75210782a63a4fffcae117f2ace19fa760`（含未批准A binding；C publisher已复审批准）。
 - 实际分支：`pi-workflow/3ceaec6a-2451-4a1b-9fe8-ede829ee5dcc/main`
-- 接收status干净。本轮读W5 source/profile/transaction及manager同步边界、对应配对审查；A/B原子approved，C为changes C-PUBLISH-01，不批准publisher或整个W5。当前没有pytest失败，但持久性审核问题必须修复。
+- 接收status干净。本轮读W6三coding/review与binding/profile/transaction及目标测试；B/C approved，B-PROFILE-01/C-PUBLISH-01关闭；A为changes A-BIND-01，不批准binding。当前两集通过，但scheduler所有权缺口必须回A修复。
 - 引擎历史由 `git log -12 --oneline` 核对：`f8e4d0e`（首轮协调）→ `7b29f4b`（M1a coding）→ `8a6763c`（M1a审查）→ `42a11a8`（第二轮协调）→ `725f48f`（M1b coding）→ `8ed954f`（M1b审查）→ `f8f83f7`（第三轮协调）→ `edd5c87`（M2a1 coding）→ `63fe34c`（M2a1审查）→ `282dd4a`（第四轮协调）→ `919b6ab`（M2a2 coding）→ `b7f9385`（M2a2审查）；其后W1分支与汇合链见本轮W1段。角色阶段由交付/审查HEAD和顺序结果支持；本轮新增授权的累计范围diff另见下。
 - Orchestrator 本轮仍只改协调文件；不自行提交。当前原子项功能及 CPU 审核接受不等于最终 candidate 或用户 main 已发布。
 
@@ -29,10 +29,13 @@
 | H3-M4b1-state-codec | W4分支task-5dfce464-611a-49d3-b174-e07b3c2246c5；同起点/代码汇合 | approved；review task-29df6a46-e199-4bd7-a9cf-6a9aa0b3d761 | coding Flash7/12.28s H3局部100/4.39s；review Flash7/12.68s H3汇合108/7.23s；DCP9warnings保留 | 接受；raw codec非完整checkpoint |
 | H3-M4a5-data-source | W5分支task-08fdc555-6975-494c-b44c-d4f5700316d9；起点d2a6b8563f5bcc2d5f95bf9e24458dc25d257b91；代码汇合230696472b735966d3ac17102120a444f4ff8697 | approved；review task-5cbffe4d-c73d-4516-8d23-53d5b99580f5 | coding Flash7/12.71s H3局部114/8.65s；review Flash7/14.59s H3汇合126/12.77s | 原子接受；真实runtime未接 |
 | H3-M2b2-profile | W5分支task-02102b61-1df8-40b3-8bcd-b808992d2146；同起点/代码汇合 | approved；review task-f4f41edd-0c54-414a-85ec-780013256fd6 | coding Flash7/13.87s H3局部114/8.64s；review Flash7/12.30s H3汇合126/16.95s | 原子接受；B-PROFILE-01组合对齐另派 |
-| H3-M4b2-checkpoint-publish | W5续跑分支task-7b9f8550-68d5-442f-b7a4-f95d64914a4e；起点d2a6b85；明确恢复snapshot5da7331f7ddf460bf793e9de032ae14857385134；汇合2306964 | **changes C-PUBLISH-01**；review task-770eef22-ff89-4046-9afa-ad24fb5d5a1f | coding已返回Flash7/14.59s H3局部114/11.81s；review Flash7/17.40s H3汇合126/14.00s | **未批准**，测试不消除目录fsync缺口 |
-| H3-M4c1-runtime-binding | W6-A；基线a54d296a7635fe3d552b0fe9beb03717e34249a2；新branch/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
-| H3-M2b2-profile-align | W6-B；同基线；新branch/snapshot待引擎 | 待审 | 未实现/测试 | active parallel |
-| H3-M4b2-checkpoint-publish-r1 | W6-C，修C-PUBLISH-01，同原配对；同基线 | 待复审 | 未修复/重测 | active parallel |
+| H3-M4b2-checkpoint-publish | W5续跑分支task-7b9f8550-68d5-442f-b7a4-f95d64914a4e；起点d2a6b85；恢复snapshot5da7331f7ddf460bf793e9de032ae14857385134；汇合2306964 | 原changes C-PUBLISH-01保留，W6 r1已approved | 原coding Flash7/14.59s H3局部114/11.81s；原review Flash7/17.40s H3汇合126/14.00s | W6修复/复审后接受，非断电实验 |
+| H3-M4c1-runtime-binding | W6 task-70fff509-7bc8-423f-813c-5d88c3eb6454；实际起点75b80699e0380a69c4b7068d19cdba62d420eaab；恢复23691bc→7f4df76687fbebda09629a925c34ab722c9e2573；汇合c8422b3 | **changes A-BIND-01**；review task-e20a6aae-21d9-4d20-b976-956a6f2023df | coding Flash7/12.63s H3局部130/12.54s；review Flash7/15.86s H3汇合135/16.09s | 未批准，W7同A返工 |
+| H3-M2b2-profile-align | W6 task-0dd03e52-f2a5-447d-894b-6c051e7d0af7；实际起点75b8069；恢复54c43b1d3fcb1640fb216c7e76eb4071743fd979；汇合c8422b3 | approved；review task-dce489eb-4fbf-4a19-ae37-b716bbf163c3 | coding Flash7/11.86s H3局部129/11.96s；review Flash7/15.59s H3汇合135/14.07s | 接受，B-PROFILE-01关闭 |
+| H3-M4b2-checkpoint-publish-r1 | W6 task-1554f542-75f4-46a7-9d47-b77adebddef5；实际起点75b8069；汇合c8422b3 | approved；review task-9cf19e5a-1f6c-4f8c-bf92-58e7e78572be | coding Flash7/13.11s H3局部128/12.45s；review Flash7/13.66s H3汇合135/16.58s | 接受，C-PUBLISH-01关闭 |
+| H3-M4c1-runtime-binding-r1 | W7-A；基线d7c75b75210782a63a4fffcae117f2ace19fa760 | 待原配对复审 | 未修复/重测 | active parallel |
+| H3-M4c2a-runtime-session | W7-B；同基线 | 待审 | 未实现/测试 | active parallel |
+| H3-M4b3-bound-checkpoint-integration | W7-C；同基线 | 待审 | 未实现/测试 | active parallel |
 
 ## 首轮 baseline 命令（历史记录）
 
@@ -161,4 +164,14 @@ C仅h3_transaction+本feature测试修父目录fsync，保留所有原断言与l
 
 当前原默认runtime仍optimizer-before-prepare且无H3受控G3 binding，故A先完成必要单一binding功能；C获批+A binding稳定后直接唯一RunController默认生命周期，不能另造Runner或用大量helper宣布完成。本轮仅协调文档，无服务器/GPU/HTTP/PG初始化/下载/升级/push。
 
-状态：MVP 未完成；C-PUBLISH-01未关闭；GPU_PENDING。
+以上为W6派工时状态：当时C-PUBLISH-01未关闭；最新接收如下。
+
+## W6接收与W7派工（当前）
+
+- 实际HEAD d7c75b75210782a63a4fffcae117f2ace19fa760，接收status干净。已读三份coding及对应review原文、完整h3_binding/h3_transaction、profile解析与新增交叉测试、fsync顺序/故障用例；B/C各显式approved，A显式changes。不以parallel-review done替代裁决。
+- B真实复用source._prompts/_FILE_LIMIT及PARSE/SAMPLING/STREAM；有效同文件/cache实际reserve/commit与BOM/CR/空行/大文件负例存在，关闭B-PROFILE-01。C真实publish块在verify-ranks后同步h3-ranks且失败进入同phase；同配对r1 approved解除原publisher唯一返工项，关闭C-PUBLISH-01。CPU证据不等于断电/真实多卡。
+- A-BIND-01确认：_observe_model只检查LambdaLR类型；contract声明constant，而scheduler与prepared optimizer的关系未核验，绑定后替换也缺保护。135项没有该负例；按review回同A最小修复，所有公开接口冻结。
+- 本轮orchestrator亲跑：Flash **7 passed in 14.61s**；H3通配符 **135 passed, 18 warnings in 14.28s**，均exit0。原Flash完整历史diff相对d818b8a无输出，断言不变；DCP no-dist/损坏fixture warnings未过滤。
+- W6实际attempt起点75b80699e0380a69c4b7068d19cdba62d420eaab（不是派工前a54d296；由引擎协调snapshot推进）。A报告明确恢复23691bc744cd247eb9e1f90f07bafefd0c851ed6→7f4df76687fbebda09629a925c34ab722c9e2573，B明确54c43b1d3fcb1640fb216c7e76eb4071743fd979。最新log见coding完成snapshot集合d40f31757d6789fb426ac7e97abcf7a18ffbdf98、375910636a51e4ad014423c203750a94861a3e6c、5cd664e712c1271309cbdd59fabfad7c809bc478，代码汇合c8422b3a780d933564e94dd58c52a5c8efd8f9dc；review集合01b0f0952c39edb75b6e443f1187fae1c2d5f0d8、b659d64811122768b7cd2f290d21af734ac43382、3a3fbed3c489bf637134a06dbac16a68a8795be6，纳入当前d7c75b7。除报告明确恢复SHA外，不凭merge顺序猜逐branch原子归属，仍待引擎提供精确映射。
+- 本波已查真实RunController完整stage顺序、default composition与single-only session；无H3 PG owner，第一恢复门需要实际contract，第二门data回读不能虚构fresh trainer已完成tail。故W7并行A返工、B真实session、C仅新真实binding/source/publisher组合测试。详见wave-07与三assignment；不是再建通用框架，下一项优先唯一默认controller装配。
+- 本轮只改允许协调文档，无功能源码、GPU/服务器/HTTP/PG初始化/下载/环境升级/push。MVP未完成；A-BIND-01未关闭；GPU_PENDING。
