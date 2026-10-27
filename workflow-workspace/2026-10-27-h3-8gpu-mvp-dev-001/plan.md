@@ -10,9 +10,9 @@
 
 ## 当前轮更新
 
-M1a与M1b均已实现且 simplifier-a approved；CPS coding snapshot `725f48f4d67c67d90c60cc3536f4bc40f12802f2`，本轮 HEAD `8ed954f2562cf9d1f5432a7bb84ada181cdae6a9`。Orchestrator 读CPS及完整目标测试、交付/审查，并独立复跑 Flash7/7（12.78s）和 H3十二项（0.88s），均 exit0。数值前置合同通过，但无真实模型/生产controller消费者或旧锚。
+M1a/M1b与M2a1均已配对approved；forward coding snapshot `edd5c874f10ffa917a71bd9f2fa9085247075a6e`，本轮HEAD `63fe34c99f96a115ef3cb743965aa4338e3653d6`。Orchestrator读geometry/forward、对应五项新测试与交付/审查，并独立复跑Flash7/7（12.27s）、H3十七项（0.91s），均exit0。tiny forward已串CPS；无真实权重/生产controller/FSDP证据。
 
-本轮唯一 active 为 B/H3-M2a1-forward；A/C idle。将原M2a完整adapter进一步拆成forward、loader、AV decode/cache三个原子项，防止一次大提交。完整链、GPU 与最终 candidate 均未通过。历史 snapshot diff 目前不在命令白名单内，精确历史范围审计待主会话/引擎材料补足，见 merge-ledger；不能以 clean 工作区替代。
+本轮唯一active为B/H3-M2a2-loader；A/C idle。任务是本地artifact→meta/FP32岛/限定LoRA→严格CPU输入，给C提供明确blocks/FQN/初态。无optimizer/PG/fully_shard；C待该接口稳定再接prepare。原M2a完整adapter分为forward、loader、AV decode/cache，防止一次大提交。完整链、GPU 与最终 candidate 均未通过。历史 snapshot diff 目前不在命令白名单内，精确历史范围审计待主会话/引擎材料补足，见 merge-ledger；不能以 clean 工作区替代。
 
 ## 权限与完成边界
 
@@ -35,8 +35,8 @@ M1a与M1b均已实现且 simplifier-a approved；CPS coding snapshot `725f48f4d6
 |---|---|---|---|
 | H3-M1a-joint-schedule | A | 已实现 `models/h3_joint.py` generated AV packing；`algorithms/dynamics/h3_schedule.py` 精确双 sigma；六项目标测试 | approved；coding snapshot7b29f4b；仅前置合同 |
 | H3-M1b-cps | A | 已实现 CPS sample/evaluate/record，消费 M1a；Gaussian未放松 | approved；coding snapshot725f48f；H3目标12项 |
-| H3-M2a1-forward | B | T2VA真实几何/attention packing、双t、单次callable、符号转换，连接CPS目标测试 | 本轮唯一active；依赖M1a/b；tiny仅替重transformer叶子，不称完整adapter |
-| H3-M2a2-loader | B | 本地artifact/API准入、meta构造/精度岛/主blocks LoRA，给C准备FQN输入 | forward稳定；选真实公开依赖接口或已审最小移植，无安装下载，不先全模型上GPU |
+| H3-M2a1-forward | B | 已实现真实T2VA几何、attention packing、双t与单次callable，连接CPS目标测试 | approved；snapshot edd5c87；目标17项，不称完整adapter |
+| H3-M2a2-loader | B | 本地artifact/API准入、meta构造/精度岛/主blocks LoRA及严格CPU输入，给C准备FQN | 本轮唯一active；依赖forward；真实公开lazy依赖，无安装下载或全模型上GPU |
 | H3-M2a3-aux | B | 严格离线text cache消费、真实video/audio VAE decode与AV结果 | loader和forward稳定；双VAE FP32、有界逐条媒体；如仍过大再拆，不造服务平台 |
 | H3-M2b-profile | B | H3 独立声明/recipe/registry 接入现 capability 与入口 | adapter 接口稳定；未知配置/不支持组合早拒，不改 Flash |
 | H3-M3a-prepare | C | 单 owner WORLD8 FSDP2 prepare/最终参数绑定，再 optimizer；真实 lazy API | 模型 block/FQN 合同稳定；tiny 验证调用顺序、严格加载覆盖；CPU 不证明 CUDA |
@@ -61,4 +61,4 @@ env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_
 env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. CUDA_VISIBLE_DEVICES= VISUALRL_FLASH_AUTHOR_DATA='/Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/reference_code/flash_grpo/dataset/video' /Users/qvanium/Desktop/Efficient_Diffusion_RL_infra_for_Visual_Generation/framecode/.venv/bin/python -m pytest tests/test_h3_mvp_cpu.py -q -p no:cacheprovider
 ```
 
-最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前十二项目标集只证明已批准 joint/双schedule/CPS 合同，尚未覆盖全部完成条件。
+最终目标集必须覆盖 joint/双schedule、CPS/Gaussian边界、冻结旧锚、world 数学、真实事件序列及 uneven 拒绝、完整 checkpoint/fresh 恢复、真实 controller tiny 闭环；Flash baseline 不证明 H3；当前十七项目标集只证明joint/双schedule/CPS及tiny单次forward桥接，尚未覆盖全部完成条件。
