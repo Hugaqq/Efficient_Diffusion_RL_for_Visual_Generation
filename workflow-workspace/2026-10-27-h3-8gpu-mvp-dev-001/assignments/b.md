@@ -1,30 +1,53 @@
-# Assignment B — W7 WORLD8会话生命周期
+# Assignment B — W8 默认唯一controller闭环装配
 
 - active: true
-- task_id: H3-M4c2a-runtime-session
+- task_id: H3-M4c2-controller
 - pair: coding-b → simplifier-b
-- execution: parallel W7；decisions/wave-07.md
-- integration_parent: `d7c75b75210782a63a4fffcae117f2ace19fa760`
-- dependencies: 已approved H3Profile/H3LocalFacts、prepare_h3_fsdp与WORLD8合同；不依赖A-BIND-01修复或C本波测试。
+- execution: B单一active；decisions/wave-08.md说明并行重评及A/C真实依赖
+- integration_parent: `a5fef751a88cad751a36240ffe1f5731986e1b1e`
+- dependencies: W7源码汇合6a7616aa26a63215cdae2b1cdd091dc33204f9e4；A runtime-binding-r1、B session、C bound-checkpoint组合均approved。A-BIND-01已关闭。
 
-## 单一目标/允许文件
+## 唯一原子目标与边界
 
-为现唯一RunController的create_runtime阶段提供**一个真实单节点WORLD8 NCCL session owner**，不是新的controller/runner。本项只新增 `visual_rl/runtime/h3_session.py`、`tests/test_h3_mvp_cpu_session.py` 及本task_id交付报告。现composition/controller/lifecycle/train、profile/binding/prepare等只读。下一波由本配对将该owner直接接默认生命周期，不在本波实现第二套训练循环或提前接未批准binding。
+把**已批准真实组件**接进现 `python -m visual_rl.train CONFIG` → `create_default_run_controller()` → 唯一 `RunController` 的全生命周期，包含实际完整tail checkpoint与同拓扑fresh恢复后的下一轮。此项是装配，不重写模型/算法/manager或新建Runner。
 
-冻结供下一装配使用的最小接口：`H3RuntimeSession.create(profile: H3Profile, facts: H3LocalFacts)` 返回owner，公开只读 `process_group, rank, local_rank, local_world_size, device, gpu_uuids` 与幂等 `close()`；device是显式cuda:local_rank，gpu_uuids为实际核对后的有序tuple。无训练/optimizer/模型/评分/checkpoint责任，无可传verified=True的旁路。
+允许新增 `visual_rl/runtime/h3_lifecycle.py`、`tests/test_h3_mvp_cpu_controller.py`；仅最小修改 `visual_rl/runtime/composition.py` 做明确profile选择及backend构造。新增本task_id交付报告。`train.py`、`controller.py`、旧`lifecycle.py`、types、现H3 binding/session/source/stages/prepare/codec/transaction、现全部tests及Flash配置只读。若实际组合发现这些owner缺口，报告具体最小请求，不能私自扩散修改。不得新增独立train命令、把tests fixture导入生产或以NotImplemented/noop占位交付。
 
-## 实际准入/所有权
+## 默认入口与编译
 
-- lazy使用公开torch CUDA/distributed API。创建前检查profile/facts属于同一次binding、torchrun环境WORLD_SIZE=LOCAL_WORLD_SIZE=8、rank/local_rank严格0..7且相等、单节点配置；缺失/非法/多节点拒绝，不默认0..7。
-- 要求CUDA_VISIBLE_DEVICES显式八个完整UUID，顺序与profile.launch.gpu_uuids严格相同；不接数字索引、空列表、默认可见十卡或MIG替代。通过实际CUDA设备属性核对可见设备数及每个逻辑device实际UUID映射；没有可用UUID观察API时拒绝并报明确缺能力，不安装依赖/调用服务器工具。profile列表仅是用户将来填写的请求集合，格式/相等不证明用户授权或独占；报告清楚实际窗口仍需外部确认。
-- 真实cuda availability、NCCL可用、选定当前device、目标BF16能力检查先于模型物化。不要只凭名字/总显存/UMD版本推断能力；不进行模型加载或性能benchmark。禁止硬编码历史空闲量或提供CPU生产fallback。显存/主机峰值与可用窗口仍由后续实际资源准入确认，不把本session成功叫全资源ready。
-- owner只创建一次 `init_process_group(backend='nccl', init_method='env://', timeout=有限明确值)`；拒绝已经初始化的外来PG（不得销毁/重配）。保存自己成功创建的WORLD，后续prepare复用它，不创建额外mesh/子组或Accelerator。
-- 初始化后真实核对backend/world/rank和同一host、有序UUID、profile/facts身份的有界全rank一致性。复用现有有界metadata receipt合同为佳，不建新RPC框架，不gather模型/媒体。可协作本地错误统一拒绝；raw transport失败不finally补collective或barrier，timeout非自动重试。
-- create部分失败释放自己已经成功获得的本地资源；外来PG不碰。close只销毁自己仍拥有的PG，幂等、无额外barrier/collective；不关闭别人model/scorer、不杀进程、不删除输出。若WORLD引用被外部替换，不能误销毁新owner的PG。
-- 不改数值/RNG流、设备环境变量/线程数/NUMA亲和、训练配置或旧single默认；不通过环境猜测CPU测试模式。
+- 保留原public factory参数和显式service-injected `create_run_controller`旧语义；默认factory返回现RunController，不在路由中再套一个controller。内部窄backend选择在compile阶段按严格源配置recipe精确 `h3_t2va_mvp_v1` 分派，其他配置走原ProductionRuntimeLifecycleBackend。H3错误不得fallback旧Gaussian，也不根据CUDA/pytest环境隐式选mock。
+- 复用原load_source_recipe与compile_h3_profile/preflight_h3_profile；未知字段/重复YAML/待填样例失败在PG/模型/HTTP前结束。CLI已有main错误JSON/exit码通过现VisualRLError体系报告，不放松旧异常处理或旧single guard。
+- preflight实际全内容核验model/VAE及code，复用verify_h3_content和现filesystem artifact hash。默认code_root覆盖实际导入的visual_rl完整包（现FilesystemArtifactIdentityResolver默认即此）；取得实际预检digest并在binding重核，不使用版本号/全0/任意fixture字符串。保留declared与observed界线。运行时不得悄悄安装依赖或下载。
 
-## CPU验收
+## 生命周期与资源归属（冻结决策）
 
-新feature只替CUDA属性/设备与dist通信等不可用叶子，实际session验证、创建/失败/清理控制执行。覆盖八rank合法观察、UUID顺序/实际映射错配、env缺失/uneven/多节点/重复UUID、BF16/NCCL缺失、外来PG拒绝、metadata分歧、创建后故障和close幂等/不碰外来PG。断言重模型/HTTP/optimizer从未构造；无真实init_process_group/网络/GPU调用。必须测试生产公开API调用参数、有限timeout与失败不重试，不只mock整个create。
+1. create_runtime实际调用已批准H3RuntimeSession.create(profile,facts)，不得mock该owner作为生产默认。唯一WORLD在外层ledger最后close；CUDA/NCCL/UUID身份来自session，后续只复用。
+2. construct_graph用真实已解析H3声明/config构造H3Adapter、ComponentManager.load的meta路径，建立真实H3PromptSource与明确HPS124资源请求/owner。请求descriptor/artifact/runtime_binding按当前真实类型构造，来自profile/manifest/hash，不用测试_request。HPS acquire必须真实原factory/client准入；构造失败关闭部分已取得资源。
+3. prepare实际调用prepare_h3_fsdp，constant_scheduler=True，最终optimizer之后再建立一次H3RuntimeBinding。此时source未reserve、HPS已acquire、代码/模型内容已核验。**允许在prepare返回对象内建立真实binding以供第一恢复门使用**；它不是伪造BIND成功receipt。绑定/handle借用关系与各owner close明确，内部部分失败须本地清理。
+4. restore_prepared仅有resume时调用实际H3CheckpointTransaction.restore_prepared，使用上述真实contract/state_identity/validate_live；fresh必须空Adam，无dummy step。不提前恢复source/RNG。
+5. transform对prepare已经真实完成的AC/FSDP精度/最终对象作观察核验并复用已计算变换身份，不再cast/wrap/替换对象；没有要求追加变换时不编造已执行新的transform。bind复用同一个binding，构造实际H3IterationStages与其原GRPOTrainer；不得二次绑定/构建新模型。
+6. restore_bound调用实际transaction，validate_live真实刷新，restore_data=source.load_state_dict；read_data从公开source state/属性构造既有精确envelope（参照已批准C组合），不调用fresh trainer.checkpoint_boundary伪造tail。RNG最后恢复后不再做消耗随机数的初始化；prepare_run只用公开PrepareRunContext设置返回next-step。
+7. run只循环现trainer.run_iteration，不重写任何stage数学。每次成功返回后才可调用binding.checkpoint_boundary，按明确cadence发布；terminal阶段也须真实已完成tail，最终一次checkpoint不能重复发布同step。删掉backend-local trajectory/result长期引用，媒体/aux按既有lease与rank轮转。
+8. 所有rank参加既有transaction/codec，rank0仅文件发布；不可把DCP放在writer回调。raw模型/通信异常不追加finally collective或原地retry；局部可协作图构造/HPS/绑定/文件错误用现有有界健康receipt共同拒绝，不让其他rank继续下一模型collective。资源清理无新barrier，session最后关闭。
 
-最后编辑后plan Flash7/H3通配符真实门禁，无skip/xfail/全量/过滤warning；交付branch/HEAD、接口、替身边界、命令/exit/数量/时间/diff/check。若实际安装API不能支持UUID观察，给出具体可实现且合法的最小方案或blocked，禁止虚构。Simplifier B审所有权与真实观察；changes回B。此项不是默认入口闭环或GPU实测，GPU_PENDING。
+## 最小输出/恢复策略
+
+- 复用既有AtomicCheckpointManager实现及实际RunResult，不造另一个checkpoint manager。必要少量run元数据/metrics/最终marker可以在本模块生成，真实字段和文件路径；rank0写其他rank验证/共同获得结果。结果中的checkpoint必须inspect_complete成功，SUCCESS不得先于最终完整checkpoint。
+- Fresh output要求新目录（拒已有未知/非空目录及输入树重叠，不删除/覆盖）。只接受本任务完整checkpoint，严格同world/ordered UUID/代码/模型/cache/score/数学/源内容；不mid-collection恢复，不拉旧Flash状态兼容。
+- 为最小一manager闭环，首版resume限定**同一个run输出根**：resume_from是该output/checkpoints下明确完整最新checkpoint；未知run元数据/语义不匹配/已有更新后的checkpoint拒绝，不擅自覆盖。只恢复非terminal `0 < next_step < max_optimizer_steps` 继续到相同原目标；已terminal resume可明确早拒（不dummy更新或伪造fresh tail），该限制交付中写明。max目标参与现semantic，测试不能改target来制造resume相容。
+- 保留已发布合法checkpoint，即使后续metric/marker IO失败；再次resume必须核验现有树/元数据，不把unknown dirty输出当新run。元数据仅实记运行，不宣称UUID授权/空闲/总资源ready或GPU质量。
+- 这里不新增资源监控/守护服务/性能预算框架。既有显式host weight/trajectory/decode预算必须真正传给消费者；其余峰值/空闲窗口仍GPU验收事项，不填假的resource receipt。
+
+## 真实CPU验收
+
+新feature至少覆盖：
+
+- 默认factory返回的真实RunController跑有效tiny H3配置完成≥2次真实更新、cadence与terminal checkpoint/真实RunResult；实际CLI `train.main([path])` 到同默认factory亦执行一次成功或同真实运行并核验输出，不只mock _create_controller返回结果。
+- 八rank控制/通信可采用现明确CPU叶子方案；实际profile/session owner/binding/source/stages/HPS/transaction控制均执行，不高层mock backend、session.create、prepare、binding或checkpoint。重模型/VAE、CUDA/dist/FSDP/HTTP/DCP通信等叶子替换须列明。可以复用只读现feature helper，但默认生产无test路径。
+- 用同target配置在成功checkpoint之后定点中断，记录continuous参考；fresh controller/adapter/prepared/真正空Adam重新加载该checkpoint并实际下一轮至相同目标，比较请求/参数/moments/scheduler/source/RNG/progress，step spy禁止恢复期dummy更新；不改私有计数。未恢复source/RNG的第一门、第二门RNG-last及controller实际stage顺序有证据。
+- 全生命周期reverse close与部分失败清理，外来PG/输入变化/错误resume/未完整tail不发布SUCCESS。错误传播不增加raw失败后collective。原有待填样例在无GPU环境早拒，无模型或HTTP副作用。
+- 默认路由旧SD3/Wan/Flash仍到原backend，旧配置语义/七项保持；不靠更改原测试或缩减断言修绿。
+
+最后编辑后plan固定Flash七项与完整H3通配符真实执行，无skip/xfail/全量/警告过滤；交付实际branch/HEAD、源码范围、调用链/owner表、命令/exit/数量/时间、真实输出/恢复证据、未验证边界。若接口或范围不足，给出最小阻塞而不是以stub完成。
+
+Simplifier B审最小装配与唯一controller、数据/数学不重复、两恢复门和真实CPU调用证据；changes回B。所有现原子approved不代表本项已完成；GPU_PENDING。
