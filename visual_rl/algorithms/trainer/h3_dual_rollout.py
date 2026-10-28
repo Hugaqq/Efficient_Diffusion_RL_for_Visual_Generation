@@ -97,12 +97,18 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
                 gate(f'rollout/{row}/{index}/forward')
                 prediction=predict(sid,x,index)
                 stochastic=mode=='flow' or index==choice
-                if stochastic:
-                    action=dynamics.sample(x,prediction,index,video_generator=pair[0],audio_generator=pair[1])
-                    records.append(H3DualRecord(sid,index,x.cpu(),action.cpu()))
-                else:
-                    action=dynamics.deterministic_step(x,prediction,index)
+                try:
+                    if stochastic:
+                        action=dynamics.sample(x,prediction,index,video_generator=pair[0],audio_generator=pair[1])
+                        records.append(H3DualRecord(sid,index,x.cpu(),action.cpu()))
+                    else:
+                        action=dynamics.deterministic_step(x,prediction,index)
+                except Exception:
+                    gate(f'rollout/{row}/{index}/result', local_error=True)
+                    raise
+                gate(f'rollout/{row}/{index}/result', local_error=False)
                 x=action
+                del prediction
             terminals[sid]=x.detach().cpu().clone()
         if read_behavior_id()!=behavior_id:
             raise ValueError('behavior version changed during rollout')
