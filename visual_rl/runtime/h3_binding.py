@@ -81,7 +81,13 @@ def _block_policy(block):
     from torch.distributed.fsdp import FSDPModule
     if not isinstance(block, FSDPModule):
         raise ValueError("main transformer block is not FSDP2 prepared")
-    groups = block._get_fsdp_state()._fsdp_param_groups
+    state = block._get_fsdp_state()
+    # PyTorch 2.8 uses one group; newer releases expose a list. Observe
+    # the real group in both layouts, never infer precision/division defaults.
+    groups = getattr(state, '_fsdp_param_groups', None)
+    if groups is None:
+        group = getattr(state, '_fsdp_param_group', None)
+        groups = () if group is None else (group,)
     if not groups:
         raise ValueError("H3 block has no prepared parameter groups")
     for group in groups:
