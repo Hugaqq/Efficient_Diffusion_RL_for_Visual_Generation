@@ -1,1 +1,1 @@
-{"id":"exp002-host-connectivity-002","action":"inspect_host"}
+{"id":"exp003-connectivity-minimal-002","action":"exec","read_only":true,"timeout_seconds":30,"command":"hostname"}

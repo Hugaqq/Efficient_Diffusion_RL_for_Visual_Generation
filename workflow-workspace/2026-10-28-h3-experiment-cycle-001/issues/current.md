@@ -1,5 +1,7 @@
 # 当前交接：H3-EXP-001 open；网络恢复后先补环境材料
 
+第三轮补充：已按主会话09:47恢复确认继续，但exp003-host-001与最小hostname查询exp003-connectivity-minimal-002再次均port22连接超时code255，无stdout。再次needs_input暂停，详见experimenter/environment-003-connectivity.md。没有取得新的converter/配置/源hash材料，无新源码问题可交Coder修复。
+
 第二轮：Coder已核查既有分支并返回need_experiment（coder/H3-EXP-001.md）。Experimenter补材料时固定SSH连续两次code255，现请求needs_input暂停，详见needs-input.md及experimenter/environment-002-connectivity.md。没有新的源码失败或修复验收；不重复派Coder在缺相同材料时盲改。网络恢复后先只读核查，再补完整converter/原生配置/安装源hash/既有converted根信息。
 
 以下为首轮修复请求，保持有效：
