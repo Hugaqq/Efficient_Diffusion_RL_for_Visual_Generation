@@ -1,0 +1,32 @@
+{
+  "purpose": "explicit five-update smoke subset only; formal dataset unchanged",
+  "source_commit": "bd6051f68e1ab444e5ec7c6ffe0a1f7eaf559a0d",
+  "files": {
+    "train": {
+      "source_file": "dataset/video/train.txt",
+      "source_sha256": "610e16e6b0e8a30bbb1e75cf87413bf592fe491faa74d918d57d914d865e0016",
+      "source_records": 19700,
+      "selected_indices_zero_based": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "subset_sha256": "e39b3105c6dddd8d48d34ed42337760c421d646ff99c714f75704f572e3a190c"
+    },
+    "eval": {
+      "source_file": "dataset/video/test.txt",
+      "source_sha256": "96536b01ab2d091158118c4fd9f548950abce4fa5fa9a7f9ac2ebaae47776da5",
+      "source_records": 300,
+      "selected_indices_zero_based": [
+        0,
+        1
+      ],
+      "subset_sha256": "deed125c8139230a344167454827b19ab235751ba997c2f7c52b754b6cf6a305"
+    }
+  }
+}

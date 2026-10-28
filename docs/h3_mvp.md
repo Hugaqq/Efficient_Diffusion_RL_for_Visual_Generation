@@ -31,6 +31,8 @@ PyTorch 必须支持 `prepare_h3_fsdp` 所校验的 FSDP2/DCP API，包括
 1. 模型根目录下真实 transformer、video_vae、audio_vae 及其完整配置/权重。
 2. `visual_rl.h3-text-cache.v1` 的离线文本缓存，覆盖 train 和 eval；格式见
    `visual_rl/models/implementations/h3_text_cache.py` 文件头。原始 UniRL cache 不会被静默接收。
+   可用 `scripts/prepare_h3_text_cache.py --raw-root RAW_FL2VA --model CONVERTED_MODEL --train TRAIN --eval EVAL --output NEW_CACHE --max-tokens 512 --max-prompts 32` 在独立准备阶段生成：显式选择单个获准GPU UUID，使用本地Qwen3-VL原始第50层、CPU权重offload、逐prompt真实前向。超长文本拒绝而不截断，完整输入哈希和实际输出记录在provenance.json；不会下载或修改原权重。此准备程序的语法检查不代表已生成GPU缓存。
+   `data/h3_dual_smoke/` 是明确独立的8训练/2评估prompt smoke子集，来源与选择索引已记录；不替换正式19700/300数据。
 3. 精确 train/eval prompt 文件及真实内容身份。
 4. 对应画布的124帧 HPS manifest 和可用服务。不得复用81帧 Flash manifest。
 5. 已获准且空闲的8张卡，按完整UUID固定逻辑顺序；不默认选择物理0—7。
