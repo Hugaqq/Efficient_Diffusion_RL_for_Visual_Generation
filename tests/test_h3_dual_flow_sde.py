@@ -22,6 +22,12 @@ def test_sampling_replay_joint_density_and_stream_gradients():
     joint, (video,audio), (cv,ca)=d.evaluate(x,action,prediction,1)
     assert torch.allclose(joint,video*.4+audio*.6)
     assert not torch.equal(cv,ca)
+    # Derive each correction independently from its own realized mean Jacobian:
+    # Fisher-score noise scale is |d mean / d velocity| / transition std.
+    stats=d._parts(x,prediction,1)
+    for channel,(mean,std,coefficient) in zip((0,2),stats):
+        jacobian=torch.autograd.grad(mean.sum(),prediction,retain_graph=True)[0][0,channel]
+        assert torch.allclose(coefficient,std/jacobian.abs(),rtol=1e-5)
     raw=torch.autograd.grad(joint.sum(),prediction,retain_graph=True)[0]
     corrected=d.rectified_score(joint,(video,audio),(cv,ca),(cv/2,ca/3))
     assert torch.equal(corrected,joint)
