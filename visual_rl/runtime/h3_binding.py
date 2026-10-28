@@ -397,7 +397,10 @@ class H3RuntimeBinding:
         artifact_payload = dict(declaration=self.profile.model.declaration_id, model=live["model"], cache=live["cache"])
         component = ComponentContractRef("model", "model", self.profile.model.declaration_id,
                                          _id("component-artifact-binding.v1", artifact_payload), runtime_id)
-        algorithm = dict(implementation="visual_rl.algorithms.trainer.h3_stages:H3IterationStages",
+        dual = self.profile.training.algorithm != "cps"
+        implementation = ("visual_rl.algorithms.trainer.h3_dual_stages:H3DualIterationStages" if dual
+                          else "visual_rl.algorithms.trainer.h3_stages:H3IterationStages")
+        algorithm = dict(implementation=implementation,
                          math=self.profile.training.payload(), dynamics=live["dynamics"], code=live["code"])
         return CheckpointContract(
             recipe_id=_id("materialized-recipe.v2", dict(h3=live["semantics"], resources=live["resources"])),
@@ -417,7 +420,7 @@ class H3RuntimeBinding:
             preprocess_requirement_set_id=_hash(dict(layer=50, width=5120, trimmed=True, guidance=1)),
             group_size=self.profile.training.group_size, global_batch_size=8*self.profile.training.group_size,
             gradient_accumulation_steps=1, data_sharding_version=SAMPLING_VERSION, sampler_state_schema="h3.prompt-source.v1",
-            rng_policy=STREAM_VERSION, dynamics_state_schema="h3.cps-dual-all-n.v1",
+            rng_policy=STREAM_VERSION, dynamics_state_schema=("h3.dual-flow-sde.v1" if dual else "h3.cps-dual-all-n.v1"),
             progress_state_schema=f"checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}",
             ema_state_schema="none", reference_state_schema="none", execution_transform_plan_id=transform_id,
             execution_transform_chain=(("h3.world8-ac-fsdp2.v1", transform_id),), world_size=8, world_size_policy="strict",

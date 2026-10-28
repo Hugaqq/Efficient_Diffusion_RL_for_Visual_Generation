@@ -21,13 +21,16 @@ class H3DualReplayAnchor:
         self.dynamics=dynamics;self.behavior_id=behavior_id;self.expected=expected_keys
         self.attempted=False;self._scores=None
 
-    def capture(self, records, *, device, predict, read_behavior_id, gate):
-        if self.attempted: raise RuntimeError('capture already attempted')
-        self.attempted=True
+    def validate_records(self, records):
         if type(records) is not tuple or any(type(r) is not H3DualRecord for r in records):
             raise ValueError('owned tuple of dual records required')
         if tuple((r.sample_id,r.index) for r in records)!=self.expected:
             raise ValueError('record identity/order differs from expected')
+
+    def capture(self, records, *, device, predict, read_behavior_id, gate):
+        if self.attempted: raise RuntimeError('capture already attempted')
+        self.attempted=True
+        self.validate_records(records)
         if not all(callable(f) for f in (predict,read_behavior_id,gate)):
             raise TypeError('predict/version/gate are required')
         pending={};device=torch.device(device)
@@ -35,7 +38,12 @@ class H3DualReplayAnchor:
             if read_behavior_id()!=self.behavior_id: raise ValueError('behavior changed before capture')
             for ordinal,record in enumerate(records):
                 gate(f'anchor/{ordinal}/forward')
-                x=record.x.to(device);action=record.action.to(device)
+                try:
+                    x=record.x.to(device);action=record.action.to(device)
+                except Exception:
+                    gate(f'anchor/{ordinal}/prepare',local_error=True)
+                    raise
+                gate(f'anchor/{ordinal}/prepare',local_error=False)
                 prediction=predict(record.sample_id,x,record.index)
                 try:
                     joint,_,coeff=self.dynamics.evaluate(x,action,prediction,record.index)

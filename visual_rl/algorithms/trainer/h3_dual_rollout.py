@@ -83,16 +83,21 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
         for row,(sid,gid) in enumerate(samples):
             if not isinstance(sid,str) or not sid:
                 raise ValueError('nonempty sample identity required')
-            choice=selected_step(seed=seed,optimizer_step=optimizer_step,group_id=gid,num_steps=dynamics.schedule.num_steps)
-            choices[sid]=choice
-            x=initial_states[sid]
-            if not isinstance(x,torch.Tensor) or x.device.type!='cpu' or x.dtype!=torch.float16 or x.requires_grad or x.shape[0]!=1:
-                raise ValueError('initial state must be detached CPU FP16 batch-one')
-            dynamics.layout.unpack(x)
-            x=x.to(device)
-            pair=generators[sid]
-            if type(pair) is not tuple or len(pair)!=2:
-                raise ValueError('two per-sample generators required')
+            try:
+                choice=selected_step(seed=seed,optimizer_step=optimizer_step,group_id=gid,num_steps=dynamics.schedule.num_steps)
+                choices[sid]=choice
+                x=initial_states[sid]
+                if not isinstance(x,torch.Tensor) or x.device.type!='cpu' or x.dtype!=torch.float16 or x.requires_grad or x.shape[0]!=1:
+                    raise ValueError('initial state must be detached CPU FP16 batch-one')
+                dynamics.layout.unpack(x)
+                x=x.to(device)
+                pair=generators[sid]
+                if type(pair) is not tuple or len(pair)!=2:
+                    raise ValueError('two per-sample generators required')
+            except Exception:
+                gate(f'rollout/{row}/prepare',local_error=True)
+                raise
+            gate(f'rollout/{row}/prepare',local_error=False)
             for index in range(dynamics.schedule.num_steps):
                 gate(f'rollout/{row}/{index}/forward')
                 prediction=predict(sid,x,index)
