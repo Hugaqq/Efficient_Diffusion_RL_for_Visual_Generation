@@ -1,15 +1,13 @@
-# 当前交接：H3-EXP-001 open；网络恢复后先补环境材料
+# 当前交接：repair — H3-EXP-001，材料已齐
 
-第三轮补充：已按主会话09:47恢复确认继续，但exp003-host-001与最小hostname查询exp003-connectivity-minimal-002再次均port22连接超时code255，无stdout。再次needs_input暂停，详见experimenter/environment-003-connectivity.md。没有取得新的converter/配置/源hash材料，无新源码问题可交Coder修复。
+请先读`issues/H3-EXP-001-materials-r1.md`。网络本轮正常，所有新请求首次code0，不再等待网络输入。
 
-第二轮：Coder已核查既有分支并返回need_experiment（coder/H3-EXP-001.md）。Experimenter补材料时固定SSH连续两次code255，现请求needs_input暂停，详见needs-input.md及experimenter/environment-002-connectivity.md。没有新的源码失败或修复验收；不重复派Coder在缺相同材料时盲改。网络恢复后先只读核查，再补完整converter/原生配置/安装源hash/既有converted根信息。
+Coder先前need_experiment所需材料已取得：
+- 已安装三个H3类源码hash与固定版本全部一致。
+- 官方固定converter已通过600秒有界Git prepare取得、HEAD/clean/hash核验；完整阅读转录为`experimenter/converter-004-part1.txt`、part2、part3，来源/许可见converter-004-provenance.md。没有执行converter。
+- FL2VA原生小配置及audio metadata完整内容、原bytes/hash/blob路径见`experimenter/native-configs-004.json`。
+- 找到新版布局目录`/home/ubtroot/code/downloads/MiniMax-H3`，但transformer14/14、vae3/3 shards及audio payload缺失，不可复用为完整artifact。
+- 真实公开类+PEFT meta成功：1238 state keys（638 base+600 LoRA），66,363,578,880目标bytes，buffer64 bytes，全部参数meta。
+- 新probe `converted-meta-admission-001` exit1/running=false：_weight_headers拒缺第一shard；decoder _configs拒缺VAE shard。完整命令/栈/时刻在不可变r1报告，没调用full CPU loader。
 
-以下为首轮修复请求，保持有效：
-
-请Coder先读task.md及`issues/H3-EXP-001-artifact-admission.md`，修复/提供最小原生H3 artifact适配准备路径。真实GPU环境probe已执行，生产build_h3_meta对原缓存报`artifact file missing or path escape: config.json`；原文件是HF blob链接，且实读旧schema/融合QKV键与当前新类严格loader不同，不能仅解引用或改类名冒称兼容。
-
-必须优先查已有origin/h3-pytorch-training、origin/h3-readable-integration的加载/映射。只本地修改并由Git部署，Experimenter负责所有服务器操作；不删guard、不改原权重、不追加CPU回归。
-
-SHA d5c10c9f00e44a816e1f0881c7e28ba8accbcdae；job artifact-admission-probe-001 已退出code1，无活跃训练/未知操作。PID765033及完整日志/命令/实测资源见不可变issue报告。Flow/Flash真实更新0/0。
-
-后续必需single-step缺口另存`issues/H3-EXP-002-flash-single-step-gap.md`；先模型准入再逐阶段推进。text cache producer/HPS124准入尚未完成，不称ready。正式步数缺失不在此阶段请求暂停。
+请完成最小准备调用/严格映射与实际资源受限加载方案，再交Experimenter Git部署真实复验。不要再次重复索要已提供相同材料，不盲改类名或放宽guard，不让Experimenter写算法/转换脚本。原H3-EXP-001仍open；H3-EXP-002 single-step后续queued。Flow/Flash仍0更新，正式步数此阶段不询问。旧网络与失败报告全部保留。

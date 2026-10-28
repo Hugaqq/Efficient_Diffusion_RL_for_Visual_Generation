@@ -1,4 +1,10 @@
-# 再次请求步骤边界暂停：恢复后工作流固定SSH仍连接超时
+# 历史网络输入请求 — 本轮已解除，不再请求暂停
+
+第四轮已采用用户“最多5次只读重试、不改规则程序”新指令，实际所有新SSH请求首次即成功。已补齐Coder所需环境材料，并完成固定上游源码Git准备与真实meta/header探查；下一步是repair交Coder，不是needs_input。详见issues/H3-EXP-001-materials-r1.md；无活跃owned job。正式更新次数仍按两smoke通过后确认。
+
+以下历史请求与失败证据保留：
+
+## 再次请求步骤边界暂停：恢复后工作流固定SSH仍连接超时
 
 第三轮更新：已采用主会话2026-10-28 09:47+08恢复确认，但当前角色通过唯一operations入口再次两次code255：`exp003-host-001`与最小`hostname`请求`exp003-connectivity-minimal-002`均stdout空、`ssh: connect to host 192.168.102.193 port 22: Operation timed out`。不是GPU查询/模型读取阶段失败。
 

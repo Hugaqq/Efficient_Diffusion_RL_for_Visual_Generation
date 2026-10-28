@@ -1,38 +1,27 @@
-# 当前状态 — 2026-10-28 / Experimenter首次推进
+# 当前状态 — 第四轮环境材料补齐 / repair
 
-阶段：needs-input-ssh-connectivity。本轮返回needs_input，请求步骤边界暂停，用户/主会话确认固定SSH稳定后恢复；不是因正式步数缺失暂停。
+本地HEAD a195f13b384d54f5ac231c698f2f1e73645ff715；已部署探查代码d5c10c9f00e44a816e1f0881c7e28ba8accbcdae。本轮未部署新的生产代码。正式计划未修改，Flow0/Flash0。
 
-## 第三轮最新观察
+## 最新进展
 
-已采用主会话09:47+08两次SSH恢复确认，不重放旧失败请求；本轮新id exp003-host-001及exp003-connectivity-minimal-002（最小hostname）均连接port22超时code255、stdout空。尚未执行GPU查询/材料读取。再次请求needs_input，请主会话核查workflow实际执行上下文连通性，详见experimenter/environment-003-connectivity.md。无远端mutating操作、job启动或停止、部署/转换/CPU回归。当前HEAD1b70b7b102e3cff48fa87b614238a340dcd71311；Flow0/Flash0，Coder材料仍pending。
+- 已采用用户最多5次只读SSH重试授权；本轮所有请求首次成功，未修改操作/监视规则程序。历史网络暂停解除，needs-input保留历史而标明已解除。
+- 实际读取三种installed H3源文件，hash均与Coder固定版本一致；无需盲目升级包。
+- 官方Diffusers固定aaf57d03通过有界owned Git prepare取得，converter SHA256匹配。完整原文阅读转录保存为experimenter/converter-004-part1/2/3.txt，来源/许可/实际hash见provenance。未执行converter、未转换权重。
+- 原生FL2VA小配置/metadata内容及原hash/blob路径已归档experimenter/native-configs-004.json。
+- 发现新版layout候选`/home/ubtroot/code/downloads/MiniMax-H3`，但全部transformer14个shard、vae3个shard、audio权重缺失，不能作为ready artifact。
+- 真实public H3+Accelerate+PEFT meta成功：638 base、600 LoRA、1238 state，state bytes66,363,578,880、buffer64、全部参数meta。随后headers/decoder拒缺shard，probe exit1。没有调用full CPU loader、optimizer或训练，不把meta检查当GPU验收。
 
-## 第二轮观察（保留）
+## Owned jobs
 
-本地HEAD8f5b9db5d045668acb348272c80e84050f3d2773。Coder返回need_experiment，需完整converter/原生配置/安装源hash/既有转换产物。exp002-discovery-001只读SSH连接超时code255；第二次exp002-host-connectivity-002仅返回主机名与GPU0空闲后server not responding，code255。两次只读均有回执，无新mutating操作，不再继续重试。详见needs-input.md和experimenter/environment-002-connectivity.md。
+远端root `/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/`：
+1. artifact-admission-probe-001：旧失败保留，PID765033/start_ticks71836860，exit1，首轮实际八卡BF16环境探查；不是H3训练。
+2. pinned-diffusers-source-001：PID933370/start_ticks74226462，created1793155110.5590448，timeout600；started1793155110.6031036、ended1793155116.1823854，exit0/running=false。只Git取回上游源码。
+3. converted-meta-admission-001：PID938447/start_ticks74282963，created1793155675.5641956，timeout300；started1793155675.6076143、ended1793155683.9933171，exit1/running=false。真实meta/header准入探查。
 
-本轮未启动/停止job，未publish/deploy或运行CPU回归。以下首轮job退出与资源信息为最后成功观察，本轮无法刷新；H3-EXP-001仍open，Flow0/Flash0。恢复后先inspect，再继续材料收集。
+三job的spec/owner/exit/job.log均保留；无活跃训练，无新未知mutating操作，未kill或stop。
 
-## 已完成
+## 交接与待办
 
-- 读当前task/formal-plan/reference/operations/remote_job及实际H3 production profile/loader/stages/lifecycle/cache说明；旧Global历史不作为本轮执行状态。
-- 固定SSH主机train170hx真实inspect/bootstrap成功；10卡64GiB均0MiB、无compute process，host112GiB available，磁盘500GiB available（时点观测非预约）。未碰其他进程/服务。
-- 独立venv版本核对成功，未安装或升级环境；未跑CPU测试。
-- 当前SHA d5c10c9f00e44a816e1f0881c7e28ba8accbcdae已push固定实验分支，经Git远端新worktree部署。真实import位于该SHA树，探查后tree干净。
-- 有界owned probe artifact-admission-probe-001已实际完成；八个授权GPU均native BF16支持并真实matmul/backward finite。此非H3训练或NCCL证明。
-- 原模型实际缓存和train19700/test300文件已定位并读取身份。
+见issues/current.md与不可变issues/H3-EXP-001-materials-r1.md。Coder完整核对转换器/config，最小提交准备工具/必要严格加载预算修复；不丢安全guard、不虚填host预算、不移植单卡runner。收到snapshot后Experimenter Git部署、独立artifact准备与真实模型GPU复验，再推进Flow5、single-step Flash5。正式步数到两个smoke成功后确认。
 
-## 失败与交接
-
-probe exit1，真实`build_h3_meta`先因原HF blob symlink超出组件目录拒绝。旧配置与融合QKV/raw VAE格式亦与当前公开类loader合同不同，需审计映射/独立artifact准备，不能仅改类名。完整栈/参数/环境与验收在`issues/H3-EXP-001-artifact-admission.md`，current.md指向该项；已列后续H3 Flash single-step缺口H3-EXP-002。
-
-## Owned job
-
-- job_id artifact-admission-probe-001，SHA同上，kind probe，timeout300秒。
-- PID765033/start_ticks71836860/created1793131214.535802；child765034。
-- started1793131214.577547 → ended1793131229.123795，exit1，running=false。
-- `/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/artifact-admission-probe-001/{spec.json,owner.json,child.json,heartbeat.json,exit.json,job.log}`保留。
-- 首轮最后成功观察无活跃训练；本轮连接失败未刷新远端job状态。无新mutating操作/未知副作用；没有重放、stop或kill。
-
-## 后续
-
-Coder本地最小修复/工具 → snapshot → Experimenter Git publish/deploy → 原生artifact与真实H3 GPU复验 → 真实cache/HPS124准入 → Flow5 → 真single-step Flash5。两者通过后才询问正式max_optimizer_steps；正式4×8=32/256×384×124/LoRA32-64不暗改。当前Flow0、Flash0，正式未启动。
+历史证据：environment-001.md、environment-002-connectivity.md、environment-003-connectivity.md及原H3-EXP-001报告均未覆盖。本轮未跑CPU回归，无模型/reward/训练成功声明。
