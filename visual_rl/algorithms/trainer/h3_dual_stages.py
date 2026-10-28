@@ -30,7 +30,8 @@ class H3DualIterationStages(H3IterationStages):
         ctx=self._context(value)
         # Prevent mismatched modes/seeds before any rank enters model forward.
         ctx.coordinator.gate(f'dual-contract/{self.mode}/{self.seed}')
-        ctx.dual=H3DualFlowSDE(ctx.request.dynamics.layout,ctx.request.dynamics.schedule)
+        ctx.dual=_checked(ctx.coordinator,'dual/dynamics/prepare',lambda:H3DualFlowSDE(
+            ctx.request.dynamics.layout,ctx.request.dynamics.schedule))
         ctx.dual_records=None
         ctx.dual_terminals=None
         return value
@@ -78,6 +79,7 @@ class H3DualIterationStages(H3IterationStages):
         keys=tuple((record.sample_id,record.index) for record in records)
         anchor=_checked(c,'dual/anchor/prepare',lambda:H3DualReplayAnchor(dynamics=ctx.dual,
             behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells))
+        _checked(c,'dual/anchor/records',lambda:anchor.validate_records(records))
         anchor.capture(records,device=self.device,predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/anchor/version'),gate=lambda event,**kw:c.gate('dual/'+event,**kw))
         c.gate('dual/anchor/complete')
@@ -92,8 +94,9 @@ class H3DualIterationStages(H3IterationStages):
         scale=h3_slot_loss_scale(n_slot=1,global_count=global_count,reducer_divisor=self.prepared.reducer_divisor)
         total=0.
         for ordinal,rec in enumerate(records):
+            state=_checked(c,f'dual/current/{ordinal}/prepare',lambda:rec.x.to(self.device))
             c.gate(f'dual/current/{ordinal}/forward')
-            prediction=self._predict(ctx,rec.sample_id,rec.x.to(self.device),rec.index)
+            prediction=self._predict(ctx,rec.sample_id,state,rec.index)
             def local_loss():
                 old,_=anchor.get(rec.sample_id,rec.index)
                 return policy_loss(dynamics=ctx.dual,record=rec,prediction=prediction,old_joint=old,
@@ -101,7 +104,7 @@ class H3DualIterationStages(H3IterationStages):
                     world_means=means,clip_range=.005,scale=scale)
             loss=_checked(c,f'dual/current/{ordinal}/backward',local_loss)
             total+=loss.detach().item();loss.backward()
-            del loss,prediction
+            del loss,prediction,state
         self._version(ctx,'dual/current/complete')
         norm=c.clip_grad_norm(self.prepared,max_norm=1.)
         def update():

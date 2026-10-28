@@ -17,7 +17,7 @@ def test_stable_group_selection_and_full_vs_single_step():
             device='cpu',predict=lambda sid,x,index:x.float()*.1,read_behavior_id=lambda:'b',behavior_id='b',gate=lambda event,**kw:gates.append(event))
         return result,gates
     (flash,terminal,selection),fgates=run('flash'); (flow,_,_),ggates=run('flow')
-    assert fgates==ggates and len(fgates)==16
+    assert fgates==ggates and len(fgates)==18
     assert selection['a']==selection['b']==selected_step(seed=42,optimizer_step=2,group_id='g',num_steps=4)
     assert len(flash)==2 and len(flow)==8
     assert all(r.index==selection[r.sample_id] for r in flash)
@@ -25,6 +25,18 @@ def test_stable_group_selection_and_full_vs_single_step():
     (again,term2,selected2),_=run('flash')
     assert selected2==selection and all(torch.equal(a.action,b.action) for a,b in zip(flash,again))
     assert all(torch.equal(terminal[s],term2[s]) for s in terminal)
+
+
+def test_rollout_local_error_is_announced_at_result_gate():
+    d=H3DualFlowSDE(H3JointLayout(1,2,1,3),H3ScheduleSnapshot.build(3))
+    events=[]
+    def gate(event,**kwargs):events.append((event,kwargs.get('local_error',False)))
+    with pytest.raises(ValueError,match='finite'):
+        collect(dynamics=d,samples=(('a','g'),),initial_states={'a':torch.zeros((1,5),dtype=torch.float16)},
+            generators={'a':(torch.Generator(),torch.Generator())},mode='flow',seed=1,optimizer_step=0,
+            device='cpu',predict=lambda s,x,i:torch.full_like(x,float('nan')),
+            read_behavior_id=lambda:'b',behavior_id='b',gate=gate)
+    assert events[-1]==('rollout/0/0/result',True)
 
 
 def test_selection_validates_and_behavior_mismatch_rejected():
