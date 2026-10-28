@@ -34,6 +34,7 @@ class H3ReplayAnchor:
         self, *, collection_id: str, behavior_id: str,
         sample_ids: tuple[str, ...], dynamics: H3CPSDynamics,
         max_cells: int, max_trajectory_bytes: int,
+        selected_indices: dict[str, int] | None = None,
     ) -> None:
         _identifier("collection_id", collection_id)
         _identifier("behavior_id", behavior_id)
@@ -52,6 +53,18 @@ class H3ReplayAnchor:
         self._behavior_id = behavior_id
         self._sample_ids = sample_ids
         self._dynamics = dynamics
+        if selected_indices is None:
+            expected = frozenset((sid, i) for sid in sample_ids
+                                 for i in range(dynamics.schedule.num_steps))
+        else:
+            if type(selected_indices) is not dict or set(selected_indices) != set(sample_ids):
+                raise ValueError("selected_indices must cover exactly the sample IDs")
+            for index in selected_indices.values():
+                if type(index) is not int:
+                    raise ValueError("selected index must be an integer")
+                dynamics.schedule.transition(index)
+            expected = frozenset(selected_indices.items())
+        self._expected = expected
         self._max_cells = max_cells
         self._max_trajectory_bytes = max_trajectory_bytes
         self._attempted = False
@@ -72,8 +85,7 @@ class H3ReplayAnchor:
         cell_bytes = 4 * self._dynamics.layout.packed_width + 4
         if len(records) * cell_bytes > self._max_trajectory_bytes:
             raise ValueError("collection exceeds max_trajectory_bytes")
-        steps = self._dynamics.schedule.num_steps
-        if len(records) != len(self._sample_ids) * steps:
+        if len(records) != len(self._expected):
             raise ValueError("incomplete collection coverage")
         sample_ids = set(self._sample_ids)
         seen = set()
@@ -94,6 +106,8 @@ class H3ReplayAnchor:
             key = (sample_id, record.index)
             if key in seen:
                 raise ValueError("duplicate sample/index cell")
+            if key not in self._expected:
+                raise ValueError("unexpected sample/index cell")
             seen.add(key)
             # H3CPSRecord already validates/owns x, action and diagnostic with
             # matching batch/device. Read only its public copying interface.
@@ -101,8 +115,7 @@ class H3ReplayAnchor:
             if x.shape[0] != 1 or x.device.type != "cpu":
                 raise ValueError("input records must be CPU B1")
             del x
-        # Exact size, unique keys, known IDs and bounded indices imply complete
-        # sample x transition coverage, including the last q=0 transition.
+        # Exact cardinality plus uniqueness and membership prove coverage.
 
     def capture(
         self, records: tuple[tuple[str, H3CPSRecord], ...], *,
@@ -167,6 +180,10 @@ class H3ReplayAnchor:
         self._identity(collection_id, behavior_id)
         _identifier("sample_id", sample_id)
         self._dynamics.schedule.transition(index)
+        if sample_id not in self._sample_ids:
+            raise KeyError(sample_id)
+        if (sample_id, index) not in self._expected:
+            raise ValueError("unexpected sample/index cell")
         if self._scores is None:
             raise RuntimeError("anchor has no complete captured scores")
         return self._scores[(sample_id, index)].clone()
