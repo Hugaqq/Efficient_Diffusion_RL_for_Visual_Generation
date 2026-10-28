@@ -1,13 +1,9 @@
-# 当前交接：repair — H3-EXP-001，材料已齐
+# 当前状态：H3-EXP-001 retest运行中 — waiting，不派新修复
 
-请先读`issues/H3-EXP-001-materials-r1.md`。网络本轮正常，所有新请求首次code0，不再等待网络输入。
+Coder H3-EXP-001-r2已部署至`fa99cf22c11670a67c06cd16508dd8f4ab5664b3`，GitHub/远端Git/import身份一致。Experimenter启动真实独立转换job `native-artifact-convert-001`，PID952148/start_ticks74454370，timeout3600秒。
 
-Coder先前need_experiment所需材料已取得：
-- 已安装三个H3类源码hash与固定版本全部一致。
-- 官方固定converter已通过600秒有界Git prepare取得、HEAD/clean/hash核验；完整阅读转录为`experimenter/converter-004-part1.txt`、part2、part3，来源/许可见converter-004-provenance.md。没有执行converter。
-- FL2VA原生小配置及audio metadata完整内容、原bytes/hash/blob路径见`experimenter/native-configs-004.json`。
-- 找到新版布局目录`/home/ubtroot/code/downloads/MiniMax-H3`，但transformer14/14、vae3/3 shards及audio payload缺失，不可复用为完整artifact。
-- 真实公开类+PEFT meta成功：1238 state keys（638 base+600 LoRA），66,363,578,880目标bytes，buffer64 bytes，全部参数meta。
-- 新probe `converted-meta-admission-001` exit1/running=false：_weight_headers拒缺第一shard；decoder _configs拒缺VAE shard。完整命令/栈/时刻在不可变r1报告，没调用full CPU loader。
+最近exp005-inspect-convert-02：running=true、exit=null，日志实际输入payload哈希已推进到transformer shard10/13，最大已报告RSS828567552 bytes。**尚不能声称转换成功或关闭issue。** 下次先inspect同job，不重复launch、不停止任务。完整spec/日志路径/回执见experimenter/retest-005.md与state.json。
 
-请完成最小准备调用/严格映射与实际资源受限加载方案，再交Experimenter Git部署真实复验。不要再次重复索要已提供相同材料，不盲改类名或放宽guard，不让Experimenter写算法/转换脚本。原H3-EXP-001仍open；H3-EXP-002 single-step后续queued。Flow/Flash仍0更新，正式步数此阶段不询问。旧网络与失败报告全部保留。
+网络首次及前三次重试失败，第4次只读重试恢复；未改操作规则，全部失败回执保留，无unknown mutation。后续转换若明确源码错误再附新issue反馈Coder；如果成功则继续独立完整payload加载及真实八卡实验，不以准备/CPU检查算5更新。
+
+H3-EXP-002真实Flash single-step仍queued；Flow/Flash0更新，正式缺步数此阶段不暂停。原H3-EXP-001、materials-r1与全部失败记录保留。
