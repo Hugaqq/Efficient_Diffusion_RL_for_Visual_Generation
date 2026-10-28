@@ -1,9 +1,9 @@
-# 当前状态：转换exit0；原payload probe运行中 / waiting
+# 当前状态：修正Experimenter探查日志；新payload probe运行 / waiting
 
-native-artifact-convert-001已真实exit0并发布artifact。receipt c5255d2ab8720db5dadbe30ab4ea6cd03900e940ee2984b2d732df6a8cc778e6，40文件77301635348bytes，模型keys638/703/1087；路径/大小/无symlink已独立检查。详细见experimenter/observation-008.md。
+生产SHA fa99cf22c11670a67c06cd16508dd8f4ab5664b3未变。转换artifact已exit0发布。
 
-Experimenter启动了artifact-payload-verify-001（PID976840/start_ticks74717946，SHAfa99cf2）进行独立hash、实际loader及逐tensor内容核验，但随后发现本角色argv末尾日志函数重复peak_rss_bytes关键字。此为Experimenter探查命令错误，非Coder生产代码失败，不派Coder修算法。
+本轮确认artifact-payload-verify-001 exit1/running=false：真实完整loader成功返回1238 state keys，40文件hash及638 base tensor对照完成，随后末尾日志重复peak_rss_bytes触发TypeError。这是Experimenter argv错误，不是Coder生产源码缺陷；旧exit1、日志及receipt完整保留，不当成功退出。
 
-该probe的stop请求曾SSH超时uncertain；现exp008-stop-effects-retry-04已确认原owner/child活跃且stop-request/exit均缺失、全部40个输出hash已核验并进入实际loader，RSS59694592kB。exp008-reconcile-stop-01已code0核销未知状态，未观察停止效果，未重发stop。保持原probe继续收集真实反馈；若末尾已知日志错误触发exit1必须据实保留，不能改exit或归咎Coder。原转换产物/权重未更改。probe整体未验收，H3-EXP-001未完整关闭。
+确认旧child976841不存在和host资源释放后，已用新job artifact-payload-verify-002修正日志调用并重新执行完整同规格验证。owner985422/start_ticks74828602/created1793161131.9621313；3600秒有界，SHA不变。exp009-inspect-payload-02 code0：running=true/exit=null，实际import匹配、hash已至transformer2/27。详见experimenter/observation-009.md和state.json。
 
-待核查后继续受控payload/GPU链路；Flow/Flash均0，H3-EXP-002单步仍待实现。正式参数不在此阶段询问。
+下次先inspect该新任务，不重启；exit0后核对receipt再推进八卡FSDP2/真实cache/AV/HPS。H3-EXP-001整体仍open，暂无需Coder处理的新生产错误。Flow/Flash均0更新；H3-EXP-002单步缺口仍待后续实现，正式参数此阶段不询问。
