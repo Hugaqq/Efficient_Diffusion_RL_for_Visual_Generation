@@ -1,0 +1,20 @@
+{
+ "job_id":"native-artifact-convert-001",
+ "sha":"fa99cf22c11670a67c06cd16508dd8f4ab5664b3",
+ "artifact":"/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/native-artifact-convert-001/artifact",
+ "exit":{"code":0,"started":1793157389.6860728,"ended":1793159717.5206215},
+ "running_at_inspection":false,
+ "receipt_sha256":"c5255d2ab8720db5dadbe30ab4ea6cd03900e940ee2984b2d732df6a8cc778e6",
+ "receipt_bytes":662419,
+ "status":"converted_validated_not_gpu_tested",
+ "converter_commit":"aaf57d03a3edfbd9de457d2872417a92f149a91d",
+ "native_files":23,
+ "converted_files":40,
+ "converted_bytes":77301635348,
+ "model_keys":{"transformer":638,"vae":703,"audio_vae":1087},
+ "reported_peak_rss_bytes_at_publication":11994386432,
+ "independent_checks":{"relative_path_coverage":true,"file_sizes":true,"no_symlinks":true,"partial_absent":true,"payload_full_hash_recheck_complete":true,"full_loader_verified":false,"gpu_training_verified":false},
+ "operation_ids":["exp008-inspect-convert-retry-02","exp008-artifact-receipt-01","exp008-stop-effects-retry-04"],
+ "hash_recheck_evidence":"Live payload probe has passed all40 file_hash_verified assertions and reached load_begin; overall probe exit pending.",
+ "training_updates":0
+}

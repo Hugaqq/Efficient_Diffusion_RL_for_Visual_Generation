@@ -1,26 +1,17 @@
-# 当前状态 — 第七轮 / native-artifact-conversion / waiting
+# 第八轮当前状态：转换exit0；原payload probe继续运行 / waiting
 
-当前本地协调snapshot为`54e0516185845241b3bff3c20fd3821ef5545a49`；正在运行job与此前发布/部署/import核验的源码仍为`fa99cf22c11670a67c06cd16508dd8f4ab5664b3`，未热更新。未跑CPU回归。
+生产SHA fa99cf22c11670a67c06cd16508dd8f4ab5664b3，本地协调HEAD f8e6dc91583ccf9675d4a0a595dd257ae96a21f8。无算法源码修改或CPU回归。
 
-## 已执行
+## 已确认资产准备
 
-已读Coder H3-EXP-001-r2及完整准备脚本/direct-IO loader。初次SSH与前3次只读重试连接超时，第4次重试成功；遵守用户最多5次重试要求，不改规则程序。实测10卡空闲、host112GiB available/disk499GiB available、无compute processes。随后Git发布部署核验，启动独立转换job。
+原native-artifact-convert-001 exit0/running=false，started1793157389.6860728 ended1793159717.5206215；artifact_published，末次峰值RSS11994386432 bytes。conversion.json SHA c5255d2ab8720db5dadbe30ab4ea6cd03900e940ee2984b2d732df6a8cc778e6，40文件/77301635348 bytes，638/703/1087模型keys。已独立核查完整相对路径集合、大小、无symlink、partial消失；新probe已逐文件通过全部40个输出hash断言并进入实际loader，整体probe仍未退出，完整读取验收尚待完成。
 
-## 当前owned job
+## 新probe与操作错误
 
-- job_id：native-artifact-convert-001，kind=prepare，SHA同上。
-- owner PID952148，start_ticks74454370，created1793157389.6425683；child952149。
-- timeout3600秒，CUDA_VISIBLE_DEVICES为空，显式offline，host working limit48GiB。
-- 日志：`/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/native-artifact-convert-001/job.log`。
-- artifact目标同job目录`artifact`，进行中独立`artifact.partial`。原始权重和旧不完整目录不写入。
-- 最近inspect exp007-inspect-convert-01：首次连接code0，running=true、exit=null；heartbeat1793159443.9584627/elapsed2054.2724s；日志mtime1793159459.7605774。
-- transformer638键/27 shards、video703键/5 shards、audio1087键/单文件已转换；全部33个validated_shard事件已出现（脚本完整key/shape/dtype后逐tensor finite检查）。
-- 源转换后完整hash已再次完成，正在输出inventory hash。已报告进程peak RSS11,994,386,432 bytes（约11.17GiB），不是最终退出峰值。仍缺最终conversion.json/发布和exit0，不能宣布完整准备通过或用partial加载。
+artifact-payload-verify-001：PID976840/start_ticks74717946/created1793160025.3965695，timeout3600秒，日志`/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/artifact-payload-verify-001/job.log`。本角色发现自己探查命令最后report调用重复peak_rss_bytes关键字，非Coder源码错误，尚未观察实际运行至末尾。
 
-返回waiting，保持job运行。下次必须先inspect同job，禁止重复launch；网络失败按最多5次只读重试，不停止任务。
+本角色曾发出仅该probe的stop_job请求exp008-stop-payload-command-error-01，SSH code255造成uncertain。后续exp008-stop-effects-retry-04成功确认原owner976840/start_ticks74717946和child976841均存活，stop-request/exit/payload-verification均缺失、heartbeat已541.48s、日志进入load_begin，child RSS59694592kB。exp008-reconcile-stop-01已code0核销未知状态，未观察停止效果、未重发stop。
 
-## 待验收
+现在保留原probe继续收集真实loader反馈，不停止已经推进的读取，不改运行spec。末尾日志缺陷可能仍造成exit1，届时据实保留并按本角色操作命令错误处理，不能改退出状态或仅凭receipt称probe通过。原转换job/产物不受影响。
 
-H3-EXP-001仍open/retest进行中。等exit后核对conversion.json、严格覆盖/源输出hash/实际峰值/文件路径，然后才进入真实完整payload加载probe与GPU FSDP复验。准备完成不是训练更新；Flow0/Flash0，H3-EXP-002真实single-step queued。两个smoke通过后再确认正式步数，不改4×8=32。
-
-本轮只读inspect首次成功；未停止或重启job。最新证据：experimenter/observation-007.md；上轮网络重试证据：experimenter/observation-006.md；启动/部署证据：experimenter/retest-005.md。旧3个job退出及所有网络/模型失败报告保留；无未知mutating操作，无stop/kill或服务器hotfix。
+全部回执在experimenter/observation-008.md；state.json保留旧job与stop核查记录，uncertain_operations已清空。本轮转换inspect第二次重试成功；stop效果观察第四次重试成功，符合最多5次授权。返回waiting，下次先inspect同probe不新launch。Flow/Flash0，正式目标此阶段不询问。
