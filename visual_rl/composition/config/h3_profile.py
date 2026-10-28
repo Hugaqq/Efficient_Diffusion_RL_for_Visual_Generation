@@ -259,7 +259,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
     from visual_rl.data import h3_source
     from visual_rl.core.protocols.flash_hpsv3 import MAX_HEALTH_BYTES, VideoContract, decode_json, validate_health
     from visual_rl.models.implementations.h3_decode import H3CPUDecoder
-    from visual_rl.models.implementations.h3_loading import _weight_headers, _TARGETS
+    from visual_rl.models.implementations.h3_loading import _weight_headers, _TARGETS, _FP32_ROOTS, _state_read_budget
     from visual_rl.models.implementations.h3_text_cache import H3TextCache
 
     if not isinstance(profile, H3Profile):
@@ -285,7 +285,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
         raise ValueError("H3 condition/trajectory/media/decode budget cannot fit fixed minimum workload")
     decoder = H3CPUDecoder(launch.model, max_media_bytes=budget.media_bytes, max_decode_bytes=budget.decode_bytes)
     decoder._configs()  # existing strict config/stats/path checks; never load either VAE
-    configs, header_sets, files = {}, {}, {}
+    configs, header_sets = {}, {}
     for component in ("transformer", "vae", "audio_vae"):
         directory = launch.model / component
         if directory.is_symlink() or any(p.is_symlink() for p in directory.rglob("*")):
@@ -295,7 +295,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
         locations, headers = _weight_headers(directory.resolve())  # actual safetensors headers, no get_tensor
         if not headers or any(header["dtype"] not in ("F16", "BF16", "F32") for header in headers.values()):
             raise ValueError("model requires nonempty floating safetensors weights")
-        header_sets[component], files[component] = headers, set(locations.values())
+        header_sets[component] = headers
         if component == "transformer":
             model_config = decode_json(raw, 1024 * 1024)
     if (model_config.get("_class_name") != "MiniMaxH3Transformer3DModel"
@@ -313,9 +313,14 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
             if header is None or len(header["shape"]) != 2:
                 raise ValueError("transformer header missing main-block LoRA target")
             lora_numel += config.lora_rank * sum(header["shape"])
-    # All base elements conservatively budgeted FP32, plus FP32 LoRA. Exact
-    # model/FQN validation and loader budget still run after meta construction.
-    host_bytes = 2 * sum(p.stat().st_size for p in files["transformer"]) + 8 * (sum(math.prod(h["shape"]) for h in headers.values()) + lora_numel) + 1024 * 1024
+    # Same mixed-precision destination and direct-IO working-set formula as
+    # the actual loader. Exact model/FQN validation still follows on meta;
+    # preflight neither allocates state nor claims observed host availability.
+    destination_bytes = 4 * lora_numel + sum(
+        math.prod(h["shape"]) * (4 if name.split('.')[0] in _FP32_ROOTS else 2)
+        for name, h in headers.items())
+    rope_bytes = 4 * positive_int('rope_freq_dim', model_config.get('rope_freq_dim', 16))
+    host_bytes = _state_read_budget(destination_bytes, headers, rope_bytes)
     if host_bytes > budget.host_weight_bytes:
         raise ValueError("host weight budget cannot fit transformer initialization estimate")
     raw_hps = _read(launch.hps_manifest, MAX_HEALTH_BYTES)

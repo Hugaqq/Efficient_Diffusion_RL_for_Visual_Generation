@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import json
 import math
+import sys
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -255,14 +256,67 @@ def _weight_headers(directory: Path) -> tuple[dict[str, Path], dict[str, dict]]:
     return locations, headers
 
 
+def _state_read_budget(destination_bytes: int, headers: dict, buffer_bytes: int) -> int:
+    # Owned destination state plus the largest simultaneously live source
+    # tensor during dtype conversion. No full source shard mmap or second state.
+    source_sizes = {"F32": 4, "BF16": 2, "F16": 2}
+    scratch = max(math.prod(h["shape"]) * source_sizes[h["dtype"]] for h in headers.values())
+    return destination_bytes + scratch + 4 * 1024**2 + 2 * buffer_bytes
+
+
+def _cpu_state_budget(meta: H3MetaModel, headers: dict) -> int:
+    return _state_read_budget(sum(s.nbytes for s in meta.state_specs.values()), headers,
+                             sum(t.numel() * t.element_size() for t in meta.nonpersistent_buffers.values()))
+
+
+def _admit_host_memory(budget: int) -> None:
+    # Linux production telemetry; the declared budget is still checked on
+    # other platforms. Reserve is for Python/peers/allocator overhead, not a
+    # claim to bound later CUDA/DCP workspaces or concurrent processes.
+    meminfo = Path('/proc/meminfo')
+    if meminfo.is_file():
+        fields = dict(line.split(':', 1) for line in meminfo.read_text().splitlines())
+        available = int(fields['MemAvailable'].split()[0]) * 1024
+        if budget + 24 * 1024**3 > available:
+            raise ValueError(f"host available memory insufficient: {available}, weights {budget}, reserve 24GiB")
+
+
+def _read_owned_tensor(stream, header: dict, data_start: int, dtype: torch.dtype) -> torch.Tensor:
+    """Read directly into owned CPU storage; never retain a safetensors mmap."""
+    if sys.byteorder != 'little':
+        raise ValueError('H3 safetensors direct loading requires a little-endian host')
+    source_dtype = {'F32': torch.float32, 'BF16': torch.bfloat16, 'F16': torch.float16}[header['dtype']]
+    tensor = torch.empty(tuple(header['shape']), dtype=source_dtype, device='cpu')
+    start, end = header['data_offsets']
+    if end - start != tensor.numel() * tensor.element_size():
+        raise ValueError('safetensors payload size disagrees with shape/dtype')
+    stream.seek(data_start + start)
+    view = memoryview(tensor.reshape(-1).view(torch.uint8).numpy()).cast('B')
+    offset = 0
+    while offset < len(view):
+        count = stream.readinto(view[offset:offset + 1024**2])
+        if not count:
+            raise ValueError('truncated safetensors payload')
+        offset += count
+    del view
+    tensor = tensor.to(dtype=dtype)
+    # Finite validation scratch is bounded, even for the large AdaLN matrix.
+    for chunk in tensor.reshape(-1).split(1024**2):
+        if not bool(torch.isfinite(chunk).all()):
+            raise ValueError('nonfinite checkpoint tensor after conversion')
+    return tensor
+
+
 def load_h3_cpu_state(
     meta: H3MetaModel, *, is_init_owner: bool, host_weight_limit_bytes: int, init_seed: int,
 ) -> H3CPUState:
     """Owner only; complete CPU base + FP32 Kaiming-A/zero-B initialization.
 
-    Budget conservatively includes twice source file bytes plus twice complete
-    destination bytes and constructor-buffer copies. It is NOT a host RSS bound.
-    Header validation and admission happen before any tensor payload read.
+    Budget includes the complete owned destination, largest source tensor for
+    dtype conversion, bounded IO/finite scratch and constructor-buffer copies.
+    Direct readinto avoids full-shard mmap residency or a second full state.
+    Header validation and admission precede payload reads; Linux also requires
+    an observed 24GiB host reserve. Later DCP/GPU workspace is not included.
     """
     if is_init_owner is not True:
         raise PermissionError("only the designated initialization owner may read full CPU weights")
@@ -282,30 +336,35 @@ def load_h3_cpu_state(
         if header["dtype"] not in ("F32", "BF16", "F16"):
             raise ValueError(f"unsupported checkpoint dtype: {name}: {header['dtype']}")
     files = sorted(set(locations.values()))
-    budget = (2 * sum(p.stat().st_size for p in files)
-              + 2 * sum(s.nbytes for s in meta.state_specs.values())
-              + 2 * sum(t.numel() * t.element_size() for t in meta.nonpersistent_buffers.values()))
+    budget = _cpu_state_budget(meta, headers)
     if budget > host_weight_limit_bytes:
         raise ValueError(f"host weight budget exceeded: estimated {budget} > {host_weight_limit_bytes}")
-    from safetensors import safe_open
+    _admit_host_memory(budget)
 
     state, identities = {}, {"config.json": meta.config_sha256}
     for path in files:
         digest = hashlib.sha256()
+        before = path.stat()
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
-        identities[str(path.relative_to(meta.transformer_dir))] = digest.hexdigest()
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            for name in handle.keys():
+            stream.seek(0)
+            size = int.from_bytes(stream.read(8), 'little')
+            if not 2 <= size <= min(100_000_000, before.st_size - 8):
+                raise ValueError('invalid safetensors header size after admission')
+            current = _json(stream.read(size))
+            current.pop('__metadata__', None)
+            expected = {name: headers[name] for name, location in locations.items() if location == path}
+            if current != expected:
+                raise ValueError('checkpoint metadata changed after admission')
+            for name, header in current.items():
                 target = meta.base_to_model[name]
-                view = handle.get_slice(name)
-                if view.get_shape() != headers[name]["shape"] or view.get_dtype() != headers[name]["dtype"]:
-                    raise ValueError(f"checkpoint metadata changed after admission: {name}")
-                tensor = handle.get_tensor(name).to(dtype=meta.state_specs[target].dtype, copy=True)
-                if not bool(torch.isfinite(tensor).all()):
-                    raise ValueError(f"nonfinite checkpoint tensor after conversion: {name}")
-                state[target] = tensor
+                state[target] = _read_owned_tensor(stream, header, 8 + size, meta.state_specs[target].dtype)
+        after = path.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError('checkpoint file changed during load')
+        identities[str(path.relative_to(meta.transformer_dir))] = digest.hexdigest()
     generator = torch.Generator(device="cpu").manual_seed(init_seed)
     for name in meta.lora_names:
         tensor = torch.empty(meta.state_specs[name].shape, dtype=torch.float32, device="cpu")

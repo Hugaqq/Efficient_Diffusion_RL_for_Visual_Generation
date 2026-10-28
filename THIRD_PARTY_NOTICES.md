@@ -1,5 +1,18 @@
 # Third-party notices
 
+## H3 artifact preparation dependency
+
+`scripts/prepare_h3_artifact.py` invokes, but does not vendor, Hugging Face
+Diffusers' `scripts/convert_minimax_h3_to_diffusers.py` from commit
+`aaf57d03a3edfbd9de457d2872417a92f149a91d` (Apache License 2.0).
+Source: https://github.com/huggingface/diffusers/tree/aaf57d03a3edfbd9de457d2872417a92f149a91d
+License: https://github.com/huggingface/diffusers/blob/aaf57d03a3edfbd9de457d2872417a92f149a91d/LICENSE
+The tool verifies the external checkout's converter, LICENSE and installed H3
+component source hashes before execution. Its key-plan/config APIs provide the
+upstream mappings; no upstream transformer/VAE/converter implementation is
+copied into this repository. Original MiniMax model weights are not distributed
+here and remain subject to their own license. Conversion is not GPU validation.
+
 ## World-R1 camera trajectory utilities
 
 `visual_rl/algorithms/conditioning/camera_math.py` contains the camera trajectory
