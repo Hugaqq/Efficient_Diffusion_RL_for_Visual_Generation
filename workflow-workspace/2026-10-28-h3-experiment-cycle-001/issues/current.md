@@ -1,9 +1,9 @@
-# 当前状态：H3-EXP-001 retest运行中 — waiting，不派新修复
+# 当前状态：转换exit0；原payload probe运行中 / waiting
 
-Coder H3-EXP-001-r2已部署至`fa99cf22c11670a67c06cd16508dd8f4ab5664b3`，GitHub/远端Git/import身份一致。Experimenter启动真实独立转换job `native-artifact-convert-001`，PID952148/start_ticks74454370，timeout3600秒。
+native-artifact-convert-001已真实exit0并发布artifact。receipt c5255d2ab8720db5dadbe30ab4ea6cd03900e940ee2984b2d732df6a8cc778e6，40文件77301635348bytes，模型keys638/703/1087；路径/大小/无symlink已独立检查。详细见experimenter/observation-008.md。
 
-最近exp007-inspect-convert-01：同owner running=true、exit=null，elapsed2054.2724s。transformer638/video703/audio1087键已转换，全部33个validated_shard事件已出现；源前后hash比较后正在计算输出文件hash。已报告peak RSS11994386432 bytes（约11.17GiB），非最终峰值。仍缺conversion.json/最终发布与exit0，不使用partial启动加载。**尚不能声称转换成功或关闭issue。** 下次先inspect同job，不重复launch、不停止任务。完整spec/日志路径/回执见experimenter/retest-005.md与state.json。
+Experimenter启动了artifact-payload-verify-001（PID976840/start_ticks74717946，SHAfa99cf2）进行独立hash、实际loader及逐tensor内容核验，但随后发现本角色argv末尾日志函数重复peak_rss_bytes关键字。此为Experimenter探查命令错误，非Coder生产代码失败，不派Coder修算法。
 
-本轮inspect首次连接成功；未改操作规则、未停止或重启任务，旧失败回执保留，无unknown mutation。最新证据见experimenter/observation-007.md。后续转换若明确源码错误再附新issue反馈Coder；如果成功则继续独立完整payload加载及真实八卡实验，不以准备/CPU检查算5更新。
+该probe的stop请求曾SSH超时uncertain；现exp008-stop-effects-retry-04已确认原owner/child活跃且stop-request/exit均缺失、全部40个输出hash已核验并进入实际loader，RSS59694592kB。exp008-reconcile-stop-01已code0核销未知状态，未观察停止效果，未重发stop。保持原probe继续收集真实反馈；若末尾已知日志错误触发exit1必须据实保留，不能改exit或归咎Coder。原转换产物/权重未更改。probe整体未验收，H3-EXP-001未完整关闭。
 
-H3-EXP-002真实Flash single-step仍queued；Flow/Flash0更新，正式缺步数此阶段不暂停。原H3-EXP-001、materials-r1与全部失败记录保留。
+待核查后继续受控payload/GPU链路；Flow/Flash均0，H3-EXP-002单步仍待实现。正式参数不在此阶段询问。
