@@ -2,7 +2,11 @@
 
 阶段：needs-input-ssh-connectivity。本轮返回needs_input，请求步骤边界暂停，用户/主会话确认固定SSH稳定后恢复；不是因正式步数缺失暂停。
 
-## 第二轮最新观察
+## 第三轮最新观察
+
+已采用主会话09:47+08两次SSH恢复确认，不重放旧失败请求；本轮新id exp003-host-001及exp003-connectivity-minimal-002（最小hostname）均连接port22超时code255、stdout空。尚未执行GPU查询/材料读取。再次请求needs_input，请主会话核查workflow实际执行上下文连通性，详见experimenter/environment-003-connectivity.md。无远端mutating操作、job启动或停止、部署/转换/CPU回归。当前HEAD1b70b7b102e3cff48fa87b614238a340dcd71311；Flow0/Flash0，Coder材料仍pending。
+
+## 第二轮观察（保留）
 
 本地HEAD8f5b9db5d045668acb348272c80e84050f3d2773。Coder返回need_experiment，需完整converter/原生配置/安装源hash/既有转换产物。exp002-discovery-001只读SSH连接超时code255；第二次exp002-host-connectivity-002仅返回主机名与GPU0空闲后server not responding，code255。两次只读均有回执，无新mutating操作，不再继续重试。详见needs-input.md和experimenter/environment-002-connectivity.md。
 
