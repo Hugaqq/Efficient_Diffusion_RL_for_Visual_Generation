@@ -1,17 +1,13 @@
-# 第八轮当前状态：转换exit0；原payload probe继续运行 / waiting
+# 第九轮状态：新payload复验运行 / waiting
 
-生产SHA fa99cf22c11670a67c06cd16508dd8f4ab5664b3，本地协调HEAD f8e6dc91583ccf9675d4a0a595dd257ae96a21f8。无算法源码修改或CPU回归。
+生产SHA `fa99cf22c11670a67c06cd16508dd8f4ab5664b3`；本地协调HEAD `3121a478fff8045537c4f4169eee75b5fe25dae3`。无生产源码修改，无CPU回归。
 
-## 已确认资产准备
+转换任务已exit0并发布artifact。旧`artifact-payload-verify-001`现确认exit1/running=false：完整loader、40文件hash、638基础张量比较、600 LoRA及buffer检查完成，但末尾Experimenter日志命令重复peak_rss_bytes触发TypeError。receipt SHA256 `76a2a03ba5ddc056228d64bbb583023adc4debea105a1f2fc768a2124f5f4e4c`，peak RSS69770481664 bytes。失败输出与exit保留，不称成功退出。
 
-原native-artifact-convert-001 exit0/running=false，started1793157389.6860728 ended1793159717.5206215；artifact_published，末次峰值RSS11994386432 bytes。conversion.json SHA c5255d2ab8720db5dadbe30ab4ea6cd03900e940ee2984b2d732df6a8cc778e6，40文件/77301635348 bytes，638/703/1087模型keys。已独立核查完整相对路径集合、大小、无symlink、partial消失；新probe已逐文件通过全部40个输出hash断言并进入实际loader，整体probe仍未退出，完整读取验收尚待完成。
+确认旧child已不存在、MemAvailable120944046080 bytes后，仅修正新探查argv日志调用，启动独立 `artifact-payload-verify-002`：PID985422/start_ticks74828602/created1793161131.9621313，child985423，timeout3600秒。
 
-## 新probe与操作错误
+日志：`/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/artifact-payload-verify-002/job.log`。
 
-artifact-payload-verify-001：PID976840/start_ticks74717946/created1793160025.3965695，timeout3600秒，日志`/home/ubtroot/qifan/h3-experiment-cycle-20261028-001/runs/artifact-payload-verify-001/job.log`。本角色发现自己探查命令最后report调用重复peak_rss_bytes关键字，非Coder源码错误，尚未观察实际运行至末尾。
+最新exp009-inspect-payload-02：running=true/exit=null；实际import匹配fa99cf2，hash推进至transformer2/27。新任务完整加载和退出待验收，不重启或停止。全部本轮操作code0/uncertain=false，无未知mutation。
 
-本角色曾发出仅该probe的stop_job请求exp008-stop-payload-command-error-01，SSH code255造成uncertain。后续exp008-stop-effects-retry-04成功确认原owner976840/start_ticks74717946和child976841均存活，stop-request/exit/payload-verification均缺失、heartbeat已541.48s、日志进入load_begin，child RSS59694592kB。exp008-reconcile-stop-01已code0核销未知状态，未观察停止效果、未重发stop。
-
-现在保留原probe继续收集真实loader反馈，不停止已经推进的读取，不改运行spec。末尾日志缺陷可能仍造成exit1，届时据实保留并按本角色操作命令错误处理，不能改退出状态或仅凭receipt称probe通过。原转换job/产物不受影响。
-
-全部回执在experimenter/observation-008.md；state.json保留旧job与stop核查记录，uncertain_operations已清空。本轮转换inspect第二次重试成功；stop效果观察第四次重试成功，符合最多5次授权。返回waiting，下次先inspect同probe不新launch。Flow/Flash0，正式目标此阶段不询问。
+详见experimenter/observation-009.md。下一轮先inspect原probe002；成功后继续真实八卡FSDP2/cache/AV/HPS和两个5更新run。H3-EXP-001整体仍open，Flash单步H3-EXP-002待实现；Flow/Flash0，正式步数到两smoke通过后再问。
