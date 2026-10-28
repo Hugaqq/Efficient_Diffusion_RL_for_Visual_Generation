@@ -82,17 +82,22 @@ class H3Budgets:
 class H3Training:
     group_size: int = 8
     num_steps: int = 10
+    algorithm: str = "cps"
 
     def __post_init__(self):
         if type(self.group_size) is not int or not 2 <= self.group_size <= 64:
             raise ValueError("group_size must be an integer in [2,64]")
         if type(self.num_steps) is not int or not 1 <= self.num_steps <= 100:
             raise ValueError("num_steps must be an integer in [1,100]")
+        if self.algorithm not in ("cps", "dual_flow", "dual_flash"):
+            raise ValueError("algorithm must be cps, dual_flow or dual_flash")
+        if self.algorithm != "cps" and self.num_steps < 2:
+            raise ValueError("dual Flow-SDE requires at least two transitions")
 
     def payload(self):
         from visual_rl.data import h3_source
 
-        return dict(group_size=self.group_size, num_steps=self.num_steps,
+        result = dict(group_size=self.group_size, num_steps=self.num_steps,
             groups_per_rank=1, world_size=8, sp=1, tp=1, microbatch=1, chunk_size=1,
             optimizer_updates_per_collection=1, score="cps_proxy_negative_mse", av_weighting="generated_element_mean",
             action_dtype="fp16", score_dtype="fp32", schedule_dtype="fp32", video_shift=12., audio_shift=3., eta=.7,
@@ -105,6 +110,13 @@ class H3Training:
             sampling=h3_source.SAMPLING_VERSION,
             random_streams=h3_source.STREAM_VERSION,
             reward="h3_hpsv3_video_only_v1", reward_weight=1., audio_quality_scored=False)
+        if self.algorithm != "cps":
+            result.update(algorithm=self.algorithm, score="dual_gaussian_element_mean_v1",
+                          eta=None, policy_steps=("all_stochastic" if self.algorithm == "dual_flow" else "one_group_selected"),
+                          selection="h3-dual-prompt-group-sha256-rejection-v1",
+                          deterministic="dual_euler_nonpolicy_v1",
+                          rectification=("per_stream_world_mean_gradient_v1" if self.algorithm == "dual_flash" else "none"))
+        return result
 
 
 @dataclass(frozen=True)
@@ -171,7 +183,7 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
     model_group = _exact(overrides.get("model", {"params": {}}), ("params",), "H3 model")
     model_params = strict_values(model_group["params"], allowed=frozenset(("height", "width", "frames", "fps", "guidance_scale", "lora_rank", "lora_alpha")),
                                  required=frozenset(), label="H3 model params")
-    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps")), required=frozenset(), label="H3 training")
+    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps", "algorithm")), required=frozenset(), label="H3 training")
     training = H3Training(**train_params)
     launch = _exact(raw["launch"], ("output_dir", "resume_from", "artifacts", "expected", "execution", "seed",
         "max_optimizer_steps", "checkpoint_every_optimizer_steps", "resume_policy", "budgets", "hps"), "H3 launch")

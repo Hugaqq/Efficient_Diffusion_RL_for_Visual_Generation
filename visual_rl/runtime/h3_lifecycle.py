@@ -251,10 +251,16 @@ class H3LifecycleBackend:
         from visual_rl.algorithms.trainer.h3_stages import H3IterationStages
         binding = self.binding
         def assemble():
-            stages = H3IterationStages(data=graph.source, prepared=prepared,
+            options = dict(data=graph.source, prepared=prepared,
                 predict=binding.predict, decode=binding.decode, score_one=binding.score_one,
                 coordination_factory=binding.coordination_factory, process_group=runtime.process_group,
                 rank=runtime.rank, device=_execution_device(runtime), read_behavior_id=graph.source.read_behavior_id)
+            if graph.profile.training.algorithm == 'cps':
+                stages = H3IterationStages(**options)
+            else:
+                from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
+                stages = H3DualIterationStages(mode=graph.profile.training.algorithm,
+                                               seed=graph.profile.launch.seed, **options)
             trainer = stages.trainer()
             return SimpleNamespace(graph=graph, prepared=prepared, binding=binding, stages=stages,
                 trainer=trainer, transaction=self.transaction, close=trainer.close)

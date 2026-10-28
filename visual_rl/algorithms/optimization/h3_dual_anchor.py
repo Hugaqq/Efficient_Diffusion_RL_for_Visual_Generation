@@ -37,8 +37,14 @@ class H3DualReplayAnchor:
                 gate(f'anchor/{ordinal}/forward')
                 x=record.x.to(device);action=record.action.to(device)
                 prediction=predict(record.sample_id,x,record.index)
-                joint,_,coeff=self.dynamics.evaluate(x,action,prediction,record.index)
-                pending[(record.sample_id,record.index)]=(joint.detach().cpu().clone(),tuple(v.detach().cpu().clone() for v in coeff))
+                try:
+                    joint,_,coeff=self.dynamics.evaluate(x,action,prediction,record.index)
+                    pending[(record.sample_id,record.index)]=(joint.detach().cpu().clone(),tuple(v.detach().cpu().clone() for v in coeff))
+                except Exception:
+                    gate(f'anchor/{ordinal}/result', local_error=True)
+                    raise
+                gate(f'anchor/{ordinal}/result', local_error=False)
+                del prediction, joint, coeff, x, action
             if read_behavior_id()!=self.behavior_id: raise ValueError('behavior changed during capture')
         self._scores=pending
 
