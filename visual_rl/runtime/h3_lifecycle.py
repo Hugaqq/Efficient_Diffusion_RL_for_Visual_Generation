@@ -327,8 +327,10 @@ class H3LifecycleBackend:
         count = graph.profile.launch.max_optimizer_steps
         if committed.step != count or bound.trainer.next_optimizer_step != count:
             raise ValueError("H3 final checkpoint does not match the complete training target")
-        expected_counts = dict(step=count - 1, sample_count=8 * graph.profile.training.group_size,
-            active_transition_count=8 * graph.profile.training.group_size * graph.profile.training.num_steps)
+        training = graph.profile.training
+        policy_steps = 1 if training.algorithm == "dual_flash" else training.num_steps
+        expected_counts = dict(step=count - 1, sample_count=8 * training.group_size,
+            active_transition_count=8 * training.group_size * policy_steps)
         if (set(metrics) != {*expected_counts, 'loss', 'gradient_norm'}
                 or any(type(metrics[k]) is not int or metrics[k] != v for k, v in expected_counts.items())
                 or any(type(metrics[k]) is not float or not math.isfinite(metrics[k])
