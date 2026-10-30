@@ -102,6 +102,7 @@ class H3Training:
             optimizer_updates_per_collection=1, score="cps_proxy_negative_mse", av_weighting="generated_element_mean",
             action_dtype="fp16", score_dtype="fp32", schedule_dtype="fp32", video_shift=12., audio_shift=3., eta=.7,
             model_precision="mixed_bf16_fp32_islands", lora_master_dtype="fp32", aux_dtype="fp32",
+            decode_backend="rank_local_cuda_fp32_cpu_media_v1",
             fp32_roots=("proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out", "rope"),
             lora_targets="main_transformer_blocks_six_linear_only.v1",
             policy_steps="all_including_terminal_q0", old_policy="frozen_replay", beta=0., ema=False, reference=False,

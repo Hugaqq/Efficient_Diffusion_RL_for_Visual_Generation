@@ -1,4 +1,4 @@
-"""One-sample, sequential CPU H3 video/audio VAE decoding, never a reward loop.
+"""One-sample sequential H3 AV decoding, with explicit CPU and CUDA backends.
 
 Independent math/API implementation from UniRL
 8cfbac17765004afb68fef08a4e011a4c8daf555 minimax_h3/vae.py and vendor packing /
@@ -20,7 +20,7 @@ import importlib
 import json
 import time
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Event, Thread
 
 import torch
 
@@ -231,6 +231,12 @@ class H3CPUDecoder:
             raise ValueError("VAE output must be finite")
         return tensor.detach()
 
+    def _run_decode(self, model, latents, shape):
+        return self._output(model.decode(latents, return_dict=False), shape)
+
+    def _release_device_cache(self):
+        pass  # CPU reference owns no CUDA allocation.
+
     def _decode_stream(self, component, rows, geometry, config):
         started = time.monotonic()
         print(json.dumps(dict(event='h3_vae_load_begin', component=component)), flush=True)
@@ -253,8 +259,8 @@ class H3CPUDecoder:
                 latents = latents * std.view(1, 24, 1, 1, 1) + mean.view(1, 24, 1, 1, 1)
                 if not bool(torch.isfinite(latents).all()):
                     raise ValueError("video denormalization must be finite")
-                decoded = self._output(model.decode(latents, return_dict=False),
-                                       (1, 3, geometry.num_frames, geometry.height, geometry.width))
+                decoded = self._run_decode(model, latents,
+                                           (1, 3, geometry.num_frames, geometry.height, geometry.width))
                 pixel_mean = torch.tensor((.485, .456, .406), dtype=torch.float32, device="cpu").view(1, 3, 1, 1, 1)
                 pixel_std = torch.tensor((.229, .224, .225), dtype=torch.float32, device="cpu").view(1, 3, 1, 1, 1)
                 video = (decoded * pixel_std + pixel_mean).clamp_(0, 1)
@@ -266,12 +272,13 @@ class H3CPUDecoder:
             latents = latents * std.view(1, 32, 1) + mean.view(1, 32, 1)
             if not bool(torch.isfinite(latents).all()):
                 raise ValueError("audio denormalization must be finite")
-            decoded = self._output(model.decode(latents, return_dict=False), (2, 1, geometry.audio_latents * 800))
+            decoded = self._run_decode(model, latents, (2, 1, geometry.audio_latents * 800))
             return decoded[:, 0].transpose(0, 1).contiguous(), rate
         finally:
             print(json.dumps(dict(event='h3_vae_decode_exit', component=component,
                                   seconds=time.monotonic()-started)), flush=True)
             del model  # No owner-held leaf survives success or failure.
+            self._release_device_cache()
 
     def _decode(self, terminal, geometry) -> H3AVMedia:
         media_bytes, decode_bytes = self.estimate_bytes(geometry)
@@ -292,3 +299,90 @@ class H3CPUDecoder:
                 return H3AVMedia(frames, waveform, geometry.fps, rate)
             finally:
                 del frames  # No half-AV result if audio fails.
+
+
+class H3GPUDecoder(H3CPUDecoder):
+    """Rank-local CUDA FP32 VAE; return the same bounded CPU FP32 AV lease.
+
+    Aux work is serialized across WORLD8 by the caller. Do not overlap decode
+    with policy forward or HPS scoring on this card. Never fall back to CPU.
+    Official VAE tiling defaults and all layout/statistics checks are preserved.
+    """
+    def __init__(self, local_model_dir, *, max_media_bytes, max_decode_bytes, device):
+        super().__init__(local_model_dir, max_media_bytes=max_media_bytes,
+                         max_decode_bytes=max_decode_bytes)
+        self._device = torch.device(device)
+        if self._device.type != 'cuda' or self._device.index is None:
+            raise ValueError('GPU decoder requires an explicit rank-local CUDA device')
+
+    def _load(self, component):
+        model = super()._load(component)
+        try:
+            model.to(device=self._device, dtype=torch.float32)
+            if any(t.device != self._device for t in (*model.parameters(), *model.buffers())):
+                raise ValueError('VAE did not materialize completely on the selected GPU')
+            return model
+        except BaseException:
+            del model
+            self._release_device_cache()
+            raise
+
+    def _run_decode(self, model, latents, shape):
+        with torch.autocast('cuda', enabled=False):
+            inputs = latents.to(device=self._device, dtype=torch.float32)
+            outputs = model.decode(inputs, return_dict=False)
+            if (not isinstance(outputs, tuple) or len(outputs) != 1
+                    or not isinstance(outputs[0], torch.Tensor)
+                    or outputs[0].device != self._device or outputs[0].dtype != torch.float32
+                    or tuple(outputs[0].shape) != shape):
+                raise ValueError('GPU VAE output shape/device/FP32 mismatch')
+            # Blocking CPU copy completes this stream before GPU temporaries die.
+            result = self._output((outputs[0].detach().to('cpu'),), shape)
+            del outputs, inputs
+            return result
+
+    def _release_device_cache(self):
+        with torch.cuda.device(self._device):
+            torch.cuda.current_stream(self._device).synchronize()
+            torch.cuda.empty_cache()
+
+    def _decode(self, terminal, geometry):
+        with torch.cuda.device(self._device):
+            self._release_device_cache()  # release only unused allocator cache
+            free = torch.cuda.mem_get_info(self._device)[0] / 1024**3
+            if free < 40:
+                raise BlockingIOError('GPU VAE needs40GiB free; no CPU fallback')
+            baseline = torch.cuda.memory_allocated(self._device)
+            torch.cuda.reset_peak_memory_stats(self._device)
+            minimum = [free]
+            monitor_errors = []
+            stop = Event()
+            def monitor():
+                try:
+                    while not stop.wait(.1):
+                        minimum[0] = min(minimum[0], torch.cuda.mem_get_info(self._device)[0] / 1024**3)
+                except Exception as exc:
+                    monitor_errors.append(exc)
+            watcher = Thread(target=monitor, name='h3-gpu-decode-memory', daemon=True)
+            watcher.start()
+            started = time.monotonic()
+            media = None
+            try:
+                media = super()._decode(terminal, geometry)
+                if monitor_errors:
+                    raise RuntimeError('GPU VAE memory monitor failed') from monitor_errors[0]
+                if minimum[0] < 16:
+                    raise BlockingIOError('GPU VAE safety margin fell below16GiB')
+                print(json.dumps(dict(event='h3_gpu_decode_complete', device=str(self._device),
+                                      seconds=time.monotonic()-started, dtype='float32',
+                                      incremental_peak_gib=(torch.cuda.max_memory_allocated(self._device)-baseline)/1024**3,
+                                      min_card_free_gib=minimum[0], frames=geometry.num_frames)), flush=True)
+                return media
+            except BaseException:
+                if media is not None:
+                    media._release()
+                raise
+            finally:
+                stop.set()
+                watcher.join(timeout=3)
+                self._release_device_cache()
