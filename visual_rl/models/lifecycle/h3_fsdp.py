@@ -12,6 +12,8 @@ import inspect
 import json
 import math
 import socket
+import threading
+import time
 
 import torch
 import torch.distributed as dist
@@ -238,7 +240,14 @@ def prepare_h3_fsdp(
     model._h3_prepare_started = True
     state = {}
     owner_error = None
-    if rank == 0:
+    # Loading the real 66GB CPU state takes longer than WORLD's 180s
+    # transport deadline. Keep the owner main thread in bounded heartbeats,
+    # rather than leaving peers blocked in a single NCCL collective throughout
+    # the entire disk/hash/finite-check phase. Only the worker reads weights;
+    # only main threads use CUDA/distributed APIs. Failure aborts this attempt.
+    done = threading.Event()
+    def load_owner():
+        nonlocal state, owner_error
         try:
             loaded = load_h3_cpu_state(meta, is_init_owner=True,
                                       host_weight_limit_bytes=host_weight_limit_bytes, init_seed=init_seed)
@@ -246,9 +255,44 @@ def prepare_h3_fsdp(
             del loaded
             if set(state) != set(meta.state_specs):
                 raise ValueError("incomplete owner initialization state")
-        except Exception as error:
+        except BaseException as error:
             owner_error = error
             state = {}
+        finally:
+            done.set()
+
+    started = time.monotonic()
+    worker = None
+    if rank == 0:
+        print(json.dumps(dict(event='h3_owner_load_begin', rank=rank,
+                              timeout_seconds=3600)), flush=True)
+        worker = threading.Thread(target=load_owner, name='h3-cpu-weight-loader', daemon=True)
+        worker.start()
+    signal = torch.zeros((), dtype=torch.int32, device=device)
+    tick = 0
+    while True:
+        if rank == 0:
+            elapsed = time.monotonic() - started
+            status_code = 1 if done.is_set() else (2 if elapsed >= 3600 else 0)
+            signal.fill_(status_code)
+            if tick % 30 == 0:
+                print(json.dumps(dict(event='h3_owner_load_wait', seconds=elapsed,
+                                      done=done.is_set())), flush=True)
+        dist.broadcast(signal, src=0, group=process_group)
+        status_code = int(signal.item())
+        if status_code == 2:
+            raise TimeoutError('H3 CPU owner initialization exceeded3600s; abort entire attempt')
+        if status_code == 1:
+            break
+        if status_code != 0:
+            raise RuntimeError('invalid H3 owner-load heartbeat status')
+        tick += 1
+        time.sleep(1)
+    if worker is not None:
+        worker.join()
+        print(json.dumps(dict(event='h3_owner_load_end', seconds=time.monotonic()-started,
+                              ok=owner_error is None,
+                              error=None if owner_error is None else repr(owner_error))), flush=True)
     # Every live rank reaches this gate before any mesh/wrapping/state collective.
     status = hashlib.sha256(b"h3-init-ok" if owner_error is None else b"h3-init-failed").hexdigest()
     try:
