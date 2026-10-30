@@ -3,7 +3,7 @@
 No model/optimizer/HTTP, training loop, environment mutation or CPU fallback.
 Only create() performs CUDA/PG actions; importing this module is side-effect free.
 Device UUID observation requires get_device_properties(...).uuid (full UUID
-string or uuid.UUID); missing capability fails closed, never uses device names.
+string, uuid.UUID or PyTorch _CUuuid); missing capability fails closed, never uses device names.
 A matching requested UUID set is NOT authorization, exclusivity or free-memory
 proof. Host/GPU resource margins, window and model/API admission remain separate.
 """
@@ -94,9 +94,16 @@ def _launch_ranks(profile):
 
 
 def _observed_uuids(cuda):
+    import torch
+
     if cuda.device_count() != 8:
         raise ValueError("CUDA must expose exactly the eight requested devices")
-    result = tuple(_uuid(getattr(cuda.get_device_properties(index), "uuid", None)) for index in range(8))
+    # PyTorch 2.8 exposes a pybind _CUuuid rather than str/uuid.UUID.
+    # Convert only that concrete runtime type, not arbitrary stringable objects.
+    cuda_uuid_type = getattr(torch._C, "_CUuuid", ())
+    values = (getattr(cuda.get_device_properties(index), "uuid", None) for index in range(8))
+    result = tuple(_uuid(str(value) if isinstance(value, cuda_uuid_type) else value)
+                   for value in values)
     if len(set(result)) != 8:
         raise ValueError("actual CUDA UUID mapping contains duplicate devices")
     return result
