@@ -54,13 +54,23 @@ class H3DualIterationStages(H3IterationStages):
         ctx=self._context(value);r=ctx.request
         def work():
             import math
+            import json
+            import time
             rows=[]
             for sid,gid,member in r.samples:
                 terminal=ctx.dual_terminals[sid].clone()
+                started=time.monotonic()
+                print(json.dumps(dict(event='h3_reward_decode_begin',sample_id=sid)),flush=True)
                 with self.decode(terminal) as media:
+                    print(json.dumps(dict(event='h3_reward_decode_end',sample_id=sid,
+                                          seconds=time.monotonic()-started)),flush=True)
+                    started=time.monotonic()
+                    print(json.dumps(dict(event='h3_reward_score_begin',sample_id=sid)),flush=True)
                     score=self.score_one(sample_id=sid,prompt=r.prompts[sid],media=media)
                     if type(score) is not float or not math.isfinite(score):
                         raise ValueError('reward must be a finite Python float')
+                    print(json.dumps(dict(event='h3_reward_score_end',sample_id=sid,
+                                          seconds=time.monotonic()-started,score=score)),flush=True)
                 rows.append((sid,gid,member,score,True))
             return tuple(rows)
         ctx.rewards=ctx.coordinator.aux_turns(work)
