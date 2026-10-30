@@ -349,6 +349,8 @@ class H3LifecycleBackend:
                 score="h3_hpsv3_video_only_v1", audio_quality_scored=False))
             atomic_write(output / "metrics.jsonl", canonical_line(dict(schema_version=1, **metrics)))
             _write_json(output / "SUCCESS", marker)
-        _phase(graph.session, "finalize", finalize)
+        # Complete-state hashing is rank0 file IO and may exceed a transport
+        # deadline just like checkpoint publication; keep peers heartbeating.
+        bound.transaction.finalize_files(finalize)
         return RunResult(graph.run_id, output, count, committed.path, output / "resolved_recipe.json",
             output / "run_manifest.json", output / "metrics.jsonl", output / "SUCCESS", metrics)
