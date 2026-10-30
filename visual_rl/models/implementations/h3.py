@@ -51,6 +51,7 @@ class _H3Aux:
     def decoder(self):
         self.require_open()
         if self._decoder is None:
+            import torch
             from visual_rl.models.implementations.h3_decode import H3GPUDecoder
             if not torch.cuda.is_available():
                 raise ModelPortError('H3 production decode requires CUDA; no CPU fallback')
