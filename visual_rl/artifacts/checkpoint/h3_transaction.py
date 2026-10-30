@@ -14,6 +14,9 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
+import time
+import faulthandler
 
 import torch
 
@@ -190,10 +193,65 @@ class H3CheckpointTransaction:
 
     def _phase(self, label, action):
         payload, error = None, None
-        try:
-            payload = action()  # local metadata/file IO ONLY, never a state/model collective
-        except Exception as exc:
-            error = exc
+        started = time.monotonic()
+        if self.rank == 0:
+            print(json.dumps(dict(event='h3_checkpoint_phase_begin', phase=label)), flush=True)
+        if label in ('publish', 'finalize-files'):
+            # Only rank0 hashes/fsyncs/atomically publishes the full checkpoint.
+            # Peers must not spend that entire disk phase inside one 180s NCCL
+            # receipt exchange. The worker is file-only; ALL CUDA/PG calls stay
+            # on the main threads. A timeout poisons the whole attempt; callers
+            # must inspect actual publication state before any future recovery.
+            done = threading.Event()
+            def publish_files():
+                nonlocal payload, error
+                try:
+                    payload = action()
+                except BaseException as exc:
+                    error = exc
+                finally:
+                    done.set()
+            worker = None
+            if self.rank == 0:
+                worker = threading.Thread(target=publish_files, name='h3-checkpoint-publisher', daemon=True)
+                worker.start()
+            else:
+                # The existing nonowner publish callback must remain local-only.
+                try:
+                    payload = action()
+                except Exception as exc:
+                    error = exc
+            signal = torch.zeros((), dtype=torch.int32, device=torch.device('cuda', self.rank))
+            tick = 0
+            while True:
+                if self.rank == 0:
+                    elapsed = time.monotonic() - started
+                    signal.fill_(1 if done.is_set() else (2 if elapsed >= 3600 else 0))
+                    if tick % 30 == 0:
+                        print(json.dumps(dict(event='h3_checkpoint_publish_wait', seconds=elapsed,
+                                              done=done.is_set(), timeout_seconds=3600)), flush=True)
+                    if tick and tick % 300 == 0 and not done.is_set():
+                        faulthandler.dump_traceback(all_threads=True)
+                torch.distributed.broadcast(signal, src=0, group=self.group)
+                code = int(signal.item())
+                if code == 1:
+                    break
+                if code == 2:
+                    raise TimeoutError('checkpoint publication exceeded3600s; abort and inspect disk state')
+                if code != 0:
+                    raise RuntimeError('invalid checkpoint publication heartbeat status')
+                tick += 1
+                time.sleep(1)
+            if worker is not None:
+                worker.join()
+        else:
+            try:
+                payload = action()  # local metadata/file IO ONLY, never a state/model collective
+            except Exception as exc:
+                error = exc
+        if self.rank == 0 and error is not None:
+            print(json.dumps(dict(event='h3_checkpoint_phase_error', phase=label,
+                                  error=repr(error))), flush=True)
         try:
             rows = _exchange(f'h3-checkpoint/{self._sequence}/{label}', self.rank, self.group,
                              payload, error is None)
@@ -202,7 +260,19 @@ class H3CheckpointTransaction:
                 raise exc from error
             raise
         self._sequence += 1
+        if self.rank == 0:
+            print(json.dumps(dict(event='h3_checkpoint_phase_end', phase=label,
+                                  seconds=time.monotonic()-started)), flush=True)
         return rows
+
+    def finalize_files(self, action):
+        """All-rank bounded wait for caller-owned rank0 terminal file verification.
+
+        The action must be local file work and return immediately on nonowners;
+        it must never touch model or distributed APIs.
+        """
+        with self._attempt():
+            self._phase('finalize-files', action)
 
     @staticmethod
     def _same(rows):
@@ -263,8 +333,14 @@ class H3CheckpointTransaction:
                 return str(_direct_checkpoint_path(self.manager.root, self.manager.root / root['name']))
             path = Path(self._same(self._phase('resolve-staging', resolve)))
             # ALL ranks call the real codec outside ANY manager writer callback.
+            codec_started = time.monotonic()
+            if self.rank == 0:
+                print(json.dumps(dict(event='h3_checkpoint_codec_begin', path=str(path))), flush=True)
             codec = save_h3_state(prepared, path, process_group=self.group, identity=identity,
                                   safe_point=safe_point, progress=progress)
+            if self.rank == 0:
+                print(json.dumps(dict(event='h3_checkpoint_codec_end',
+                                      seconds=time.monotonic()-codec_started)), flush=True)
             self._same(self._phase('codec-complete', lambda: codec))
             payload = dict(schema=_SCHEMA, rank=self.rank, world_size=8,
                            identity_id=_payload_digest(identity.payload()), progress_id=progress.progress_id,
