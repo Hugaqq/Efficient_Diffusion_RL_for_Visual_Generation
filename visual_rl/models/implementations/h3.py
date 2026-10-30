@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class _H3Aux:
-    """One idempotent non-prepared owner; cache/CPU decoder are acquired lazily."""
+    """One idempotent non-prepared owner; cache/GPU decoder are acquired lazily."""
     def __init__(self, config, model_path, cache_path, expected_identity):
         self.config, self.model_path, self.cache_path = config, model_path, cache_path
         self.expected_identity = MappingProxyType(dict(expected_identity))
@@ -51,9 +51,12 @@ class _H3Aux:
     def decoder(self):
         self.require_open()
         if self._decoder is None:
-            from visual_rl.models.implementations.h3_decode import H3CPUDecoder
-            self._decoder = H3CPUDecoder(self.model_path, max_media_bytes=self.config.max_media_bytes,
-                                         max_decode_bytes=self.config.max_decode_bytes)
+            from visual_rl.models.implementations.h3_decode import H3GPUDecoder
+            if not torch.cuda.is_available():
+                raise ModelPortError('H3 production decode requires CUDA; no CPU fallback')
+            self._decoder = H3GPUDecoder(self.model_path, max_media_bytes=self.config.max_media_bytes,
+                                         max_decode_bytes=self.config.max_decode_bytes,
+                                         device=torch.device('cuda', torch.cuda.current_device()))
         return self._decoder
 
     def close(self):
