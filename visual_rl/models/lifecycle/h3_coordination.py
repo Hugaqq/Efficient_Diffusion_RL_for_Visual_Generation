@@ -9,6 +9,9 @@ from collections.abc import Callable
 import hashlib
 import json
 import math
+import threading
+import time
+import faulthandler
 from typing import TypeVar
 
 import torch
@@ -149,11 +152,61 @@ class H3Coordination:
             for owner in range(WORLD_SIZE):
                 self.gate(f'aux/{owner}/begin', local_error=invalid)
                 error = None
+                # Nonowners must not sit in the end gate throughout CPU VAE
+                # decode / HTTP scoring. Keep main threads in short heartbeats
+                # while only the owner worker runs auxiliary work (never PG work).
+                done = threading.Event()
+                worker = None
+                started = time.monotonic()
+                signal = torch.zeros((), dtype=torch.int32, device=self._device)
                 if owner == self._rank:
-                    try:
-                        result = work()
-                    except Exception as exc:
-                        error = exc
+                    producer = torch.cuda.current_stream(self._device)
+                    work_stream = torch.cuda.Stream(device=self._device)
+                    work_stream.wait_stream(producer)
+                    grad_enabled = torch.is_grad_enabled()
+                    def execute():
+                        nonlocal result, error
+                        try:
+                            # CUDA selection and streams are thread-local. A
+                            # separate work stream prevents long auxiliary CUDA
+                            # kernels from holding up the main heartbeat stream.
+                            with torch.cuda.device(self._device), torch.cuda.stream(work_stream), torch.set_grad_enabled(grad_enabled):
+                                result = work()
+                                work_stream.synchronize()
+                        except BaseException as exc:
+                            error = exc
+                        finally:
+                            done.set()
+                    worker = threading.Thread(target=execute, name=f'h3-aux-{owner}', daemon=True)
+                    print(json.dumps(dict(event='h3_aux_begin', owner=owner,
+                                          timeout_seconds=3600)), flush=True)
+                    worker.start()
+                tick = 0
+                while True:
+                    if owner == self._rank:
+                        elapsed = time.monotonic() - started
+                        signal.fill_(1 if done.is_set() else (2 if elapsed >= 3600 else 0))
+                        if tick % 30 == 0:
+                            print(json.dumps(dict(event='h3_aux_wait', owner=owner,
+                                                  seconds=elapsed, done=done.is_set())), flush=True)
+                        if tick and tick % 300 == 0 and not done.is_set():
+                            faulthandler.dump_traceback(all_threads=True)
+                    dist.broadcast(signal, src=owner, group=self._group)
+                    code = int(signal.item())
+                    if code == 2:
+                        raise H3CoordinationError('auxiliary owner exceeded3600s; abort entire attempt')
+                    if code == 1:
+                        break
+                    if code != 0:
+                        raise H3CoordinationError('invalid auxiliary heartbeat status')
+                    tick += 1
+                    time.sleep(1)
+                if worker is not None:
+                    worker.join()
+                    torch.cuda.current_stream(self._device).wait_stream(work_stream)
+                    print(json.dumps(dict(event='h3_aux_end', owner=owner,
+                                          seconds=time.monotonic()-started,
+                                          error=None if error is None else repr(error))), flush=True)
                 try:
                     self.gate(f'aux/{owner}/end', local_error=error is not None)
                 except H3CoordinationError as exc:

@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import importlib
 import json
+import time
 from pathlib import Path
 from threading import Lock
 
@@ -231,7 +232,13 @@ class H3CPUDecoder:
         return tensor.detach()
 
     def _decode_stream(self, component, rows, geometry, config):
+        started = time.monotonic()
+        print(json.dumps(dict(event='h3_vae_load_begin', component=component)), flush=True)
         model = self._load(component)
+        print(json.dumps(dict(event='h3_vae_load_end', component=component,
+                              seconds=time.monotonic()-started)), flush=True)
+        started = time.monotonic()
+        print(json.dumps(dict(event='h3_vae_decode_begin', component=component)), flush=True)
         try:
             channels = 24 if component == "vae" else 32
             mean, std = _stats(model.config, channels)
@@ -262,6 +269,8 @@ class H3CPUDecoder:
             decoded = self._output(model.decode(latents, return_dict=False), (2, 1, geometry.audio_latents * 800))
             return decoded[:, 0].transpose(0, 1).contiguous(), rate
         finally:
+            print(json.dumps(dict(event='h3_vae_decode_exit', component=component,
+                                  seconds=time.monotonic()-started)), flush=True)
             del model  # No owner-held leaf survives success or failure.
 
     def _decode(self, terminal, geometry) -> H3AVMedia:
