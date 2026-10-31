@@ -46,7 +46,9 @@ def _profile(collection_id, behavior_id, group_size, num_steps, geometry_id, sch
     return (collection_id, behavior_id, group_size, num_steps, geometry_id, schedule_id, score_profile)
 
 
-def _samples(rows, group_size):
+def _samples(rows, group_size, group_layout='rank_local'):
+    if group_layout not in ('rank_local', 'paired_4x8'):
+        raise ValueError('invalid group layout')
     if type(rows) not in (tuple, list) or not 1 <= len(rows) <= MAX_WORLD_SAMPLES // WORLD_SIZE:
         raise ValueError('empty or oversized local sample table')
     result, seen, groups = [], set(), {}
@@ -61,7 +63,10 @@ def _samples(rows, group_size):
         seen.add(sid)
         groups.setdefault(gid, []).append(member)
         result.append((sid, gid, member))
-    if any(sorted(members) != list(range(group_size)) for members in groups.values()):
+    if group_layout == 'paired_4x8':
+        if group_size != 8 or len(result) != 4 or len(groups) != 1 or sorted(next(iter(groups.values()))) not in (list(range(4)), list(range(4,8))):
+            raise ValueError('paired_4x8 requires one contiguous four-member half')
+    elif any(sorted(members) != list(range(group_size)) for members in groups.values()):
         raise ValueError('each occurrence group must be local_complete, members 0..K-1 exactly once')
     return tuple(result)
 
@@ -77,20 +82,31 @@ class H3WorldPlan:
     schedule_id: str
     score_profile: str
     samples_by_rank: tuple[tuple[tuple[str, str, int], ...], ...]
+    group_layout: str = 'rank_local'
 
     def __post_init__(self):
         _profile(self.collection_id, self.behavior_id, self.group_size, self.num_steps,
                  self.geometry_id, self.schedule_id, self.score_profile)
         if type(self.samples_by_rank) is not tuple or len(self.samples_by_rank) != WORLD_SIZE:
             raise ValueError('plan requires eight rank tables')
-        tables = tuple(_samples(rows, self.group_size) for rows in self.samples_by_rank)
+        tables = tuple(_samples(rows, self.group_size, self.group_layout) for rows in self.samples_by_rank)
+        if self.group_layout == 'paired_4x8':
+            paired_groups = set()
+            for rank in range(0, WORLD_SIZE, 2):
+                left, right = tables[rank:rank+2]
+                gids = {row[1] for row in left + right}
+                if (len(gids) != 1 or paired_groups & gids or
+                        tuple(row[2] for row in left) != tuple(range(4)) or
+                        tuple(row[2] for row in right) != tuple(range(4,8))):
+                    raise ValueError('paired_4x8 requires four distinct groups on adjacent rank pairs')
+                paired_groups.update(gids)
         if len({len(rows) for rows in tables}) != 1:
             raise ValueError('uneven rank sample counts')
         seen_samples, seen_groups = set(), set()
         for rows in tables:
             ids = {row[0] for row in rows}
             groups = {row[1] for row in rows}
-            if seen_samples & ids or seen_groups & groups:
+            if seen_samples & ids or (self.group_layout == 'rank_local' and seen_groups & groups):
                 raise ValueError('world sample duplicate or occurrence group split/shared across ranks')
             seen_samples.update(ids)
             seen_groups.update(groups)
@@ -109,6 +125,8 @@ class H3WorldPlan:
     def plan_id(self) -> str:
         profile = _profile(self.collection_id, self.behavior_id, self.group_size, self.num_steps,
                            self.geometry_id, self.schedule_id, self.score_profile)
+        if self.group_layout != 'rank_local':
+            profile = (*profile, self.group_layout)
         return hashlib.sha256(json.dumps((profile, self.samples_by_rank), ensure_ascii=True).encode()).hexdigest()
 
     def loss_scale(self, *, n_slot: int, reducer_divisor: float) -> float:
@@ -177,7 +195,7 @@ def _exchange(kind, rank, process_group, payload, valid):
 def admit_h3_world(
     *, process_group, collection_id, behavior_id, samples, group_size, num_steps,
     geometry_id, schedule_id, score_profile, sp=1, tp=1, rollout_microbatch=1,
-    replay_microbatch=1, chunk_size=1, guidance=1., beta=0., local_error=False,
+    replay_microbatch=1, chunk_size=1, guidance=1., beta=0., local_error=False, group_layout='rank_local',
 ) -> H3WorldPlan:
     """All ranks call before rollout: equal positive work and complete local groups.
 
@@ -197,7 +215,9 @@ def admit_h3_world(
                 or type(beta) not in (float, int) or beta != 0):
             raise ValueError('H3 requires guidance1/beta0')
         profile = _profile(collection_id, behavior_id, group_size, num_steps, geometry_id, schedule_id, score_profile)
-        payload = [profile, _samples(samples, group_size)]
+        if group_layout != 'rank_local':
+            profile = (*profile, group_layout)
+        payload = [profile, _samples(samples, group_size, group_layout)]
         valid = True
     except (ValueError, TypeError, OverflowError):
         pass
@@ -205,9 +225,10 @@ def admit_h3_world(
     if any(type(table) is not list or len(table) != 2 for table in tables):
         raise ValueError('invalid admission table')
     profile = tables[0][0]
-    if type(profile) is not list or len(profile) != 7 or any(table[0] != profile for table in tables):
+    if type(profile) is not list or len(profile) not in (7,8) or any(table[0] != profile for table in tables):
         raise ValueError('collection/behavior/schedule/geometry/score profile mismatch')
-    return H3WorldPlan(*profile, samples_by_rank=tuple(table[1] for table in tables))
+    return H3WorldPlan(*profile[:7], samples_by_rank=tuple(table[1] for table in tables),
+                       group_layout=profile[7] if len(profile) == 8 else 'rank_local')
 
 
 def _reward_rows(plan, rank, rows):

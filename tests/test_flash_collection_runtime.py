@@ -972,7 +972,56 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     assert list(original.glob("checkpoints/step-*")) == [step2]  # no reset/conversion
 
 
-def test_approved140_manifest_counts():
+def test_approved140_manifest_counts(tmp_path, monkeypatch):
+    # Formal H3 WORLD8 four prompt occurrences / eight members. Tiny adapter
+    # leaves only; real source, plan validation, credit and restore identities.
+    from tests.test_h3_mvp_cpu_source import _fixture, _same_request, TRAIN
+    from visual_rl.data.h3_source import H3PromptSource
+    from visual_rl.composition.config.h3_profile import H3Training
+    from visual_rl.algorithms.optimization import h3_world
+    formal = H3Training(group_size=8, algorithm='dual_flash', group_layout='paired_4x8')
+    assert formal.local_samples == 4 and formal.global_samples == 32
+    assert 'group_layout' not in H3Training().payload()  # default CPS payload unchanged
+    for algorithm in ('cps', 'dual_flow'):
+        with pytest.raises(ValueError):
+            H3Training(algorithm=algorithm, group_layout='paired_4x8')
+    with monkeypatch.context() as patch:
+        (tmp_path / 'paired').mkdir()
+        adapter, manager, _, args = _fixture(tmp_path / 'paired', patch)
+        width = args['dynamics'].layout.packed_width
+        args.update(group_size=8, group_layout='paired_4x8', max_samples=4,
+                    max_cells=12, max_trajectory_bytes=12*(4*width+4)+8*width)
+        sources = [H3PromptSource(**(args | dict(rank=r))) for r in range(8)]
+        requests = [s.reserve(0) for s in sources]
+        tables = tuple(r.samples for r in requests)
+        plan = h3_world.H3WorldPlan('c','b',8,3,'g','schedule','score',tables,'paired_4x8')
+        assert len(plan.samples) == len({s[0] for s in plan.samples}) == 32
+        assert len({s[1] for s in plan.samples}) == 4
+        for rank, request in enumerate(requests):
+            assert list(request.prompts.values()) == [TRAIN[rank//2]] * 4
+            assert tuple(s[2] for s in request.samples) == tuple(range(rank%2*4, rank%2*4+4))
+        from dataclasses import replace
+        with pytest.raises(ValueError): replace(plan, group_layout='rank_local')
+        bad = list(tables); bad[1] = bad[0]
+        with pytest.raises(ValueError): replace(plan, samples_by_rank=tuple(bad))
+        bad = list(tables); bad[1], bad[3] = bad[3], bad[1]
+        with pytest.raises(ValueError): replace(plan, samples_by_rank=tuple(bad))
+        values = torch.arange(32, dtype=torch.float64)
+        reward_tables = [[plan.plan_id,'c','b',[(sid,gid,m,float(values[i*4+j]),True)
+            for j,(sid,gid,m) in enumerate(rows)]] for i,rows in enumerate(tables)]
+        patch.setattr(h3_world, '_world_rank', lambda group: 0)
+        patch.setattr(h3_world, '_exchange', lambda *a: reward_tables)
+        credit = h3_world.gather_h3_credit(plan,process_group=None,collection_id='c',behavior_id='b',rewards=reward_tables[0][3])
+        expected = (values.reshape(4,8)-values.reshape(4,8).mean(1,keepdim=True)).flatten()/(values.std(correction=0)+1e-4)
+        assert torch.allclose(torch.stack([credit[sid] for sid,_,_ in plan.samples]),expected.float())
+        for source, request in zip(sources, requests): source.commit(request)
+        state = sources[0].state_dict()
+        assert state['global_cursor'] == 4
+        restored = H3PromptSource(**args); restored.load_state_dict(state)
+        _same_request(sources[0].reserve(1), restored.reserve(1))
+        with pytest.raises(ValueError):
+            H3PromptSource(**(args | dict(group_layout='rank_local',max_samples=8,max_cells=24,max_trajectory_bytes=24*(4*width+4)+16*width))).load_state_dict(state)
+        manager.close()
     manifest = json.loads((Path(__file__).parents[1] / "experiments/flash_wan_capacity_20261022/workload-140.json").read_text())
     assert manifest["optimizer_commits_target"] == 140
     assert len(manifest["collections"]) == 70

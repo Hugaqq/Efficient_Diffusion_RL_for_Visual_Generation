@@ -78,7 +78,7 @@ class H3PromptSource:
     def __init__(self, *, train_path, eval_path, train_sha256: str, eval_sha256: str,
                  adapter: H3Adapter, dynamics: H3CPSDynamics, rank: int, world_size: int,
                  group_size: int, base_seed: int, device, max_samples: int,
-                 max_cells: int, max_trajectory_bytes: int):
+                 max_cells: int, max_trajectory_bytes: int, group_layout: str = 'rank_local'):
         if not isinstance(adapter, H3Adapter) or not isinstance(dynamics, H3CPSDynamics):
             raise TypeError("loaded H3Adapter and exact H3CPSDynamics required")
         if type(world_size) is not int or world_size != 8 or type(rank) is not int or not 0 <= rank < 8:
@@ -99,8 +99,13 @@ class H3PromptSource:
         width, steps = dynamics.layout.packed_width, dynamics.schedule.num_steps
         if steps > 4096:
             raise ValueError("policy steps exceed the WORLD8 admission bound")
-        required_bytes = group_size * (steps * (4 * width + 4) + 2 * width)
-        if group_size > max_samples or group_size * steps > max_cells or required_bytes > max_trajectory_bytes:
+        if group_layout not in ('rank_local', 'paired_4x8') or (group_layout == 'paired_4x8' and group_size != 8):
+            raise ValueError('invalid prompt group layout')
+        self._group_layout = group_layout
+        local_samples = 4 if group_layout == 'paired_4x8' else group_size
+        self._groups_per_step = 4 if group_layout == 'paired_4x8' else 8
+        required_bytes = local_samples * (steps * (4 * width + 4) + 2 * width)
+        if local_samples > max_samples or local_samples * steps > max_cells or required_bytes > max_trajectory_bytes:
             raise ValueError("complete collection exceeds sample/cell/trajectory budget")
         self._paths = (Path(train_path), Path(eval_path))
         self._hashes = (train_sha256, eval_sha256)
@@ -128,6 +133,8 @@ class H3PromptSource:
                              audio_sigmas=dynamics.schedule.audio_sigmas.tolist(), eta=dynamics.eta,
                              base_seed=base_seed, device_type=device.type, budgets=list(self._budgets),
                              score_profile="h3_hpsv3_video_only_v1")
+        if group_layout == 'paired_4x8':
+            self._binding.update(group_layout=group_layout, placement='adjacent-rank-pairs-4x8-v1')
         self._data_identity = "h3-data:" + _digest(self._binding)
         self._next_step = 0
         self._pending = None
@@ -155,7 +162,7 @@ class H3PromptSource:
 
     @property
     def next_global_batch_id(self):
-        return "h3-batch:" + _digest((self._data_identity, list(range(self._next_step*8, (self._next_step+1)*8))))
+        return "h3-batch:" + _digest((self._data_identity, list(range(self._next_step*self._groups_per_step, (self._next_step+1)*self._groups_per_step))))
 
     def _check_inputs(self):
         for path, expected in zip(self._paths, self._hashes):
@@ -181,11 +188,12 @@ class H3PromptSource:
             if type(step) is not int or step != self._next_step or not 0 <= step < _MAX_STEP:
                 raise ValueError("reserve requires the exact next optimizer step")
             self._check_inputs()
-            occurrence = step*8 + self._rank
+            occurrence = step*self._groups_per_step + (self._rank//2 if self._group_layout == 'paired_4x8' else self._rank)
+            members = range((self._rank % 2)*4, (self._rank % 2 + 1)*4) if self._group_layout == 'paired_4x8' else range(self._k)
             prompt = self._train[occurrence % len(self._train)]
             group = "h3-group:" + _digest((self._source_id, occurrence))
             samples = tuple(("h3-sample:" + _digest((self._source_id, occurrence, member)), group, member)
-                            for member in range(self._k))
+                            for member in members)
             conditions, initial, generators, typed = {}, {}, {}, {}
             for sid, _, member in samples:
                 condition = self._adapter.encode(H3PromptInput(prompt))
@@ -205,6 +213,7 @@ class H3PromptSource:
                 identity, "h3-collection:" + _digest((self._data_identity, step)), self.read_behavior_id(),
                 self._behavior(step+1), samples, {sid: prompt for sid, _, _ in samples}, conditions,
                 self._dynamics, self._geometry_id, initial, generators, self._k, *self._budgets,
+                group_layout=self._group_layout,
             )
             self._pending, self._conditions = request, typed
             return request
@@ -242,8 +251,8 @@ class H3PromptSource:
     def _state(self, step):
         return dict(schema_version=_SCHEMA, binding=self._binding, data_identity=self._data_identity,
                     rank=self._rank, device=str(self._device), next_optimizer_step=step,
-                    global_cursor=step*8, behavior_id=self._behavior(step),
-                    next_global_batch_id="h3-batch:" + _digest((self._data_identity, list(range(step*8, (step+1)*8)))))
+                    global_cursor=step*self._groups_per_step, behavior_id=self._behavior(step),
+                    next_global_batch_id="h3-batch:" + _digest((self._data_identity, list(range(step*self._groups_per_step, (step+1)*self._groups_per_step)))))
 
     def state_dict(self):
         if self._pending is not None or self._poisoned:
