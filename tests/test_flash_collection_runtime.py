@@ -102,6 +102,48 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         _save_dcp({}, root / 'dcp', None)
         assert calls == [dict(overwrite=False, sync_files=True,
                               single_file_per_rank=False, thread_count=1)]
+    # Observation-only export: cadence, original score, media/RNG and real CPU codec.
+    from scripts.launch_h3_media import observed_score, save_media
+    from visual_rl.models.implementations.h3_decode import H3AVMedia
+    from types import SimpleNamespace
+    import shutil, random
+    samples = tuple((f's{g}-{m}',f'g{g}',m) for g in range(4) for m in range(8))
+    request = SimpleNamespace(identity=SimpleNamespace(optimizer_step=0),
+        group_layout='paired_4x8',samples=samples,prompts={sid:'a prompt' for sid,_,_ in samples},
+        collection_id='collection',behavior_id='behavior')
+    source = SimpleNamespace(_pending=request)
+    saved,scored = [],[]
+    marker = object()
+    def original(**kw):
+        assert kw['media'] is marker
+        scored.append(kw['sample_id'])
+        return 1.25
+    callback = observed_score(original,source=source,root=tmp_path/'media',
+        ffmpeg='ffmpeg',ffprobe='ffprobe',launcher_sha='test',saver=lambda **kw:saved.append(kw))
+    for step in (1,9,10,20):
+        request.identity.optimizer_step=step-1
+        count=len(saved)
+        for sid,_,_ in samples:
+            assert callback(sample_id=sid,prompt='a prompt',media=marker)==1.25
+        assert len(saved)-count == (4 if step%10==0 else 0)
+    assert len(scored)==128
+    assert {x['metadata']['member'] for x in saved}=={0}
+    assert {x['metadata']['group_id'] for x in saved}=={'g0','g1','g2','g3'}
+    ffmpeg,ffprobe=shutil.which('ffmpeg'),shutil.which('ffprobe')
+    assert ffmpeg and ffprobe, 'CPU media gate requires ffmpeg and ffprobe'
+    video=torch.linspace(0,1,3*3*16*16).reshape(3,3,16,16)
+    audio=torch.zeros(8000,2);media=H3AVMedia(video,audio,12,32000)
+    before_video,before_audio=video.clone(),audio.clone()
+    rng,python_rng=torch.get_rng_state().clone(),random.getstate()
+    folder=save_media(root=tmp_path/'real-encode',metadata=saved[0]['metadata'],
+        media=media,reward=1.25,ffmpeg=ffmpeg,ffprobe=ffprobe,launcher_sha='test')
+    receipt=json.loads((folder/'receipt.json').read_text())
+    assert receipt['frames']==3 and receipt['reward']==1.25 and (folder/'video.mp4').stat().st_size>0
+    assert torch.equal(video,before_video) and torch.equal(audio,before_audio)
+    assert torch.equal(torch.get_rng_state(),rng) and random.getstate()==python_rng
+    with pytest.raises(FileExistsError):
+        save_media(root=tmp_path/'real-encode',metadata=saved[0]['metadata'],
+            media=media,reward=1.25,ffmpeg=ffmpeg,ffprobe=ffprobe,launcher_sha='test')
     from scripts.launch_flash140 import SafePointPause, observe_checkpoints, inspect_checkpoint
     caplog.set_level("INFO", logger="visual_rl.flash140")
     from visual_rl.algorithms.optimization.recompute import PolicyRecomputer
