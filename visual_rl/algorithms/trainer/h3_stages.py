@@ -48,6 +48,7 @@ class H3IterationRequest:
     max_cells: int
     max_trajectory_bytes: int
     score_profile: str = "h3_hpsv3_video_only_v1"
+    group_layout: str = 'rank_local'
 
 
 @dataclass
@@ -140,7 +141,8 @@ class H3IterationStages:
         pool = H3RolloutPool(collection_id=request.collection_id, behavior_id=request.behavior_id,
                              samples=request.samples, group_size=request.group_size, dynamics=request.dynamics,
                              max_samples=request.max_samples, max_cells=request.max_cells,
-                             max_trajectory_bytes=request.max_trajectory_bytes)
+                             max_trajectory_bytes=request.max_trajectory_bytes,
+                             group_layout=request.group_layout)
         ids = tuple(row[0] for row in request.samples)
         if (request.identity.row_identities != ids
                 or request.identity.group_ids != tuple(row[1] for row in request.samples)
@@ -202,13 +204,20 @@ class H3IterationStages:
                 admission = dict(collection_id=request.collection_id, behavior_id=request.behavior_id,
                                  samples=request.samples, group_size=request.group_size,
                                  num_steps=d.schedule.num_steps, geometry_id=request.geometry_id,
-                                 schedule_id=schedule_id, score_profile=request.score_profile)
+                                 schedule_id=schedule_id, score_profile=request.score_profile,
+                                 group_layout=request.group_layout)
             except Exception:
                 local_error = True
             plan = admit_h3_world(process_group=self.process_group, **admission, local_error=local_error)
             if local_error:
                 raise RuntimeError("world admission accepted an invalid local request")
             coordinator = self.coordination_factory(plan)
+            if request.group_layout == 'paired_4x8':
+                print(json.dumps(dict(event='h3_formal_group_admitted',
+                    optimizer_step=optimizer_step, plan_id=plan.plan_id,
+                    group_layout=plan.group_layout, global_samples=len(plan.samples),
+                    global_groups=len({row[1] for row in plan.samples}),
+                    group_size=plan.group_size, local_samples=len(request.samples))), flush=True)
             for name in ("gate", "aux_turns", "clip_grad_norm"):
                 if not callable(getattr(coordinator, name, None)):
                     raise TypeError(f"coordinator lacks {name}")

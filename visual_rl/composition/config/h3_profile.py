@@ -83,6 +83,15 @@ class H3Training:
     group_size: int = 8
     num_steps: int = 10
     algorithm: str = "cps"
+    group_layout: str = "rank_local"
+
+    @property
+    def local_samples(self):
+        return 4 if self.group_layout == "paired_4x8" else self.group_size
+
+    @property
+    def global_samples(self):
+        return 8 * self.local_samples
 
     def __post_init__(self):
         if type(self.group_size) is not int or not 2 <= self.group_size <= 64:
@@ -91,6 +100,10 @@ class H3Training:
             raise ValueError("num_steps must be an integer in [1,100]")
         if self.algorithm not in ("cps", "dual_flow", "dual_flash"):
             raise ValueError("algorithm must be cps, dual_flow or dual_flash")
+        if self.group_layout not in ('rank_local', 'paired_4x8'):
+            raise ValueError('unknown H3 group layout')
+        if self.group_layout == 'paired_4x8' and (self.algorithm != 'dual_flash' or self.group_size != 8):
+            raise ValueError('paired_4x8 requires dual_flash and group_size8')
         if self.algorithm != "cps" and self.num_steps < 2:
             raise ValueError("dual Flow-SDE requires at least two transitions")
 
@@ -111,6 +124,9 @@ class H3Training:
             sampling=h3_source.SAMPLING_VERSION,
             random_streams=h3_source.STREAM_VERSION,
             reward="h3_hpsv3_video_only_v1", reward_weight=1., audio_quality_scored=False)
+        if self.group_layout == 'paired_4x8':
+            result.update(group_layout=self.group_layout, groups_per_rank=.5,
+                          global_prompt_groups=4, local_samples=4, global_samples=32)
         if self.algorithm != "cps":
             result.update(algorithm=self.algorithm, score="dual_gaussian_element_mean_v1",
                           eta=None, policy_steps=("all_stochastic" if self.algorithm == "dual_flow" else "one_group_selected"),
@@ -184,7 +200,7 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
     model_group = _exact(overrides.get("model", {"params": {}}), ("params",), "H3 model")
     model_params = strict_values(model_group["params"], allowed=frozenset(("height", "width", "frames", "fps", "guidance_scale", "lora_rank", "lora_alpha")),
                                  required=frozenset(), label="H3 model params")
-    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps", "algorithm")), required=frozenset(), label="H3 training")
+    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps", "algorithm", "group_layout")), required=frozenset(), label="H3 training")
     training = H3Training(**train_params)
     launch = _exact(raw["launch"], ("output_dir", "resume_from", "artifacts", "expected", "execution", "seed",
         "max_optimizer_steps", "checkpoint_every_optimizer_steps", "resume_policy", "budgets", "hps"), "H3 launch")
@@ -289,9 +305,9 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
         embedding = cache.get(prompt)  # one bounded tensor at a time, including finite validation
         largest = max(largest, embedding.numel() * embedding.element_size())
         del embedding
-    condition_bytes = training.group_size * largest
+    condition_bytes = training.local_samples * largest
     width = config.geometry.joint_layout.packed_width
-    trajectory_bytes = training.group_size * training.num_steps * (4 * width + 4) + training.group_size * 2 * width
+    trajectory_bytes = training.local_samples * training.num_steps * (4 * width + 4) + training.local_samples * 2 * width
     media, workspace = H3CPUDecoder.estimate_bytes(config.geometry)
     if (condition_bytes > budget.condition_bytes or trajectory_bytes > budget.trajectory_bytes
             or media > budget.media_bytes or workspace > budget.decode_bytes):

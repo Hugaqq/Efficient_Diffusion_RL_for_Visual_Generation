@@ -199,9 +199,10 @@ class H3LifecycleBackend:
                 source = H3PromptSource(train_path=launch.train, eval_path=launch.eval,
                     train_sha256=facts.train_sha256, eval_sha256=facts.eval_sha256,
                     adapter=adapter, dynamics=dynamics, rank=runtime.rank, world_size=8,
-                    group_size=profile.training.group_size, base_seed=launch.seed, device=_execution_device(runtime),
-                    max_samples=profile.training.group_size,
-                    max_cells=profile.training.group_size * profile.training.num_steps,
+                    group_size=profile.training.group_size, group_layout=profile.training.group_layout,
+                    base_seed=launch.seed, device=_execution_device(runtime),
+                    max_samples=profile.training.local_samples,
+                    max_cells=profile.training.local_samples * profile.training.num_steps,
                     max_trajectory_bytes=launch.budgets.trajectory_bytes)
                 scorer = _hps(profile, runtime)
                 resources.callback(scorer.close)
@@ -298,7 +299,7 @@ class H3LifecycleBackend:
             from visual_rl.algorithms.optimization.h3_world import _exchange
             losses = _exchange('lifecycle/loss', bound.graph.session.rank,
                                bound.graph.session.process_group, float(update.scaled_loss), True)
-            metrics = dict(step=step, sample_count=8 * bound.graph.profile.training.group_size,
+            metrics = dict(step=step, sample_count=bound.graph.profile.training.global_samples,
                 active_transition_count=8 * update.local_cells,
                 loss=sum(losses) / 8, gradient_norm=float(update.grad_norm))
             # Persist diagnostics before publishing the checkpoint that can depend on them.
@@ -306,7 +307,8 @@ class H3LifecycleBackend:
                 if bound.graph.session.rank == 0:
                     _write_json(launch.output_dir / "h3-last-metrics.json", metrics)
             _phase(bound.graph.session, "metrics", record_metrics)
-            if (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
+            first_formal_flash = (step == 0 and bound.graph.profile.training.group_layout == 'paired_4x8')
+            if first_formal_flash or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
                 boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
                     bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
                 progress, proof, data, _ = boundary
@@ -329,8 +331,8 @@ class H3LifecycleBackend:
             raise ValueError("H3 final checkpoint does not match the complete training target")
         training = graph.profile.training
         policy_steps = 1 if training.algorithm == "dual_flash" else training.num_steps
-        expected_counts = dict(step=count - 1, sample_count=8 * training.group_size,
-            active_transition_count=8 * training.group_size * policy_steps)
+        expected_counts = dict(step=count - 1, sample_count=training.global_samples,
+            active_transition_count=training.global_samples * policy_steps)
         if (set(metrics) != {*expected_counts, 'loss', 'gradient_norm'}
                 or any(type(metrics[k]) is not int or metrics[k] != v for k, v in expected_counts.items())
                 or any(type(metrics[k]) is not float or not math.isfinite(metrics[k])

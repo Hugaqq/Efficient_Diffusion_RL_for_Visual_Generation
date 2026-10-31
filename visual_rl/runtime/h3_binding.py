@@ -198,8 +198,9 @@ class H3RuntimeBinding:
                 or state["rank"] != self.rank or state["device"] != str(self.device)
                 or binding["world_size"] != 8 or binding["base_seed"] != launch.seed
                 or binding["group_size"] != self.profile.training.group_size
-                or binding["budgets"] != [self.profile.training.group_size,
-                    self.profile.training.group_size * self.profile.training.num_steps, launch.budgets.trajectory_bytes]
+                or binding.get('group_layout', 'rank_local') != self.profile.training.group_layout
+                or binding["budgets"] != [self.profile.training.local_samples,
+                    self.profile.training.local_samples * self.profile.training.num_steps, launch.budgets.trajectory_bytes]
                 or binding["train_sha256"] != self.facts.train_sha256 or binding["eval_sha256"] != self.facts.eval_sha256
                 or binding["geometry"]["cache_identity"] != self.facts.cache_identity
                 or binding["parse"] != PARSE_VERSION or binding["sampling"] != SAMPLING_VERSION
@@ -424,7 +425,7 @@ class H3RuntimeBinding:
             scaler_schema="none", lr_scheduler_schema="h3.constant.v1", precision="bf16-blocks-fp32-islands-lora",
             preprocess_identity=_hash(dict(cache=live["cache"], geometry=self.source.geometry_id)),
             preprocess_requirement_set_id=_hash(dict(layer=50, width=5120, trimmed=True, guidance=1)),
-            group_size=self.profile.training.group_size, global_batch_size=8*self.profile.training.group_size,
+            group_size=self.profile.training.group_size, global_batch_size=self.profile.training.global_samples,
             gradient_accumulation_steps=1, data_sharding_version=SAMPLING_VERSION, sampler_state_schema="h3.prompt-source.v1",
             rng_policy=STREAM_VERSION, dynamics_state_schema=("h3.dual-flow-sde.v1" if dual else "h3.cps-dual-all-n.v1"),
             progress_state_schema=f"checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}",

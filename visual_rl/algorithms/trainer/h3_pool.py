@@ -33,7 +33,7 @@ class H3RolloutPool:
         self, *, collection_id: str, behavior_id: str,
         samples: tuple[tuple[str, str, int], ...], group_size: int,
         dynamics: H3CPSDynamics, max_samples: int, max_cells: int,
-        max_trajectory_bytes: int,
+        max_trajectory_bytes: int, group_layout: str = 'rank_local',
     ) -> None:
         _id("collection_id", collection_id)
         _id("behavior_id", behavior_id)
@@ -71,7 +71,10 @@ class H3RolloutPool:
             if member in members:
                 raise ValueError("duplicate group member_index")
             members.add(member)
-        if any(len(members) != group_size for members in groups.values()):
+        if group_layout == 'paired_4x8':
+            from visual_rl.algorithms.optimization.h3_world import _samples
+            _samples(samples, group_size, group_layout)
+        elif group_layout != 'rank_local' or any(len(members) != group_size for members in groups.values()):
             raise ValueError("every local group must contain all K members")
         self._collection_id = collection_id
         self._behavior_id = behavior_id
