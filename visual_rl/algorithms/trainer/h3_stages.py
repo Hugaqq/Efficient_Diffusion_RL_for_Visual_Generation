@@ -388,8 +388,12 @@ class H3IterationStages:
             raise RuntimeError("checkpoint requires this trainer's complete unpoisoned tail")
         step = trainer.next_optimizer_step
         state = self.data.state_dict()
+        layout = state["binding"].get("group_layout", "rank_local")
+        if layout not in ("rank_local", "paired_4x8"):
+            raise RuntimeError("checkpoint has unsupported prompt group layout")
+        groups_per_step = 4 if layout == "paired_4x8" else 8
         if (type(step) is not int or step <= 0 or state["next_optimizer_step"] != step
-                or state["global_cursor"] != step * 8
+                or state["global_cursor"] != step * groups_per_step
                 or state["behavior_id"] != self.data.read_behavior_id()
                 or state["behavior_id"] != self._expected_behavior):
             raise RuntimeError("trainer/data/behavior boundary mismatch")
