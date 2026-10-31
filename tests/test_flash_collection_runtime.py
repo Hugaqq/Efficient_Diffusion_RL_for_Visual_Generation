@@ -1017,6 +1017,35 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         for source, request in zip(sources, requests): source.commit(request)
         state = sources[0].state_dict()
         assert state['global_cursor'] == 4
+        # Exercise the actual post-tail checkpoint boundary, not just source
+        # cursor serialization. Only trainer/prepared-model leaves are tiny.
+        from types import SimpleNamespace
+        from visual_rl.algorithms.trainer.h3_stages import H3IterationStages
+        def boundary(source, last_collection):
+            stages = object.__new__(H3IterationStages)
+            stages.data = source
+            stages._active = None
+            stages._poisoned = False
+            stages._last_collection = last_collection
+            stages._expected_behavior = source.read_behavior_id()
+            parameter = torch.nn.Parameter(torch.ones(1))
+            stages.prepared = SimpleNamespace(trainable_named_parameters=lambda: (('tiny',parameter),))
+            trainer = SimpleNamespace(_prelude=stages,next_optimizer_step=1)
+            assert stages.checkpoint_boundary(trainer) == source.state_dict()
+            original = source.state_dict
+            with monkeypatch.context() as bp:
+                wrong = original() | dict(global_cursor=8 if original()['global_cursor']==4 else 4)
+                bp.setattr(source,'state_dict',lambda: wrong)
+                with pytest.raises(RuntimeError,match='boundary mismatch'):
+                    stages.checkpoint_boundary(trainer)
+            parameter.grad = torch.ones_like(parameter)
+            with pytest.raises(RuntimeError,match='cleared optimizer gradients'):
+                stages.checkpoint_boundary(trainer)
+        for source,request in zip(sources,requests): boundary(source,request.collection_id)
+        local = H3PromptSource(**(args | dict(group_layout='rank_local',group_size=2)))
+        local_request = local.reserve(0); local.commit(local_request)
+        assert local.state_dict()['global_cursor'] == 8
+        boundary(local,local_request.collection_id)
         restored = H3PromptSource(**args); restored.load_state_dict(state)
         _same_request(sources[0].reserve(1), restored.reserve(1))
         with pytest.raises(ValueError):
