@@ -299,8 +299,14 @@ def _disk_schema(path, template):
 
 def _save_dcp(state, path, process_group):
     import torch.distributed.checkpoint as dcp
+    # Torch 2.8's writer retains tensor_dict for every tensor in one output
+    # file, even for TORCH_SAVE. One file per rank retains an entire CPU shard
+    # on all eight ranks. One item per file bounds this retention to a tensor
+    # while preserving the complete DCP state/metadata and synchronous fsync.
     dcp.save(state, checkpoint_id=path, process_group=process_group,
-             storage_writer=dcp.FileSystemWriter(path, overwrite=False, sync_files=True))
+             storage_writer=dcp.FileSystemWriter(
+                 path, overwrite=False, sync_files=True,
+                 single_file_per_rank=False, thread_count=1))
 
 
 def _load_dcp(state, path, process_group):

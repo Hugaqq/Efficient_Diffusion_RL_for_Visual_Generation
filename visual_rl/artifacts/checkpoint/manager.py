@@ -610,6 +610,17 @@ def _payload_digest(value: Mapping[str, object]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _file_digest_size(path: Path) -> tuple[str, int]:
+    """Hash checkpoint shards with bounded host memory, including on verification."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
 def _build_state_tree(root: Path) -> dict[str, object]:
     entries: list[dict[str, object]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
@@ -624,12 +635,12 @@ def _build_state_tree(root: Path) -> dict[str, object]:
             raise ValueError(
                 f"checkpoint writer must not create reserved file {relative!r}"
             )
-        data = path.read_bytes()
+        digest, size = _file_digest_size(path)
         entries.append(
             {
                 "path": relative,
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "size": len(data),
+                "sha256": digest,
+                "size": size,
             }
         )
         descriptor = os.open(path, os.O_RDONLY)
@@ -671,8 +682,8 @@ def _verify_state_tree(root: Path, value: Mapping[str, object]) -> None:
         path = root / relative
         if path.is_symlink() or not path.is_file():
             raise ValueError("checkpoint state file is missing or not regular")
-        data = path.read_bytes()
-        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        actual_digest, actual_size = _file_digest_size(path)
+        if actual_size != size or actual_digest != digest:
             raise ValueError("checkpoint state file digest mismatch")
     if expected_paths != sorted(set(expected_paths)):
         raise ValueError("checkpoint state paths must be sorted and unique")

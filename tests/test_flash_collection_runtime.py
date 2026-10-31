@@ -71,6 +71,37 @@ def setup(monkeypatch, tmp_path):
 
 def test_real_controller_collects384_then_two192_and_resumes_without_scoring(monkeypatch, tmp_path, caplog):
     from dataclasses import replace
+    from visual_rl.artifacts.checkpoint import manager as checkpoint_manager
+    from visual_rl.artifacts.checkpoint.h3_state import _save_dcp
+    import torch.distributed.checkpoint as dcp
+    from pathlib import Path
+    import hashlib
+
+    # Real tree hashing/verification must never materialize a checkpoint shard.
+    root = tmp_path / "bounded-tree"
+    root.mkdir()
+    payload = b"checkpoint" * 250000
+    shard = root / "shard.bin"
+    shard.write_bytes(payload)
+    with monkeypatch.context() as patch:
+        def reject_read_bytes(self):
+            raise AssertionError("unbounded checkpoint read")
+        patch.setattr(Path, "read_bytes", reject_read_bytes)
+        tree = checkpoint_manager._build_state_tree(root)
+        assert tree['files'][0]['sha256'] == hashlib.sha256(payload).hexdigest()
+        checkpoint_manager._verify_state_tree(root, tree)
+        with shard.open('r+b') as stream:
+            stream.write(b'X')
+        with pytest.raises(ValueError, match='digest mismatch'):
+            checkpoint_manager._verify_state_tree(root, tree)
+    # Check the production writer configuration without pretending this is GPU DCP.
+    with monkeypatch.context() as patch:
+        calls = []
+        patch.setattr(dcp, 'FileSystemWriter', lambda path, **kw: calls.append(kw))
+        patch.setattr(dcp, 'save', lambda *args, **kw: None)
+        _save_dcp({}, root / 'dcp', None)
+        assert calls == [dict(overwrite=False, sync_files=True,
+                              single_file_per_rank=False, thread_count=1)]
     from scripts.launch_flash140 import SafePointPause, observe_checkpoints, inspect_checkpoint
     caplog.set_level("INFO", logger="visual_rl.flash140")
     from visual_rl.algorithms.optimization.recompute import PolicyRecomputer
@@ -871,8 +902,15 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
 
     from scripts import flash_small40_repair as repair
     import hashlib
-    # Real candidate Git object/working-tree check, not package-version trust.
-    assert repair.git_read(launch.ROOT, "diff", repair.REPAIR_BASE, "--name-only", "--", "visual_rl", "experiments", "data") == ""
+    # Historical launcher-only upgrades must reject this H3 runtime branch.
+    # Still verify the historical base's actual Git objects/config bytes below.
+    current_sha = repair.git_read(launch.ROOT, 'rev-parse', 'HEAD')
+    changed = repair.git_read(launch.ROOT, 'diff', '--name-only', repair.REPAIR_BASE, current_sha)
+    if not set(changed.splitlines()) <= repair.ALLOWED_CHANGES:
+        with pytest.raises(RuntimeError, match='outside the allowed paths'):
+            repair.prove_launcher_upgrade(launch.ROOT, current_sha, small_path)
+    else:
+        repair.prove_launcher_upgrade(launch.ROOT, current_sha, small_path)
     real_proof = repair.prove_launcher_upgrade(launch.ROOT, repair.REPAIR_BASE, small_path)
     assert set(real_proof["unchanged_git_objects"]) == {"visual_rl", "experiments", "data"}
     new_sha = "f" * 40
