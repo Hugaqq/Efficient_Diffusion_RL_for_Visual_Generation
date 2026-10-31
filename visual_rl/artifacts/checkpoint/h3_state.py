@@ -22,7 +22,8 @@ from visual_rl.artifacts.checkpoint.protocol import CheckpointProgress
 from visual_rl.models.lifecycle.h3_coordination import _trainables
 from visual_rl.models.lifecycle.h3_fsdp import _canonical_parameter_names
 
-_SCHEMA = 'visual_rl.h3-state.v1'
+_LEGACY_SCHEMA = 'visual_rl.h3-state.v1'
+_SCHEMA = 'visual_rl.h3-state.adapter.v2'
 _DIRECTORY = 'h3-state'
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
@@ -245,17 +246,34 @@ def _buffer_hash(value):
     return hashlib.sha256(value.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
 
-def _manifest(identity, progress, inventory):
-    _, _, _, trainable, state, extras, groups, schedule = inventory
-    return dict(schema=_SCHEMA, identity=identity.payload(), progress_id=progress.progress_id,
-                step=progress.global_step, model={n: _tensor_spec(v) for n, v in state.items()},
-                trainable=list(trainable), buffers={n: _tensor_spec(v) for n, v in extras.items()},
-                buffer_hashes={n: _buffer_hash(v) for n, v in extras.items()},
-                groups=groups, scheduler=schedule)
+def _model_subset(inventory, schema):
+    _, _, params, trainable, state, _, _, _ = inventory
+    if schema == _LEGACY_SCHEMA:
+        return state
+    if schema != _SCHEMA:
+        raise ValueError('unsupported H3 state schema')
+    # Persistent buffers remain explicit; only immutable frozen PARAMETERS
+    # are omitted. The identity binds the fully verified base model artifact.
+    return {n: v for n, v in state.items() if n in trainable or n not in params}
+
+
+def _manifest(identity, progress, inventory, *, schema=_SCHEMA):
+    _, _, params, trainable, _, extras, groups, schedule = inventory
+    state = _model_subset(inventory, schema)
+    result = dict(schema=schema, identity=identity.payload(), progress_id=progress.progress_id,
+                  step=progress.global_step, model={n: _tensor_spec(v) for n, v in state.items()},
+                  trainable=list(trainable), buffers={n: _tensor_spec(v) for n, v in extras.items()},
+                  buffer_hashes={n: _buffer_hash(v) for n, v in extras.items()},
+                  groups=groups, scheduler=schedule)
+    if schema == _SCHEMA:
+        result['frozen_base'] = dict(model_id=identity.model_id,
+            parameters={n: _tensor_spec(p) for n, p in params.items() if n not in trainable})
+    return result
 
 
 def _template(inventory, manifest):
-    _, _, _, trainable, state, extras, _, _ = inventory
+    _, _, _, trainable, _, extras, _, _ = inventory
+    state = _model_subset(inventory, manifest['schema'])
     # These are load destinations, NOT installed optimizer moments and NOT a
     # zero-gradient/dummy step. DCP fills them with saved nonzero state first.
     moments = {name: dict(step=torch.empty((), dtype=torch.float32, device='cpu'),
@@ -315,7 +333,7 @@ def _load_dcp(state, path, process_group):
 
 
 def _receipt(manifest):
-    return dict(relative_path=_DIRECTORY, schema=_SCHEMA, manifest_id=_digest(manifest),
+    return dict(relative_path=_DIRECTORY, schema=manifest['schema'], manifest_id=_digest(manifest),
                 progress_id=manifest['progress_id'], step=manifest['step'])
 
 
@@ -348,9 +366,11 @@ def save_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
     _health(rank, process_group, 'save/preflight', payload, error)
     _, options, get_model, get_optimizer, _ = api
     # Warm-state admission above precedes the potentially side-effecting helper.
-    state = dict(model=get_model(model, options=options),
+    captured = get_model(model, options=options)
+    state = dict(model={n: captured[n] for n in manifest['model']},
                  optimizer=get_optimizer(model, optimizer, options=options),
                  buffers={n: v.detach() for n, v in extras.items()})
+    del captured
     error = None
     try:
         if ({n: _tensor_spec(v) for n, v in state['model'].items()} != manifest['model']
@@ -396,7 +416,7 @@ def load_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
         model, optimizer, _, trainable, _, extras, _, schedule = inventory
         if optimizer.state:
             raise ValueError('load requires genuinely fresh empty Adam state')
-        expected = _manifest(identity, progress, inventory)
+        expected = _manifest(identity, progress, inventory, schema=manifest.get('schema'))
         # Current lr/step are fresh defaults: saved groups/scheduler values must
         # be restored, while their schema and FQN ordering must remain exact.
         if (set(manifest) != set(expected) or manifest['scheduler']['kind'] != schedule['kind']
@@ -429,7 +449,9 @@ def load_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
         error = exc
     _health(rank, process_group, 'load/preflight', payload, error)
     _, options, get_model, _, set_model = api
-    state['model'] = get_model(model, options=options)
+    captured = get_model(model, options=options)
+    state['model'] = {n: captured[n] for n in manifest['model']}
+    del captured
     _load_dcp(state, target / 'dcp', process_group)
     error = None
     try:
@@ -448,9 +470,17 @@ def load_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
     except Exception as exc:
         error = exc
     _health(rank, process_group, 'load/validated', payload, error)
-    incompatible = set_model(model, model_state_dict=state['model'], options=options)
-    if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise ValueError('strict model setter returned incompatible keys')
+    if manifest['schema'] == _LEGACY_SCHEMA:
+        incompatible = set_model(model, model_state_dict=state['model'], options=options)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise ValueError('strict model setter returned incompatible keys')
+    else:
+        destinations = _model_subset(inventory, _SCHEMA)
+        if set(state['model']) != set(destinations):
+            raise ValueError('adapter/buffer state must exactly cover the admitted subset')
+        with torch.no_grad():
+            for name, destination in destinations.items():
+                destination.copy_(state['model'][name])
     # Current DCP set_optimizer_state_dict calls _init_optim_state -> dummy step
     # on fresh Adam. The public Optimizer setter accepts these checked FQN keys
     # via its saved-ID -> current-Parameter mapping, without any step/getter.
@@ -463,7 +493,7 @@ def load_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
         if prepared.scheduler is not None:
             prepared.scheduler.load_state_dict(manifest['scheduler']['state'])
         _warm_state(optimizer.state, trainable, process_group, progress.global_step)
-        restored = _manifest(identity, progress, _inventory(prepared, process_group))
+        restored = _manifest(identity, progress, _inventory(prepared, process_group), schema=manifest['schema'])
         if restored != manifest:
             raise ValueError('applied model/optimizer/scheduler/buffer schema mismatch')
     except Exception as exc:

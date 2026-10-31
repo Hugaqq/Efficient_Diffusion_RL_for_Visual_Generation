@@ -62,12 +62,20 @@ def _unpack_id(value, namespace):
     return value[len(namespace)+1:]
 
 
-def verify_h3_content(profile: H3Profile, *, code_root: Path, expected_code_sha256: str):
+def verify_h3_content(profile: H3Profile, *, code_root: Path, expected_code_sha256: str,
+                      process_group=None, rank=None):
     """Always stream actual bytes; no caller-provided verified=True escape hatch."""
     if not isinstance(profile, H3Profile):
         raise TypeError("H3Profile required")
-    model = _hash_artifact(profile.launch.model, content_policy="all-files.v1")
-    code = _hash_artifact(Path(code_root), content_policy="python-code.v1")
+    def hash_files():
+        return (_hash_artifact(profile.launch.model, content_policy="all-files.v1"),
+                _hash_artifact(Path(code_root), content_policy="python-code.v1"))
+    if process_group is not None:
+        from visual_rl.runtime.h3_file_phase import file_phase
+        model, code = file_phase(hash_files, rank=rank, group=process_group,
+                                 label='content-identity')
+    else:
+        model, code = hash_files()
     if (model["content_sha256"] != profile.expected["model_sha256"]
             or profile.expected["cache_identity"]["model_sha256"] != model["content_sha256"]):
         raise ValueError("full model content differs from declared model/cache SHA256")
@@ -128,7 +136,8 @@ class H3RuntimeBinding:
         self.dynamics = H3CPSDynamics(adapter.geometry.joint_layout, H3ScheduleSnapshot.build(profile.training.num_steps))
         self.topology = dict(world_size=8, gpu_uuids=list(gpu_uuids), placement="rank-local-cuda-index",
                              sp=1, tp=1, reducer_divisor=8)
-        self.content = verify_h3_content(profile, code_root=self.code_root, expected_code_sha256=expected_code_sha256)
+        self.content = verify_h3_content(profile, code_root=self.code_root, expected_code_sha256=expected_code_sha256,
+                                         process_group=self.process_group, rank=self.rank)
         self._check_resources()
         self._source_binding = source.state_dict()["binding"]
         self._check_source()
@@ -363,16 +372,17 @@ class H3RuntimeBinding:
             raise RuntimeError("H3 binding closed")
         return H3Coordination(plan, process_group=self.process_group, device=f"cuda:{self.rank}")
 
-    def _live_ids(self):
+    def _live_ids(self, *, code_content=None):
         semantics = dict(profile=to_plain_dict(self.facts.semantic_payload),
                          source=self._source_binding, numerics=self.numerics.to_payload(),
                          blocks=self.block_policies)
+        content = self.content if code_content is None else dict(self.content, code=code_content)
         return dict(model=self.content["model"]["content_sha256"], topology=_hash(self.topology),
                     semantics=_hash(semantics), data=_unpack_id(self.source.data_identity, "h3-data"),
                     cache=self.facts.cache_identity, score=_hash(asdict(self.scorer.identity)),
                     dynamics=_hash({k: self._source_binding[k] for k in ("num_steps", "video_sigmas", "audio_sigmas", "eta")}),
-                    resources=_hash(dict(content=self.content, cache=self.facts.cache_identity,
-                                         score=asdict(self.scorer.identity))), code=self.content["code"]["content_sha256"])
+                    resources=_hash(dict(content=content, cache=self.facts.cache_identity,
+                                         score=asdict(self.scorer.identity))), code=content["code"]["content_sha256"])
 
     def validate_live(self):
         if self._closed:
@@ -381,7 +391,8 @@ class H3RuntimeBinding:
                 or _cuda_device(torch.device(f"cuda:{self.rank}")) != self.device
                 or self.topology["gpu_uuids"] != list(self.profile.launch.gpu_uuids)):
             raise ValueError("live rank/device/topology changed")
-        if verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256) != self.content:
+        if verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256,
+                             process_group=self.process_group, rank=self.rank) != self.content:
             raise ValueError("artifact content identity changed")
         self._check_resources()
         self._check_source()
@@ -392,8 +403,8 @@ class H3RuntimeBinding:
             raise ValueError("numerics binding drift")
         return self._live_ids()
 
-    def _contract(self):
-        live = self._live_ids()
+    def _contract(self, *, live=None):
+        live = self._live_ids() if live is None else live
         projection = self.parameter_state.state_projection
         params = self.parameter_state.named_trainable_parameters()
         policy_payload = [p.to_payload() for p in self.execution_policies]

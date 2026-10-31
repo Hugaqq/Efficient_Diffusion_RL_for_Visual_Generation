@@ -40,7 +40,12 @@ def _phase(session, label, work):
     from visual_rl.algorithms.optimization.h3_world import _exchange
     result = error = None
     try:
-        result = work()
+        if label == 'output':
+            from visual_rl.runtime.h3_file_phase import file_phase
+            result = file_phase(work, rank=session.rank, group=session.process_group,
+                                label='lifecycle/output')
+        else:
+            result = work()
     except Exception as exc:
         error = exc
     try:
@@ -114,7 +119,8 @@ class _Graph:
 
 
 class H3LifecycleBackend:
-    def __init__(self, *, code_root=None):
+    def __init__(self, *, code_root=None, code_upgrade=None):
+        self.code_upgrade = code_upgrade
         self.code_root = Path(code_root or Path(__file__).resolve().parents[1]).resolve()
         self.binding = self.transaction = None
         self.start_step = 0
@@ -174,7 +180,10 @@ class H3LifecycleBackend:
                 _write_json(output / "h3-run.json", dict(owner, run_id=uuid4().hex))
             else:
                 saved = json.loads((output / "h3-run.json").read_text())
-                if {k: saved.get(k) for k in owner} != owner or not isinstance(saved.get("run_id"), str):
+                if self.code_upgrade is not None:
+                    self.code_upgrade.admit_owner(saved=saved, current=owner, profile=profile,
+                                                  code_root=self.code_root)
+                elif {k: saved.get(k) for k in owner} != owner or not isinstance(saved.get("run_id"), str):
                     raise ValueError("output belongs to a different H3 run/code/topology")
                 manager = AtomicCheckpointManager(output / "checkpoints")
                 latest = manager.latest_complete()
@@ -238,8 +247,13 @@ class H3LifecycleBackend:
             path = graph.profile.launch.resume_from
             if path is not None:
                 live = _phase(runtime, "prepared-live", self.binding.validate_live)
-                self.transaction.restore_prepared(prepared, path, expected_contract=self.binding.contract,
-                    identity=self.binding.state_identity, bindings=live)
+                self.restore_contract = self.binding.contract
+                self.restore_live = live
+                if self.code_upgrade is not None:
+                    self.restore_contract, self.restore_live = self.code_upgrade.restore_contract(
+                        self.binding, path)
+                self.transaction.restore_prepared(prepared, path, expected_contract=self.restore_contract,
+                    identity=self.binding.state_identity, bindings=self.restore_live)
             return self.binding  # existing controller ledger owns close even if later binding fails
         except BaseException:
             self.binding.close()
@@ -278,7 +292,7 @@ class H3LifecycleBackend:
                 next_global_batch_id=graph.source.next_global_batch_id.split(":", 1)[1],
                 cursor=state["global_cursor"], behavior_id=state["behavior_id"], open_reservations=0, payload=state)
         progress = bound.transaction.restore_bound(
-            validate_live=lambda: (bound.binding.contract, bound.binding.state_identity, bound.binding.validate_live()),
+            validate_live=lambda: self._restore_live(bound),
             restore_data=graph.source.load_state_dict, read_data=data_state)
         self.start_step = progress.next_optimizer_step
         if not 0 < self.start_step <= graph.profile.launch.max_optimizer_steps:
@@ -288,6 +302,15 @@ class H3LifecycleBackend:
     def prepare_run(self, bound):
         from visual_rl.algorithms.trainer.interface import PrepareRunContext
         bound.trainer.prepare_run(PrepareRunContext(bound.graph.run_id, "h3_t2va_mvp_v1", self.start_step))
+
+    def _restore_live(self, bound):
+        live = bound.binding.validate_live()
+        if self.code_upgrade is not None:
+            contract, live = self.code_upgrade.restore_contract(
+                bound.binding, bound.graph.profile.launch.resume_from)
+        else:
+            contract = bound.binding.contract
+        return contract, bound.binding.state_identity, live
 
     def run(self, bound):
         launch = bound.graph.profile.launch
@@ -308,7 +331,8 @@ class H3LifecycleBackend:
                     _write_json(launch.output_dir / "h3-last-metrics.json", metrics)
             _phase(bound.graph.session, "metrics", record_metrics)
             first_formal_flash = (step == 0 and bound.graph.profile.training.group_layout == 'paired_4x8')
-            if first_formal_flash or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
+            first_upgraded_update = self.code_upgrade is not None and step == self.start_step
+            if first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
                 boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
                     bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
                 progress, proof, data, _ = boundary

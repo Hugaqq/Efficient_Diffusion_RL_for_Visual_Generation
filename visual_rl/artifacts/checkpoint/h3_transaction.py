@@ -246,7 +246,11 @@ class H3CheckpointTransaction:
                 worker.join()
         else:
             try:
-                payload = action()  # local metadata/file IO ONLY, never a state/model collective
+                if label in ('restore-prepared/inspect', 'restore-bound/refresh'):
+                    from visual_rl.runtime.h3_file_phase import file_phase
+                    payload = file_phase(action, rank=self.rank, group=self.group, label=label)
+                else:
+                    payload = action()  # local metadata/file IO ONLY, never a state/model collective
             except Exception as exc:
                 error = exc
         if self.rank == 0 and error is not None:
@@ -451,11 +455,17 @@ class H3CheckpointTransaction:
                 raise RuntimeError('restore_bound requires one successful prepared gate and is once-only')
             self._bound_attempted = True
             inspected = None
+            live = None
+            def read_live():
+                nonlocal live
+                live = validate_live()  # CUDA/model observation stays on the main thread.
+                return None
+            self._phase('restore-bound/live', read_live)
             def refresh():
                 nonlocal inspected
                 if not all(callable(fn) for fn in (validate_live, restore_data, read_data)):
                     raise TypeError('live validation and data restore/read callbacks are mandatory')
-                contract, identity, bindings = validate_live()  # never just reuse prepared-gate hashes
+                contract, identity, bindings = live  # freshly observed above, not prepared-gate hashes
                 inspected = self._inspect(self._pending.path, contract, identity, bindings)
                 current = inspected[0].committed
                 if (current.state_tree_id != self._pending.state_tree_id or current.progress_id != self._pending.progress_id

@@ -155,8 +155,22 @@ def main():
     parser.add_argument('config',type=Path)
     parser.add_argument('--ffmpeg',required=True,type=Path)
     parser.add_argument('--ffprobe',required=True,type=Path)
+    parser.add_argument('--upgrade-from',choices=[BASE_SHA])
+    parser.add_argument('--legacy-source',type=Path)
+    parser.add_argument('--expected-sha')
     args=parser.parse_args()
-    proof=prove_observation_only()
+    upgrade=None
+    if args.upgrade_from is not None:
+        if args.legacy_source is None or args.expected_sha is None:
+            raise ValueError('explicit code upgrade needs legacy source and expected SHA')
+        from scripts.h3_checkpoint_upgrade import H3CodeUpgrade
+        upgrade=H3CodeUpgrade(root=ROOT,legacy_root=args.legacy_source,expected_sha=args.expected_sha)
+        proof=dict(upgrade.proof,launcher_sha=args.expected_sha,
+                   launcher_file_sha256=sha256_file(__file__),cadence=10,samples_per_prompt=1)
+    else:
+        if args.legacy_source is not None or args.expected_sha is not None:
+            raise ValueError('legacy options require explicit upgrade-from')
+        proof=prove_observation_only()
     if not args.ffmpeg.is_file() or not args.ffprobe.is_file():raise ValueError('media binaries absent')
     from visual_rl.runtime.controller import RunController
     from visual_rl.runtime.h3_lifecycle import H3LifecycleBackend, _phase
@@ -179,7 +193,7 @@ def main():
                     root=root,ffmpeg=args.ffmpeg,ffprobe=args.ffprobe,launcher_sha=proof['launcher_sha'])
             _phase(runtime,'attach-media-observer',attach)
             return bound
-    result=RunController(ObservedBackend()).run(args.config)
+    result=RunController(ObservedBackend(code_upgrade=upgrade)).run(args.config)
     print(json.dumps(dict(status='ok',committed_steps=result.committed_steps,
                           checkpoint=str(result.authoritative_checkpoint))),flush=True)
 

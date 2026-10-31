@@ -102,6 +102,109 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         _save_dcp({}, root / 'dcp', None)
         assert calls == [dict(overwrite=False, sync_files=True,
                               single_file_per_rank=False, thread_count=1)]
+    # A slow file worker must keep main-thread collectives alive; worker
+    # exceptions and a separate total deadline are preserved, never hidden.
+    from visual_rl.runtime import h3_file_phase
+    import threading, time
+    with monkeypatch.context() as heartbeat_patch:
+        zeros = torch.zeros
+        ticks=[]
+        heartbeat_patch.setattr(h3_file_phase.torch,'zeros',lambda *a,**kw: zeros((),dtype=torch.int32))
+        def reduce(signal,**kw):
+            assert threading.current_thread() is threading.main_thread()
+            ticks.append(int(signal.item())); signal.add_(7)
+        heartbeat_patch.setattr(h3_file_phase.dist,'all_reduce',reduce)
+        def slow_file():
+            assert threading.current_thread() is not threading.main_thread()
+            time.sleep(.04);return 'hashed'
+        assert h3_file_phase.file_phase(slow_file,rank=0,group=None,label='cpu-test',timeout_s=1,interval_s=.005)=='hashed'
+        assert ticks.count(0)>1 and ticks[-1]==1
+        with pytest.raises(TimeoutError,match='file phase exceeded'):
+            h3_file_phase.file_phase(slow_file,rank=0,group=None,label='bounded',timeout_s=.005,interval_s=.005)
+        def broken_file(): raise ValueError('disk-failure')
+        with pytest.raises(ValueError,match='disk-failure'):
+            h3_file_phase.file_phase(broken_file,rank=0,group=None,label='error',timeout_s=1,interval_s=.005)
+    # Real disk DCP: new adapter-only payload and legacy full-state restore.
+    # Only WORLD8/CUDA transport leaves use the established tiny CPU fixture.
+    from tests import test_h3_mvp_cpu_checkpoint_state as h3_fixture
+    from visual_rl.artifacts.checkpoint import h3_state as h3_codec
+    with monkeypatch.context() as hp:
+        from visual_rl.models.implementations import h3_loading
+        # Tiny ~4MB CPU fixture, not admission for the real 33B model; the
+        # VPS has 15GiB, below the production-only 24GiB loading reserve.
+        hp.setattr(h3_loading,'_admit_host_memory',lambda budget: None)
+        group, _ = h3_fixture._cpu_transport(hp)
+        prepared = h3_fixture._prepared(tmp_path/'h3-source',hp)
+        h3_fixture._step(prepared); h3_fixture._step(prepared)
+        saved_state = h3_fixture._snapshot(prepared)
+        original_manifest = h3_codec._manifest
+        for version in ('legacy','adapter'):
+            checkpoint = tmp_path/f'h3-{version}';checkpoint.mkdir()
+            if version == 'legacy':
+                with monkeypatch.context() as legacy_patch:
+                    legacy_patch.setattr(h3_codec,'_manifest',lambda *a,**kw: original_manifest(*a,schema=h3_codec._LEGACY_SCHEMA))
+                    h3_fixture._save(prepared,checkpoint,group)
+            else:
+                h3_fixture._save(prepared,checkpoint,group)
+            manifest = json.loads((checkpoint/'h3-state/manifest.json').read_text())
+            if version == 'adapter':
+                assert manifest['schema']==h3_codec._SCHEMA
+                assert manifest['frozen_base']['parameters']
+                assert not set(manifest['model']) & set(manifest['frozen_base']['parameters'])
+                assert set(manifest['trainable']) <= set(manifest['model'])
+            else:
+                assert manifest['schema']==h3_codec._LEGACY_SCHEMA
+                assert 'frozen_base' not in manifest
+            restored=h3_fixture._prepared(tmp_path/f'h3-restored-{version}',hp)
+            h3_fixture._load(restored,checkpoint,group)
+            h3_fixture._equal(h3_fixture._snapshot(restored),saved_state)
+        bad_manifest = json.loads((tmp_path/'h3-adapter/h3-state/manifest.json').read_text())
+        bad_manifest['frozen_base']['model_id']='f'*64
+        (tmp_path/'h3-adapter/h3-state/manifest.json').write_text(json.dumps(bad_manifest))
+        rejected=h3_fixture._prepared(tmp_path/'h3-rejected',hp)
+        with pytest.raises(ValueError,match='load/preflight rejected local input') as rejected_error:
+            h3_fixture._load(rejected,tmp_path/'h3-adapter',group)
+        assert isinstance(rejected_error.value.__cause__, ValueError)
+        assert 'schema mismatch' in str(rejected_error.value.__cause__)
+        assert not rejected.optimizer.state
+    # Scoped code upgrade preserves the old owner and refuses other outputs,
+    # semantics or unrecognized checkpoint code. Only tiny live-contract leaves.
+    from scripts import h3_checkpoint_upgrade as upgrade_module
+    from types import SimpleNamespace
+    with monkeypatch.context() as up:
+        output=tmp_path/'upgrade-output';output.mkdir()
+        checkpoint=output/'checkpoints/step-1';checkpoint.mkdir(parents=True)
+        up.setattr(upgrade_module,'OUTPUT',output)
+        upgrade=object.__new__(upgrade_module.H3CodeUpgrade)
+        upgrade.root=tmp_path/'new-source'
+        upgrade.proof=dict(expected_sha='f'*40)
+        upgrade.legacy_code={'content_sha256':upgrade_module.OLD_CODE}
+        current=dict(schema_version=1,semantic_id=upgrade_module.SEMANTIC,code='f'*64,gpu_uuids=['gpu'])
+        saved=dict(current,code=upgrade_module.OLD_CODE,run_id=upgrade_module.RUN_ID)
+        owner=output/'h3-run.json';owner.write_text(json.dumps(saved))
+        before_owner=owner.read_bytes()
+        profile=SimpleNamespace(launch=SimpleNamespace(output_dir=output,resume_from=checkpoint,max_optimizer_steps=200),
+                                training=SimpleNamespace(algorithm='dual_flash',group_layout='paired_4x8'))
+        upgrade.admit_owner(saved=saved,current=current,profile=profile,code_root=upgrade.root/'visual_rl')
+        assert owner.read_bytes()==before_owner
+        assert (output/'code-upgrades'/('f'*40+'.json')).is_file()
+        with pytest.raises(ValueError,match='owner/semantics/topology'):
+            upgrade.admit_owner(saved=dict(saved,semantic_id='different'),current=current,profile=profile,code_root=upgrade.root/'visual_rl')
+        live_calls=[]
+        def live_ids(**kw):
+            live_calls.append(kw);return {'code':kw.get('code_content',{'content_sha256':'f'*64})['content_sha256']}
+        binding=SimpleNamespace(content={'code':{'content_sha256':'f'*64}},contract='current-contract',
+                                _live_ids=live_ids,_contract=lambda *,live: ('legacy-contract',live))
+        manifest=checkpoint/'h3_transaction.json'
+        manifest.write_text(json.dumps({'binding':{'live':{'code':upgrade_module.OLD_CODE}}}))
+        contract,live=upgrade.restore_contract(binding,checkpoint)
+        assert live['code']==upgrade_module.OLD_CODE and contract[0]=='legacy-contract'
+        manifest.write_text(json.dumps({'binding':{'live':{'code':'f'*64}}}))
+        assert upgrade.restore_contract(binding,checkpoint)==('current-contract',{'code':'f'*64})
+        manifest.write_text(json.dumps({'binding':{'live':{'code':'unknown'}}}))
+        with pytest.raises(ValueError,match='unknown checkpoint code'):
+            upgrade.restore_contract(binding,checkpoint)
+        assert owner.read_bytes()==before_owner
     # Observation-only export: cadence, original score, media/RNG and real CPU codec.
     from scripts.launch_h3_media import observed_score, save_media
     from visual_rl.models.implementations.h3_decode import H3AVMedia
