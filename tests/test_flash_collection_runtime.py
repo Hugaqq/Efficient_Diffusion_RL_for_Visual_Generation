@@ -132,6 +132,17 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert len(records)==2 and choices['s0']==choices['s1'] and all(0<=r.index<5 for r in records)
     assert all(not x.requires_grad for x in terminals.values())
     assert len(rollout('flow')[0])==20
+    from visual_rl.algorithms.optimization.h3_dual_anchor import H3DualReplayAnchor
+    keys=tuple((record.sample_id,record.index) for record in records)
+    anchor=H3DualReplayAnchor(dynamics=dynamics,behavior_id='behavior',expected_keys=keys,max_records=2)
+    anchor.capture(records,device='cpu',predict=lambda sid,x,index:torch.zeros_like(x),
+        read_behavior_id=lambda:'behavior',gate=lambda *a,**kw:None)
+    for record in records:assert torch.equal(anchor.get(record.sample_id,record.index)[0],record.old_joint)
+    bad_records=(replace(records[0],old_joint=records[0].old_joint+1),records[1])
+    bad_anchor=H3DualReplayAnchor(dynamics=dynamics,behavior_id='behavior',expected_keys=keys,max_records=2)
+    with pytest.raises(ValueError,match='sampled/replayed old score mismatch'):
+        bad_anchor.capture(bad_records,device='cpu',predict=lambda sid,x,index:torch.zeros_like(x),
+            read_behavior_id=lambda:'behavior',gate=lambda *a,**kw:None)
     from tests.test_h3_dual_rollout import test_stable_group_selection_and_full_vs_single_step
     test_stable_group_selection_and_full_vs_single_step()
     # Independent Gaussian derivative for each stream (not two calls to a
@@ -203,7 +214,9 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     with torch.no_grad():module.lora.add_(.1)
     after=weight_fingerprints(module)
     assert before['hashes']['frozen']==after['hashes']['frozen'] and before['hashes']['trainable']!=after['hashes']['trainable']
-    from visual_rl.runtime.h3_lifecycle import _pause_requested
+    from visual_rl.runtime.h3_lifecycle import _pause_requested,H3LifecycleBackend
+    with pytest.raises(RuntimeError,match='inspection-only backend'):
+        H3LifecycleBackend(inspection_only=True).run(None)
     from visual_rl.algorithms.optimization import h3_world as pause_world
     pause_root=tmp_path/'pause-root';pause_root.mkdir()
     with monkeypatch.context() as pp:

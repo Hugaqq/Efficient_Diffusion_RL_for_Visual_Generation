@@ -134,7 +134,8 @@ class _Graph:
 
 
 class H3LifecycleBackend:
-    def __init__(self, *, code_root=None, code_upgrade=None):
+    def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False):
+        self.inspection_only=inspection_only
         self.code_upgrade = code_upgrade
         self.code_root = Path(code_root or Path(__file__).resolve().parents[1]).resolve()
         self.binding = self.transaction = None
@@ -205,7 +206,7 @@ class H3LifecycleBackend:
                 if (launch.resume_from.parent != output / "checkpoints" or latest is None
                         or latest.path != launch.resume_from):
                     raise ValueError("resume must select this run's latest complete checkpoint")
-                if (output / "SUCCESS").exists():
+                if (output / "SUCCESS").exists() and not self.inspection_only:
                     raise ValueError("run already succeeded; do not train it again")
         try:
             _phase(runtime, "output-lock", acquire_output_lock)
@@ -328,6 +329,8 @@ class H3LifecycleBackend:
         return contract, bound.binding.state_identity, live
 
     def run(self, bound):
+        if self.inspection_only:
+            raise RuntimeError('inspection-only backend cannot execute the training loop')
         launch = bound.graph.profile.launch
         committed = None
         metrics = None

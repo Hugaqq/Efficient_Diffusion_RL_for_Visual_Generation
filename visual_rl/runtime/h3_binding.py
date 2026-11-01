@@ -459,7 +459,12 @@ class H3RuntimeBinding:
             raise ValueError("scheduler position differs from completed tail")
         rng = RankRNGSnapshot.capture_current(self.rank)
         batch_id = _unpack_id(self.source.next_global_batch_id, "h3-batch")
-        selection = DynamicsSelectionPolicyState(0, "h3.all-policy-steps-including-q0.v1", "h3.no-selection-rng", 1)
+        if self.profile.training.algorithm=='dual_flash':
+            from visual_rl.algorithms.trainer.h3_dual_rollout import SELECTION_VERSION
+            selection=DynamicsSelectionPolicyState(self.profile.launch.seed,SELECTION_VERSION,
+                                                     'h3.stateless-first-window-sha256.v2',1)
+        else:
+            selection = DynamicsSelectionPolicyState(0, "h3.all-policy-steps-including-q0.v1", "h3.no-selection-rng", 1)
         progress = CheckpointProgress(step, step, step, self.source.source_id, batch_id, "train",
             ("h3_hpsv3_video_only_v1",), ((self.source.source_id, state["global_cursor"]),), selection,
             0, False, False, self.contract.execution_transform_plan_id, rng.state_identity)
