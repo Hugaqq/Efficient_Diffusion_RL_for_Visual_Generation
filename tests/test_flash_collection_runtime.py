@@ -193,6 +193,18 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     fresh=SimpleNamespace(launch=SimpleNamespace(max_optimizer_steps=1,resume_from=None,checkpoint_every_optimizer_steps=5),
         training=H3Training(group_size=8,algorithm='dual_flash',group_layout='paired_4x8'),expected={'train_sha256':TRAIN_SHA,'eval_sha256':TEST_SHA})
     assert validate_fresh(fresh) is fresh
+    # Exercise the real compiler, not only the launcher's already-typed guard.
+    from tests.test_h3_mvp_cpu_profile import _fixture as h3_profile_fixture,_save as save_h3_profile
+    from visual_rl.composition.config.h3_profile import compile_h3_profile
+    profile_path,raw=h3_profile_fixture(tmp_path/'terminal-profile')
+    raw['overrides']['training']=dict(group_size=8,num_steps=10,algorithm='dual_flash',group_layout='paired_4x8')
+    raw['launch'].update(max_optimizer_steps=1,checkpoint_every_optimizer_steps=5)
+    raw['launch']['expected'].update(train_sha256=TRAIN_SHA,eval_sha256=TEST_SHA)
+    typed=compile_h3_profile(save_h3_profile(profile_path.parent,raw))
+    assert validate_fresh(typed).launch.checkpoint_every_optimizer_steps==5
+    raw['launch']['checkpoint_every_optimizer_steps']=6
+    with pytest.raises(ValueError,match='terminal exception'):
+        compile_h3_profile(save_h3_profile(profile_path.parent,raw))
     fresh.launch.max_optimizer_steps=200
     with pytest.raises(ValueError,match='max1'): validate_fresh(fresh)
     fresh.launch.max_optimizer_steps=1;fresh.launch.resume_from=Path('old/step-3')
