@@ -52,8 +52,12 @@ def build(args):
 
     if args.max_tokens < 1 or args.max_prompts < 1:
         raise ValueError("positive explicit token/prompt bounds required")
-    if not os.environ.get("CUDA_VISIBLE_DEVICES", "").startswith("GPU-") or "," in os.environ["CUDA_VISIBLE_DEVICES"]:
-        raise ValueError("set CUDA_VISIBLE_DEVICES to exactly one authorized GPU UUID")
+    visible=os.environ.get('CUDA_VISIBLE_DEVICES','').split(',')
+    count=2 if args.encoder_placement=='two-gpu' else 1
+    if len(visible)!=count or len(set(visible))!=count or any(not v.startswith('GPU-') for v in visible):
+        raise ValueError('set CUDA_VISIBLE_DEVICES to the exact authorized GPU UUIDs for encoder placement')
+    if args.shard_prompts<1 or args.shard_prompts>128:
+        raise ValueError('shard-prompts must be within1..128')
     raw, model = args.raw_root.resolve(strict=True), args.model.resolve(strict=True)
     output = args.output.absolute()
     staging = output.with_name(output.name + ".partial")
@@ -86,8 +90,10 @@ def build(args):
     if available < source_bytes + 24 * 1024**3:
         raise MemoryError("insufficient host RAM for encoder plus 24GiB reserve")
     device = torch.device("cuda:0")
-    if torch.cuda.mem_get_info(device)[0] < 16 * 1024**3:
-        raise MemoryError("need 16GiB free for bounded encoder offload")
+    required_gpu=52 if count==2 else 16
+    for index in range(count):
+        if torch.cuda.mem_get_info(index)[0]<required_gpu*1024**3:
+            raise MemoryError('insufficient GPU headroom for chosen encoder placement')
     output.parent.mkdir(parents=True, exist_ok=True)
     staging.mkdir()
     print(json.dumps({"event": "hash_model_begin", "path": str(model)}), flush=True)
@@ -99,6 +105,13 @@ def build(args):
     tokenized = [tokenizer(prompt, add_special_tokens=False, truncation=False)["input_ids"] for prompt in prompts]
     if any(not ids or len(ids) > args.max_tokens for ids in tokenized):
         raise ValueError("empty/overlength prompt; implicit truncation is forbidden")
+    import shutil
+    estimated_bytes=sum(len(ids)*5120*4 for ids in tokenized)
+    if shutil.disk_usage(output.parent).free<estimated_bytes+32*1024**3:
+        raise MemoryError('cache output plus32GiB disk reserve does not fit')
+    print(json.dumps(dict(event='all_prompts_tokenized',train_rows=len(groups[0]),eval_rows=len(groups[1]),
+        unique_prompts=len(prompts),max_tokens_observed=max(map(len,tokenized)),
+        estimated_embedding_bytes=estimated_bytes)),flush=True)
     processor = {"kind": "text-only-no-multimodal-processor", "transformers": transformers.__version__,
                  "encoder_python_sha256": digest_file(inspect.getfile(Qwen3VLForConditionalGeneration)),
                  "tokenizer_python_sha256": digest_file(inspect.getfile(Qwen2TokenizerFast)),
@@ -111,15 +124,32 @@ def build(args):
     metadata = {"h3_text_identity_sha256": hashlib.sha256(canonical(identity)).hexdigest()}
     entries, shards = {}, {}
     print(json.dumps({"event": "encoder_load_begin", "weight_bytes": source_bytes, "prompts": len(prompts)}), flush=True)
+    placement=(dict(device_map='balanced',max_memory={0:'50GiB',1:'50GiB'}) if count==2 else {})
     encoder = Qwen3VLForConditionalGeneration.from_pretrained(enc, torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True, local_files_only=True, trust_remote_code=False,
-        use_safetensors=True, attn_implementation="sdpa")
+        use_safetensors=True, attn_implementation="sdpa",**placement)
     try:
         if encoder.config.text_config.num_hidden_layers <= 50 or encoder.config.text_config.hidden_size != 5120:
             raise ValueError("requires raw intermediate layer50, width5120")
         encoder.eval().requires_grad_(False)
         encoder.lm_head = torch.nn.Identity()
-        cpu_offload(encoder.model, execution_device=device, offload_buffers=True)
+        if count==1:
+            cpu_offload(encoder.model, execution_device=device, offload_buffers=True)
+        elif any(v not in (0,1,'cuda:0','cuda:1') for v in encoder.hf_device_map.values()):
+            raise ValueError('two-GPU encoder must be resident; no implicit CPU/disk fallback')
+        pending={}
+        def flush(ordinal):
+            if not pending:return
+            name=f'prompts-through-{ordinal:06d}.safetensors'
+            if (staging/name).exists():raise FileExistsError('refuse overwriting cache shard')
+            save_file(dict(pending),staging/name,metadata=metadata)
+            shards[name]=digest_file(staging/name)
+            for key,feature in pending.items():
+                entries[key]=dict(shard=name,tensor=key,tokens=feature.shape[0])
+            pending.clear()
+            progress=dict(encoded_prompts=len(entries),shards=len(shards),total_prompts=len(prompts))
+            (staging/'progress.tmp').write_bytes(canonical(progress)+b'\n')
+            (staging/'progress.tmp').replace(staging/'progress.json')
         with torch.inference_mode():
             for ordinal, (prompt, ids) in enumerate(zip(prompts, tokenized)):
                 inputs = torch.tensor([ids], device=device, dtype=torch.long)
@@ -130,13 +160,12 @@ def build(args):
                 if feature.shape != (len(ids), 5120) or not bool(torch.isfinite(feature).all()):
                     raise ValueError("invalid real encoder feature")
                 key = hashlib.sha256(prompt.encode()).hexdigest()
-                name = f"prompt-{ordinal:06d}.safetensors"
-                save_file({key: feature}, staging / name, metadata=metadata)
-                shards[name] = digest_file(staging / name)
-                entries[key] = {"shard": name, "tensor": key, "tokens": len(ids)}
+                pending[key]=feature
+                if len(pending)>=args.shard_prompts:flush(ordinal)
                 del feature
                 print(json.dumps({"event": "prompt_encoded", "ordinal": ordinal, "prompt_sha256": key,
                                   "tokens": len(ids)}), flush=True)
+        flush(len(prompts)-1)
     finally:
         del encoder
         gc.collect()
@@ -149,6 +178,7 @@ def build(args):
     provenance = dict(identity=identity, processor=processor, encoder_files=encoder_files,
                       tokenizer_files=tokenizer_files, prompt_file_sha256=prompt_hashes,
                       unique_prompts=len(prompts), max_tokens=args.max_tokens,
+                      encoder_placement=args.encoder_placement,shard_prompts=args.shard_prompts,
                       peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                       peak_gpu_allocated_bytes=torch.cuda.max_memory_allocated(device),
                       validation="real encoder outputs, strict cache reader and train/eval coverage; not training")
@@ -165,6 +195,8 @@ def main():
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--max-tokens", type=int, required=True)
     p.add_argument("--max-prompts", type=int, required=True)
+    p.add_argument('--encoder-placement',choices=['cpu-offload','two-gpu'],default='cpu-offload')
+    p.add_argument('--shard-prompts',type=int,default=32)
     build(p.parse_args())
 
 

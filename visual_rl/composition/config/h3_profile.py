@@ -104,6 +104,8 @@ class H3Training:
             raise ValueError('unknown H3 group layout')
         if self.group_layout == 'paired_4x8' and (self.algorithm != 'dual_flash' or self.group_size != 8):
             raise ValueError('paired_4x8 requires dual_flash and group_size8')
+        if self.algorithm == 'dual_flash' and self.num_steps <= 5:
+            raise ValueError('Flash first-five window requires more than five total transitions')
         if self.algorithm != "cps" and self.num_steps < 2:
             raise ValueError("dual Flow-SDE requires at least two transitions")
 
@@ -133,6 +135,10 @@ class H3Training:
                           selection="h3-dual-prompt-group-sha256-rejection-v1",
                           deterministic="dual_euler_nonpolicy_v1",
                           rectification=("per_stream_world_mean_gradient_v1" if self.algorithm == "dual_flash" else "none"))
+        if self.algorithm == 'dual_flash':
+            from visual_rl.algorithms.trainer.h3_dual_rollout import SELECTION_VERSION, FLASH_WINDOW_SIZE
+            result.update(selection=SELECTION_VERSION,stochastic_window_size=FLASH_WINDOW_SIZE,
+                          stochastic_indices=tuple(range(FLASH_WINDOW_SIZE)),terminal_stochastic=False)
         return result
 
 

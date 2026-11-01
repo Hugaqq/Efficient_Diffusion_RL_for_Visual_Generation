@@ -102,6 +102,57 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         _save_dcp({}, root / 'dcp', None)
         assert calls == [dict(overwrite=False, sync_files=True,
                               single_file_per_rank=False, thread_count=1)]
+    # New first-five protocol: stateless group selection, no terminal noise,
+    # and an explicit one-step window for the old two-transition tiny fixture.
+    from visual_rl.algorithms.trainer.h3_dual_rollout import selected_step,collect,SELECTION_VERSION
+    from visual_rl.composition.config.h3_profile import H3Training
+    from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
+    from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+    from visual_rl.models.h3_joint import H3JointLayout
+    picks=[selected_step(seed=i,optimizer_step=0,group_id='g',num_steps=10) for i in range(5000)]
+    assert set(picks)==set(range(5)) and all(850<picks.count(k)<1150 for k in range(5))
+    assert selected_step(seed=42,optimizer_step=1,group_id='g',num_steps=10)==selected_step(seed=42,optimizer_step=1,group_id='g',num_steps=10)
+    with pytest.raises(ValueError,match='window'):
+        selected_step(seed=42,optimizer_step=0,group_id='g',num_steps=2)
+    assert selected_step(seed=42,optimizer_step=0,group_id='g',num_steps=2,window_size=1)==0
+    with pytest.raises(ValueError,match='window'): H3Training(algorithm='dual_flash',num_steps=5)
+    assert H3Training(algorithm='dual_flash').payload()['selection']==SELECTION_VERSION
+    assert 'stochastic_window_size' not in H3Training(algorithm='dual_flow',num_steps=2).payload()
+    dynamics=H3DualFlowSDE(H3JointLayout(1,2,1,3),H3ScheduleSnapshot.build(10))
+    def rollout(mode):
+        def predict(sid,x,index):
+            assert not torch.is_grad_enabled()
+            return torch.zeros_like(x)
+        return collect(dynamics=dynamics,samples=(('s0','group'),('s1','group')),
+            initial_states={sid:torch.full((1,5),.25,dtype=torch.float16) for sid in ['s0','s1']},
+            generators={sid:(torch.Generator().manual_seed(i*2),torch.Generator().manual_seed(i*2+1)) for i,sid in enumerate(['s0','s1'])},
+            mode=mode,seed=42,optimizer_step=0,device='cpu',predict=predict,
+            read_behavior_id=lambda:'behavior',behavior_id='behavior',gate=lambda *a,**kw:None)
+    records,terminals,choices=rollout('flash')
+    assert len(records)==2 and choices['s0']==choices['s1'] and all(0<=r.index<5 for r in records)
+    assert all(not x.requires_grad for x in terminals.values())
+    assert len(rollout('flow')[0])==20
+    # Independent Gaussian derivative for each stream (not two calls to a
+    # shared likelihood helper), followed by element weights and rectification.
+    rec=records[0];prediction=torch.full_like(rec.x,.125,dtype=torch.float32,requires_grad=True)
+    joint,components,coefs=dynamics.evaluate(rec.x,rec.action,prediction,rec.index)
+    means=(torch.tensor(2.),torch.tensor(3.))
+    rectified=dynamics.rectified_score(joint,components,coefs,means).sum()
+    rectified.backward()
+    offset=0
+    for width,grid,coef,normalizer in zip([2,3],[dynamics.schedule.video_sigmas,dynamics.schedule.audio_sigmas],coefs,means):
+        s=float(grid[rec.index]);u=float(grid[rec.index+1]);maximum=float(grid[1]);dt=u-s
+        diffusion=maximum*s;variance=diffusion**2*(-dt)
+        velocity=(1+diffusion**2*(1-s)/(2*s))*dt
+        x=rec.x.double()[:,offset:offset+width];a=rec.action.double()[:,offset:offset+width]
+        mu=x*(1+diffusion**2/(2*s)*dt)+.125*velocity
+        expected=(a-mu)/variance*velocity/5*float(coef/normalizer)
+        assert torch.allclose(prediction.grad[:,offset:offset+width],expected.float(),rtol=3e-4,atol=3e-4)
+        offset+=width
+    from visual_rl.algorithms.optimization.h3_world import h3_slot_loss_scale
+    scale=h3_slot_loss_scale(n_slot=1,global_count=32,reducer_divisor=8)
+    gradients=torch.arange(32,dtype=torch.float64)
+    assert torch.equal((gradients*scale).sum()/8,gradients.mean())
     # A slow file worker must keep main-thread collectives alive; worker
     # exceptions and a separate total deadline are preserved, never hidden.
     from visual_rl.runtime import h3_file_phase

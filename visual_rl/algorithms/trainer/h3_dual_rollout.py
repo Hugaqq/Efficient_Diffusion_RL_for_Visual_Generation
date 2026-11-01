@@ -14,10 +14,12 @@ import torch
 from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
 
 
-SELECTION_VERSION = 'h3-dual-prompt-group-sha256-rejection-v1'
+SELECTION_VERSION = 'h3-dual-prompt-group-first-window-v2'
+FLASH_WINDOW_SIZE = 5
 
 
-def selected_step(*, seed: int, optimizer_step: int, group_id: str, num_steps: int) -> int:
+def selected_step(*, seed: int, optimizer_step: int, group_id: str, num_steps: int,
+                  window_size: int = FLASH_WINDOW_SIZE) -> int:
     """Stateless uniform selection shared by an occurrence group, resume-safe."""
     if type(seed) is not int or not 0 <= seed < 2**64:
         raise ValueError('seed must be uint64')
@@ -27,13 +29,16 @@ def selected_step(*, seed: int, optimizer_step: int, group_id: str, num_steps: i
         raise ValueError('group_id must be a bounded nonempty string')
     if type(num_steps) is not int or not 2 <= num_steps <= 4096:
         raise ValueError('num_steps must be in [2,4096]')
-    prefix = (SELECTION_VERSION.encode() + b'\0' + seed.to_bytes(8,'big') +
+    if type(window_size) is not int or not 1 <= window_size < num_steps:
+        raise ValueError('stochastic window must be positive and exclude the terminal transition')
+    prefix = (SELECTION_VERSION.encode() + b'\0' + window_size.to_bytes(2,'big') +
+              num_steps.to_bytes(2,'big') + seed.to_bytes(8,'big') +
               optimizer_step.to_bytes(8,'big') + group_id.encode('utf-8') + b'\0')
-    ceiling = (2**256 // num_steps) * num_steps
+    ceiling = (2**256 // window_size) * window_size
     for counter in range(100):
         value = int.from_bytes(hashlib.sha256(prefix+counter.to_bytes(4,'big')).digest(),'big')
         if value < ceiling:
-            return value % num_steps
+            return value % window_size
     raise RuntimeError('selection rejection limit exceeded')
 
 
@@ -58,7 +63,7 @@ class H3DualRecord:
 
 def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
             mode: str, seed: int, optimizer_step: int, device, predict, read_behavior_id,
-            behavior_id: str, gate):
+            behavior_id: str, gate, window_size: int = FLASH_WINDOW_SIZE):
     """Flow: all stochastic transitions. Flash: one stochastic, rest Euler.
 
     Exactly one sample group stays rank-local. Flow/Flash share the same SDE
@@ -84,7 +89,9 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
             if not isinstance(sid,str) or not sid:
                 raise ValueError('nonempty sample identity required')
             try:
-                choice=selected_step(seed=seed,optimizer_step=optimizer_step,group_id=gid,num_steps=dynamics.schedule.num_steps)
+                choice=(selected_step(seed=seed,optimizer_step=optimizer_step,group_id=gid,
+                                      num_steps=dynamics.schedule.num_steps,window_size=window_size)
+                        if mode=='flash' else None)
                 choices[sid]=choice
                 x=initial_states[sid]
                 if not isinstance(x,torch.Tensor) or x.device.type!='cpu' or x.dtype!=torch.float16 or x.requires_grad or x.shape[0]!=1:
