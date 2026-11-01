@@ -132,6 +132,8 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert len(records)==2 and choices['s0']==choices['s1'] and all(0<=r.index<5 for r in records)
     assert all(not x.requires_grad for x in terminals.values())
     assert len(rollout('flow')[0])==20
+    from tests.test_h3_dual_rollout import test_stable_group_selection_and_full_vs_single_step
+    test_stable_group_selection_and_full_vs_single_step()
     # Independent Gaussian derivative for each stream (not two calls to a
     # shared likelihood helper), followed by element weights and rectification.
     rec=records[0];prediction=torch.full_like(rec.x,.125,dtype=torch.float32,requires_grad=True)
@@ -139,20 +141,82 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     means=(torch.tensor(2.),torch.tensor(3.))
     rectified=dynamics.rectified_score(joint,components,coefs,means).sum()
     rectified.backward()
-    offset=0
+    offset=0;manual_score=0.;manual_grad=[]
+    import math
     for width,grid,coef,normalizer in zip([2,3],[dynamics.schedule.video_sigmas,dynamics.schedule.audio_sigmas],coefs,means):
         s=float(grid[rec.index]);u=float(grid[rec.index+1]);maximum=float(grid[1]);dt=u-s
         diffusion=maximum*s;variance=diffusion**2*(-dt)
         velocity=(1+diffusion**2*(1-s)/(2*s))*dt
         x=rec.x.double()[:,offset:offset+width];a=rec.action.double()[:,offset:offset+width]
         mu=x*(1+diffusion**2/(2*s)*dt)+.125*velocity
-        expected=(a-mu)/variance*velocity/5*float(coef/normalizer)
+        coefficient=1/(math.sqrt(-dt)/diffusion+diffusion*math.sqrt(-dt)*(1-s)/(2*s))
+        assert abs(float(coef)-coefficient)<1e-4
+        expected=(a-mu)/variance*velocity/5*(coefficient/float(normalizer))
+        manual_grad.append(expected)
+        manual_score+=float((-.5*(a-mu).square()/variance-.5*math.log(variance)-.5*math.log(2*math.pi)).sum())/5
         assert torch.allclose(prediction.grad[:,offset:offset+width],expected.float(),rtol=3e-4,atol=3e-4)
         offset+=width
+    from visual_rl.algorithms.optimization.h3_dual_credit import policy_loss,global_stream_means
+    assert abs(float(joint.detach())-manual_score)<1e-4
+    p2=torch.full_like(rec.x,.125,dtype=torch.float32,requires_grad=True);audit_values=[]
+    loss=policy_loss(dynamics=dynamics,record=rec,prediction=p2,old_joint=torch.tensor(manual_score),
+        advantage=torch.tensor(.7),mode='flash',world_means=means,clip_range=.005,scale=.25,
+        audit=lambda delta,ratio:audit_values.append((delta,ratio)))
+    loss.backward()
+    assert audit_values[0][0]<1e-4 and abs(audit_values[0][1]-1)<1e-4
+    assert torch.allclose(p2.grad,torch.cat(manual_grad,dim=1).float()*(-.7*.25),rtol=4e-4,atol=4e-4)
+    with monkeypatch.context() as reduction_patch:
+        reduction_patch.setattr(torch.distributed,'all_reduce',lambda value,**kw:value.add_(torch.tensor([525.,1080.,30.,0.],dtype=torch.float64)))
+        actual=global_stream_means(((torch.tensor(1.),torch.tensor(3.)),(torch.tensor(2.),torch.tensor(5.))),process_group=None,device='cpu')
+        assert [float(v) for v in actual]==[16.5,34.0]
     from visual_rl.algorithms.optimization.h3_world import h3_slot_loss_scale
     scale=h3_slot_loss_scale(n_slot=1,global_count=32,reducer_divisor=8)
     gradients=torch.arange(32,dtype=torch.float64)
     assert torch.equal((gradients*scale).sum()/8,gradients.mean())
+    # Fresh single-update launcher denies formal200/resume; output observers
+    # use cadence5 plus the explicit terminal1 exception without updating twice.
+    from scripts.launch_h3_one_update import validate_fresh,TRAIN_SHA,TEST_SHA
+    from scripts.launch_h3_media import selection
+    from scripts.h3_one_update_audit import PredictAudit,weight_fingerprints
+    from types import SimpleNamespace
+    fresh=SimpleNamespace(launch=SimpleNamespace(max_optimizer_steps=1,resume_from=None,checkpoint_every_optimizer_steps=5),
+        training=H3Training(group_size=8,algorithm='dual_flash',group_layout='paired_4x8'),expected={'train_sha256':TRAIN_SHA,'eval_sha256':TEST_SHA})
+    assert validate_fresh(fresh) is fresh
+    fresh.launch.max_optimizer_steps=200
+    with pytest.raises(ValueError,match='max1'): validate_fresh(fresh)
+    fresh.launch.max_optimizer_steps=1;fresh.launch.resume_from=Path('old/step-3')
+    with pytest.raises(ValueError,match='max1'): validate_fresh(fresh)
+    fresh.launch.resume_from=None
+    media_source=SimpleNamespace(_pending=SimpleNamespace(identity=SimpleNamespace(optimizer_step=0),
+        group_layout='paired_4x8',samples=(('s','g',0),),prompts={'s':'prompt'},collection_id='c',behavior_id='b'))
+    assert selection(media_source,'s',every=5,terminal_step=1)['step']==1
+    assert selection(media_source,'s',every=5) is None
+    media_source._pending.identity.optimizer_step=4
+    assert selection(media_source,'s',every=5)['step']==5
+    module=torch.nn.Module();module.register_parameter('frozen',torch.nn.Parameter(torch.ones(2),requires_grad=False));module.register_parameter('lora',torch.nn.Parameter(torch.ones(2)))
+    before=weight_fingerprints(module)
+    watcher=PredictAudit(lambda *a,**kw:module.lora*2)
+    prediction=watcher(index=2)
+    with pytest.raises(RuntimeError,match='retained'):watcher(index=2)
+    prediction.sum().backward();del prediction
+    assert watcher.payload()['final_prediction_released']
+    with torch.no_grad():module.lora.add_(.1)
+    after=weight_fingerprints(module)
+    assert before['hashes']['frozen']==after['hashes']['frozen'] and before['hashes']['trainable']!=after['hashes']['trainable']
+    from visual_rl.runtime.h3_lifecycle import _pause_requested
+    from visual_rl.algorithms.optimization import h3_world as pause_world
+    pause_root=tmp_path/'pause-root';pause_root.mkdir()
+    with monkeypatch.context() as pp:
+        pp.setattr(pause_world,'_exchange',lambda label,rank,group,local,valid:[local]+[None]*7)
+        session=SimpleNamespace(rank=0,process_group=None)
+        assert not _pause_requested(session,pause_root)
+        (pause_root/'PAUSE_REQUESTED').touch()
+        assert _pause_requested(session,pause_root)
+    data_root=Path(__file__).resolve().parents[1]/'data/h3_author_video'
+    train_bytes=(data_root/'train.txt').read_bytes();test_bytes=(data_root/'test.txt').read_bytes()
+    assert hashlib.sha256(train_bytes).hexdigest()==TRAIN_SHA and hashlib.sha256(test_bytes).hexdigest()==TEST_SHA
+    assert len(train_bytes.splitlines())==19700 and len(test_bytes.splitlines())==300
+    assert not set(train_bytes.splitlines())&set(test_bytes.splitlines())
     # A slow file worker must keep main-thread collectives alive; worker
     # exceptions and a separate total deadline are preserved, never hidden.
     from visual_rl.runtime import h3_file_phase

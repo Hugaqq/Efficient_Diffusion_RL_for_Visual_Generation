@@ -14,11 +14,11 @@ def test_stable_group_selection_and_full_vs_single_step():
         gs={sid:(torch.Generator().manual_seed(1+i),torch.Generator().manual_seed(5+i)) for i,(sid,_) in enumerate(samples)}
         gates=[]
         result=collect(dynamics=d,samples=samples,initial_states=states,generators=gs,mode=mode,seed=42,optimizer_step=2,
-            device='cpu',predict=lambda sid,x,index:x.float()*.1,read_behavior_id=lambda:'b',behavior_id='b',gate=lambda event,**kw:gates.append(event))
+            device='cpu',predict=lambda sid,x,index:x.float()*.1,read_behavior_id=lambda:'b',behavior_id='b',gate=lambda event,**kw:gates.append(event),window_size=2)
         return result,gates
     (flash,terminal,selection),fgates=run('flash'); (flow,_,_),ggates=run('flow')
     assert fgates==ggates and len(fgates)==18
-    assert selection['a']==selection['b']==selected_step(seed=42,optimizer_step=2,group_id='g',num_steps=4)
+    assert selection['a']==selection['b']==selected_step(seed=42,optimizer_step=2,group_id='g',num_steps=4,window_size=2)
     assert len(flash)==2 and len(flow)==8
     assert all(r.index==selection[r.sample_id] for r in flash)
     assert set(terminal)=={'a','b'} and all(t.dtype==torch.float16 for t in terminal.values())

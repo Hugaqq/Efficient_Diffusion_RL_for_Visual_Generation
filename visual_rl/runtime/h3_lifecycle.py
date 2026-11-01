@@ -35,6 +35,21 @@ class RecipeLifecycleBackend:
         return getattr(self.selected, name)
 
 
+class H3SafeBoundaryPause(RuntimeError):
+    def __init__(self, checkpoint):
+        self.checkpoint=checkpoint
+        super().__init__('paused after durable optimizer boundary '+str(checkpoint.path))
+
+
+def _pause_requested(session, output):
+    from visual_rl.algorithms.optimization.h3_world import _exchange
+    local=(output/'PAUSE_REQUESTED').exists() if session.rank==0 else None
+    rows=_exchange('lifecycle/pause-request',session.rank,session.process_group,local,True)
+    if type(rows[0]) is not bool or any(v is not None for v in rows[1:]):
+        raise ValueError('invalid safe-boundary pause decision')
+    return rows[0]
+
+
 def _phase(session, label, work):
     """Exchange failures of LOCAL work only, never wrap a model collective."""
     from visual_rl.algorithms.optimization.h3_world import _exchange
@@ -330,15 +345,18 @@ class H3LifecycleBackend:
                 if bound.graph.session.rank == 0:
                     _write_json(launch.output_dir / "h3-last-metrics.json", metrics)
             _phase(bound.graph.session, "metrics", record_metrics)
+            pause = _pause_requested(bound.graph.session,launch.output_dir)
             first_formal_flash = (step == 0 and bound.graph.profile.training.group_layout == 'paired_4x8')
             first_upgraded_update = self.code_upgrade is not None and step == self.start_step
-            if first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
+            if pause or first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
                 boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
                     bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
                 progress, proof, data, _ = boundary
                 committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,
                     progress=progress, safe_point=proof, identity=bound.binding.state_identity,
                     bindings=live, data_state=data)
+                if pause and step+1<launch.max_optimizer_steps:
+                    raise H3SafeBoundaryPause(committed)
         if committed is None:
             committed = bound.transaction.manager.inspect_complete(launch.resume_from).checkpoint
             metrics = json.loads((launch.output_dir / "h3-last-metrics.json").read_text())

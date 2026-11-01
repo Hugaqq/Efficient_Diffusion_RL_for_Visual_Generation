@@ -48,6 +48,7 @@ class H3DualRecord:
     index: int
     x: torch.Tensor
     action: torch.Tensor
+    old_joint: torch.Tensor | None = None
 
     def __post_init__(self):
         if not isinstance(self.sample_id,str) or not self.sample_id or type(self.index) is not int:
@@ -57,6 +58,12 @@ class H3DualRecord:
                 raise ValueError('record requires finite detached CPU FP16 tensors')
         if self.x.shape != self.action.shape or self.x.shape[0] != 1:
             raise ValueError('record requires matching batch-one states')
+        if self.old_joint is not None:
+            score=self.old_joint
+            if (not isinstance(score,torch.Tensor) or score.numel()!=1 or score.device.type!='cpu'
+                    or score.dtype!=torch.float32 or score.requires_grad or not bool(torch.isfinite(score).all())):
+                raise ValueError('stored rollout score must be detached finite CPU FP32 scalar')
+            object.__setattr__(self,'old_joint',score.detach().clone())
         object.__setattr__(self,'x',self.x.detach().clone())
         object.__setattr__(self,'action',self.action.detach().clone())
 
@@ -112,7 +119,9 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
                 try:
                     if stochastic:
                         action=dynamics.sample(x,prediction,index,video_generator=pair[0],audio_generator=pair[1])
-                        records.append(H3DualRecord(sid,index,x.cpu(),action.cpu()))
+                        old=(dynamics.evaluate(x,action,prediction,index)[0].detach().cpu()
+                             if mode=='flash' else None)
+                        records.append(H3DualRecord(sid,index,x.cpu(),action.cpu(),old))
                     else:
                         action=dynamics.deterministic_step(x,prediction,index)
                 except Exception:

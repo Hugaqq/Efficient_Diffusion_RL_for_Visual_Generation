@@ -43,7 +43,7 @@ def global_stream_means(coefficients, *, process_group, device):
     return means
 
 
-def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, world_means, clip_range, scale):
+def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, world_means, clip_range, scale, audit=None):
     """A single globally-scaled cell, with independent Flash stream gradients."""
     if mode not in ('flow','flash'):
         raise ValueError('explicit flow or flash mode required')
@@ -63,6 +63,9 @@ def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, wor
     else:
         if world_means is not None: raise ValueError('Flow must not apply Flash correction')
         current=joint
+    if audit is not None:
+        audit(float((joint.detach()-old_joint.to(joint.device)).abs().max()),
+              float(torch.exp(joint.detach()-old_joint.to(joint.device)).reshape(())))
     adv=advantage.to(device=current.device,dtype=current.dtype).reshape(1,1)
     inputs=PolicyLossInputs(adv,torch.ones_like(adv),torch.ones_like(adv,dtype=torch.bool),clip_range,0.)
     output=ClippedSurrogateObjective().compute(old_log_probs=old_joint.to(current.device).reshape(1,1),

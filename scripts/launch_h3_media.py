@@ -26,7 +26,9 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def selection(source, sample_id):
+def selection(source, sample_id, *, every=10, terminal_step=None):
+    if type(every) is not int or every<1:
+        raise ValueError('video cadence must be a positive integer')
     request = source._pending
     if request is None:
         raise ValueError('media observation requires a live source reservation')
@@ -37,7 +39,7 @@ def selection(source, sample_id):
     if len(matches) != 1:
         raise ValueError('sample absent or duplicated in current reservation')
     group, member = matches[0]
-    if step % 10 or member != 0:
+    if (step % every and step != terminal_step) or member != 0:
         return None
     return dict(step=step, sample_id=sample_id, group_id=group, member=member,
                 prompt=request.prompts[sample_id], collection_id=request.collection_id,
@@ -116,9 +118,10 @@ def save_media(*, root, metadata, media, reward, ffmpeg, ffprobe, launcher_sha):
     return target
 
 
-def observed_score(original, *, source, root, ffmpeg, ffprobe, launcher_sha, saver=save_media):
+def observed_score(original, *, source, root, ffmpeg, ffprobe, launcher_sha, saver=save_media,
+                   every=10,terminal_step=None):
     def score(*, sample_id, prompt, media):
-        chosen = selection(source,sample_id)
+        chosen = selection(source,sample_id,every=every,terminal_step=terminal_step)
         if chosen is not None and chosen['prompt'] != prompt:
             raise ValueError('observed prompt differs from reservation')
         reward = original(sample_id=sample_id,prompt=prompt,media=media)

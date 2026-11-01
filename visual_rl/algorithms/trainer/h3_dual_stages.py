@@ -7,6 +7,18 @@ H3 extension, not a claim of official Flash mathematical equivalence.
 from __future__ import annotations
 
 import torch
+import functools,json,time
+
+
+def _timed(method):
+    @functools.wraps(method)
+    def run(self,*args,**kwargs):
+        started=time.monotonic()
+        try:return method(self,*args,**kwargs)
+        finally:
+            if self.rank==0:
+                print(json.dumps(dict(event='h3_stage_seconds',stage=method.__name__,seconds=time.monotonic()-started)),flush=True)
+    return run
 
 from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
 from visual_rl.algorithms.optimization.h3_dual_anchor import H3DualReplayAnchor
@@ -36,6 +48,7 @@ class H3DualIterationStages(H3IterationStages):
         ctx.dual_terminals=None
         return value
 
+    @_timed
     def rollout(self, value):
         ctx=self._context(value);r=ctx.request;c=ctx.coordinator
         _checked(c,'dual/rollout/prepare',self.prepared.prepared_root.eval)
@@ -50,6 +63,7 @@ class H3DualIterationStages(H3IterationStages):
         c.gate('dual/rollout/complete')
         return StageValue(value.identity,ctx)
 
+    @_timed
     def reward(self,value):
         ctx=self._context(value);r=ctx.request
         def work():
@@ -70,7 +84,9 @@ class H3DualIterationStages(H3IterationStages):
                     if type(score) is not float or not math.isfinite(score):
                         raise ValueError('reward must be a finite Python float')
                     print(json.dumps(dict(event='h3_reward_score_end',sample_id=sid,
-                                          seconds=time.monotonic()-started,score=score)),flush=True)
+                                          seconds=time.monotonic()-started,score=score,
+                                          optimizer_step=r.identity.optimizer_step,group_id=gid,member=member,
+                                          stochastic_index=ctx.dual_selection[sid])),flush=True)
                 rows.append((sid,gid,member,score,True))
             return tuple(rows)
         ctx.rewards=ctx.coordinator.aux_turns(work)
@@ -84,6 +100,7 @@ class H3DualIterationStages(H3IterationStages):
         _checked(ctx.coordinator,'dual/credit/ready',validate)
         return StageValue(value.identity,ctx)
 
+    @_timed
     def optimize(self,value):
         ctx=self._context(value);r=ctx.request;c=ctx.coordinator;records=ctx.dual_records
         keys=tuple((record.sample_id,record.index) for record in records)
@@ -109,9 +126,13 @@ class H3DualIterationStages(H3IterationStages):
             prediction=self._predict(ctx,rec.sample_id,state,rec.index)
             def local_loss():
                 old,_=anchor.get(rec.sample_id,rec.index)
+                def audit(delta,ratio):
+                    if delta>1e-4:raise ValueError('current/old logprob differs before the optimizer update')
+                    print(json.dumps(dict(event='h3_initial_policy_ratio',sample_id=rec.sample_id,
+                        optimizer_step=r.identity.optimizer_step,index=rec.index,max_abs_logprob_delta=delta,ratio=ratio)),flush=True)
                 return policy_loss(dynamics=ctx.dual,record=rec,prediction=prediction,old_joint=old,
                     advantage=ctx.advantages[rec.sample_id],mode=('flow' if self.mode=='dual_flow' else 'flash'),
-                    world_means=means,clip_range=.005,scale=scale)
+                    world_means=means,clip_range=.005,scale=scale,audit=audit)
             loss=_checked(c,f'dual/current/{ordinal}/backward',local_loss)
             total+=loss.detach().item();loss.backward()
             del loss,prediction,state

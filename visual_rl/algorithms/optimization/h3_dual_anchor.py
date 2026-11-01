@@ -47,6 +47,12 @@ class H3DualReplayAnchor:
                 prediction=predict(record.sample_id,x,record.index)
                 try:
                     joint,_,coeff=self.dynamics.evaluate(x,action,prediction,record.index)
+                    if record.old_joint is not None:
+                        import json
+                        delta=float((joint.detach().cpu()-record.old_joint).abs().max())
+                        if delta>1e-4:raise ValueError('sampled/replayed old score mismatch')
+                        print(json.dumps(dict(event='h3_rollout_replay_score_check',sample_id=record.sample_id,
+                                              index=record.index,max_abs_delta=delta)),flush=True)
                     pending[(record.sample_id,record.index)]=(joint.detach().cpu().clone(),tuple(v.detach().cpu().clone() for v in coeff))
                 except Exception:
                     gate(f'anchor/{ordinal}/result', local_error=True)
