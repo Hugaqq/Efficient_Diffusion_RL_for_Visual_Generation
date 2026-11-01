@@ -308,11 +308,12 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
     cache = H3TextCache(launch.text_cache, expected_identity=expected["cache_identity"],
                        max_tokens=budget.max_tokens, max_embedding_bytes=budget.embedding_bytes)
     cache.verify_coverage(train, evaluation)
-    largest = 0
-    for prompt in dict.fromkeys((*train, *evaluation)):
-        embedding = cache.get(prompt)  # one bounded tensor at a time, including finite validation
-        largest = max(largest, embedding.numel() * embedding.element_size())
-        del embedding
+    import time
+    started=time.monotonic()
+    print(json.dumps(dict(event='h3_cache_finite_scan_begin',train_rows=len(train),eval_rows=len(evaluation))),flush=True)
+    largest=cache.validate_embeddings(dict.fromkeys((*train,*evaluation)))
+    print(json.dumps(dict(event='h3_cache_finite_scan_end',seconds=time.monotonic()-started,
+                          largest_embedding_bytes=largest)),flush=True)
     condition_bytes = training.local_samples * largest
     width = config.geometry.joint_layout.packed_width
     trajectory_bytes = training.local_samples * training.num_steps * (4 * width + 4) + training.local_samples * 2 * width

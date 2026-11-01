@@ -226,6 +226,33 @@ class H3TextCache:
             with self._checked_shard(name):
                 pass
 
+    def validate_embeddings(self, prompts: Iterable[str]) -> int:
+        """Scan requested embeddings once per shard, still one tensor at a time.
+
+        Before/after content+inode+metadata checks cover the whole open shard;
+        no identity, finite-value, token or coverage check is skipped. This
+        avoids rehashing a packed shard for every prompt during full preflight.
+        """
+        import torch
+        self._check_index()
+        requested={}
+        for prompt in prompts:
+            key=_prompt_key(prompt)
+            if key not in self._entries:
+                raise ValueError('missing prompt in finite cache scan')
+            requested.setdefault(self._entries[key]['shard'],set()).add(key)
+        if not requested:raise ValueError('finite cache scan requires prompts')
+        largest=0
+        for name,keys in sorted(requested.items()):
+            with self._checked_shard(name) as handle:
+                for key in sorted(keys):
+                    tensor=handle.get_tensor(key)
+                    if not bool(torch.isfinite(tensor).all()):
+                        raise ValueError('embedding must be finite')
+                    largest=max(largest,tensor.numel()*tensor.element_size())
+                    del tensor
+        return largest
+
     def get(self, prompt: str):
         import torch
 

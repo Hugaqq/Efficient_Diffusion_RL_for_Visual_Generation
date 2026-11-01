@@ -242,6 +242,25 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert hashlib.sha256(train_bytes).hexdigest()==TRAIN_SHA and hashlib.sha256(test_bytes).hexdigest()==TEST_SHA
     assert len(train_bytes.splitlines())==19700 and len(test_bytes.splitlines())==300
     assert not set(train_bytes.splitlines())&set(test_bytes.splitlines())
+    # Full cache finite scan visits each packed shard once, keeps before/after
+    # hash/index guards and still rejects legitimate-hash nonfinite payloads.
+    from tests import test_h3_mvp_cpu_text_cache as cache_fixture
+    from contextlib import contextmanager
+    cache_root=tmp_path/'packed-cache';data,tensors=cache_fixture._fixture(cache_root)
+    reader=cache_fixture._reader(cache_root);visited=[];checked=reader._checked_shard
+    with monkeypatch.context() as cp:
+        @contextmanager
+        def observed_shard(name):
+            visited.append(name)
+            with checked(name) as handle:yield handle
+        cp.setattr(reader,'_checked_shard',observed_shard)
+        cp.setattr(reader,'get',lambda prompt: (_ for _ in ()).throw(AssertionError('per-prompt rehash regression')))
+        assert reader.validate_embeddings(['cat',' cat','heldout\n'])==3*5120*4
+    assert len(visited)==2 and len(set(visited))==2
+    tensors['embeddings_00000.safetensors'][cache_fixture._key('cat')][1,0]=float('nan')
+    cache_fixture._replace_shard(cache_root,data,tensors,'embeddings_00000.safetensors')
+    with pytest.raises(ValueError,match='finite'):
+        cache_fixture._reader(cache_root).validate_embeddings(['cat',' cat','heldout\n'])
     # A slow file worker must keep main-thread collectives alive; worker
     # exceptions and a separate total deadline are preserved, never hidden.
     from visual_rl.runtime import h3_file_phase
