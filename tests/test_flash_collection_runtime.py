@@ -261,6 +261,12 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     cache_fixture._replace_shard(cache_root,data,tensors,'embeddings_00000.safetensors')
     with pytest.raises(ValueError,match='finite'):
         cache_fixture._reader(cache_root).validate_embeddings(['cat',' cat','heldout\n'])
+    # Actual preflight entry on real tiny files (not only the scan method) so
+    # progress-log imports and integration seams execute in the CPU gate.
+    from visual_rl.composition.config.h3_profile import preflight_h3_profile
+    integration_path,_=h3_profile_fixture(tmp_path/'full-preflight-entry')
+    facts=preflight_h3_profile(compile_h3_profile(integration_path))
+    assert facts.semantic_id.startswith('h3.semantic.v1:')
     # A slow file worker must keep main-thread collectives alive; worker
     # exceptions and a separate total deadline are preserved, never hidden.
     from visual_rl.runtime import h3_file_phase
