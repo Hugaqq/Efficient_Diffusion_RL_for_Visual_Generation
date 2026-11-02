@@ -1,13 +1,14 @@
-fix(tests): isolate launcher output fixtures in managed worktrees
+perf(h3): share fresh live validation at checkpoint boundaries
 
-Scope simulated source roots to real prepare_output fixture calls so CPU
-regressions work when workflow tmp_path lives inside the checkout. Cover
-both owned-output and repair-owner resume lifecycles without patching the
-real Git/config proof paths or weakening production output admission.
+Return the checkpoint boundary and its freshly validated live bindings from
+one narrow snapshot API. Keep the legacy boundary API self-validating and
+recheck owned source/tail state after the long scan. Do not cache validation
+across boundaries or change full content, finite, identity or restore gates.
 
-Retain all seven tests and existing assertions; add source-root/subpath
-rejection and no-side-effect checks, including an actual checkout path.
-No production training or launcher behavior changes; no speedup claim.
+Use the snapshot once in the existing synchronous lifecycle save phase.
+Extend the original seven CPU tests with real binding scan counts, repeated
+boundaries, read-only state/RNG, VAE byte drift, source advancement/reservation
+rejection, and lifecycle exact-result forwarding/failure-before-save checks.
 
-Validation: original CPU gate 7 passed, 3 warnings in 46.53s;
-git diff --check passed. GPU execution remains unauthorized and untested.
+Validation: original CPU gate 7 passed, 3 warnings in 53.30s;
+git diff --check passed. No GPU execution or measured speedup claim.

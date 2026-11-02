@@ -1544,3 +1544,174 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     assert small["evaluation_steps"] == [0, 20, 40] and small["terminal_evaluation_required"]
     assert small["evaluation_videos_target"] == small["evaluation_prompts"] * 3 == 48
     assert small["logical_hps_frame_scores_target"] == (640 + 48) * 81
+
+    # I1: actual binding/artifact/source/tail checks, with only the existing
+    # tiny-model, CUDA/FSDP and HTTP leaves substituted by the shared fixture.
+    from tests.test_h3_mvp_cpu_binding import _fixture as binding_fixture
+    from tests.test_h3_mvp_cpu_checkpoint_state import _snapshot, _equal
+    from visual_rl.algorithms.trainer.h3_stages import H3IterationStages
+    from visual_rl.algorithms.trainer.interface import PrepareRunContext
+    from visual_rl.artifacts.checkpoint.state import RankRNGSnapshot
+    from types import SimpleNamespace
+    with monkeypatch.context() as patch:
+        assets_path = tmp_path / 'checkpoint-snapshot'
+        assets_path.mkdir()
+        # Shared fixture predates the file-IO heartbeat transport. Keep real
+        # file work, replacing only CPU-test broadcast/CUDA wait leaves.
+        from visual_rl.runtime import h3_file_phase
+        from visual_rl.models.implementations import h3_loading
+        def admit_tiny_cpu_weights(budget):
+            assert 0 < budget < 10**7  # no production 24GiB CUDA-host reserve here
+        patch.setattr(h3_loading, '_admit_host_memory', admit_tiny_cpu_weights)
+        patch.setattr(torch.distributed, 'broadcast', lambda *args, **kwargs: None)
+        patch.setattr(h3_file_phase, 'file_phase', lambda action, **kwargs: action())
+        h = binding_fixture(assets_path, patch)
+        from tests.test_h3_mvp_cpu_stages import _CoordinationLeaf
+        from visual_rl.models.lifecycle.h3_coordination import H3Coordination
+        patch.setattr(H3Coordination, 'aux_turns', _CoordinationLeaf.aux_turns)
+        from tests.test_h3_mvp_cpu_decode import _decoder
+        h.adapter._aux._decoder = _decoder(h.profile.launch.model, h.adapter.geometry)
+        b = h.binding
+        stages = H3IterationStages(data=h.source, prepared=h.prepared, predict=b.predict,
+            decode=b.decode, score_one=b.score_one, coordination_factory=b.coordination_factory,
+            process_group=h.pg, rank=0, device='cpu', read_behavior_id=h.source.read_behavior_id)
+        trainer = stages.trainer()
+        trainer.prepare_run(PrepareRunContext('snapshot-test', 'h3', 0))
+        validations = []
+        real_validate = b.validate_live
+        def validate():
+            live = real_validate()
+            validations.append(live)
+            return live
+        patch.setattr(b, 'validate_live', validate)
+        try:
+            with pytest.raises(RuntimeError, match='tail'):
+                b.checkpoint_snapshot(stages, trainer)
+            with pytest.raises(ValueError, match='foreign'):
+                b.checkpoint_snapshot(SimpleNamespace(data=object(), prepared=h.prepared), trainer)
+            assert validations == []
+            for step in range(2):
+                trainer.run_iteration(step)
+                before = _snapshot(h.prepared)
+                source_before = h.source.state_dict()
+                rng_before = RankRNGSnapshot.capture_current(0)
+                count = len(validations)
+                boundary, live = b.checkpoint_snapshot(stages, trainer)
+                assert len(validations) == count + 1 and live is validations[-1]
+                assert boundary[0].next_optimizer_step == step + 1
+                assert boundary[2]['payload'] == source_before
+                assert b.checkpoint_boundary(stages, trainer) == boundary
+                assert len(validations) == count + 2  # legacy API is self-validating
+                again, again_live = b.checkpoint_snapshot(stages, trainer)
+                assert again == boundary and again_live == live
+                assert len(validations) == count + 3  # no same-boundary memoization
+                assert RankRNGSnapshot.capture_current(0) == rng_before == boundary[3]
+                _equal(_snapshot(h.prepared), before)
+                assert h.source.state_dict() == source_before
+            p = next(iter(h.prepared.trainable_named_parameters()))[1]
+            p.grad = torch.zeros_like(p)
+            with pytest.raises(RuntimeError, match='gradients'):
+                b.checkpoint_snapshot(stages, trainer)
+            p.grad = None
+            with patch.context() as fault:
+                fault.setattr(h.prepared.scheduler, 'last_epoch', 1)
+                with pytest.raises(ValueError, match='scheduler'):
+                    b.checkpoint_snapshot(stages, trainer)
+            with patch.context() as fault:
+                saved = h.prepared.optimizer.state[p]
+                fault.setitem(saved, 'step', torch.tensor(3.))
+                with pytest.raises(ValueError, match='scheduler|Adam'):
+                    b.checkpoint_snapshot(stages, trainer)
+            artifact = h.profile.launch.model / 'vae/diffusion_pytorch_model.safetensors'
+            original_bytes = artifact.read_bytes()
+            try:
+                artifact.write_bytes(original_bytes + b' ')
+                with pytest.raises(ValueError, match='model content'):
+                    b.checkpoint_snapshot(stages, trainer)
+            finally:
+                artifact.write_bytes(original_bytes)
+            b.checkpoint_snapshot(stages, trainer)  # no stale failed receipt/cache
+            # Modify live source only AFTER a successful real scan. Read-only
+            # tail recheck must reject both advancement and a new reservation.
+            for mode in ('advance', 'reservation'):
+                with patch.context() as fault:
+                    def drift():
+                        result = validate()
+                        if mode == 'advance':
+                            fault.setattr(h.source, '_next_step', 3)
+                        else:
+                            h.source.reserve(2)  # real new reservation; deliberately not rolled back
+                        return result
+                    fault.setattr(b, 'validate_live', drift)
+                    with pytest.raises(RuntimeError, match='boundary'):
+                        b.checkpoint_snapshot(stages, trainer)
+                if mode == 'advance':
+                    assert h.source.state_dict() == source_before
+                else:
+                    assert h.source._pending is not None
+                    h.source.abort(h.source._pending)  # test teardown, leaves source poisoned
+        finally:
+            trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
+
+    # Exercise the real lifecycle save branch and _phase error propagation.
+    # Trainer/transaction are CPU leaves; no publication or CUDA execution.
+    from visual_rl.runtime import h3_lifecycle as lifecycle
+    from visual_rl.algorithms.optimization import h3_world
+    with monkeypatch.context() as patch:
+        exchanges, snapshots, saves = [], [], []
+        def exchange(label, rank, group, payload, ok):
+            exchanges.append((label, ok))
+            if not ok:
+                raise ValueError('peer phase rejected')
+            if label == 'lifecycle/pause-request':
+                return [False] + [None] * 7
+            return [payload] * 8
+        patch.setattr(h3_world, '_exchange', exchange)
+        output = tmp_path / 'lifecycle-snapshot'
+        output.mkdir()
+        fake_trainer = SimpleNamespace(next_optimizer_step=0)
+        def iteration(step):
+            fake_trainer.next_optimizer_step = step + 1
+            return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(
+                scaled_loss=1., local_cells=4, grad_norm=.5)))
+        fake_trainer.run_iteration = iteration
+        fake_binding = SimpleNamespace(contract=object(), state_identity=object())
+        fake_stages, prepared = object(), object()
+        def forbidden():
+            pytest.fail('lifecycle must not call validate_live after snapshot')
+        fake_binding.validate_live = forbidden
+        def snapshot(stages, trainer):
+            assert stages is fake_stages and trainer is fake_trainer
+            step = trainer.next_optimizer_step
+            boundary = (object(), object(), {'step': step}, object())
+            live = {'step': step}
+            snapshots.append((boundary, live))
+            return boundary, live
+        fake_binding.checkpoint_snapshot = snapshot
+        def save(actual_prepared, **kwargs):
+            boundary, live = snapshots[-1]
+            assert actual_prepared is prepared
+            assert kwargs['bindings'] is live
+            assert kwargs['progress'] is boundary[0] and kwargs['safe_point'] is boundary[1]
+            assert kwargs['data_state'] is boundary[2]
+            assert kwargs['contract'] is fake_binding.contract
+            assert kwargs['identity'] is fake_binding.state_identity
+            saves.append(kwargs)
+            return SimpleNamespace(step=live['step'])
+        bound = SimpleNamespace(trainer=fake_trainer, stages=fake_stages, prepared=prepared,
+            binding=fake_binding, transaction=SimpleNamespace(checkpoint=save),
+            graph=SimpleNamespace(session=SimpleNamespace(rank=0, process_group=object()),
+                profile=SimpleNamespace(training=SimpleNamespace(global_samples=32, group_layout='paired_4x8'),
+                    launch=SimpleNamespace(output_dir=output, max_optimizer_steps=2,
+                                           checkpoint_every_optimizer_steps=1))))
+        backend = lifecycle.H3LifecycleBackend()
+        committed, _ = backend.run(bound)
+        assert committed.step == 2 and len(snapshots) == len(saves) == 2
+        assert [live['step'] for _, live in snapshots] == [1, 2]
+        assert exchanges.count(('lifecycle/checkpoint-boundary', True)) == 2
+        def fail_snapshot(*args):
+            raise RuntimeError('snapshot rejected')
+        fake_binding.checkpoint_snapshot = fail_snapshot
+        with pytest.raises(RuntimeError, match='snapshot rejected'):
+            backend.run(bound)
+        assert len(saves) == 2 and exchanges[-1] == ('lifecycle/checkpoint-boundary', False)

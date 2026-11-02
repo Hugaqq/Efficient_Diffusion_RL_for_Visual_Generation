@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
@@ -446,10 +447,18 @@ class H3RuntimeBinding:
         )
 
     def checkpoint_boundary(self, stages, trainer):
-        if stages.data is not self.source or stages.prepared is not self.prepared:
+        """Compatibility API: every call still performs fresh full validation."""
+        boundary, _ = self.checkpoint_snapshot(stages, trainer)
+        return boundary
+
+    def checkpoint_snapshot(self, stages, trainer):
+        """Validate once for immediate synchronous checkpoint publication; never cache."""
+        source, prepared = self.source, self.prepared
+        if stages.data is not source or stages.prepared is not prepared:
             raise ValueError("checkpoint requested for a foreign stage binding")
-        state = stages.checkpoint_boundary(trainer)
-        self.validate_live()
+        state = deepcopy(stages.checkpoint_boundary(trainer))
+        next_batch = source.next_global_batch_id
+        live = self.validate_live()
         step = state["next_optimizer_step"]
         for _, p in self.prepared.trainable_named_parameters():
             saved = self.prepared.optimizer.state.get(p, {})
@@ -475,7 +484,14 @@ class H3RuntimeBinding:
                     content_id=_unpack_id(self.source.data_identity, "h3-data"), source_id=self.source.source_id,
                     next_optimizer_step=step, next_global_batch_id=batch_id, cursor=state["global_cursor"],
                     behavior_id=state["behavior_id"], open_reservations=0, payload=state)
-        return progress, proof, data, rng
+        # Full content validation can take minutes. Recheck the cheap tail and
+        # owned source snapshot so advancement/reservation during it fails closed.
+        if (self.source is not source or self.prepared is not prepared
+                or stages.data is not source or stages.prepared is not prepared):
+            raise ValueError("checkpoint requested for a foreign stage binding")
+        if stages.checkpoint_boundary(trainer) != state or source.next_global_batch_id != next_batch:
+            raise RuntimeError("checkpoint boundary changed during live validation")
+        return (progress, proof, data, rng), live
 
     def close(self):
         self._closed = True  # borrowed adapter/prepared/scorer and WORLD remain caller-owned

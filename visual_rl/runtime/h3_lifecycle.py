@@ -354,8 +354,8 @@ class H3LifecycleBackend:
             if pause or first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
                 from visual_rl.runtime import h3_memory as memory
                 with memory.span('checkpoint_validation',step=step+1):
-                    boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
-                        bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
+                    boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda:
+                        bound.binding.checkpoint_snapshot(bound.stages, bound.trainer))
                 progress, proof, data, _ = boundary
                 with memory.span('checkpoint_save',step=step+1):
                     committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,
