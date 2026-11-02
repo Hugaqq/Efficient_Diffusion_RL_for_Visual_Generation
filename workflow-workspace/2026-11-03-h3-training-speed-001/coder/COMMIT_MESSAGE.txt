@@ -1,0 +1,13 @@
+fix(tests): isolate launcher output fixtures in managed worktrees
+
+Scope simulated source roots to real prepare_output fixture calls so CPU
+regressions work when workflow tmp_path lives inside the checkout. Cover
+both owned-output and repair-owner resume lifecycles without patching the
+real Git/config proof paths or weakening production output admission.
+
+Retain all seven tests and existing assertions; add source-root/subpath
+rejection and no-side-effect checks, including an actual checkout path.
+No production training or launcher behavior changes; no speedup claim.
+
+Validation: original CPU gate 7 passed, 3 warnings in 46.53s;
+git diff --check passed. GPU execution remains unauthorized and untested.

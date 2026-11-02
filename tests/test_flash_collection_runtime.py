@@ -1318,26 +1318,43 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
     with launch.exclusive_launch(lock, {"pid": 789}):
         assert json.loads(lock.read_text())["pid"] == 789
     identity = {"git_sha": "a" * 40, "source_config_sha256": "b" * 64}
-    out = launch.prepare_output(tmp_path / "owned", identity=identity)
-    with pytest.raises(FileExistsError):
-        launch.prepare_output(out, identity=identity)
-    launch.prepare_output(out, identity=identity, retry_incomplete=True)
-    with pytest.raises(RuntimeError, match="different source/config"):
-        launch.prepare_output(out, identity={**identity, "git_sha": "c" * 40}, retry_incomplete=True)
-    checkpoint = out / "checkpoints/step-1"
-    checkpoint.mkdir(parents=True)
-    launch.prepare_output(out, identity=identity, resume=checkpoint)
-    with pytest.raises(RuntimeError, match="explicit --resume"):
+    real_root = launch.ROOT
+    rejected_output = real_root / "test-output-must-not-be-created"
+    assert not rejected_output.exists()
+    with pytest.raises(RuntimeError, match="outside the clean source checkout"):
+        launch.prepare_output(rejected_output, identity=identity)
+    assert not rejected_output.exists()
+    # Workflow tmp_path may itself be inside the real checkout. Model the
+    # deployment's sibling source/output layout only for output admission.
+    source_root = tmp_path / "source-checkout"
+    with monkeypatch.context() as output_patch:
+        output_patch.setattr(launch, "ROOT", source_root)
+        for rejected in (source_root, source_root / "nested-output"):
+            with pytest.raises(RuntimeError, match="outside the clean source checkout"):
+                launch.prepare_output(rejected, identity=identity)
+            assert not rejected.exists()
+        assert not source_root.exists()  # rejection creates neither root nor owner
+        out = launch.prepare_output(tmp_path / "owned", identity=identity)
+        with pytest.raises(FileExistsError):
+            launch.prepare_output(out, identity=identity)
         launch.prepare_output(out, identity=identity, retry_incomplete=True)
-    (out / "checkpoints/step-2").mkdir()
-    with pytest.raises(RuntimeError, match="latest"):
+        with pytest.raises(RuntimeError, match="different source/config"):
+            launch.prepare_output(out, identity={**identity, "git_sha": "c" * 40}, retry_incomplete=True)
+        checkpoint = out / "checkpoints/step-1"
+        checkpoint.mkdir(parents=True)
         launch.prepare_output(out, identity=identity, resume=checkpoint)
-    (out / "checkpoints/step-3.tmp-orphan").mkdir()
-    launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
-    assert (out / "checkpoints/step-3.tmp-orphan").exists()
-    (out / "SUCCESS").write_text("terminal")
-    with pytest.raises(RuntimeError, match="terminal"):
+        with pytest.raises(RuntimeError, match="explicit --resume"):
+            launch.prepare_output(out, identity=identity, retry_incomplete=True)
+        (out / "checkpoints/step-2").mkdir()
+        with pytest.raises(RuntimeError, match="latest"):
+            launch.prepare_output(out, identity=identity, resume=checkpoint)
+        (out / "checkpoints/step-3.tmp-orphan").mkdir()
         launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
+        assert (out / "checkpoints/step-3.tmp-orphan").exists()
+        (out / "SUCCESS").write_text("terminal")
+        with pytest.raises(RuntimeError, match="terminal"):
+            launch.prepare_output(out, identity=identity, resume=out / "checkpoints/step-2")
+    assert launch.ROOT == real_root
 
     from scripts import flash_small40_repair as repair
     import hashlib
@@ -1401,10 +1418,16 @@ def test_approved140_candidate_compiles_typed_cadence(monkeypatch, tmp_path):
                {"resume": original / "checkpoints/step-0"}):
         with pytest.raises(RuntimeError, match="different source/config"):
             authorize(**kw)
-    launch.prepare_output(original, identity=previous, resume=step2)
+    with monkeypatch.context() as output_patch:
+        output_patch.setattr(launch, "ROOT", source_root)
+        launch.prepare_output(original, identity=previous, resume=step2)
+    assert launch.ROOT == real_root
     launch.publish(owner_file, next_owner)  # same single atomic owner+audit publication as main
     assert authorize(upgrade_from=None) == (next_owner, next_owner)
-    launch.prepare_output(original, identity=next_owner, resume=step2)
+    with monkeypatch.context() as output_patch:
+        output_patch.setattr(launch, "ROOT", source_root)
+        launch.prepare_output(original, identity=next_owner, resume=step2)
+    assert launch.ROOT == real_root
     launch.publish(owner_file, {**next_owner, "launcher_upgrade": dict(proof, new_sha="forged")})
     with pytest.raises(RuntimeError, match="audit/source"):
         authorize()
