@@ -1,67 +1,94 @@
-# Round 002 — 同一checkpoint安全边界复用一次完整live校验结果
+# Round 003 — P1：显式可关闭、单owner内的有界解码/HPS双缓冲
 
-## 决策与前置结论
+## 决策与上轮验收
 
-唯一单元 **I1：一次新鲜校验同时产出boundary与live bindings**。返回implement；不和VAE复用/流水/FSDP/profile混做。
+本轮唯一优化单元 **P1：在一个既有aux owner turn内部重叠解码与远端HPS/观看副本消费**。不改变8个owner顺序，不跨owner排队，不复用VAE模型，不改FSDP/HTTP/reward数学。返回implement。
 
-G0已复审：Coder原子commit `e324aaf`，Simplifier无必要修改且无commit。Planner在HEAD `78fb5c544442df51369b727b00f7677bc38daba3`实际检查累计源码diff：仅原测试函数局部ROOT夹具，生产零diff；固定原七项 **7 passed, 3 warnings in 47.76s**。无正确性遗留阻塞。
+I1已独立复审：原子commit `a211cbf`，Simplifier无必要修改/无commit。当前HEAD `266a25c43d5b7c76c0caed63da0ca737b35484c1`真实累计diff及最新源码与计划相符；Planner固定原七项 **7 passed, 3 warnings in 48.32s**。旧boundary仍自校验、snapshot每次fresh验证、后置tail/source复核及lifecycle立即消费均通过。没有新发现的I1正确性缺口；不把调用次数减少称为已测节时。
 
-## 实际代码与收益依据
+## 真实依据与收益分母
 
-- `visual_rl/runtime/h3_binding.py::checkpoint_boundary`：检查同一stages/prepared，读取已提交tail状态，调用完整`validate_live()`；随后检查Adam/scheduler、捕获RNG、构造progress/proof/data并返回四元组。
-- `visual_rl/runtime/h3_lifecycle.py::run`：同一个`checkpoint_validation` span、同一个`_phase(...,'checkpoint-boundary',...)`中，紧接再次`bound.binding.validate_live()`拿live，之后立即交原`H3CheckpointTransaction.checkpoint`。
-- 两次之间没有模型forward/optimizer/scheduler/data更新，只有只读边界构造。`validate_live`每次又完整stream模型/code、`preflight_h3_profile`全缓存finite/身份、source/model/numerics等；不能改成“信任初始化hash”。
-- `inputs/baseline-MEMORY-REPORT.md`第二轮整个validation1007.942s≈16.8min，**没有单次validate耗时**。若两个相同全扫描各占约一半，可省约8.4min/保存轮：127.73→119.33min条件约1.07×（分母含采样/评分/优化/校验/保存、不含初始化等）。旧两步每步诊断保存；正式cadence5不能说每update省8.4min，稳态仅假设摊1.68min/update，111.08min含优化/摊销校验保存分母约1.5%。实际收益可能更低，未有GPU/IO实测，不宣称实现速度目标。
-- 选在VAE前：无需额外CPU/GPU权重驻留、RNG loader或新offload假设，当前重复调用可直接确证；VAE/P1仍是开放高优先后续项，不是已排除。
+- `h3_dual_stages.py::reward`：当前owner worker对4条样本依次decode→score_one，后者含原HPS校验/JPEG/同步HTTP及可能观看副本导出。
+- `H3Coordination.aux_turns`：依次owner0..7；主线程心跳，只有owner工作线程可做VAE；直到work结束才进入owner-end门。可以在work内部加一个**CPU消费线程**，不改变PG序列和CUDA生产者线程/stream。
+- 已存事实HPS物理4独立于训练0/1/2/3/6/7/8/9；不是GPU5授权，也不是实时服务绑定证明。默认关闭，并在后续批准实验中独立核查服务实际GPU，角色不得探测/部署/请求HPS。
+- 现有decoder一条lease持有锁至消费结束，必须明确移交CPU媒体所有权；直接在lease内提交future会阻止下一decode，直接出with则媒体失效。
+- 现有`h3_memory.Journal.stack`为进程共享列表；decode/reward_score/video_save的并发嵌套会错配、跨样本归因并重置另一个阶段的峰。**必须随此功能修复局部并发观测合同**，不能关日志、删reset前落盘或靠全程锁把流水串行化。
 
-## 修改范围
+保存基线第二轮：42.600+51.318+12.994min，校验16.799、保存4.021；127.73min含优化/校验/保存，不含初始化/其它审计。用户D≈45s（假设加载8+decode37）、H≈50s不是单独实测。
 
-仅此单元必要文件：
-1. `visual_rl/runtime/h3_binding.py`：提供一次调用产生 `(boundary, live)` 的窄API（建议`checkpoint_snapshot(stages, trainer)`；boundary仍是既有progress/proof/data/rng四元组）。
-2. `visual_rl/runtime/h3_lifecycle.py`：仅正常run保存边界切到该API，原_phase/all-rank错误交换、保存条件、memory spans、原transaction调用保留。
-3. `tests/test_flash_collection_runtime.py`：扩展原七个函数内部的必要覆盖，不新增/替换/skip/参数化函数。允许复用现有H3 CPU fixtures，只替换原本CUDA/重模型/HTTP叶子；不编辑其它测试文件。
-4. Coder自己的round-002报告/commit message。
+本方案8个四样本owner各自fill/drain，理想辅助主体为`8*(D+H+3*max(D,H))`，而非32样本全局流水`D+H+31*max(D,H)`。若D=45/H=50，主体3040→1960s，条件省18min/轮（实际还受CPU竞争/日志/导出/传输影响）；对已存阶段总量仅作近似：93.918→75.918min约1.24×（前两段，**不含优化/保存**），127.73→109.73约1.16×（**含优化/校验/保存，不含初始化**）。不叠加I1未测收益，不宣称达到51→27min或2倍。跨owner全局流水留下一独立候选。
 
-不得修改transaction/codec/schema/recipe/dependencies/任务授权；不做跨边界模型或embedding缓存。若确需超出这三个代码/测试文件才能保持正确，先报告而非扩大本轮优化。
+## 修改边界（同一逻辑单元的必要部分）
 
-## API/校验合同
+允许代码文件：
+- 新 `visual_rl/algorithms/trainer/h3_reward_pipeline.py`：窄本地双缓冲辅助函数，不是训练循环/工作流调度器；输入有序样本与decode/score能力，返回原reward rows。
+- `visual_rl/models/implementations/h3_decode.py`：显式、单次CPU媒体所有权移交/关闭；不改VAE加载/数学/精度/显存门。
+- `visual_rl/algorithms/trainer/h3_dual_stages.py`：默认串行，opt-in仅支持本任务`dual_flash + paired_4x8`；接到现有aux_turns内部，原score_one回调不绕过。
+- `visual_rl/runtime/h3_lifecycle.py`：显式strict-bool运行选项及现有预算传递/模式准入，不改科研profile/schema/保存条件/restore。
+- `visual_rl/runtime/h3_memory.py`：仅流水CPU消费者的隔离观测上下文；保留默认串行日志格式/peak-reset合同，不做通用重写。
+- `scripts/launch_h3_resolution_memory.py`：可选`--reward-pipeline`（默认False）传入既有backend，保留fresh两步所有门禁/审计；此flag不是执行授权。
+- `tests/test_flash_collection_runtime.py`：原七函数内部扩展必要覆盖；不改其它测试文件、函数数量、skip或参数化。
+- Coder自己的round-003/commit message。
 
-- 所有现有`checkpoint_boundary(stages,trainer)`调用继续获得原四元组，仍是自校验、失败关闭的API；**不能**把它改成不校验的低层接口。可委托新snapshot API并丢弃live；不留两套复制实现。
-- 新API必须自己完整执行`validate_live()`一次并返回**该次真实返回值**，不能取`_live_ids()`/`self.content`冒充已验证结果，不能接受caller给的live/verified/token。
-- 每次调用/每个保存边界都重新完整验证；无`self.last_live`等持久cache、无跨更新receipt、无可选跳过校验flag。
-- 建议先做合法tail/foreign binding检查，再完整验证得到局部live，最后做原有Adam/scheduler/RNG/progress/proof/data构建，并把两者一同返回。这是保留旧内层校验顺序的最窄重构；不需要“先算boundary再在lifecycle第二遍验证”。
-- 在长校验前后对tail/source边界做**廉价只读一致性复核**，确认source state/step/behavior/next batch不变，拒绝校验期间推进或新reservation；不是再跑全内容扫描。必要时轻量检查完整对象所有权仍一致。不得把外部可变嵌套引用直接当历史快照比较（用独立JSON/deepcopy快照）。这里的结果只在同步run里立即使用，无外部异步复用。
-- 保留原foreign stages/prepared、tail/清空grad、Adam complete counter、scheduler、selection provenance、RNG identity/proof ready等断言及所有full `validate_live`子检查；不修改其含义、模型数据hash、finite扫描、HPS manifest检查。
-- 原验证本身不提供文件系统锁/原子全盘snapshot。新实现同样不能声称能阻止任意并发写盘；完整hash前后检查保留，后续边界仍全重验，transaction文件/参数证明仍保留。任何已检测内容漂移必须抛错、不能重试吞掉。
+不改HPS服务/客户端、transaction/codec、依赖、任务授权、科学配置或其它角色报告。不扩大到CPS/dual_flow/通用组件缓存。若需要范围外修复先报告。
 
-## 必要CPU回归（放入原函数）
+## 设计合同
 
-### 真实binding层
-- 用现有CPU binding/source/stages fixture完成真实小迭代，调用新API；`validate_live`用**委托真实实现**的spy计数：每次snapshot恰好一次；旧boundary API每次也恰好一次，返回格式、progress/proof/data/RNG与不变状态时旧路径相等。
-- 连续两个合法更新边界各自再验（计数递增），不能跨更新复用live；同一边界重复调用也重新验，非memoization。验证只读：Python/NumPy/Torch RNG（CPU测试可观测部分）及模型/Adam/source不变，不probe `.step()`。
-- 非法pre-tail、foreign binding、残留grad、counter/scheduler不符仍失败关闭。
-- 真改模型/VAE文件、cache index或HPS manifest中至少一个受保护artifact：下一次snapshot必须被真实检查拒绝；不要仅靠mock raise证明强检查保留。沿用已读fixture的drift模式可避免无关巨大模型。
-- 故障注入：在真实校验成功后、返回前修改source cursor/behavior或打开reservation，要求廉价复核拒绝且不产生保存receipt；禁止把此测试做成自动修复/回滚生产状态。
+### 1. Opt-in、模式一致及设备
 
-### 实际lifecycle分支
-- 在原七项内用CPU fake trainer/transaction叶子驱动真实`H3LifecycleBackend.run`保存分支（可在一个tiny两步序列验证每个边界），确认run只调用新snapshot一次/边界，且把该次live精确交给原transaction接口，**没有额外validate_live调用**。
-- 验证snapshot抛错后transaction未被调用；保留_phase错误传播。不要只靠字符串搜索/源码assert证明已接通。
-- 保留restore-prepared/restore-bound/final-file完整性路径不变；不将新snapshot扩用于restore门禁。
+- 默认路径严格维持当前串行行为。backend布尔开关应拒绝非bool；开启只接受本任务dual_flash/paired_4x8，launch仍保持`validate_fresh`的480×320、124@24、10步、4×8、LoRA32/64、两步/cadence5。
+- 在进入aux_turns前，所有rank通过原coordinator的**同位置**gate协商串行/流水模式及队列/字节预算；配置不一致必须先失败，不能一rank启线程、一rank走不同collective序列。worker不做PG/模型collective。
+- CUDA解码始终在已有owner辅助线程及其work_stream；消费者不创建/选择CUDA设备、不做VAE/forward/optimizer，只操作已完成blocking D2H的CPU FP32张量及原远端score_one/导出。原40GiB准入、16GiB安全边界、VAE释放与monitor保持。
+- 开启条件是**另行批准实验卡确认独立HPS GPU**；不把CLI声明当观测证明，不新发health/score请求、不改服务identity。这里交付代码，不启动GPU。
 
-这些是同一优化的功能回归，必须与实现同commit。CPU fake计数证明调用/失败边界，不证明每次扫描节省几分钟或NCCL正确性。
+### 2. 精确媒体所有权和严格内存界
 
-## 固定协议/安全不变量
+- 建议`H3AVMedia`增加明确single-use transfer/handoff接口：只接收活跃、已完成的detached CPU媒体，返回一个可close/上下文管理的owned媒体对象，张量storage、dtype、shape、顺序、metadata完全相同，**不clone/reencode/resize/quantize**。原媒体立即失效；旧lease退出释放decoder锁；owned对象关闭后也失效。双重移交/过期访问拒绝，close释放幂等。
+- 原decode_one标准单lease语义不放宽；只通过明确handoff把独立CPU存储生命周期移到有界消费者，不延长GPU模型或decoder锁。不可把消费者通过Python保存的任意alias称为可撤销；测试区分合法owner引用与外部故意留引用。
+- 一个producer、一个consumer；队列容量固定1，另有**在decode前获取**的总在途许可固定2。许可从开始decode持有到score+观看副本完成或失败关闭；计数包括正在decode、等待队列和正在消费。只有Queue(maxsize=1)不够，它可能容许消费1+排队1+解码1=3条。
+- 不保留整轮媒体列表、不建32个future/无界executor。完成rows仅保留小标量；terminal沿用原CPU latent绑定，及时释放局部引用。2条原生AV payload上界约`2 * 229881600 bytes`（约438.5MiB），解码工作区、JPEG/JSON/encoder scratch另算；不能拿这个值冒充整个RSS上界。
+- 使用已有预算：单payload仍不超过media_bytes，解码工作区仍受decode_bytes。开启前在owner工作内对`decode_bytes + media_bytes`的保守额外工作集做host可用内存准入（保留现有24GiB reserve惯例，可复用`h3_loading._admit_host_memory`），不改budget含义/配置。CPU测试只替换telemetry叶子；不足须显式失败或在工作开始前明确选择串行，不能半途吞错/丢样本。
 
-480×320、124帧24fps、10步first5选1、4×8、LoRA32/64、lr1e-4、精度、reward124/top37、优势/Flash/缩放/逐样本反向释放、随机流与checkpoint进度/保存恢复数学均不变。无新线程/驻留/queue，无GPU或服务操作；原Euler-B保持暂停。正式cadence5及首个/terminal/pause特例不变。
+### 3. 顺序、数学、更新屏障
 
-## 验收与原子commit
+- packet不可变地绑定ordinal/sample_id/group/member/prompt/selected index；producer按r.samples顺序，consumer严格FIFO。只调用原score_one一次/样本，原有限Python float门、124帧/top37校验、manifest/JPEG/identity和observed_score/saver保持。
+- 原始张量storage移交，消费者导出必须在owned媒体活跃期间；不能用保存MP4回读评分或先关lease。
+- 同一owner只发一个HPS请求；不改变服务请求顺序/微批/精度。下一owner必须等本owner所有packet评分/导出完且consumer退出后才开始；credit/optimize必须等所有owner完成。没有冻结策略跨更新混用。
+- 不新增随机数调用/改变生成器次序。加载/解码仍由原producer串行执行；CPU消费者不得采样或改变全局RNG。保留r.behavior_id与局部read_behavior_id在工作前后的一致性保护；不得从worker调用带PG的_version。
 
-每个代码commit前实际运行：
+### 4. 背压、错误、取消、排空
+
+- producer入队/许可等待、consumer取队使用可取消轮询或等价有界机制，不能依赖满队列永久put sentinel。完成/错误信号与队列解耦。
+- 任一decode/transfer/score/非finite/导出/日志/清理失败：记录原错误，停止新生产/新POST，唤醒队列/许可等待；关闭未消费owned媒体；producer/consumer退出并join，排空后再向原aux_turns传播，不能返回partial rows。
+- 不重试POST，不把失败改成默认reward，不继续credit/update；多重cleanup错误附note而非覆盖首个业务错误。错误退出不进入新owner或模型工作；不新增finally collective。
+- 线程不能强杀。取消时对已在进行的HTTP/ffmpeg操作只能等待原超时/结束；不并发关闭仍在用的共享client，不伪称已取消请求。保留aux的3600s整attempt deadline：不可停的外部/kernel卡死是poison/整attempt退出，不可将其当正常排空或允许新更新。正常/可控失败路径必须join真实worker，不留后台consumer。报告这一硬边界；CPU测试用可释放的阻塞叶子验证取消过程。
+
+### 5. 并发观测不能破坏lossless日志
+
+建议只给CPU消费者一个从reward父上下文捕获的隔离观测scope（thread-local独立stack/context），decode继续现有GPU span/reset路径。CPU消费者中的reward_score及既有exporter.video_save嵌套必须走此隔离scope：
+- 正确记录本sample/thread/父reward上下文、begin/end/错误/壁钟；不push/pop共享GPU stack。
+- **不重置CUDA峰、不调用CUDA synchronize**；如记录allocator快照须明确它是共享进程观测而非CPU评分专属分配。可以用独立cpu_span_begin/end事件，不伪造独占阶段峰。
+- journal所有写仍经原锁、序号、byte bound、flush/fsync；默认GPU reset前持久化/high-water不变。任何日志失败仍fail closed。
+- 此scope只用于新consumer，不悄悄关闭日志/吞异常，不改原baseline单线程schema/事件语义。避免大范围contextvars重构；不持journal锁跨整个HTTP/导出以抵消流水收益。
+
+## 必要CPU验收（全放原七函数内部，实际驱动而非字符串断言）
+
+1. handoff：原媒体/过期lease失效，owned storage指针/内容/metadata相同；关闭/重复移交/consumer异常清理；原普通单lease重入保护仍在。使用真实tiny CPU decoder或其已有fake重模型叶子，验证下一decode可在前一owned消费中运行。
+2. helper＋实际dual reward接线：4条样本顺序不变、只评分一次、float一致；Event/Barrier控制证明第二decode与第一score重叠，不用sleep耗时比宣称speedup。只替重模型/transport，不把整个reward/helper mock掉。
+3. 严格容量：阻塞消费者时最多2个包括在decode的许可；第三decode未启动，队列max1，释放后完成。用weakref/活跃计数确认完成/失败packet不再被合法owner/队列持有；不存在整轮视频列表。
+4. 数学/身份：同一组原始CPU张量分别串行/流水传给真实H3HPSReward＋原JPEG/validate_score（本地fake transport），相同sample/prompt/124帧顺序/top37/标量结果；至少断言payload/JPEG相等，不只fake计数。观测回调在lease活跃时能导出，serial/pipeline RNG状态与terminal不变。
+5. decoder第2条失败、consumer第1条失败/非finite、saver失败、transfer失败、取消时队列满/producer等许可等情形：无deadlock、无新POST/下一owner/update、所有worker已退出、每个已交接owned媒体关闭，原错误传播。线程超时测试用有界Event并确保测试teardown不留线程。
+6. 双线程跨序退出的日志：阻塞score时decode span可以完整进出，score中嵌套video_save；无stack mismatch/样本污染，CPU span不reset/sync，原durable-before-reset/high-water/byte-budget/错误测试继续通过。
+7. opt-in默认off、模式不符/非bool/跨rank配置不一致门禁、host预算不足在启动前拒绝；两步launcher原fresh/graph/weight/monitor/媒体审计仍在（只CPU叶子验证，不执行main训练）。原I1/G0测试与七个函数完整保留。
+
+## 原子提交与未验证项
+
+提交前仅例行原七项＋diff检查：
 
 ```text
 PATH=/home/user/projects/h3-visual-rl/.scratch/h3-media-tools:/usr/local/bin:/usr/bin:/bin VISUALRL_FLASH_AUTHOR_DATA=/home/user/projects/h3-visual-rl/.scratch/flash-grpo/source/dataset/video PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/bin/python -m pytest -q tests/test_flash_collection_runtime.py
 ```
 
-必须7/7，当前worktree导入断言保留；`git diff --check`通过，真实diff仅本单元。记录实际输出、diff、SHA与GPU未验证。保留未跟踪`.pi/`，不访问/清理/提交，不以ignore隐藏，不宣称clean。
+必须7/7、当前worktree导入断言保持、`git diff --check`通过；功能及必要回归同一个可回退commit，建议 `perf(h3): pipeline owner-local decode and reward with bounded media ownership`。Simplifier独立复审，有必要等价简化另原子commit并先7/7；无必要不造commit。保留未跟踪.pi/，只显式stage所属文件。
 
-Coder建议原子标题 `perf(h3): share fresh live validation at checkpoint boundaries`；功能+必要测试一起，先测后commit，不amend/rebase/squash。Simplifier独立复审；必要等价简化另commit并先7/7，不造空commit。Planner下一轮再核真实diff/数学/测试，并继续VAE/流水等候选；本轮不是结束或GPU性能证明。
+本轮CPU不证明GPU性能/数值等价/真实独立设备绑定。后续实验卡须明确授权新的输出、最终SHA、物理训练8卡＋HPS4、保持原模型/数据/种子/精度/几何/步数/评分/更新，先核资源和服务身份，验证媒体字节/逐帧与top37排序容差、样本/梯度/两更新/保存恢复；收集decode/score/export/queue等待/峰内存和完整含优化保存墙钟。**此处仅计划，禁止执行或重跑旧两步，Euler-B保持暂停。** VAE复用、跨owner流水和FSDP候选仍开放，当前不写FINAL。
