@@ -1,0 +1,192 @@
+{
+  "frozen_block_bytes": 64557184000,
+  "replicated_frozen_bytes": 1723246080,
+  "trainable_fp32_bytes": 665190400,
+  "sample_names": [
+    "audio_proj_in.bias",
+    "audio_proj_in.weight",
+    "audio_proj_out.bias"
+  ],
+  "shard_estimates": {
+    "8": {
+      "persistent_bytes": 10125489280.0,
+      "allgather_rx_bytes_per_traversal": 56487536000.0
+    },
+    "4": {
+      "persistent_bytes": 18527732480.0,
+      "allgather_rx_bytes_per_traversal": 48417888000.0
+    },
+    "2": {
+      "persistent_bytes": 35332218880.0,
+      "allgather_rx_bytes_per_traversal": 32278592000.0
+    },
+    "1": {
+      "persistent_bytes": 68941191680.0,
+      "allgather_rx_bytes_per_traversal": 0.0
+    }
+  },
+  "memory_kind_counts": {
+    "segment_begin": 9,
+    "segment_end": 9,
+    "before_unified_reset": 9,
+    "after_unified_reset": 9,
+    "optimizer_step_about_to_execute": 1,
+    "optimizer_step_executed": 1
+  },
+  "memory_examples": [
+    {
+      "schema": "h3.memory-event.v1",
+      "seq": 934,
+      "utc": "2026-11-02T10:58:06.097835+00:00",
+      "monotonic_ns": 1204240165355332,
+      "pid": 3997145,
+      "rank": 0,
+      "role": "train",
+      "device": 0,
+      "expected_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab",
+      "thread": "MainThread",
+      "kind": "before_unified_reset",
+      "phase": "optimizer_step",
+      "ancestors": [
+        "full_lifecycle",
+        "optimize",
+        "optimizer_step"
+      ],
+      "context": {
+        "step": 1
+      },
+      "counters": {
+        "allocated": 10159280640,
+        "reserved": 46279950336,
+        "max_allocated": 10242429440,
+        "max_reserved": 46279950336,
+        "device_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab"
+      },
+      "whole_run_high_water": {
+        "allocated": 20978487296,
+        "reserved": 67507322880
+      },
+      "reset_id": 221,
+      "synchronized": false,
+      "synchronization_seconds": 0.0,
+      "cpu_rss_bytes": 2092097536,
+      "reason": "leave:optimizer_step"
+    },
+    {
+      "schema": "h3.memory-event.v1",
+      "seq": 935,
+      "utc": "2026-11-02T10:58:06.100854+00:00",
+      "monotonic_ns": 1204240168372736,
+      "pid": 3997145,
+      "rank": 0,
+      "role": "train",
+      "device": 0,
+      "expected_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab",
+      "thread": "MainThread",
+      "kind": "after_unified_reset",
+      "phase": "optimizer_step",
+      "ancestors": [
+        "full_lifecycle",
+        "optimize",
+        "optimizer_step"
+      ],
+      "context": {
+        "step": 1
+      },
+      "counters": {
+        "allocated": 10159280640,
+        "reserved": 46279950336,
+        "max_allocated": 10159280640,
+        "max_reserved": 46279950336,
+        "device_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab"
+      },
+      "whole_run_high_water": {
+        "allocated": 20978487296,
+        "reserved": 67507322880
+      },
+      "reset_id": 222,
+      "synchronized": false,
+      "synchronization_seconds": 0.0,
+      "cpu_rss_bytes": 2092097536,
+      "reason": "leave:optimizer_step"
+    },
+    {
+      "schema": "h3.memory-event.v1",
+      "seq": 931,
+      "utc": "2026-11-02T10:58:03.743907+00:00",
+      "monotonic_ns": 1204237811425550,
+      "pid": 3997145,
+      "rank": 0,
+      "role": "train",
+      "device": 0,
+      "expected_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab",
+      "thread": "MainThread",
+      "kind": "optimizer_step_about_to_execute",
+      "phase": "optimizer_step",
+      "ancestors": [
+        "full_lifecycle",
+        "optimize",
+        "optimizer_step"
+      ],
+      "context": {
+        "step": 1
+      },
+      "counters": {
+        "allocated": 9992983040,
+        "reserved": 46038777856,
+        "max_allocated": 9992983040,
+        "max_reserved": 46038777856,
+        "device_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab"
+      },
+      "whole_run_high_water": {
+        "allocated": 20978487296,
+        "reserved": 67507322880
+      },
+      "reset_id": 221,
+      "synchronized": false,
+      "synchronization_seconds": 0.0,
+      "cpu_rss_bytes": 2044420096,
+      "optimizer_index": 0
+    },
+    {
+      "schema": "h3.memory-event.v1",
+      "seq": 932,
+      "utc": "2026-11-02T10:58:06.079247+00:00",
+      "monotonic_ns": 1204240146777459,
+      "pid": 3997145,
+      "rank": 0,
+      "role": "train",
+      "device": 0,
+      "expected_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab",
+      "thread": "MainThread",
+      "kind": "optimizer_step_executed",
+      "phase": "optimizer_step",
+      "ancestors": [
+        "full_lifecycle",
+        "optimize",
+        "optimizer_step"
+      ],
+      "context": {
+        "step": 1
+      },
+      "counters": {
+        "allocated": 10159280640,
+        "reserved": 46279950336,
+        "max_allocated": 10242429440,
+        "max_reserved": 46279950336,
+        "device_uuid": "GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab"
+      },
+      "whole_run_high_water": {
+        "allocated": 20978487296,
+        "reserved": 67507322880
+      },
+      "reset_id": 221,
+      "synchronized": false,
+      "synchronization_seconds": 0.0,
+      "cpu_rss_bytes": 2092097536,
+      "optimizer_index": 0,
+      "counter_min": 1.0,
+      "counter_max": 1.0
+    }
+  ]
+}

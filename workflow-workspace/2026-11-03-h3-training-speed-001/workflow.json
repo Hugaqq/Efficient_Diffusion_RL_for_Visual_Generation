@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "id": "h3-training-speed-20261103",
+  "name": "H3同协议提速：Planner-Coder-Simplifier",
+  "mode": "delivery",
+  "goal": "结合CMP170HX/Gen2x4/无NVLink和真实阶段耗时，循环实施保持科学协议的显著节时优化，原子commit，交付可审核代码与待测性能方案。",
+  "completion": "Planner独立审核实现、原子commit与真实原七项CPU结果，无正确性缺口、无进一步明确可实施的显著代码收益项；最终integration真实测试通过并发布perf分支。完成仅指代码阶段，不冒称GPU提速/2倍达成；需要先测量才能决策时waiting_external，预算触顶不算完成。",
+  "principles": [
+    "先查看真实源码和硬件证据，不用GPU型号记忆猜互联；标准DDP静态已超64GiB。",
+    "一次循环一个独立优化单元；Coder和Simplifier分开原子commit，必要测试与功能一起提交。",
+    "解码/评分流水化、组件复用、减少冗余搬运和FSDP通信优先；禁止改变reward/分辨率/样本/步数/精度和更新数学。",
+    "所有耗时估算必须列出分母是否含优化和保存；代码未实测不写speedup已达成。"
+  ],
+  "roles": {
+    "planner": {
+      "name": "Planner",
+      "responsibility": "审核实际代码、硬件与阶段成本，选择一个显著收益优化或修复，审核每轮实际diff/tests/commits，维护候选表并决定是否继续；只写计划和报告，不写训练源码。",
+      "principles": [
+        "先读取TASK.md和输入证据；用户的提速倍数是估算，不是已实现收益。",
+        "只在工具分配worktree和writePaths写入；不修改任务授权/其他角色报告/AGENTS/依赖或.gitignore。",
+        "没有GPU执行授权；禁SSH/服务/训练/推理/部署；原Euler B继续暂停。",
+        "每个代码commit之前原七项CPU全部通过；不amend/rebase/squash或切换工具分支。"
+      ],
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6.1-sol"
+      },
+      "thinking": "high",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "edit",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-11-03-h3-training-speed-001/planner/**",
+        "workflow-workspace/2026-11-03-h3-training-speed-001/FINAL.md"
+      ],
+      "allowedCommands": [
+        "git status --short",
+        "git diff --check",
+        "git diff --stat",
+        "git diff --cached --stat",
+        "git log -12 --oneline",
+        "git show --stat --oneline HEAD",
+        "git diff 3db2a05e1c464bd8cbd97c0290a094d869a9d1fd -- visual_rl scripts tests/test_flash_collection_runtime.py",
+        "PATH=/home/user/projects/h3-visual-rl/.scratch/h3-media-tools:/usr/local/bin:/usr/bin:/bin VISUALRL_FLASH_AUTHOR_DATA=/home/user/projects/h3-visual-rl/.scratch/flash-grpo/source/dataset/video PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/bin/python -m pytest -q tests/test_flash_collection_runtime.py"
+      ],
+      "lifecycle": "persistent",
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "coder": {
+      "name": "Coder",
+      "responsibility": "只实现Planner本轮选定的一个独立优化，保持科学协议与安全合同，扩展原七项CPU回归并验证，原子提交，诚实区分预计收益与实测。",
+      "principles": [
+        "先读取TASK.md和输入证据；用户的提速倍数是估算，不是已实现收益。",
+        "只在工具分配worktree和writePaths写入；不修改任务授权/其他角色报告/AGENTS/依赖或.gitignore。",
+        "没有GPU执行授权；禁SSH/服务/训练/推理/部署；原Euler B继续暂停。",
+        "每个代码commit之前原七项CPU全部通过；不amend/rebase/squash或切换工具分支。"
+      ],
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6.1-sol"
+      },
+      "thinking": "medium",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "edit",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-11-03-h3-training-speed-001/coder/**",
+        "visual_rl/**",
+        "scripts/**",
+        "tests/test_flash_collection_runtime.py"
+      ],
+      "allowedCommands": [
+        "git status --short",
+        "git diff --check",
+        "git diff --stat",
+        "git diff --cached --stat",
+        "git log -12 --oneline",
+        "git show --stat --oneline HEAD",
+        "git diff 3db2a05e1c464bd8cbd97c0290a094d869a9d1fd -- visual_rl scripts tests/test_flash_collection_runtime.py",
+        "PATH=/home/user/projects/h3-visual-rl/.scratch/h3-media-tools:/usr/local/bin:/usr/bin:/bin VISUALRL_FLASH_AUTHOR_DATA=/home/user/projects/h3-visual-rl/.scratch/flash-grpo/source/dataset/video PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/bin/python -m pytest -q tests/test_flash_collection_runtime.py",
+        "git add -- visual_rl scripts tests/test_flash_collection_runtime.py workflow-workspace/2026-11-03-h3-training-speed-001/coder",
+        "git commit -F workflow-workspace/2026-11-03-h3-training-speed-001/coder/COMMIT_MESSAGE.txt"
+      ],
+      "lifecycle": "persistent",
+      "auxiliary": {
+        "enabled": false
+      }
+    },
+    "simplifier": {
+      "name": "Simplifier",
+      "responsibility": "审查当前实现，在保证功能、错误传播、资源生命周期与协议不变前提下做必要简化；独立测试并原子提交，没有必要改动就明确不改，反馈给Planner。",
+      "principles": [
+        "先读取TASK.md和输入证据；用户的提速倍数是估算，不是已实现收益。",
+        "只在工具分配worktree和writePaths写入；不修改任务授权/其他角色报告/AGENTS/依赖或.gitignore。",
+        "没有GPU执行授权；禁SSH/服务/训练/推理/部署；原Euler B继续暂停。",
+        "每个代码commit之前原七项CPU全部通过；不amend/rebase/squash或切换工具分支。"
+      ],
+      "model": {
+        "provider": "openai-codex",
+        "id": "gpt-6.1-sol"
+      },
+      "thinking": "medium",
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "edit",
+        "write",
+        "bash"
+      ],
+      "writePaths": [
+        "workflow-workspace/2026-11-03-h3-training-speed-001/simplifier/**",
+        "visual_rl/**",
+        "scripts/**",
+        "tests/test_flash_collection_runtime.py"
+      ],
+      "allowedCommands": [
+        "git status --short",
+        "git diff --check",
+        "git diff --stat",
+        "git diff --cached --stat",
+        "git log -12 --oneline",
+        "git show --stat --oneline HEAD",
+        "git diff 3db2a05e1c464bd8cbd97c0290a094d869a9d1fd -- visual_rl scripts tests/test_flash_collection_runtime.py",
+        "PATH=/home/user/projects/h3-visual-rl/.scratch/h3-media-tools:/usr/local/bin:/usr/bin:/bin VISUALRL_FLASH_AUTHOR_DATA=/home/user/projects/h3-visual-rl/.scratch/flash-grpo/source/dataset/video PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/bin/python -m pytest -q tests/test_flash_collection_runtime.py",
+        "git add -- visual_rl scripts tests/test_flash_collection_runtime.py workflow-workspace/2026-11-03-h3-training-speed-001/simplifier",
+        "git commit -F workflow-workspace/2026-11-03-h3-training-speed-001/simplifier/COMMIT_MESSAGE.txt"
+      ],
+      "lifecycle": "persistent",
+      "auxiliary": {
+        "enabled": false
+      }
+    }
+  },
+  "start": "plan",
+  "integration": {
+    "validationCommands": [
+      "PATH=/home/user/projects/h3-visual-rl/.scratch/h3-media-tools:/usr/local/bin:/usr/bin:/bin VISUALRL_FLASH_AUTHOR_DATA=/home/user/projects/h3-visual-rl/.scratch/flash-grpo/source/dataset/video PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/bin/python -m pytest -q tests/test_flash_collection_runtime.py",
+      "git diff --check"
+    ],
+    "timeoutSeconds": 600
+  },
+  "budget": {
+    "maxSteps": 40,
+    "maxMinutes": 480,
+    "maxRoleTurns": 60,
+    "maxChecks": 0
+  },
+  "steps": {
+    "plan": {
+      "type": "agent",
+      "role": "planner",
+      "allowExternalWait": true,
+      "inputs": {
+        "task_file": "workflow-workspace/2026-11-03-h3-training-speed-001/TASK.md",
+        "baseline_evidence": "workflow-workspace/2026-11-03-h3-training-speed-001/inputs/",
+        "output_directory": "workflow-workspace/2026-11-03-h3-training-speed-001"
+      },
+      "contextFrom": [
+        {
+          "step": "code",
+          "optional": true,
+          "fields": [
+            "summary",
+            "completed",
+            "verified",
+            "evidence",
+            "todo"
+          ]
+        },
+        {
+          "step": "simplify",
+          "optional": true,
+          "fields": [
+            "summary",
+            "completed",
+            "verified",
+            "evidence",
+            "todo"
+          ]
+        }
+      ],
+      "instruction": "先读workflow-workspace/2026-11-03-h3-training-speed-001/TASK.md及inputs。首次审核关键采样、FSDP、VAE/HPS、同步/校验路径；后续先复审真实diff、commit和CPU证据。维护planner/CANDIDATES.md和每轮报告，选一个优化或必要前置写planner/PLAN.md，内容包含收益依据、修改边界、不变量、测试、风险及预期原子commit。有明确可实施项返回implement。必要GPU数据缺失且不能继续合理选项时提交waiting_external附最小测量卡；不得启动GPU。只有已实施项无未解问题、可见高收益机会已处理/有证据暂缓时写FINAL.md和planner/VALIDATION-PLAN.md后返回exhausted；明确GPU性能未验证及最终两步验收仍需授权。不要为了结束假称不存在任何优化或2倍已实现。",
+      "outcomes": {
+        "implement": "code",
+        "exhausted": "$complete"
+      }
+    },
+    "code": {
+      "type": "agent",
+      "role": "coder",
+      "allowExternalWait": true,
+      "inputs": {
+        "task_file": "workflow-workspace/2026-11-03-h3-training-speed-001/TASK.md",
+        "baseline_evidence": "workflow-workspace/2026-11-03-h3-training-speed-001/inputs/",
+        "output_directory": "workflow-workspace/2026-11-03-h3-training-speed-001"
+      },
+      "contextFrom": [
+        {
+          "step": "plan",
+          "fields": [
+            "summary",
+            "evidence",
+            "hypotheses",
+            "todo"
+          ]
+        }
+      ],
+      "instruction": "读当前planner/PLAN.md，只实现本轮一个独立逻辑优化及必要回归。保持TASK全部协议/安全约束。用原七项CPU和git diff --check验证，失败自主修复。将意图、测试及未测收益写coder/round-NNN.md，commit标题/正文写coder/COMMIT_MESSAGE.txt，用允许的git add与git commit -F完成描述清晰的原子commit，记录SHA。禁止GPU/SSH/改依赖、改测试数量、切分支、amend或push。确有外部边界才waiting_external，普通错误继续修；完成返回done。",
+      "outcomes": {
+        "done": "simplify"
+      }
+    },
+    "simplify": {
+      "type": "agent",
+      "role": "simplifier",
+      "allowExternalWait": true,
+      "inputs": {
+        "task_file": "workflow-workspace/2026-11-03-h3-training-speed-001/TASK.md",
+        "baseline_evidence": "workflow-workspace/2026-11-03-h3-training-speed-001/inputs/",
+        "output_directory": "workflow-workspace/2026-11-03-h3-training-speed-001"
+      },
+      "contextFrom": [
+        {
+          "step": "plan",
+          "fields": [
+            "summary",
+            "evidence",
+            "todo"
+          ]
+        },
+        {
+          "step": "code",
+          "fields": [
+            "summary",
+            "completed",
+            "verified",
+            "evidence",
+            "todo"
+          ]
+        }
+      ],
+      "instruction": "读TASK与当前计划，检查真实diff而非只信Coder总结。审查资源驻留、队列上界、错误/取消/排空、样本身份、dtype/RNG与更新边界。只做保持功能的必要简化，不删除安全检查或降测试。若改源码，跑原七项及diff检查后写simplifier/COMMIT_MESSAGE.txt并独立原子commit；没必要改就不造commit。写simplifier/round-NNN.md，列真实检查/commit/剩余问题；返回done交Planner复审。不得自己宣布工作流完成或启动GPU。",
+      "outcomes": {
+        "done": "plan"
+      }
+    }
+  }
+}

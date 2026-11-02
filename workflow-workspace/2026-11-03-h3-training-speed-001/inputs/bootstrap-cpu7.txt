@@ -1,0 +1,16 @@
+.......                                                                  [100%]
+=============================== warnings summary ===============================
+tests/test_flash_collection_runtime.py::test_real_controller_collects384_then_two192_and_resumes_without_scoring
+  /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/lib/python3.11/site-packages/torch/distributed/checkpoint/state_dict_saver.py:167: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.
+    warnings.warn(
+
+tests/test_flash_collection_runtime.py::test_real_controller_collects384_then_two192_and_resumes_without_scoring
+  /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/lib/python3.11/site-packages/torch/distributed/checkpoint/filesystem.py:131: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+    if tensor.storage().size() != tensor.numel():
+
+tests/test_flash_collection_runtime.py::test_real_controller_collects384_then_two192_and_resumes_without_scoring
+  /home/user/projects/h3-visual-rl/.scratch/h3-cpu-venv/lib/python3.11/site-packages/torch/distributed/checkpoint/state_dict_loader.py:153: UserWarning: torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+7 passed, 3 warnings in 46.85s

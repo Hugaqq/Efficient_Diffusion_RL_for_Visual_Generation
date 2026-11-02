@@ -1,0 +1,298 @@
+{
+  "full_lifecycle": {
+    "max_allocated": 10076138496,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 56
+  },
+  "build": {
+    "max_allocated": 9884295168,
+    "max_reserved": 12744392704,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "rollout": {
+    "max_allocated": 9897607168,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 648
+  },
+  "rollout_forward": {
+    "max_allocated": 13917177856,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 320
+  },
+  "rollout_transition": {
+    "max_allocated": 9906313216,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 320
+  },
+  "reward": {
+    "max_allocated": 9901321728,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 72
+  },
+  "vae_decode": {
+    "max_allocated": 20978487296,
+    "max_reserved": 55559847936,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 32
+  },
+  "reward_score": {
+    "max_allocated": 9901314048,
+    "max_reserved": 10500440064,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 36
+  },
+  "optimize": {
+    "max_allocated": 13427220992,
+    "max_reserved": 58552483840,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 144
+  },
+  "anchor_forward": {
+    "max_allocated": 13928870400,
+    "max_reserved": 55801020416,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 32
+  },
+  "zero_grad": {
+    "max_allocated": 10159280640,
+    "max_reserved": 55801020416,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 16
+  },
+  "current_forward": {
+    "max_allocated": 17173038592,
+    "max_reserved": 67482157056,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 32
+  },
+  "backward": {
+    "max_allocated": 17026899968,
+    "max_reserved": 67507322880,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 32
+  },
+  "gradient_clipping": {
+    "max_allocated": 9994818560,
+    "max_reserved": 46107983872,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "optimizer_step": {
+    "max_allocated": 10242429440,
+    "max_reserved": 46349156352,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "scheduler_step": {
+    "max_allocated": 10159280640,
+    "max_reserved": 46349156352,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "post_update_validation": {
+    "max_allocated": 10076146176,
+    "max_reserved": 46349156352,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "checkpoint_validation": {
+    "max_allocated": 10076135424,
+    "max_reserved": 46349156352,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "checkpoint_save": {
+    "max_allocated": 10847882752,
+    "max_reserved": 46349156352,
+    "ranks": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "events": 8
+  },
+  "video_save": {
+    "max_allocated": 9901314048,
+    "max_reserved": 10500440064,
+    "ranks": [
+      0,
+      2,
+      4,
+      6
+    ],
+    "events": 4
+  }
+}
