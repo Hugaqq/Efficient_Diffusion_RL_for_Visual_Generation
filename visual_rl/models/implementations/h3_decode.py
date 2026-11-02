@@ -344,7 +344,10 @@ class H3GPUDecoder(H3CPUDecoder):
     def _release_device_cache(self):
         with torch.cuda.device(self._device):
             torch.cuda.current_stream(self._device).synchronize()
+            from visual_rl.runtime import h3_memory as memory
+            memory.event('empty_cache_before',reason='existing rank-local VAE unused-cache release/admission')
             torch.cuda.empty_cache()
+            memory.event('empty_cache_after',reason='existing rank-local VAE unused-cache release/admission')
 
     def _decode(self, terminal, geometry):
         with torch.cuda.device(self._device):
@@ -353,7 +356,11 @@ class H3GPUDecoder(H3CPUDecoder):
             if free < 40:
                 raise BlockingIOError('GPU VAE needs40GiB free; no CPU fallback')
             baseline = torch.cuda.memory_allocated(self._device)
-            torch.cuda.reset_peak_memory_stats(self._device)
+            from visual_rl.runtime import h3_memory as memory
+            if memory.enabled():
+                memory.event('legacy_reset_suppressed',reason='unified vae_decode segment owns peak reset')
+            else:
+                torch.cuda.reset_peak_memory_stats(self._device)
             minimum = [free]
             monitor_errors = []
             stop = Event()

@@ -7,14 +7,21 @@ H3 extension, not a claim of official Flash mathematical equivalence.
 from __future__ import annotations
 
 import torch
-import functools,json,time
+import functools,json,time,weakref
+from contextlib import ExitStack
+from visual_rl.runtime import h3_memory as memory
 
 
 def _timed(method):
     @functools.wraps(method)
     def run(self,*args,**kwargs):
         started=time.monotonic()
-        try:return method(self,*args,**kwargs)
+        if args:
+            value=args[0]
+            step=value if type(value)is int else getattr(getattr(value,'identity',None),'optimizer_step',None)
+            if step is not None:memory.set_context(step=step+1)
+        try:
+            with memory.span(method.__name__):return method(self,*args,**kwargs)
         finally:
             if self.rank==0:
                 print(json.dumps(dict(event='h3_stage_seconds',stage=method.__name__,seconds=time.monotonic()-started)),flush=True)
@@ -37,6 +44,7 @@ class H3DualIterationStages(H3IterationStages):
         self.seed=seed
         super().__init__(**kwargs)
 
+    @_timed
     def build(self, optimizer_step):
         value=super().build(optimizer_step)
         ctx=self._context(value)
@@ -75,12 +83,15 @@ class H3DualIterationStages(H3IterationStages):
                 terminal=ctx.dual_terminals[sid].clone()
                 started=time.monotonic()
                 print(json.dumps(dict(event='h3_reward_decode_begin',sample_id=sid)),flush=True)
-                with self.decode(terminal) as media:
+                with ExitStack() as stack:
+                    with memory.span('vae_decode',sample_id=sid,selected_index=ctx.dual_selection[sid]):
+                        media=stack.enter_context(self.decode(terminal))
                     print(json.dumps(dict(event='h3_reward_decode_end',sample_id=sid,
                                           seconds=time.monotonic()-started)),flush=True)
                     started=time.monotonic()
                     print(json.dumps(dict(event='h3_reward_score_begin',sample_id=sid)),flush=True)
-                    score=self.score_one(sample_id=sid,prompt=r.prompts[sid],media=media)
+                    with memory.span('reward_score',sample_id=sid,selected_index=ctx.dual_selection[sid]):
+                        score=self.score_one(sample_id=sid,prompt=r.prompts[sid],media=media)
                     if type(score) is not float or not math.isfinite(score):
                         raise ValueError('reward must be a finite Python float')
                     print(json.dumps(dict(event='h3_reward_score_end',sample_id=sid,
@@ -115,7 +126,9 @@ class H3DualIterationStages(H3IterationStages):
             coefficients=_checked(c,'dual/coefficients/prepare',lambda:tuple(anchor.get(rec.sample_id,rec.index)[1] for rec in records))
             means=global_stream_means(coefficients,process_group=self.process_group,device=self.device)
         optimizer=self.prepared.optimizer
-        _checked(c,'dual/current/prepare',lambda:optimizer.zero_grad(set_to_none=True))
+        def clear_grad():
+            with memory.span('zero_grad',synchronize=True):optimizer.zero_grad(set_to_none=True)
+        _checked(c,'dual/current/prepare',clear_grad)
         policy_steps=r.dynamics.schedule.num_steps if self.mode=='dual_flow' else 1
         global_count=len(ctx.plan.samples)*policy_steps
         scale=h3_slot_loss_scale(n_slot=1,global_count=global_count,reducer_divisor=self.prepared.reducer_divisor)
@@ -123,7 +136,8 @@ class H3DualIterationStages(H3IterationStages):
         for ordinal,rec in enumerate(records):
             state=_checked(c,f'dual/current/{ordinal}/prepare',lambda:rec.x.to(self.device))
             c.gate(f'dual/current/{ordinal}/forward')
-            prediction=self._predict(ctx,rec.sample_id,state,rec.index)
+            with memory.span('current_forward',synchronize=True,sample_id=rec.sample_id,selected_index=rec.index):
+                prediction=self._predict(ctx,rec.sample_id,state,rec.index)
             def local_loss():
                 old,_=anchor.get(rec.sample_id,rec.index)
                 def audit(delta,ratio):
@@ -134,13 +148,24 @@ class H3DualIterationStages(H3IterationStages):
                     advantage=ctx.advantages[rec.sample_id],mode=('flow' if self.mode=='dual_flow' else 'flash'),
                     world_means=means,clip_range=.005,scale=scale,audit=audit)
             loss=_checked(c,f'dual/current/{ordinal}/backward',local_loss)
-            total+=loss.detach().item();loss.backward()
+            total+=loss.detach().item()
+            with memory.span('backward',synchronize=True,sample_id=rec.sample_id,selected_index=rec.index):loss.backward()
+            prediction_ref=weakref.ref(prediction)
             del loss,prediction,state
+            memory.event('prediction_released_after_backward',sample_id=rec.sample_id,selected_index=rec.index,
+                         released=prediction_ref() is None)
         self._version(ctx,'dual/current/complete')
-        norm=c.clip_grad_norm(self.prepared,max_norm=1.)
+        with memory.span('gradient_clipping',synchronize=True):
+            norm=c.clip_grad_norm(self.prepared,max_norm=1.)
         def update():
-            optimizer.step()
-            if self.prepared.scheduler is not None:self.prepared.scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            with memory.span('optimizer_step',synchronize=True):
+                memory.event('optimizer_step_about_to_execute',optimizer_index=r.identity.optimizer_step)
+                optimizer.step()
+                memory.event('optimizer_step_executed',optimizer_index=r.identity.optimizer_step,
+                    counter_min=min(float(s['step'].item()) for s in optimizer.state.values()),
+                    counter_max=max(float(s['step'].item()) for s in optimizer.state.values()))
+            if self.prepared.scheduler is not None:
+                with memory.span('scheduler_step',synchronize=True):self.prepared.scheduler.step()
+            clear_grad()
         _checked(c,'dual/optimizer/complete',update)
         return StageValue(value.identity,H3UpdateResult(r.collection_id,r.behavior_id,r.next_behavior_id,len(records),total,norm))

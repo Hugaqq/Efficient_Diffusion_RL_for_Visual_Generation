@@ -44,7 +44,9 @@ class H3DualReplayAnchor:
                     gate(f'anchor/{ordinal}/prepare',local_error=True)
                     raise
                 gate(f'anchor/{ordinal}/prepare',local_error=False)
-                prediction=predict(record.sample_id,x,record.index)
+                from visual_rl.runtime import h3_memory as memory
+                with memory.span('anchor_forward',synchronize=True,sample_id=record.sample_id,selected_index=record.index):
+                    prediction=predict(record.sample_id,x,record.index)
                 try:
                     joint,_,coeff=self.dynamics.evaluate(x,action,prediction,record.index)
                     if record.old_joint is not None:

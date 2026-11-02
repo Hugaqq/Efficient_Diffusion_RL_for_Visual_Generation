@@ -352,12 +352,15 @@ class H3LifecycleBackend:
             first_formal_flash = (step == 0 and bound.graph.profile.training.group_layout == 'paired_4x8')
             first_upgraded_update = self.code_upgrade is not None and step == self.start_step
             if pause or first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
-                boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
-                    bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
+                from visual_rl.runtime import h3_memory as memory
+                with memory.span('checkpoint_validation',step=step+1):
+                    boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda: (
+                        bound.binding.checkpoint_boundary(bound.stages, bound.trainer), bound.binding.validate_live()))
                 progress, proof, data, _ = boundary
-                committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,
-                    progress=progress, safe_point=proof, identity=bound.binding.state_identity,
-                    bindings=live, data_state=data)
+                with memory.span('checkpoint_save',step=step+1):
+                    committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,
+                        progress=progress, safe_point=proof, identity=bound.binding.state_identity,
+                        bindings=live, data_state=data)
                 if pause and step+1<launch.max_optimizer_steps:
                     raise H3SafeBoundaryPause(committed)
         if committed is None:

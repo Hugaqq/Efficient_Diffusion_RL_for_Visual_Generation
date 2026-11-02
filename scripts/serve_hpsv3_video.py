@@ -96,6 +96,15 @@ class HpsBackend:
         }
 
     def score(self, sample_id: str, prompt: str, images: list) -> list[float]:
+        from visual_rl.runtime import h3_memory as memory
+        try:
+            with memory.span('hps_score',sample_id=sample_id,input_height=self.contract.height,input_width=self.contract.width):
+                return self._score(sample_id,prompt,images)
+        except BaseException as exc:
+            if memory.enabled():memory.journal().exception(exc)
+            raise
+
+    def _score(self, sample_id: str, prompt: str, images: list) -> list[float]:
         torch = self.torch
         free = torch.cuda.mem_get_info()[0] / 1024**3
         if free < self.min_free_gib:
@@ -108,9 +117,11 @@ class HpsBackend:
                 free_samples.append(torch.cuda.mem_get_info()[0] / 1024**3)
         thread = threading.Thread(target=monitor, daemon=True)
         thread.start()
-        torch.cuda.reset_peak_memory_stats()
+        from visual_rl.runtime import h3_memory as memory
+        if memory.enabled():memory.event('legacy_reset_suppressed',reason='unified HPS score segment owns reset')
+        else:torch.cuda.reset_peak_memory_stats()
         try:
-            self.inferencer.model.to('cuda')
+            with memory.span('hps_onload',sample_id=sample_id):self.inferencer.model.to('cuda')
             self.inferencer.device = 'cuda'
             scores = []
             with torch.inference_mode():
@@ -121,15 +132,18 @@ class HpsBackend:
             peak = torch.cuda.max_memory_allocated() / 1024**3
             free_samples.append(torch.cuda.mem_get_info()[0] / 1024**3)
         finally:
-            self.inferencer.model.to('cpu')
+            with memory.span('hps_offload',sample_id=sample_id):self.inferencer.model.to('cpu')
             self.inferencer.device = 'cpu'
+            memory.event('empty_cache_before',reason='existing HPS return-to-CPU cleanup')
             torch.cuda.empty_cache()
+            memory.event('empty_cache_after',reason='existing HPS return-to-CPU cleanup')
             stop.set(); thread.join(timeout=3)
         if min(free_samples) < 16:
             raise BlockingIOError('GPU safety margin fell below16GiB; do not commit scores')
         print(json.dumps({'event': 'real_hpsv3_video_scored', 'sample_id': sample_id,
                           'frames': len(scores), 'seconds_including_transfers': time.monotonic()-started,
-                          'own_peak_allocated_gib': peak, 'min_card_free_gib': min(free_samples)}), flush=True)
+                          'own_peak_allocated_gib': peak, 'min_card_free_gib': min(free_samples),
+                          'peak_scope':('last unified segment; use event ancestry for full score peak' if memory.enabled() else 'score-call')}), flush=True)
         return scores
 
 
@@ -208,8 +222,12 @@ def main():
     a = p.parse_args()
     if not 1 <= a.port <= 65535 or not 40 <= a.min_free_gib <= 80:
         p.error('invalid private port or safety admission budget')
-    backend = HpsBackend(a.checkpoint.resolve(strict=True), a.config.resolve(strict=True),
-                         VideoContract(a.frames, a.height, a.width), a.min_free_gib)
+    from visual_rl.runtime import h3_memory as memory
+    import atexit
+    if memory.enabled():memory.journal();atexit.register(memory.close)
+    with memory.span('hps_initialization'):
+        backend = HpsBackend(a.checkpoint.resolve(strict=True), a.config.resolve(strict=True),
+                             VideoContract(a.frames, a.height, a.width), a.min_free_gib)
     server = HTTPServer(('127.0.0.1', a.port), make_handler(backend))
     artifact = canonical_json(backend.health)
     a.artifact_output.parent.mkdir(parents=True, exist_ok=True)

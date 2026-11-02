@@ -59,7 +59,9 @@ class OneUpdateBackend(H3LifecycleBackend):
                 raise ValueError('acceptance requires genuinely fresh optimizer/data state')
             return weight_fingerprints(bound.prepared.prepared_root)
         first=_phase(session,'one-update/initial-weights',before)
-        torch.cuda.reset_peak_memory_stats(session.device)
+        from visual_rl.runtime import h3_memory as memory
+        if memory.enabled():memory.event('legacy_reset_suppressed',reason='unified journal owns full-run counters')
+        else:torch.cuda.reset_peak_memory_stats(session.device)
         if self.args.preview_only:return self.preview(bound,first)
         result=super().run(bound)
         last=_phase(session,'one-update/final-weights',lambda:weight_fingerprints(bound.prepared.prepared_root))

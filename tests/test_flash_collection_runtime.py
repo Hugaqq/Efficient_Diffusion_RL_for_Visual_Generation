@@ -202,6 +202,122 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     raw['launch']['expected'].update(train_sha256=TRAIN_SHA,eval_sha256=TEST_SHA)
     typed=compile_h3_profile(save_h3_profile(profile_path.parent,raw))
     assert validate_fresh(typed).launch.checkpoint_every_optimizer_steps==5
+    # Same seven core tests: extend internally for the authorized TWO-update
+    # geometry and lossless peak/exception journal, never a fake GPU claim.
+    from scripts.launch_h3_resolution_memory import validate_fresh as validate_two, monitor_healthy
+    from visual_rl.models.implementations.h3_geometry import H3T2VAGeometry
+    from visual_rl.core.protocols.flash_hpsv3 import VideoContract, aggregate_frame_scores, validate_health, digest
+    raw['overrides']['model']=dict(params=dict(width=480,height=320,frames=124,fps=24,lora_rank=32,lora_alpha=64))
+    raw['launch']['max_optimizer_steps']=2
+    two=compile_h3_profile(save_h3_profile(profile_path.parent,raw))
+    assert validate_two(two) is two
+    geometry=H3T2VAGeometry(width=480,height=320,num_frames=124,fps=24)
+    assert geometry.width==480 and geometry.height==320
+    contract=VideoContract(124,320,480)
+    assert aggregate_frame_scores(list(range(124)),contract)[1]==tuple(range(123,86,-1))
+    for bad_steps in (1,3,200):
+        raw['launch']['max_optimizer_steps']=bad_steps
+        if bad_steps==3:
+            with pytest.raises(ValueError):compile_h3_profile(save_h3_profile(profile_path.parent,raw))
+        else:
+            with pytest.raises(ValueError,match='max2'):validate_two(compile_h3_profile(save_h3_profile(profile_path.parent,raw)))
+    raw['launch']['max_optimizer_steps']=2
+    for w,h in ((384,256),(480,256)):
+        raw['overrides']['model']['params'].update(width=w,height=h)
+        with pytest.raises(ValueError):validate_two(compile_h3_profile(save_h3_profile(profile_path.parent,raw)))
+    raw['overrides']['model']['params'].update(width=480,height=320)
+    raw['launch']['resume_from']=str(tmp_path/'old-step1')
+    with pytest.raises(ValueError,match='max2'):validate_two(compile_h3_profile(save_h3_profile(profile_path.parent,raw)))
+    raw['launch']['resume_from']=None
+    from visual_rl.runtime.h3_memory import Journal
+    class Counters:
+        current=10;peak=10;resets=0
+        def snapshot(self):
+            self.peak=max(self.current,self.peak)
+            return dict(allocated=self.current,reserved=self.current+20,max_allocated=self.peak,max_reserved=self.peak+20,device_uuid='GPU-test')
+        def reset(self):
+            # A durable snapshot must precede EVERY reset, including nesting
+            # and exceptions. Read actual disk, not the in-memory history.
+            rows=[json.loads(line) for line in journal.path.read_text().splitlines()]
+            assert rows[-1]['kind']=='before_unified_reset'
+            assert rows[-1]['whole_run_high_water']['allocated']>=self.peak
+            self.peak=self.current;self.resets+=1
+        def synchronize(self):pass
+    counters=Counters();journal=Journal(tmp_path/'memory-events',rank=0,role='test',device=0,counters=counters)
+    with journal.span('outer',step=1):
+        counters.current=100
+        with pytest.raises(RuntimeError,match='simulated allocation failure'):
+            with journal.span('inner',sample_id='s',selected_index=2):
+                counters.current=250
+                raise RuntimeError('simulated allocation failure')
+        counters.current=10
+    journal.assert_healthy();assert journal.hwm==dict(allocated=250,reserved=270)
+    journal.exception(RuntimeError('simulated allocation failure'))
+    journal.close()
+    rows=[json.loads(line) for line in journal.path.read_text().splitlines()]
+    assert [row['seq'] for row in rows]==list(range(len(rows)))
+    assert max(row['counters']['max_allocated'] for row in rows)==250
+    assert rows[-1]['whole_run_high_water']['allocated']==250
+    assert any(row['kind']=='phase_exception' and row['context']['selected_index']==2 for row in rows)
+    required={'utc','monotonic_ns','pid','rank','role','device','counters','context','reset_id','whole_run_high_water','cpu_rss_bytes'}
+    assert all(required<=row.keys() for row in rows)
+    assert journal.path.with_suffix('.exception.json').is_file() and counters.resets==4
+    counters=Counters();journal=Journal(tmp_path/'memory-budget',rank=0,role='test',device=0,counters=counters)
+    journal.limit=journal.bytes
+    with pytest.raises(OSError,match='budget'):journal._reset('must-not-reset')
+    assert counters.resets==0 and not journal.healthy
+    journal.limit=64*1024**2;journal.close()
+    monitor=tmp_path/'monitor';monitor.mkdir()
+    (monitor/'health.json').write_text(json.dumps(dict(healthy=True,monotonic_ns=1000000000,sample_count=2)))
+    monitor_healthy(monitor,now_ns=2000000000)
+    with pytest.raises(RuntimeError,match='stale'):monitor_healthy(monitor,now_ns=30000000000)
+    from scripts import monitor_h3_memory as card_monitor
+    with monkeypatch.context() as mp:
+        mp.setattr(card_monitor,'query',lambda fields,kind: [['0','GPU-test','12','52','64','9']] if kind=='gpu' else [['GPU-test',str(os.getpid()),'10','python']])
+        row=card_monitor.sample(tmp_path/'memory-events')
+        assert row['gpus'][0]['physical_index']==0 and row['gpus'][0]['used_bytes']==12*1024**2
+        assert row['gpu_processes'][0]['pid']==os.getpid() and row['processes'][0]['cpu_rss_bytes']>0
+        assert row['schema']=='h3.card-sample.v1'
+    # Exercise the real new bind/iteration/audit wrapper twice with tiny CPU
+    # model/optimizer/world leaves. No fabricated real-GPU memory evidence.
+    from scripts import launch_h3_resolution_memory as resolution_entry
+    from visual_rl.runtime import h3_memory
+    import time
+    fake_root=tmp_path/'two-wrapper';fake_root.mkdir()
+    model=torch.nn.Module()
+    model.register_parameter('lora',torch.nn.Parameter(torch.ones(2)))
+    model.register_parameter('frozen',torch.nn.Parameter(torch.ones(2),requires_grad=False))
+    optimizer=torch.optim.AdamW([model.lora],lr=1e-4)
+    prepared=SimpleNamespace(optimizer=optimizer,prepared_root=model)
+    stages=SimpleNamespace(predict=lambda **kw:model.lora*2,score_one=lambda **kw:1.)
+    def tiny_iteration(step):
+        optimizer.zero_grad(set_to_none=True)
+        for _ in range(44):
+            with torch.no_grad():stages.predict(index=2)
+        for _ in range(4):
+            value=stages.predict(index=2);value.sum().backward();del value
+        norm=float(model.lora.grad.norm());optimizer.step();optimizer.zero_grad(set_to_none=True)
+        return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
+    bound=SimpleNamespace(stages=stages,trainer=SimpleNamespace(run_iteration=tiny_iteration))
+    graph=SimpleNamespace(source=SimpleNamespace(state_dict=lambda:dict(next_optimizer_step=0)),
+        profile=SimpleNamespace(launch=SimpleNamespace(output_dir=fake_root)))
+    runtime=SimpleNamespace(rank=0,process_group=None)
+    counters=Counters();journal=Journal(tmp_path/'wrapper-memory',rank=0,role='test',device=0,counters=counters)
+    (monitor/'health.json').write_text(json.dumps(dict(healthy=True,monotonic_ns=time.monotonic_ns(),sample_count=2)))
+    with monkeypatch.context() as mp:
+        mp.setattr(h3_memory,'journal',lambda:journal)
+        mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
+        mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
+        mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]])
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor))
+        backend.bind(None,runtime,graph,prepared,None)
+        bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
+        assert len(backend.audits)==2
+        assert backend.audits[1]['graph']['nograd_forwards']==88
+        assert backend.audits[1]['graph']['final_prediction_released']
+        assert len(backend.audits[1]['graph']['grad_forward_indices'])==8
+        assert json.loads((fake_root/'update-2-audit.json').read_text())['optimizer_updates']==2
+    journal.close()
     raw['launch']['checkpoint_every_optimizer_steps']=6
     with pytest.raises(ValueError,match='terminal exception'):
         compile_h3_profile(save_h3_profile(profile_path.parent,raw))

@@ -233,10 +233,10 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
         raise ValueError("seed must be integer in [0,2**63)")
     steps = positive_int("max_optimizer_steps", launch["max_optimizer_steps"])
     cadence = positive_int("checkpoint_every_optimizer_steps", launch["checkpoint_every_optimizer_steps"])
-    # The explicitly authorized single-update test retains the regular five-
-    # update cadence; lifecycle's terminal save still commits step1.
-    if cadence > steps and not (steps==1 and cadence==5):
-        raise ValueError("checkpoint cadence exceeds target without the step1/cadence5 terminal exception")
+    # Authorized one/two-update diagnostics retain formal cadence5;
+    # first paired-layout and terminal boundary saves cover steps1/2.
+    if cadence > steps and not (steps in (1,2) and cadence==5):
+        raise ValueError("checkpoint cadence exceeds target without the short-test/cadence5 terminal exception")
     def path(value):
         if not isinstance(value, str) or not value or value.strip() != value or "://" in value:
             raise ValueError("explicit local paths are required; no URLs or pending placeholders")
