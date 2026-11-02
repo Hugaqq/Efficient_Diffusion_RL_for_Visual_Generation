@@ -229,7 +229,20 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     raw['launch']['resume_from']=str(tmp_path/'old-step1')
     with pytest.raises(ValueError,match='max2'):validate_two(compile_h3_profile(save_h3_profile(profile_path.parent,raw)))
     raw['launch']['resume_from']=None
-    from visual_rl.runtime.h3_memory import Journal
+    from visual_rl.runtime.h3_memory import Journal, TorchCounters
+    # Actual PyTorch2.8 HPS telemetry exposed UUID text WITHOUT GPU-. Keep
+    # strict runtime/NVML identity spelling compatible, before any update.
+    with monkeypatch.context() as mp:
+        mp.setattr(torch.cuda,'is_initialized',lambda:True)
+        mp.setattr(torch.cuda,'memory_allocated',lambda device:10)
+        mp.setattr(torch.cuda,'memory_reserved',lambda device:20)
+        mp.setattr(torch.cuda,'max_memory_allocated',lambda device:30)
+        mp.setattr(torch.cuda,'max_memory_reserved',lambda device:40)
+        for observed in ('0e1cd165-126d-e889-2b87-240d8faddddb','GPU-0e1cd165-126d-e889-2b87-240d8faddddb'):
+            mp.setattr(torch.cuda,'get_device_properties',lambda device:SimpleNamespace(uuid=observed))
+            assert TorchCounters(0).snapshot()['device_uuid']=='GPU-0e1cd165-126d-e889-2b87-240d8faddddb'
+        mp.setattr(torch.cuda,'get_device_properties',lambda device:SimpleNamespace(uuid=None))
+        with pytest.raises(RuntimeError,match='UUID'):TorchCounters(0).snapshot()
     class Counters:
         current=10;peak=10;resets=0
         def snapshot(self):

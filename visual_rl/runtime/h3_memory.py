@@ -15,9 +15,16 @@ class TorchCounters:
         import torch
         if not torch.cuda.is_initialized():return None
         p=torch.cuda.get_device_properties(self.device)
+        # PyTorch 2.8's _CUuuid renders without NVML's GPU- prefix. Use the
+        # same strict normalization as runtime admission, not string equality
+        # against the CUDA_VISIBLE_DEVICES spelling.
+        from visual_rl.runtime.h3_session import _uuid
+        value=getattr(p,'uuid',None)
+        cuda_uuid_type=getattr(torch._C,'_CUuuid',())
+        observed_uuid=_uuid(str(value) if isinstance(value,cuda_uuid_type) else value)
         return dict(allocated=torch.cuda.memory_allocated(self.device),reserved=torch.cuda.memory_reserved(self.device),
                     max_allocated=torch.cuda.max_memory_allocated(self.device),max_reserved=torch.cuda.max_memory_reserved(self.device),
-                    device_uuid=str(getattr(p,'uuid','unknown')))
+                    device_uuid=observed_uuid)
     def reset(self):
         import torch
         torch.cuda.reset_peak_memory_stats(self.device)
