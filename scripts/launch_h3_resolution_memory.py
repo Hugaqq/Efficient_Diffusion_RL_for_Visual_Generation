@@ -53,7 +53,7 @@ def phase(name):
 
 class TwoUpdateBackend(H3LifecycleBackend):
     def __init__(self,*,args):
-        super().__init__(reward_pipeline=args.reward_pipeline)
+        super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae)
         from visual_rl.runtime.h3_rollout_profile import configuration
         configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
         self.profile_rollout=args.profile_rollout;self.rollout_profile=None
@@ -153,6 +153,8 @@ def main():
     p.add_argument('--monitor-dir',type=Path,required=True)
     p.add_argument('--reward-pipeline',action='store_true',
                    help='opt-in owner-local pipeline; requires separately approved independent-HPS experiment')
+    p.add_argument('--reuse-video-vae',action='store_true',
+                   help='opt-in verified owner-local video VAE reuse; requires approved experiment')
     p.add_argument('--profile-rollout',action='store_true',
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     args=p.parse_args()

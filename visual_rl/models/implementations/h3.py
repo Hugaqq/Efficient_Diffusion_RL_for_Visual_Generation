@@ -63,8 +63,9 @@ class _H3Aux:
     def close(self):
         if self.closed:
             return
+        if self._decoder is not None: self._decoder.close()
         self.closed = True
-        self._cache = self._decoder = None  # helpers own no persistent file/model handles
+        self._cache = self._decoder = None
 
 
 class H3Adapter(ModelAdapter):
@@ -207,8 +208,11 @@ class H3Adapter(ModelAdapter):
         with self._aux.decoder.decode_one(latents, self.geometry) as media:
             yield media
 
+    @contextmanager
+    def video_reuse_scope(self, evidence):
+        self._require_loaded()
+        with self._aux.decoder.video_reuse_scope(evidence): yield
+
     def _release_runtime_parts(self):
-        aux, self._aux = self._aux, None
-        self._meta = None
-        if aux is not None:
-            aux.close()
+        if self._aux is not None: self._aux.close()
+        self._aux = self._meta = None

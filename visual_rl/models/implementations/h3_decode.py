@@ -145,6 +145,8 @@ class _DecodeLease:
     def __enter__(self) -> H3AVMedia:
         if self._used:
             raise RuntimeError("decode lease cannot be reentered")
+        self._owner._require_open()
+        if self._owner._reuse is not None: self._owner._reuse.check()
         self._used = True
         terminal, self._terminal = self._terminal, None
         if not self._owner._lock.acquire(blocking=False):
@@ -176,6 +178,30 @@ class H3CPUDecoder:
                 raise ValueError(f"{name} must be an explicit positive integer")
         self._max_media_bytes, self._max_decode_bytes = max_media_bytes, max_decode_bytes
         self._lock = Lock()
+        self._closed = self._poisoned = False
+        self._reuse = None
+
+    def _require_open(self):
+        if self._closed or self._poisoned:
+            raise RuntimeError('decoder closed or poisoned')
+
+    def video_reuse_scope(self, evidence):
+        from visual_rl.models.implementations.h3_decode_reuse import video_scope
+        return video_scope(self, evidence)
+
+    def close(self):
+        if self._closed: return
+        if self._lock.locked(): raise RuntimeError('cannot close an active decode lease')
+        if self._reuse is not None:
+            import threading
+            if not self._poisoned or threading.get_ident() != self._reuse.thread:
+                raise RuntimeError('cannot close an active/foreign video producer scope')
+            state, self._reuse = self._reuse, None
+            self._closed = True
+            state.drop('decoder-close')
+        self._closed = True
+
+    def _allocated(self): return 0  # CPU reference test backend, not production fallback
 
     def decode_one(self, terminal: torch.Tensor, geometry: H3T2VAGeometry) -> _DecodeLease:
         """Use as `with decoder.decode_one(terminal, geometry) as media:`."""
@@ -265,11 +291,16 @@ class H3CPUDecoder:
         pass  # CPU reference owns no CUDA allocation.
 
     def _decode_stream(self, component, rows, geometry, config):
-        started = time.monotonic()
-        print(json.dumps(dict(event='h3_vae_load_begin', component=component)), flush=True)
-        model = self._load(component)
-        print(json.dumps(dict(event='h3_vae_load_end', component=component,
-                              seconds=time.monotonic()-started)), flush=True)
+        def load():
+            started = time.monotonic()
+            print(json.dumps(dict(event='h3_vae_load_begin', component=component)), flush=True)
+            result = self._load(component)
+            print(json.dumps(dict(event='h3_vae_load_end', component=component,
+                                  seconds=time.monotonic()-started)), flush=True)
+            return result
+        if self._reuse is not None and component == 'audio_vae': self._reuse.admission(audio=True)
+        model = (self._reuse.borrow(geometry, config, load)
+                 if self._reuse is not None and component == 'vae' else load())
         started = time.monotonic()
         print(json.dumps(dict(event='h3_vae_decode_begin', component=component)), flush=True)
         try:
@@ -302,12 +333,31 @@ class H3CPUDecoder:
             decoded = self._run_decode(model, latents, (2, 1, geometry.audio_latents * 800))
             return decoded[:, 0].transpose(0, 1).contiguous(), rate
         finally:
-            print(json.dumps(dict(event='h3_vae_decode_exit', component=component,
-                                  seconds=time.monotonic()-started)), flush=True)
-            del model  # No owner-held leaf survives success or failure.
-            self._release_device_cache()
+            import sys
+            error = sys.exc_info()[1]
+            try:
+                print(json.dumps(dict(event='h3_vae_decode_exit', component=component,
+                                      seconds=time.monotonic()-started)), flush=True)
+                if error is None and self._reuse is not None and component == 'vae':
+                    self._reuse.after_decode(model)
+            except BaseException as cleanup:
+                if error is None: error = cleanup
+                else: error.add_note('video state/log check failed: ' + repr(cleanup))
+            del model  # Drop borrower before evicting the sole owner reference.
+            try:
+                if self._reuse is not None and not self._reuse.allowed and self._reuse.model is not None:
+                    self._reuse.drop('persistent-workspace-cap', disable=True)
+                else: self._release_device_cache()
+            except BaseException as cleanup:
+                if error is None: error = cleanup
+                else: error.add_note('VAE cleanup failed: ' + repr(cleanup))
+            if error is not None:
+                self._poisoned = True
+                raise error
 
     def _decode(self, terminal, geometry) -> H3AVMedia:
+        self._require_open()
+        if self._reuse is not None: self._reuse.check()
         media_bytes, decode_bytes = self.estimate_bytes(geometry)
         if media_bytes > self._max_media_bytes or decode_bytes > self._max_decode_bytes:
             raise ValueError("decode media/tensor workspace budget exceeded before model load")
@@ -368,6 +418,16 @@ class H3GPUDecoder(H3CPUDecoder):
             del outputs, inputs
             return result
 
+    def _allocated(self): return torch.cuda.memory_allocated(self._device)
+
+    def _card_free(self):
+        import math
+        free, total = torch.cuda.mem_get_info(self._device)
+        if (any(type(v) not in (int, float) or not math.isfinite(v) for v in (free, total))
+                or not 0 <= free <= total or total <= 0):
+            raise RuntimeError('invalid VAE GPU memory telemetry')
+        return free / 1024**3
+
     def _release_device_cache(self):
         with torch.cuda.device(self._device):
             torch.cuda.current_stream(self._device).synchronize()
@@ -379,7 +439,8 @@ class H3GPUDecoder(H3CPUDecoder):
     def _decode(self, terminal, geometry):
         with torch.cuda.device(self._device):
             self._release_device_cache()  # release only unused allocator cache
-            free = torch.cuda.mem_get_info(self._device)[0] / 1024**3
+            if self._reuse is not None: self._reuse.admission()
+            free = self._card_free()
             if free < 40:
                 raise BlockingIOError('GPU VAE needs40GiB free; no CPU fallback')
             baseline = torch.cuda.memory_allocated(self._device)
@@ -394,29 +455,52 @@ class H3GPUDecoder(H3CPUDecoder):
             def monitor():
                 try:
                     while not stop.wait(.1):
-                        minimum[0] = min(minimum[0], torch.cuda.mem_get_info(self._device)[0] / 1024**3)
+                        minimum[0] = min(minimum[0], self._card_free())
                 except Exception as exc:
                     monitor_errors.append(exc)
             watcher = Thread(target=monitor, name='h3-gpu-decode-memory', daemon=True)
             watcher.start()
             started = time.monotonic()
             media = None
-            try:
-                media = super()._decode(terminal, geometry)
+            error = None
+            def cleanup(action):
+                nonlocal error
+                try: action()
+                except BaseException as exc:
+                    if error is None: error = exc
+                    else: error.add_note('GPU decode cleanup failed: ' + repr(exc))
+            def join():
+                watcher.join(timeout=3)
+                if watcher.is_alive(): raise RuntimeError('GPU VAE monitor did not terminate')
+            def check():
                 if monitor_errors:
                     raise RuntimeError('GPU VAE memory monitor failed') from monitor_errors[0]
                 if minimum[0] < 16:
                     raise BlockingIOError('GPU VAE safety margin fell below16GiB')
-                print(json.dumps(dict(event='h3_gpu_decode_complete', device=str(self._device),
-                                      seconds=time.monotonic()-started, dtype='float32',
-                                      incremental_peak_gib=(torch.cuda.max_memory_allocated(self._device)-baseline)/1024**3,
-                                      min_card_free_gib=minimum[0], frames=geometry.num_frames)), flush=True)
-                return media
-            except BaseException:
-                if media is not None:
-                    media._release()
-                raise
+            try:
+                media = super()._decode(terminal, geometry)
+                minimum[0] = min(minimum[0], self._card_free())
+            except BaseException as exc:
+                error = exc
             finally:
                 stop.set()
-                watcher.join(timeout=3)
-                self._release_device_cache()
+                cleanup(join)
+                cleanup(check)
+                cleanup(self._release_device_cache)
+            if error is not None:
+                self._poisoned = True
+                if media is not None: media._release()
+                raise error
+            try:
+                print(json.dumps(dict(event='h3_gpu_decode_complete', device=str(self._device),
+                    seconds=time.monotonic()-started, dtype='float32',
+                    incremental_peak_gib=(torch.cuda.max_memory_allocated(self._device)-baseline)/1024**3,
+                    incremental_baseline_includes_cached_weights=True,
+                    cached_video_bytes=0 if self._reuse is None else self._reuse.bytes,
+                    total_allocated_bytes=self._allocated(), min_card_free_gib=minimum[0],
+                    frames=geometry.num_frames)), flush=True)
+            except BaseException:
+                self._poisoned = True
+                media._release()
+                raise
+            return media

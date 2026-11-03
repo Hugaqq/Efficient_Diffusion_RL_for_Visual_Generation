@@ -322,7 +322,7 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
         mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
         mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]]*8)
-        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False))
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False,reuse_video_vae=False))
         backend.bind(None,runtime,graph,prepared,None)
         bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
         assert len(backend.audits)==2
@@ -1906,6 +1906,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         stage = object.__new__(H3DualIterationStages)
         stage._active = context; stage.rank = 0; stage.mode = 'dual_flash'
         stage.media_bytes = 10**7; stage.decode_bytes = 2*10**7
+        stage.reuse_video_vae = False; stage.video_reuse_scope = None
         stage.read_behavior_id = lambda: 'b'
         @contextmanager
         def decode(terminal):
@@ -2089,8 +2090,8 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             H3DualIterationStages(mode='dual_flash', seed=42, reward_pipeline=bad)
     with pytest.raises(ValueError, match='dual_flash'):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False)).reward_pipeline is True
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False)).reward_pipeline is False
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is False
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
@@ -2110,7 +2111,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         bound.close()
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys
-        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--help'])
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
     with monkeypatch.context() as patch:
@@ -2371,7 +2372,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             output = tmp_path / ('profile-backend-' + str(enabled)); output.mkdir()
             graph = SimpleNamespace(session=runtime, source=SimpleNamespace(),
                                     profile=SimpleNamespace(launch=SimpleNamespace(output_dir=output)))
-            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, expected_sha='e'*40,
+            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, reuse_video_vae=False, expected_sha='e'*40,
                 ffmpeg=Path('unused'), ffprobe=Path('unused'), monitor_dir=tmp_path / 'unused')
             backend = two_update.TwoUpdateBackend(args=args)
             assert backend.reward_pipeline is True
@@ -2401,7 +2402,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): profiling.configuration(bad)
         with pytest.raises(TypeError, match='bool'):
-            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad))
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad, reuse_video_vae=False))
 
     # H1: actual backend constructor/identity/_score and offline Handler. Only
     # the heavy inferencer, CUDA observations/transfers/clock/host admission

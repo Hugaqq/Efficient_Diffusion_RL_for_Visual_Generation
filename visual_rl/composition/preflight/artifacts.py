@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -174,10 +175,23 @@ def _location_cache_key(location: Path) -> str:
     return os.path.normcase(os.path.abspath(location))
 
 
+@dataclass(frozen=True)
+class FileHashObservation:
+    relative: str
+    sha256: str
+    size: int
+    metadata: tuple[int, ...]
+
+
+def _file_metadata(value):
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_mode)
+
+
 def _hash_artifact(
     location: Path,
     *,
     content_policy: str = _ALL_FILES_POLICY,
+    file_observer=None,
 ) -> dict[str, Any]:
     if content_policy not in {_ALL_FILES_POLICY, _PYTHON_CODE_POLICY}:
         raise ValueError(f"unsupported artifact content policy {content_policy!r}")
@@ -188,7 +202,7 @@ def _hash_artifact(
     totals = [0, 0]
 
     if node_type == "file":
-        _hash_file_record(digest, root, ".", metadata, totals)
+        _hash_file_record(digest, root, ".", metadata, totals, file_observer=file_observer)
     else:
         _hash_directory(
             digest,
@@ -197,6 +211,7 @@ def _hash_artifact(
             metadata,
             totals,
             content_policy=content_policy,
+            file_observer=file_observer,
         )
 
     return {
@@ -217,6 +232,7 @@ def _hash_directory(
     totals: list[int],
     *,
     content_policy: str,
+    file_observer=None,
 ) -> None:
     _require_directory_access(directory, metadata)
     update_filesystem_artifact_record(
@@ -253,6 +269,7 @@ def _hash_directory(
                 child_metadata,
                 totals,
                 content_policy=content_policy,
+                file_observer=file_observer,
             )
         else:
             _hash_file_record(
@@ -261,6 +278,7 @@ def _hash_directory(
                 child_relative,
                 child_metadata,
                 totals,
+                file_observer=file_observer,
             )
 
     after = _lstat(directory)
@@ -317,6 +335,7 @@ def _hash_file_record(
     relative: str,
     metadata: os.stat_result,
     totals: list[int],
+    *, file_observer=None,
 ) -> None:
     _require_file_access(path, metadata)
     before = _stable_metadata(metadata)
@@ -364,6 +383,11 @@ def _hash_file_record(
     )
     totals[0] += 1
     totals[1] += byte_count
+    if file_observer is not None:
+        snapshot = _file_metadata(metadata)
+        if any(_file_metadata(value) != snapshot for value in (opened, closed_metadata, after)):
+            raise ArtifactIdentityError('artifact metadata changed during observed hash')
+        file_observer(FileHashObservation(relative, content_digest.hexdigest(), byte_count, snapshot))
 
 
 def _lstat(path: Path) -> os.stat_result:

@@ -64,12 +64,12 @@ def _unpack_id(value, namespace):
 
 
 def verify_h3_content(profile: H3Profile, *, code_root: Path, expected_code_sha256: str,
-                      process_group=None, rank=None):
+                      process_group=None, rank=None, file_observer=None):
     """Always stream actual bytes; no caller-provided verified=True escape hatch."""
     if not isinstance(profile, H3Profile):
         raise TypeError("H3Profile required")
     def hash_files():
-        return (_hash_artifact(profile.launch.model, content_policy="all-files.v1"),
+        return (_hash_artifact(profile.launch.model, content_policy="all-files.v1", file_observer=file_observer),
                 _hash_artifact(Path(code_root), content_policy="python-code.v1"))
     if process_group is not None:
         from visual_rl.runtime.h3_file_phase import file_phase
@@ -137,8 +137,10 @@ class H3RuntimeBinding:
         self.dynamics = H3CPSDynamics(adapter.geometry.joint_layout, H3ScheduleSnapshot.build(profile.training.num_steps))
         self.topology = dict(world_size=8, gpu_uuids=list(gpu_uuids), placement="rank-local-cuda-index",
                              sp=1, tp=1, reducer_divisor=8)
+        video_records = []
         self.content = verify_h3_content(profile, code_root=self.code_root, expected_code_sha256=expected_code_sha256,
-                                         process_group=self.process_group, rank=self.rank)
+            process_group=self.process_group, rank=self.rank,
+            file_observer=lambda r: video_records.append(r) if r.relative.startswith('vae/') else None)
         self._check_resources()
         self._source_binding = source.state_dict()["binding"]
         self._check_source()
@@ -175,6 +177,8 @@ class H3RuntimeBinding:
         self.state_identity = H3StateIdentity(live["topology"], live["model"], live["semantics"],
                                                _unpack_id(source.geometry_id, "h3-geometry"))
         adapter._bind_model_execution_numerics(self.numerics, execution_policy_provider=self._policy)
+        from visual_rl.models.implementations.h3_decode_reuse import _video_files
+        self._video_files = _video_files(profile.launch.model, self.content['model']['content_sha256'], video_records)
 
     def _check_resources(self):
         current = preflight_h3_profile(self.profile)
@@ -368,6 +372,10 @@ class H3RuntimeBinding:
             raise RuntimeError("H3 binding closed")
         return self.scorer.score_one(**kwargs)
 
+    def video_reuse_scope(self):
+        if self._closed: raise RuntimeError('H3 binding closed')
+        return self.adapter.video_reuse_scope(self._video_files)
+
     def coordination_factory(self, plan):
         if self._closed:
             raise RuntimeError("H3 binding closed")
@@ -392,8 +400,10 @@ class H3RuntimeBinding:
                 or _cuda_device(torch.device(f"cuda:{self.rank}")) != self.device
                 or self.topology["gpu_uuids"] != list(self.profile.launch.gpu_uuids)):
             raise ValueError("live rank/device/topology changed")
+        video_records = []
         if verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256,
-                             process_group=self.process_group, rank=self.rank) != self.content:
+                process_group=self.process_group, rank=self.rank,
+                file_observer=lambda r: video_records.append(r) if r.relative.startswith('vae/') else None) != self.content:
             raise ValueError("artifact content identity changed")
         self._check_resources()
         self._check_source()
@@ -402,6 +412,8 @@ class H3RuntimeBinding:
         self.parameter_state.state_projection
         if self.adapter.model_execution_numerics != self.numerics:
             raise ValueError("numerics binding drift")
+        from visual_rl.models.implementations.h3_decode_reuse import _video_files
+        self._video_files = _video_files(self.profile.launch.model, self.content['model']['content_sha256'], video_records)
         return self._live_ids()
 
     def _contract(self, *, live=None):
