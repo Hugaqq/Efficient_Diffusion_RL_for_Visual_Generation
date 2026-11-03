@@ -135,11 +135,13 @@ class _Graph:
 
 class H3LifecycleBackend:
     def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False,
-                 reuse_rollout_anchor=False):
+                 reuse_rollout_anchor=False, checkpoint_threads=1):
         if type(reward_pipeline) is not bool:
             raise TypeError('reward_pipeline must be bool')
         if type(reuse_video_vae) is not bool: raise TypeError('reuse_video_vae must be bool')
         if type(reuse_rollout_anchor) is not bool: raise TypeError('reuse_rollout_anchor must be bool')
+        from visual_rl.artifacts.checkpoint.manager import _checkpoint_threads
+        self.checkpoint_threads=_checkpoint_threads(checkpoint_threads)  # strict int; 1 keeps serial publish
         self.reuse_video_vae=reuse_video_vae
         self.reuse_rollout_anchor=reuse_rollout_anchor
         self.reward_pipeline=reward_pipeline
@@ -254,8 +256,9 @@ class H3LifecycleBackend:
                 scorer.acquire()
                 return adapter, source, scorer
             adapter, source, scorer = _phase(runtime, "construct", local_graph)
-            self.transaction = H3CheckpointTransaction(AtomicCheckpointManager(output / "checkpoints"),
-                                                       process_group=runtime.process_group)
+            self.transaction = H3CheckpointTransaction(
+                AtomicCheckpointManager(output / "checkpoints", checkpoint_threads=self.checkpoint_threads),
+                process_group=runtime.process_group, checkpoint_threads=self.checkpoint_threads)
             return _Graph(runtime, profile, facts, adapter, source, scorer, resources, run_id,
                           self.code_root, preflight.code_hash)
         except BaseException:

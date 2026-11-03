@@ -24,7 +24,7 @@ from visual_rl.algorithms.optimization.h3_world import _exchange, _world_rank
 from visual_rl.artifacts.checkpoint.coordination import CheckpointSafePoint
 from visual_rl.artifacts.checkpoint.h3_state import H3StateIdentity, save_h3_state, load_h3_state, _receipt as _codec_receipt
 from visual_rl.artifacts.checkpoint.manager import (
-    AtomicCheckpointManager, CommittedCheckpoint, _atomic_json, _direct_checkpoint_path,
+    AtomicCheckpointManager, CommittedCheckpoint, _atomic_json, _checkpoint_threads, _direct_checkpoint_path,
     _payload_digest, _read_exact_json, _fsync_directory,
 )
 from visual_rl.artifacts.checkpoint.protocol import CheckpointContract, CheckpointProgress
@@ -171,10 +171,14 @@ class H3CheckpointTransaction:
     One instance per rank/attempt. Restore-prepared and restore-bound are each
     once-only; any failure poisons the instance. No retry/rollback/finally gate.
     """
-    def __init__(self, manager: AtomicCheckpointManager, *, process_group):
+    def __init__(self, manager: AtomicCheckpointManager, *, process_group, checkpoint_threads=1):
         if not isinstance(manager, AtomicCheckpointManager):
             raise TypeError('existing AtomicCheckpointManager required')
         self.manager, self.group = manager, process_group
+        # Opt-in DCP writer threads for this rank's codec save. That IO is
+        # rank-local (rank0 tree hashing is the manager's own knob), so no
+        # cross-rank agreement is required; 1 keeps the serial path.
+        self.checkpoint_threads = _checkpoint_threads(checkpoint_threads)
         self.rank = _world_rank(process_group)
         self._poisoned = False
         self._sequence = 0
@@ -341,7 +345,7 @@ class H3CheckpointTransaction:
             if self.rank == 0:
                 print(json.dumps(dict(event='h3_checkpoint_codec_begin', path=str(path))), flush=True)
             codec = save_h3_state(prepared, path, process_group=self.group, identity=identity,
-                                  safe_point=safe_point, progress=progress)
+                                  safe_point=safe_point, progress=progress, threads=self.checkpoint_threads)
             if self.rank == 0:
                 print(json.dumps(dict(event='h3_checkpoint_codec_end',
                                       seconds=time.monotonic()-codec_started)), flush=True)

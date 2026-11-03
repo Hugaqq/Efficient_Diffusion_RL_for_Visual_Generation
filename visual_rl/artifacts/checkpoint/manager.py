@@ -8,8 +8,11 @@ import os
 import shutil
 import tempfile
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,6 +43,7 @@ _STATE_TREE_FILE = "state_tree.json"
 _RESERVED_FILES = frozenset(
     {_CONTRACT_FILE, _COMPLETE_FILE, _PROGRESS_FILE, _STATE_TREE_FILE}
 )
+_MAX_CHECKPOINT_THREADS = 64
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
@@ -120,9 +124,12 @@ class CheckpointStaging:
 class AtomicCheckpointManager:
     """Commit ``step-N.tmp-UUID`` to ``step-N`` before updating latest.json."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, checkpoint_threads: int = 1) -> None:
         if not isinstance(root, (str, Path)) or isinstance(root, bool):
             raise TypeError("checkpoint root must be str or Path")
+        # Opt-in worker count for rank-0 state-tree hashing/fsync at publish
+        # time only; 1 (default) is the unchanged serial path.
+        self.checkpoint_threads = _checkpoint_threads(checkpoint_threads)
         self.root = Path(root).expanduser().resolve(strict=False)
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.root.is_dir() or self.root.is_symlink():
@@ -221,7 +228,7 @@ class AtomicCheckpointManager:
         renamed = False
         try:
             _fault(fault_injector, "after_writer")
-            state_tree = _build_state_tree(temporary)
+            state_tree = _build_state_tree(temporary, threads=self.checkpoint_threads)
             state_tree_id = _payload_digest(state_tree)
             _atomic_json(
                 temporary / _STATE_TREE_FILE,
@@ -621,8 +628,59 @@ def _file_digest_size(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _build_state_tree(root: Path) -> dict[str, object]:
-    entries: list[dict[str, object]] = []
+def _checkpoint_threads(value: object) -> int:
+    """Strict opt-in worker count; 1 keeps the serial publication path."""
+    if type(value) is not int:
+        raise TypeError("checkpoint_threads must be int")
+    if not 1 <= value <= _MAX_CHECKPOINT_THREADS:
+        raise ValueError(
+            f"checkpoint_threads must be within 1..{_MAX_CHECKPOINT_THREADS}"
+        )
+    return value
+
+
+def _hash_and_fsync(path: Path) -> tuple[str, int]:
+    """Digest one state file, then fsync its content: the per-file work."""
+    digest, size = _file_digest_size(path)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return digest, size
+
+
+def _bounded_map(function: Callable, items: list, threads: int) -> list:
+    """Results in input order from at most ``threads`` in-flight workers.
+
+    The earliest failing item in input order propagates, as in a serial loop;
+    queued items are cancelled and running ones are joined before raising.
+    """
+    pending: deque = deque()
+    remaining = iter(items)
+    results = []
+    with ThreadPoolExecutor(
+        max_workers=threads, thread_name_prefix="checkpoint-state-tree"
+    ) as pool:
+        try:
+            pending.extend(
+                pool.submit(function, item) for item in islice(remaining, threads)
+            )
+            while pending:
+                results.append(pending.popleft().result())
+                pending.extend(
+                    pool.submit(function, item) for item in islice(remaining, 1)
+                )
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
+    return results
+
+
+def _build_state_tree(root: Path, *, threads: int = 1) -> dict[str, object]:
+    threads = _checkpoint_threads(threads)
+    files: list[tuple[str, Path]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink():
             raise ValueError("checkpoint writer must not create symlinks")
@@ -635,21 +693,20 @@ def _build_state_tree(root: Path) -> dict[str, object]:
             raise ValueError(
                 f"checkpoint writer must not create reserved file {relative!r}"
             )
-        digest, size = _file_digest_size(path)
-        entries.append(
-            {
-                "path": relative,
-                "sha256": digest,
-                "size": size,
-            }
-        )
-        descriptor = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    if not entries:
+        files.append((relative, path))
+    if not files:
         raise ValueError("checkpoint writer produced no training state files")
+    # Same files, same per-file hash+fsync and same sorted fold either way;
+    # threads>1 only overlaps the per-file open/read/fsync latency.
+    paths = [path for _, path in files]
+    if threads == 1:
+        hashed = [_hash_and_fsync(path) for path in paths]
+    else:
+        hashed = _bounded_map(_hash_and_fsync, paths, threads)
+    entries: list[dict[str, object]] = [
+        {"path": relative, "sha256": digest, "size": size}
+        for (relative, _), (digest, size) in zip(files, hashed)
+    ]
     return {"schema_version": 1, "files": entries}
 
 

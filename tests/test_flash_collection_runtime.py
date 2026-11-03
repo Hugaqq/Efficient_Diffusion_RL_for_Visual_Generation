@@ -83,25 +83,114 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     payload = b"checkpoint" * 250000
     shard = root / "shard.bin"
     shard.write_bytes(payload)
+    # Opt-in parallel hashing must fold to the same ordered tree and digest.
+    (root / "nested").mkdir()
+    for index in range(9):
+        (root / "nested" / f"item-{index}.bin").write_bytes(bytes([index]) * ((index + 1) * 1000))
+    import threading
+    expected_paths = [f'nested/item-{i}.bin' for i in range(9)] + ['shard.bin']
     with monkeypatch.context() as patch:
         def reject_read_bytes(self):
             raise AssertionError("unbounded checkpoint read")
         patch.setattr(Path, "read_bytes", reject_read_bytes)
+        fsync_threads = []
+        real_fsync = os.fsync
+        def observed_fsync(descriptor):
+            fsync_threads.append(threading.get_ident())
+            return real_fsync(descriptor)
+        patch.setattr(os, "fsync", observed_fsync)
         tree = checkpoint_manager._build_state_tree(root)
-        assert tree['files'][0]['sha256'] == hashlib.sha256(payload).hexdigest()
+        assert [entry['path'] for entry in tree['files']] == expected_paths
+        assert tree['files'][-1]['sha256'] == hashlib.sha256(payload).hexdigest()
+        assert fsync_threads == [threading.get_ident()] * len(expected_paths)
+        fsync_threads.clear()
+        parallel = checkpoint_manager._build_state_tree(root, threads=4)
+        assert parallel == tree
+        assert checkpoint_manager._payload_digest(parallel) == checkpoint_manager._payload_digest(tree)
+        assert len(fsync_threads) == len(expected_paths) and threading.get_ident() not in fsync_threads
+        for bad in (True, 4.0, '4', None):
+            with pytest.raises(TypeError, match='int'):
+                checkpoint_manager._build_state_tree(root, threads=bad)
+        for bad in (0, -1, 65):
+            with pytest.raises(ValueError, match='1..64'):
+                checkpoint_manager._build_state_tree(root, threads=bad)
         checkpoint_manager._verify_state_tree(root, tree)
         with shard.open('r+b') as stream:
             stream.write(b'X')
         with pytest.raises(ValueError, match='digest mismatch'):
             checkpoint_manager._verify_state_tree(root, tree)
+    # A hashing worker failure propagates like the serial loop and nothing is
+    # published; the unchanged restore/validation path accepts a parallel publish.
+    from tests.test_checkpoint_coordinator import _contract as publish_contract, _progress as publish_progress, _selection_policy
+    contract = publish_contract()
+    progress = publish_progress(1, _selection_policy())
+    real_digest = checkpoint_manager._file_digest_size
+    def broken_digest(path):
+        if path.name == 'item-3.bin':
+            raise OSError('injected hash failure')
+        return real_digest(path)
+    def write_tree(directory):
+        (directory / 'nested').mkdir()
+        for index in range(9):
+            (directory / 'nested' / f'item-{index}.bin').write_bytes(bytes([index]) * ((index + 1) * 1000))
+        (directory / 'shard.bin').write_bytes(payload)
+    parallel_manager = checkpoint_manager.AtomicCheckpointManager(tmp_path / 'publish-parallel', checkpoint_threads=4)
+    serial_manager = checkpoint_manager.AtomicCheckpointManager(tmp_path / 'publish-serial')
+    assert (parallel_manager.checkpoint_threads, serial_manager.checkpoint_threads) == (4, 1)
+    with pytest.raises(TypeError, match='int'):
+        checkpoint_manager.AtomicCheckpointManager(tmp_path / 'publish-bad', checkpoint_threads=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint_manager, '_file_digest_size', broken_digest)
+        for threads in (1, 4):
+            with pytest.raises(OSError, match='injected hash failure'):
+                checkpoint_manager._build_state_tree(root, threads=threads)
+        with pytest.raises(OSError, match='injected hash failure'):
+            parallel_manager.commit(1, contract, write_tree, progress=progress)
+    assert list(parallel_manager.root.iterdir()) == [] and parallel_manager.latest_complete() is None
+    published = parallel_manager.commit(1, contract, write_tree, progress=progress)
+    serial = serial_manager.commit(1, contract, write_tree, progress=progress)
+    assert published.state_tree_id == serial.state_tree_id
+    assert json.loads((published.path / 'state_tree.json').read_text()) == json.loads((serial.path / 'state_tree.json').read_text())
+    assert [entry['path'] for entry in json.loads((published.path / 'state_tree.json').read_text())['tree']['files']] == expected_paths
+    assert parallel_manager.inspect_complete(published.path, expected_contract=contract).committed.state_tree_id == published.state_tree_id
     # Check the production writer configuration without pretending this is GPU DCP.
     with monkeypatch.context() as patch:
         calls = []
         patch.setattr(dcp, 'FileSystemWriter', lambda path, **kw: calls.append(kw))
         patch.setattr(dcp, 'save', lambda *args, **kw: None)
         _save_dcp({}, root / 'dcp', None)
+        _save_dcp({}, root / 'dcp', None, thread_count=4)
         assert calls == [dict(overwrite=False, sync_files=True,
-                              single_file_per_rank=False, thread_count=1)]
+                              single_file_per_rank=False, thread_count=1),
+                         dict(overwrite=False, sync_files=True,
+                              single_file_per_rank=False, thread_count=4)]
+        with pytest.raises(TypeError, match='int'):
+            _save_dcp({}, root / 'dcp', None, thread_count=True)
+        with pytest.raises(ValueError, match='1..64'):
+            _save_dcp({}, root / 'dcp', None, thread_count=0)
+    # Real tiny CPU DCP through the same leaf: four writer threads produce the
+    # same one-item-per-file set with identical item bytes and equal metadata
+    # (.metadata bytes carry DCP's per-save uuid), and the unchanged reader
+    # restores it. This is not GPU/WORLD8 evidence.
+    from torch.distributed.checkpoint import FileSystemReader
+    def tiny_state():
+        generator = torch.Generator().manual_seed(7)
+        return {'model': {f'layer{i}.weight': torch.randn(16, 8, generator=generator) for i in range(6)},
+                'buffers': {'rope.inv_freq': torch.arange(4.)}}
+    serial_dcp, parallel_dcp = tmp_path / 'dcp-threads-1', tmp_path / 'dcp-threads-4'
+    _save_dcp(tiny_state(), serial_dcp, None)
+    _save_dcp(tiny_state(), parallel_dcp, None, thread_count=4)
+    names = sorted(entry.name for entry in serial_dcp.iterdir())
+    assert names == sorted(entry.name for entry in parallel_dcp.iterdir()) and len(names) == 8 and '.metadata' in names
+    assert all((serial_dcp / name).read_bytes() == (parallel_dcp / name).read_bytes() for name in names if name != '.metadata')
+    serial_meta, parallel_meta = (FileSystemReader(path).read_metadata() for path in (serial_dcp, parallel_dcp))
+    assert serial_meta.state_dict_metadata == parallel_meta.state_dict_metadata
+    assert serial_meta.storage_data == parallel_meta.storage_data
+    restored = tiny_state()
+    for value in restored['model'].values():
+        value.zero_()
+    dcp.load(restored, checkpoint_id=parallel_dcp, process_group=None)
+    assert all(torch.equal(restored['model'][name], value) for name, value in tiny_state()['model'].items())
     # New first-five protocol: stateless group selection, no terminal noise,
     # and an explicit one-step window for the old two-transition tiny fixture.
     from visual_rl.algorithms.trainer.h3_dual_rollout import selected_step,collect,SELECTION_VERSION
@@ -349,7 +438,7 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
         mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
         mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]]*8)
-        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False))
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False, checkpoint_threads=1))
         backend.bind(None,runtime,graph,prepared,None)
         bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
         assert len(backend.audits)==2
@@ -2378,6 +2467,22 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     assert H3LifecycleBackend().reward_pipeline is False
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reward_pipeline=bad)
+    # --checkpoint-threads: strict int, default 1 (serial publish), wired to
+    # both the manager (rank0 tree hashing) and the transaction (DCP writer).
+    assert H3LifecycleBackend().checkpoint_threads == 1
+    for bad in (True, 4.0, '4', None):
+        with pytest.raises(TypeError, match='int'): H3LifecycleBackend(checkpoint_threads=bad)
+    for bad in (0, -1, 65):
+        with pytest.raises(ValueError, match='1..64'): H3LifecycleBackend(checkpoint_threads=bad)
+    assert H3LifecycleBackend(checkpoint_threads=4).checkpoint_threads == 4
+    from visual_rl.artifacts.checkpoint import h3_transaction as h3_tx
+    with monkeypatch.context() as patch:
+        patch.setattr(h3_tx, '_world_rank', lambda group: 0)
+        threaded_manager = h3_tx.AtomicCheckpointManager(tmp_path / 'threaded-checkpoints', checkpoint_threads=4)
+        assert h3_tx.H3CheckpointTransaction(threaded_manager, process_group=object()).checkpoint_threads == 1
+        assert h3_tx.H3CheckpointTransaction(threaded_manager, process_group=object(), checkpoint_threads=4).checkpoint_threads == 4
+        with pytest.raises(TypeError, match='int'):
+            h3_tx.H3CheckpointTransaction(threaded_manager, process_group=object(), checkpoint_threads=True)
     enabled_backend = H3LifecycleBackend(reward_pipeline=True)
     for algorithm, layout in (('cps', 'rank_local'), ('dual_flow', 'rank_local'), ('dual_flash', 'rank_local')):
         with pytest.raises(ValueError, match='paired_4x8'):
@@ -2393,15 +2498,15 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reuse_rollout_anchor=bad)
     with pytest.raises(ValueError, match='dual_flash'):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False)).reward_pipeline is True
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False)).reward_pipeline is False
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False, checkpoint_threads=1)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False, checkpoint_threads=1)).reward_pipeline is False
     # V1v flag: strict bool, default off, paired_4x8 dual_flash only, real binding scope factory required.
     assert H3LifecycleBackend().reuse_video_vae is False
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reuse_video_vae=bad)
         with pytest.raises(TypeError, match='bool'): H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=bad)
         with pytest.raises(TypeError, match='bool'):
-            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False, reuse_video_vae=bad, reuse_rollout_anchor=False))
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False, reuse_video_vae=bad, reuse_rollout_anchor=False, checkpoint_threads=1))
     with pytest.raises(ValueError, match='binding scope factory'):
         H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=True)
     with pytest.raises(ValueError, match='dual_flash'):
@@ -2410,16 +2515,16 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for algorithm, layout in (('cps', 'rank_local'), ('dual_flow', 'paired_4x8'), ('dual_flash', 'rank_local')):
         with pytest.raises(ValueError, match='video reuse requires paired_4x8'):
             reuse_backend._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(algorithm=algorithm, group_layout=layout)))
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=True,reuse_rollout_anchor=False)).reuse_video_vae is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=True,reuse_rollout_anchor=False, checkpoint_threads=1)).reuse_video_vae is True
     with pytest.raises(ValueError, match='dual_flash'):
         H3DualIterationStages(mode='dual_flow', seed=42, reuse_rollout_anchor=True)
     with pytest.raises(ValueError, match='dual_flash'):
-        H3LifecycleBackend(reuse_rollout_anchor=True)._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(
+        H3LifecycleBackend(reuse_rollout_anchor=True, checkpoint_threads=1)._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(
             algorithm='dual_flow', group_layout='paired_4x8')))
     # O1 audit constant: 44 no-grad forwards per update by default (40 rollout + 4 anchor), 40 when reused.
     for reuse, expected in ((False, 44), (True, 40)):
         backend = two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False,
-                                                                   reuse_video_vae=False, reuse_rollout_anchor=reuse))
+                                                                   reuse_video_vae=False, reuse_rollout_anchor=reuse, checkpoint_threads=1))
         assert backend.reuse_rollout_anchor is reuse and backend.nograd_forwards_per_update == expected
     # O1: the real iteration() audit wrapper (not only the constant) with the flag
     # on. Exactly 40 no-grad predicts per update pass for two updates (40, 80);
@@ -2454,7 +2559,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 mp.setattr(two_update, '_exchange', lambda *a: [a[3]]*8)
                 backend = two_update.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'), ffprobe=Path('ffprobe'),
                     expected_sha='test', monitor_dir=monitor, reward_pipeline=False, profile_rollout=False,
-                    reuse_video_vae=False, reuse_rollout_anchor=reuse))
+                    reuse_video_vae=False, reuse_rollout_anchor=reuse, checkpoint_threads=1))
                 backend.bind(None, SimpleNamespace(rank=0, process_group=None), graph, prepared, None)
                 bound.trainer.run_iteration(0); bound.trainer.run_iteration(1)
                 assert len(backend.audits) == 2 and all(row['graph']['final_prediction_released'] for row in backend.audits)
@@ -2468,6 +2573,11 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for reuse, nograd in ((True, 44), (False, 40)):
         with pytest.raises(ValueError, match='graph/count/release audit'):
             audited_nograd_counts(reuse=reuse, nograd=nograd)
+    launcher_args = dict(reward_pipeline=True, profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1)
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(launcher_args, reward_pipeline=False))).reward_pipeline is False
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).checkpoint_threads == 1
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(launcher_args, reuse_rollout_anchor=False, checkpoint_threads=4))).checkpoint_threads == 4
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
@@ -2502,6 +2612,21 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
+        # The parsed namespace carries the strict int default; the spy exits
+        # before main()'s Git/preflight/GPU side effects.
+        import argparse
+        parsed = []
+        real_parse_args = argparse.ArgumentParser.parse_args
+        def spy_parse_args(self, *args, **kwargs):
+            parsed.append(real_parse_args(self, *args, **kwargs))
+            raise SystemExit(0)
+        patch.setattr(argparse.ArgumentParser, 'parse_args', spy_parse_args)
+        required = ['launch_h3_resolution_memory', 'profile.yaml', '--expected-sha', 'x',
+                    '--ffmpeg', 'f', '--ffprobe', 'p', '--monitor-dir', 'm']
+        for argv in (required, required + ['--checkpoint-threads', '4']):
+            patch.setattr(sys, 'argv', argv)
+            with pytest.raises(SystemExit): two_update.main()
+        assert [row.checkpoint_threads for row in parsed] == [1, 4]
     with monkeypatch.context() as patch:
         def no_memory(n): raise BlockingIOError('host pipeline budget insufficient')
         patch.setattr(h3_loading, '_admit_host_memory', no_memory)
@@ -2797,7 +2922,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             output = tmp_path / ('profile-backend-' + str(enabled)); output.mkdir()
             graph = SimpleNamespace(session=runtime, source=SimpleNamespace(),
                                     profile=SimpleNamespace(launch=SimpleNamespace(output_dir=output)))
-            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, reuse_video_vae=False, reuse_rollout_anchor=False, expected_sha='e'*40,
+            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1, expected_sha='e'*40,
                 ffmpeg=Path('unused'), ffprobe=Path('unused'), monitor_dir=tmp_path / 'unused')
             backend = two_update.TwoUpdateBackend(args=args)
             assert backend.reward_pipeline is True
@@ -2827,7 +2952,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): profiling.configuration(bad)
         with pytest.raises(TypeError, match='bool'):
-            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad, reuse_video_vae=False, reuse_rollout_anchor=False))
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1))
 
     # H1: actual backend constructor/identity/_score and offline Handler. Only
     # the heavy inferencer, CUDA observations/transfers/clock/host admission

@@ -18,6 +18,7 @@ import torch
 
 from visual_rl.algorithms.optimization.h3_world import _exchange, _world_rank
 from visual_rl.artifacts.checkpoint.coordination import CheckpointSafePoint
+from visual_rl.artifacts.checkpoint.manager import _checkpoint_threads
 from visual_rl.artifacts.checkpoint.protocol import CheckpointProgress
 from visual_rl.models.lifecycle.h3_coordination import _trainables
 from visual_rl.models.lifecycle.h3_fsdp import _canonical_parameter_names
@@ -315,16 +316,20 @@ def _disk_schema(path, template):
             raise ValueError('missing/truncated/escaping DCP storage file')
 
 
-def _save_dcp(state, path, process_group):
+def _save_dcp(state, path, process_group, *, thread_count=1):
     import torch.distributed.checkpoint as dcp
     # Torch 2.8's writer retains tensor_dict for every tensor in one output
     # file, even for TORCH_SAVE. One file per rank retains an entire CPU shard
     # on all eight ranks. One item per file bounds this retention to a tensor
     # while preserving the complete DCP state/metadata and synchronous fsync.
+    # thread_count>1 is an explicit opt-in: the writer drains the same
+    # one-item-per-file queue from N threads, still fsyncing every file before
+    # close, so names, item bytes and metadata keys are unchanged and at most
+    # N items are in flight.
     dcp.save(state, checkpoint_id=path, process_group=process_group,
              storage_writer=dcp.FileSystemWriter(
                  path, overwrite=False, sync_files=True,
-                 single_file_per_rank=False, thread_count=1))
+                 single_file_per_rank=False, thread_count=_checkpoint_threads(thread_count)))
 
 
 def _load_dcp(state, path, process_group):
@@ -338,12 +343,17 @@ def _receipt(manifest):
 
 
 def save_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity,
-                  safe_point: CheckpointSafePoint, progress: CheckpointProgress):
-    """ALL ranks save to the same new child of caller-owned staging; no publish."""
+                  safe_point: CheckpointSafePoint, progress: CheckpointProgress, threads=1):
+    """ALL ranks save to the same new child of caller-owned staging; no publish.
+
+    threads>1 opts this rank's DCP item writes into N writer threads; the
+    default keeps the serial leaf call unchanged.
+    """
     rank = _world_rank(process_group)
     error = None
     payload = None
     try:
+        threads = _checkpoint_threads(threads)
         _progress(identity, progress)
         if not isinstance(safe_point, CheckpointSafePoint):
             raise TypeError('existing CheckpointSafePoint proof is required')
@@ -380,7 +390,10 @@ def save_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
     except Exception as exc:
         error = exc
     _health(rank, process_group, 'save/captured', payload, error)
-    _save_dcp(state, target / 'dcp', process_group)
+    if threads == 1:
+        _save_dcp(state, target / 'dcp', process_group)  # unchanged serial leaf call
+    else:
+        _save_dcp(state, target / 'dcp', process_group, thread_count=threads)
     error = None
     try:
         if rank == 0:
