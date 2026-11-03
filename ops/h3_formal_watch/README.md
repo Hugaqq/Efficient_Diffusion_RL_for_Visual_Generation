@@ -58,6 +58,8 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   audits and integrity errors require humans. Permanent evidence wins over
   transient patterns. Unrecognized exception/error records veto recovery, while
   normal launcher JSON (including identity metadata) is not failure evidence.
+  Each explicit exception must itself be an allowlisted transient record; an
+  unrelated error cannot borrow a later NCCL substring, even on the same line.
   Log matching is conservative and bounded to the attempt's
   last 256 KiB; missing evidence never authorizes retry.
 * Resume requires healthy prerequisites, latest complete checkpoint metadata and

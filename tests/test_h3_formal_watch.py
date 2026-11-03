@@ -1181,6 +1181,12 @@ def test_failure_records_veto_transient_retry(box, failure):
     assert box.watch.death_cause() == 'correctness_or_permanent_error'
 
 
+@pytest.mark.parametrize('error', ['ValueError: invalid application state', 'RuntimeError: missing cache'])
+def test_unrecognized_error_cannot_borrow_same_line_nccl_signature(box, error):
+    box.log(error + '; NCCL watchdog timed out')
+    assert box.watch.death_cause() == 'correctness_or_permanent_error'
+
+
 def test_launcher_identity_json_does_not_veto_nccl(box):
     box.log('{"identity": "approved", "status": "ready"}\n'
             '[rank1]: RuntimeError: NCCL watchdog timed out')

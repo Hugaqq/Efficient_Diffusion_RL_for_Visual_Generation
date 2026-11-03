@@ -468,6 +468,19 @@ class Watchdog:
                 return 'correctness_or_permanent_error'
             failure = re.search(r'\b[\w.]*(?:error|exception)\s*:|\b(?:error|fatal|critical)\b|'
                                 r'\b(?:audit|graph|gradient|identity)[^\n]*(?:failed|mismatch)', line)
+            # An application exception cannot borrow a later NCCL substring on
+            # the same line. Inspect each explicit exception's own type/message.
+            exceptions = list(re.finditer(r'\b([\w.]*(?:error|exception))\s*:\s*', line))
+            for index, exc in enumerate(exceptions):
+                message = line[exc.end():exceptions[index + 1].start() if index + 1 < len(exceptions) else len(line)]
+                kind = exc[1].rsplit('.', 1)[-1]
+                if kind == 'childfailederror' and not message.strip():
+                    continue  # elastic aggregate wrapper, not a new application failure
+                message = re.sub(r'^(?:\[[^\]]*\]\s*)*', '', message)
+                if not (kind in ('runtimeerror', 'distbackenderror') and
+                        re.match(r'(?:nccl|processgroupnccl|watchdog|card(?:/process)? monitor)\b', message) and
+                        re.search(nccl + '|' + monitor, message)):
+                    return 'correctness_or_permanent_error'
             # Elastic's aggregate wrapper is not an additional application failure.
             wrapper = re.search(r'\b(?:torch\.distributed\.elastic\.multiprocessing\.errors\.)?childfailederror:\s*$', line)
             if failure and not wrapper and not re.search(nccl + '|' + monitor + '|h3safeboundarypause', line):
