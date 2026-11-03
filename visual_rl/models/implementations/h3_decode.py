@@ -21,7 +21,7 @@ import importlib
 import json
 import time
 from pathlib import Path
-from threading import Lock, Event, Thread
+from threading import Lock, Event, Thread, get_ident
 
 import torch
 
@@ -151,10 +151,12 @@ class _DecodeLease:
         terminal, self._terminal = self._terminal, None
         if not self._owner._lock.acquire(blocking=False):
             raise RuntimeError("only one media lease may be in flight")
+        self._owner._lease_thread = get_ident()
         try:
             self._media = self._owner._decode(terminal, self._geometry)
             return self._media
         except BaseException:
+            self._owner._lease_thread = None
             self._owner._lock.release()
             raise
 
@@ -163,6 +165,7 @@ class _DecodeLease:
             raise RuntimeError("decode lease is not active")
         self._media._release()
         self._media = None
+        self._owner._lease_thread = None
         self._owner._lock.release()
 
 
@@ -179,7 +182,7 @@ class H3CPUDecoder:
         self._max_media_bytes, self._max_decode_bytes = max_media_bytes, max_decode_bytes
         self._lock = Lock()
         self._closed = self._poisoned = False
-        self._reuse = None
+        self._reuse = self._lease_thread = None
 
     def _require_open(self):
         if self._closed or self._poisoned:
@@ -190,16 +193,31 @@ class H3CPUDecoder:
         return video_scope(self, evidence)
 
     def close(self):
+        """Idempotent. Never raises for leases/scopes owned by another thread."""
         if self._closed: return
-        if self._lock.locked(): raise RuntimeError('cannot close an active decode lease')
-        if self._reuse is not None:
-            import threading
-            if not self._poisoned or threading.get_ident() != self._reuse.thread:
-                raise RuntimeError('cannot close an active/foreign video producer scope')
-            state, self._reuse = self._reuse, None
-            self._closed = True
-            state.drop('decoder-close')
+        me, state = get_ident(), self._reuse
+        if self._lock.locked() and self._lease_thread == me:
+            raise RuntimeError('cannot close inside this thread\'s active decode lease')
+        if state is not None and state.thread == me and not self._poisoned:
+            raise RuntimeError('cannot close inside this thread\'s active video producer scope')
         self._closed = True
+        if self._lock.locked() or (state is not None and state.thread != me):
+            # A foreign producer thread (e.g. an aux owner past its 3600s limit)
+            # still owns the lease/scope. Never drop or empty_cache across
+            # threads: poison so no new lease/scope starts; the producer's own
+            # exit still releases its model. No memory-freed claim is made.
+            self._poisoned = True
+            try:
+                print(json.dumps(dict(event='h3_vae_close_deferred', lease_active=self._lock.locked(),
+                                      video_scope_active=state is not None,
+                                      reason='foreign producer thread owns the lease/scope')), flush=True)
+                from visual_rl.runtime import h3_memory as memory
+                memory.event('vae_close_deferred', lease_active=self._lock.locked(), video_scope_active=state is not None)
+            except Exception: pass
+            return
+        if state is not None:  # this thread's already-poisoned scope: release the owner reference now
+            self._reuse = None
+            state.drop('decoder-close')
 
     def _allocated(self): return 0  # CPU reference test backend, not production fallback
 

@@ -39,20 +39,20 @@ def _video_files(root, model_sha, records):
 def _check_files(evidence, root):
     if not isinstance(evidence, _VideoFiles) or evidence.root != root:
         raise ValueError('video reuse requires binding-owned model file evidence')
-    expected = {r.relative: r for r in evidence.records}
+    expected = {r.relative: r.metadata for r in evidence.records}
     video = root / 'vae'
     if any(p.is_symlink() for p in (root, video, *root.parents)):
         raise ValueError('video artifact path symlink changed')
     actual = {}
-    directories = {'vae'}
-    expected_directories = {str(p) for name in expected for p in Path(name).parents if str(p) != '.'}
     for path in video.rglob('*'):
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
             raise ValueError('video artifact node changed')
-        if stat.S_ISDIR(info.st_mode): directories.add(path.relative_to(root).as_posix())
+        # The hasher records files only; a directory without files (empty
+        # shard folder) carries no credential, so only the file set and each
+        # file's stat sentinel are compared.
         if stat.S_ISREG(info.st_mode): actual[path.relative_to(root).as_posix()] = _file_metadata(info)
-    if directories != expected_directories or actual != {name: r.metadata for name, r in expected.items()}:
+    if actual != expected:
         raise ValueError('video artifact list/stat/ctime changed since full verification')
 
 
@@ -120,6 +120,7 @@ class VideoReuse:
         _check_files(self.evidence, self.decoder._root)
 
     def event(self, kind, **fields):
+        print(json.dumps(dict(event='h3_video_reuse_' + kind, cached_bytes=self.bytes, **fields)), flush=True)
         memory.event('video_reuse_' + kind, cached_bytes=self.bytes, **fields)
 
     def drop(self, reason, *, disable=False):
@@ -168,9 +169,10 @@ class VideoReuse:
             signature, size = _state(model, self.device)
             actual = max(size, self.decoder._allocated() - self.load_baseline) if self.device.type == 'cuda' else size
             if actual > VIDEO_CAP: raise ValueError('video persistent byte cap exceeded')
-        except (ValueError, RuntimeError) as error:
+        except Exception as error:
+            # Eligibility is advisory: any probe failure means the off path.
             self.allowed = False
-            self.event('ineligible', reason=str(error))
+            self.event('ineligible', reason=f'{type(error).__name__}: {error}')
             return model
         self.model, self.signature, self.geometry = model, signature, key
         self.bytes = actual
@@ -180,9 +182,15 @@ class VideoReuse:
     def after_decode(self, model):
         self.check()
         if self.model is None: return
-        signature, size = _state(model, self.device)
-        if model is not self.model or signature != self.signature:
-            raise ValueError('video decode changed registered state')
+        try:
+            signature, size = _state(model, self.device)
+            if model is not self.model or signature != self.signature:
+                raise ValueError('video decode changed registered state')
+        except Exception as error:
+            # The media came from this verified fresh load exactly as the off
+            # path; only later borrowing of the drifted object is refused.
+            self.drop(f'decode-state-drift: {type(error).__name__}: {error}', disable=True)
+            return
         actual = max(size, self.decoder._allocated() - self.load_baseline) if self.device.type == 'cuda' else size
         if actual > VIDEO_CAP:
             self.allowed = False  # drop after the borrower's local ref expires

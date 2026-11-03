@@ -1758,6 +1758,215 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             _ = owned.audio
         assert torch.equal(terminal, before_terminal)
 
+    # V1v: owner-local video VAE reuse on the real tiny decoder. Only the two
+    # VAE leaves, CUDA RNG/free telemetry and the memory journal are
+    # synthetic; credentials come from the real full hasher over real files.
+    import hashlib, random, time
+    from contextlib import nullcontext
+    from safetensors.torch import save_file
+    from visual_rl.models.implementations import h3_decode
+    from visual_rl.models.implementations import h3_decode_reuse as reuse
+    from visual_rl.models.implementations.h3 import _H3Aux
+    from visual_rl.models.implementations.h3_decode import H3CPUDecoder
+    from visual_rl.composition.preflight.artifacts import _hash_artifact
+    with monkeypatch.context() as patch:
+        root = (tmp_path / 'reuse-decoder').resolve(); root.mkdir()
+        geometry = H3T2VAGeometry(32, 32, 124)
+        configs = _artifacts(root)
+        for component in ('vae', 'audio_vae'):
+            save_file({'weight': torch.tensor(1.)}, str(root / component / 'diffusion_pytorch_model.safetensors'))
+        (root / 'vae/empty-shard-dir').mkdir()  # hashed directory that records no file
+        def credential():
+            records = []
+            identity = _hash_artifact(root, content_policy='all-files.v1',
+                file_observer=lambda r: records.append(r) if r.relative.startswith('vae/') else None)
+            assert identity == _hash_artifact(root, content_policy='all-files.v1')  # observer never alters identity
+            return reuse._video_files(root, identity['content_sha256'], records)
+        evidence = credential()
+        assert sorted(r.relative for r in evidence.records) == ['vae/config.json', 'vae/diffusion_pytorch_model.safetensors']
+        assert all(r.sha256 == hashlib.sha256((root / r.relative).read_bytes()).hexdigest() for r in evidence.records)
+        events, loads, decodes, finalized = [], [], [], []
+        knobs = dict(rng=False, drift=None, probe=False)
+        patch.setattr(memory, 'event', lambda kind, **fields: events.append((kind, fields)))
+        for module, name in ((torch, 'set_rng_state'), (random, 'setstate'), (np.random, 'set_state')):
+            patch.setattr(module, name, lambda *a, **k: pytest.fail('video reuse must observe RNG read-only'))
+        def resolve(component):
+            class Leaf(torch.nn.Module):
+                def __init__(self, config):
+                    super().__init__()
+                    self.weight = torch.nn.Parameter(torch.tensor(1.))
+                    self.register_buffer('filter', torch.tensor([.5]))
+                    self.config = config; self.hop_length = 800
+                    if knobs['probe'] and component == 'vae': self.flags = {None, 'mixed'}  # probe sorted() TypeError
+                @classmethod
+                def from_pretrained(cls, path, *, subfolder, torch_dtype, local_files_only):
+                    assert subfolder == component and torch_dtype == torch.float32 and local_files_only is True
+                    if knobs['rng'] and component == 'vae': random.random(); np.random.rand(); torch.rand(1)
+                    loads.append(component)
+                    model = cls(json.loads((Path(path) / component / 'config.json').read_text()))
+                    weakref.finalize(model, finalized.append, component)
+                    return model
+                def decode(self, latents, *, return_dict):
+                    assert return_dict is False and not self.training and not torch.is_grad_enabled()
+                    decodes.append(component)
+                    if component != 'vae':
+                        return (latents[:, :1].repeat_interleave(800, dim=2) * self.weight,)
+                    if knobs['drift'] == 'buffer': self.filter.add_(1.)  # registered state changed in place
+                    if knobs['drift'] == 'attribute': self.scratch = torch.ones(1)  # unregistered tensor state
+                    t = torch.arange(geometry.num_frames) % latents.shape[2]
+                    h = torch.arange(geometry.height) % latents.shape[3]
+                    w = torch.arange(geometry.width) % latents.shape[4]
+                    return (latents[:, :3].index_select(2, t).index_select(3, h).index_select(4, w) * self.weight,)
+            if component == 'vae':  # the only class the reuse gate accepts
+                Leaf.__module__ = 'diffusers.models.autoencoders.autoencoder_kl_minimax_h3'
+                Leaf.__name__ = Leaf.__qualname__ = 'AutoencoderKLMiniMaxH3'
+            return Leaf
+        patch.setattr(h3_decode, '_resolve_vae_class', resolve)
+        terminals = (_terminal(geometry), _terminal(geometry)); terminals[1][0, 7] = 3.  # second sample differs
+        def rng(): return (random.getstate(), np.random.get_state()[1].tobytes(), torch.get_rng_state().numpy().tobytes())
+        def run(decoder, scoped):
+            del loads[:], decodes[:], events[:]
+            random.seed(11); np.random.seed(11); torch.manual_seed(11)
+            outputs, start = [], len(finalized)
+            with (decoder.video_reuse_scope(evidence) if scoped else nullcontext()):
+                for terminal in terminals:
+                    with decoder.decode_one(terminal, geometry) as media:
+                        assert media.video.dtype == media.audio.dtype == torch.float32
+                        outputs.append((media.video.numpy().tobytes(), media.audio.numpy().tobytes(), media.metadata))
+                assert (decoder._reuse is not None) is scoped
+            assert decoder._reuse is None and finalized[start:].count('vae') == loads.count('vae')  # no model survives
+            return outputs, list(loads), list(decodes), rng()
+        decoder = _decoder(root, geometry)
+        off, on = run(decoder, False), run(decoder, True)
+        assert on[0] == off[0] and on[3] == off[3] and on[2] == off[2] == ['vae', 'audio_vae'] * 2
+        assert off[1] == ['vae', 'audio_vae'] * 2 and on[1] == ['vae', 'audio_vae', 'audio_vae']  # one video load, audio never cached
+        assert [k for k, _ in events] == ['video_reuse_scope_begin', 'video_reuse_miss', 'video_reuse_hit', 'video_reuse_drop']
+        assert events[0][1]['version'] == reuse.REUSE_VERSION and events[-1][1]['reason'] == 'owner-scope-release'
+        knobs['rng'] = True  # loader consumes Python/NumPy/Torch RNG: no cache, no replay/restore, same sequence as off
+        off, on = run(decoder, False), run(decoder, True)
+        assert on[0] == off[0] and on[3] == off[3] and on[1] == off[1] == ['vae', 'audio_vae'] * 2
+        assert [f['reason'] for k, f in events if k == 'video_reuse_ineligible'] == ['loader-global-RNG-or-unobservable']
+        assert 'video_reuse_hit' not in [k for k, _ in events] and not decoder._poisoned
+        knobs['rng'], knobs['probe'] = False, True  # a TypeError inside the eligibility probe is advisory, not fatal
+        off, on = run(decoder, False), run(decoder, True)
+        assert on[0] == off[0] and on[1] == off[1] == ['vae', 'audio_vae'] * 2 and not decoder._poisoned
+        assert [f['reason'][:9] for k, f in events if k == 'video_reuse_ineligible'] == ['TypeError']
+        knobs['probe'] = False
+        for drift in ('buffer', 'attribute'):  # decode changed registered/unregistered state: media kept, cache dropped
+            knobs['drift'] = drift
+            off, on = run(decoder, False), run(decoder, True)
+            assert on[0] == off[0] and on[1] == off[1] == ['vae', 'audio_vae'] * 2 and not decoder._poisoned
+            reasons = [f['reason'] for k, f in events if k == 'video_reuse_drop']
+            assert reasons[0].startswith('decode-state-drift') and reasons[-1] == 'owner-scope-release'
+            assert 'video_reuse_hit' not in [k for k, _ in events]
+        knobs['drift'] = None
+        # Credential is an invalidation sentinel over the hashed file set/stat.
+        shard = root / 'vae/diffusion_pytorch_model.safetensors'
+        original, stamp = shard.read_bytes(), shard.stat()
+        time.sleep(.02)
+        shard.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))  # same size, mtime restored, ctime moves
+        os.utime(shard, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        assert (shard.stat().st_size, shard.stat().st_mtime_ns) == (stamp.st_size, stamp.st_mtime_ns)
+        del loads[:]
+        for restore in (False, True):
+            if restore: shard.write_bytes(original)  # bytes back, but the full hash was not rerun
+            with pytest.raises(ValueError, match='changed since full verification'):
+                with decoder.video_reuse_scope(evidence): pytest.fail('tampered shard accepted')
+        evidence = credential()
+        with decoder.video_reuse_scope(evidence): pass
+        (root / 'vae/late-empty-dir').mkdir()  # directories without files never gate reuse
+        with decoder.video_reuse_scope(evidence): pass
+        extra = root / 'vae/extra.bin'; extra.write_bytes(b'x')
+        with pytest.raises(ValueError, match='changed since full verification'):
+            with decoder.video_reuse_scope(evidence): pytest.fail('extra file accepted')
+        extra.unlink(); shard.rename(root / 'shard.bak')
+        with pytest.raises(ValueError, match='changed since full verification'):
+            with decoder.video_reuse_scope(evidence): pytest.fail('missing file accepted')
+        (root / 'shard.bak').rename(shard)
+        assert loads == [] and decoder._reuse is None and not decoder._poisoned
+        evidence = credential(); start = len(finalized)
+        with pytest.raises(ValueError, match='changed since full verification'):  # mid-scope drift fails closed
+            with decoder.video_reuse_scope(evidence):
+                with decoder.decode_one(terminals[0], geometry): pass
+                extra.write_bytes(b'x')
+                with decoder.decode_one(terminals[1], geometry): pytest.fail('drifted file list accepted mid-scope')
+        extra.unlink()
+        assert decoder._poisoned and decoder._reuse is None and loads == ['vae', 'audio_vae']
+        assert finalized[start:] == ['audio_vae', 'vae']  # cached video model released only at scope exit
+        with pytest.raises(RuntimeError, match='closed or poisoned'):
+            with decoder.decode_one(terminals[0], geometry): pytest.fail('poisoned decoder decoded')
+        decoder.close(); decoder.close()  # idempotent after poison
+        # A foreign thread (main thread after an aux timeout) closes without
+        # raising or dropping; the producer's own scope exit releases the model.
+        decoder = _decoder(root, geometry)
+        inside, release, worker_errors = Event(), Event(), []
+        def producer():
+            try:
+                with decoder.video_reuse_scope(evidence):
+                    with decoder.decode_one(terminals[0], geometry):
+                        inside.set(); assert release.wait(5), 'test never released the lease'
+                    with pytest.raises(RuntimeError, match='closed or poisoned'):
+                        with decoder.decode_one(terminals[1], geometry): pytest.fail('lease after close')
+            except BaseException as exc: worker_errors.append(exc)
+        worker = Thread(target=producer, name='reuse-producer'); worker.start()
+        try:
+            assert inside.wait(5)
+            del loads[:]; start = len(finalized)
+            decoder.close()
+            assert decoder._closed and decoder._poisoned and decoder._reuse is not None and decoder._reuse.model is not None
+            with pytest.raises(RuntimeError, match='closed or poisoned'):
+                with decoder.video_reuse_scope(evidence): pytest.fail('scope after close')
+        finally:
+            release.set(); worker.join(10)
+        assert not worker.is_alive() and not worker_errors and loads == []
+        assert decoder._reuse is None and finalized[start:] == ['vae']
+        decoder.close()
+        decoder = _decoder(root, geometry)  # same-thread misuse keeps raising and leaves the decoder open
+        with decoder.video_reuse_scope(evidence):
+            with pytest.raises(RuntimeError, match='active video producer scope'): decoder.close()
+            with decoder.decode_one(terminals[0], geometry):
+                with pytest.raises(RuntimeError, match='active decode lease'): decoder.close()
+        assert not decoder._closed and not decoder._poisoned
+        aux = object.__new__(_H3Aux); aux.closed = False; aux._cache = object(); aux._decoder = decoder
+        aux.close(); aux.close()
+        assert aux.closed and aux._decoder is None and aux._cache is None and decoder._closed
+        # Synthetic rank-local CUDA telemetry (no GPU): warm entry below 40GiB
+        # drops its own cache first, re-reads the real free, then cold or refuse.
+        class Card:
+            def __init__(self): self._root, self._device, self.free, self.releases = root, torch.device('cuda', 0), 100., 0
+            def _card_free(self): return self.free
+            def _allocated(self): return 0
+            def _release_device_cache(self): self.releases += 1
+        card, cached = Card(), resolve('vae')(configs['vae'])
+        state = reuse.VideoReuse(card, evidence)
+        def warm(): state.model, state.signature, state.geometry, state.bytes, state.allowed = cached, 'sig', 'key', 8, True
+        warm(); card.free = 39.; del events[:]
+        with pytest.raises(BlockingIOError, match='40GiB'): state.admission()
+        assert state.model is None and not state.allowed and card.releases == 1 and state.bytes == 0
+        warm(); reads = []
+        card._card_free = lambda: reads.append(len(reads)) or (39. if len(reads) == 1 else 64.)
+        state.admission(audio=True)  # evict the idle video cache, then the real re-read admits the cold audio load
+        assert state.model is None and not state.allowed and reads == [0, 1] and card.releases == 2
+        assert [f['reason'] for k, f in events if k == 'video_reuse_drop'] == ['warm-headroom', 'audio-headroom']
+        cold = state.borrow(geometry, configs['vae'], lambda: resolve('vae')(configs['vae']))
+        assert isinstance(cold, torch.nn.Module) and state.model is None and state.bytes == 0  # cold path never caches
+        card.free = 100.; warm(); state.admission()
+        assert state.model is cached and state.allowed  # enough real free: the warm model stays
+        class SyntheticCard(H3CPUDecoder):  # real decoder path; only device/free telemetry are synthetic
+            free = 39.
+            def __init__(self, *a, **k): super().__init__(*a, **k); self._device = torch.device('cuda', 0)
+            def _card_free(self): return self.free
+            def _allocated(self): return 0
+            def _release_device_cache(self): pass
+        media_bytes, workspace = H3CPUDecoder.estimate_bytes(geometry)
+        synthetic = SyntheticCard(root, max_media_bytes=media_bytes, max_decode_bytes=workspace)
+        del loads[:], events[:]
+        with pytest.raises(BlockingIOError, match='40GiB'):
+            with synthetic.video_reuse_scope(evidence):
+                with synthetic.decode_one(terminals[0], geometry): pytest.fail('audio cold load admitted below 40GiB')
+        assert loads == ['vae'] and synthetic._poisoned and synthetic._reuse is None  # audio refused before its load
+        assert [f['reason'] for k, f in events if k == 'video_reuse_ineligible'] == ['loader-global-RNG-or-unobservable']
+
     samples = tuple(pipeline.RewardSample(i, f'pipe-{i}', 'g', i, f'prompt {i}', i) for i in range(4))
     # Deterministic capacity/overlap and cancellation: score0 blocks, decode1
     # completes, packet1 queues, producer attempts permit3 but cannot decode2.
@@ -1938,6 +2147,42 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert RankRNGSnapshot.capture_current(0) == before_rng
         assert all(torch.equal(t, original_terminals[sid]) for sid, t in terminals.items())
         assert len(aux) == 2 and gates[-1].startswith('dual/reward-pipeline/1/queue1/total2/')
+        # V1v: the binding scope wraps the whole P1 owner work on the owner
+        # worker; it is released only after the consumer joined and before
+        # owner-end, and its rank gate precedes the reward-pipeline gate.
+        order = []
+        @contextmanager
+        def reuse_scope():
+            order.append(('enter', threading.current_thread().name))
+            try: yield
+            finally:
+                assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate()), 'scope released before consumer join'
+                order.append(('exit', threading.current_thread().name))
+        class OwnerCoordinator(Coordinator):
+            def aux_turns(self, work):
+                order.append(('owner-begin', None)); box = []
+                def execute():
+                    try: box.append(('ok', work()))
+                    except BaseException as exc: box.append(('error', exc))
+                runner = Thread(target=execute, name='h3-aux-0'); runner.start(); runner.join(30)
+                assert not runner.is_alive() and box
+                order.append(('owner-end', None))
+                if box[0][0] == 'error': raise box[0][1]
+                return box[0][1]
+        real_score_one = stage.score_one
+        stage.score_one = lambda **kw: float(int(kw['sample_id'].split('-')[1]))
+        stage.reuse_video_vae, stage.video_reuse_scope = True, reuse_scope
+        for pipelined in (False, True):
+            stage.reward_pipeline = pipelined; del order[:]; del gates[:]
+            context.coordinator = OwnerCoordinator()
+            stage.reward(value)
+            assert order == [('owner-begin', None), ('enter', 'h3-aux-0'), ('exit', 'h3-aux-0'), ('owner-end', None)]
+            assert context.rewards == tuple((s.sample_id, s.group_id, s.member, float(s.ordinal), True) for s in samples)
+            video_gate = f'dual/video-reuse/1/{reuse.REUSE_VERSION}/{reuse.VIDEO_CAP}'
+            assert gates.index(video_gate) < gates.index(gates[-1]) and gates[-1].startswith('dual/reward-pipeline/')
+        assert RankRNGSnapshot.capture_current(0) == before_rng
+        stage.reuse_video_vae, stage.video_reuse_scope, stage.score_one = False, None, real_score_one
+        stage.reward_pipeline = True; context.coordinator = Coordinator()
         context.coordinator.mismatch = True
         with pytest.raises(ValueError, match='mismatch'): stage.reward(value)
         assert len(aux) == 2 and len(payloads) == 8
@@ -2092,6 +2337,22 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is True
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is False
+    # V1v flag: strict bool, default off, paired_4x8 dual_flash only, real binding scope factory required.
+    assert H3LifecycleBackend().reuse_video_vae is False
+    for bad in (1, 'yes', None):
+        with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reuse_video_vae=bad)
+        with pytest.raises(TypeError, match='bool'): H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=bad)
+        with pytest.raises(TypeError, match='bool'):
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False, reuse_video_vae=bad))
+    with pytest.raises(ValueError, match='binding scope factory'):
+        H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=True)
+    with pytest.raises(ValueError, match='dual_flash'):
+        H3DualIterationStages(mode='dual_flow', seed=42, reuse_video_vae=True, video_reuse_scope=lambda: None)
+    reuse_backend = H3LifecycleBackend(reuse_video_vae=True)
+    for algorithm, layout in (('cps', 'rank_local'), ('dual_flow', 'paired_4x8'), ('dual_flash', 'rank_local')):
+        with pytest.raises(ValueError, match='video reuse requires paired_4x8'):
+            reuse_backend._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(algorithm=algorithm, group_layout=layout)))
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=True)).reuse_video_vae is True
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
@@ -2108,6 +2369,12 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert bound.stages.reward_pipeline is True
         assert (bound.stages.media_bytes, bound.stages.decode_bytes) == (1024, 2048)
         assert bound.stages.score_one is backend.binding.score_one
+        bound.close()
+        backend = H3LifecycleBackend(reward_pipeline=True, reuse_video_vae=True)
+        backend.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf, video_reuse_scope=leaf)
+        backend.transaction = object()
+        bound = backend.bind(None, runtime, graph, object(), None)
+        assert bound.stages.reuse_video_vae is True and bound.stages.video_reuse_scope is leaf
         bound.close()
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys

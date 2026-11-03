@@ -63,9 +63,10 @@ class _H3Aux:
     def close(self):
         if self.closed:
             return
-        if self._decoder is not None: self._decoder.close()
-        self.closed = True
-        self._cache = self._decoder = None
+        decoder, self._decoder = self._decoder, None
+        self._cache = None
+        self.closed = True  # references are dropped even if the decoder close raises
+        if decoder is not None: decoder.close()
 
 
 class H3Adapter(ModelAdapter):
