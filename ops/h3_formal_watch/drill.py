@@ -69,7 +69,16 @@ class Sandbox:
         Store(self.root / 'monitor').save('health.json', dict(dict(healthy=True, degraded=False, monotonic_ns=self.ns), **kw))
 
     def tick(self):
-        with patch('ops.h3_formal_watch.watchdog.hps_check', return_value=self.health):
+        real_popen = subprocess.Popen
+        def fake_supervisor(spec_name):
+            # ONLY the offline drill replaces systemd with a new local sleep.
+            spec = self.watch.store.load(spec_name)
+            child = real_popen(['/bin/sleep', '600'], start_new_session=True)
+            self.children.append(child)
+            self.watch.store.save('process-' + spec['launch_id'] + '.json', process.capture(child.pid, spec['launch_id']))
+            self.watch.supervisor = child
+        with patch('ops.h3_formal_watch.watchdog.hps_check', return_value=self.health), \
+                patch.object(self.watch, 'start_supervisor', side_effect=fake_supervisor):
             return self.watch.tick()
 
     def advance(self, seconds):

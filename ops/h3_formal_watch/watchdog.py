@@ -165,8 +165,10 @@ class Watchdog:
                                pending_launch=None, stop=None, last_checks={})
         if not self.s['process'] and not self.s['pending_launch']:
             self.s['process'] = self.store.load('initial-process.json')
+        if not self.s['process'] and not self.s['pending_launch'] and config.get('training_unit'):
+            self.s['process'] = process.capture_unit(config['training_unit'])
         if not self.s['process'] and not self.s['pending_launch']:
-            raise ValueError('record initial training PGID/PIDs or supervised launch receipt first')
+            raise ValueError('record initial training unit or process tree first')
 
     def persist(self):
         self.s['heartbeat_at'] = self.clock()
@@ -251,7 +253,7 @@ class Watchdog:
             self.send(signal.SIGTERM)
 
     def send(self, sig):
-        self.action('signal', pgid=self.s['process']['pgid'], signal=sig.name)
+        self.action('signal', owner=self.s['process'].get('unit', self.s['process'].get('pgid')), signal=sig.name)
         if not self.dry_run:
             process.signal_group(self.s['process'], sig)
 
@@ -276,7 +278,8 @@ class Watchdog:
     def exit_receipt(self):
         record = self.s['process']
         receipt = self.store.load('exit-' + record['launch_id'] + '.json')
-        if receipt and (receipt['launch_id'] != record['launch_id'] or receipt['pgid'] != record['pgid']):
+        fields = ('unit', 'invocation_id', 'boot_id') if record.get('kind') == 'cgroup' else ('pgid',)
+        if receipt and (receipt['launch_id'] != record['launch_id'] or any(receipt.get(k) != record[k] for k in fields)):
             raise ValueError('exit receipt identity mismatch')
         return receipt
 
@@ -332,7 +335,8 @@ class Watchdog:
         if argv.count('{resume_config}') != 1:
             raise ValueError('launcher argv must contain one standalone {resume_config}')
         self.store.save(name, recipe)
-        return dict(launch_id=launch_id, argv=[str(self.store.path(name)) if a == '{resume_config}' else a for a in argv],
+        return dict(launch_id=launch_id, unit='h3-training-' + launch_id + '.service',
+                    argv=[str(self.store.path(name)) if a == '{resume_config}' else a for a in argv],
                     env=launch['env'], cwd=launch['cwd'])
 
     def resume(self, checks):
@@ -369,7 +373,10 @@ class Watchdog:
         if pause.exists() and self.pause_supported():
             pause.rename(self.store.path('pause-archived-' + launch_id))
         self.action('resume_intent', checkpoint=ckpt['path'], launch_id=launch_id)
-        # Supervisor is detached and only owns training's exit receipt, not restart policy.
+        self.start_supervisor(spec_name)
+
+    def start_supervisor(self, spec_name):
+        # Supervisor submits an independently owned training unit, never retries.
         root = Path(__file__).resolve().parents[2]
         self.supervisor = subprocess.Popen([sys.executable, '-m', 'ops.h3_formal_watch.process',
             'supervise', str(self.store.root), spec_name], cwd=root, env={**os.environ, 'PYTHONPATH': str(root)},

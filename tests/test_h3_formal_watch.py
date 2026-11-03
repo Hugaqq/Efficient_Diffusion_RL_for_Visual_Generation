@@ -598,6 +598,55 @@ def test_snapshot_identity_mismatch_counts_as_unreachable(tmp_path):
     assert not (Path(config['state_dir']) / 'remote-status.json').exists()
 
 
+def test_descendant_sessions_orphans_and_signal_order(box):
+    rec = box.config['process']
+    leader = dict(rec['members'][0], ppid=1)
+    rank = dict(leader, pid=leader['pid'] + 100000, ppid=leader['pid'],
+                pgid=leader['pid'] + 100000, sid=leader['pid'] + 100000, token='rank-start')
+    tree = {p['pid']: p for p in (leader, rank)}
+    rec['members'] = process.inspect(rec, tree)['members']
+    orphan = dict(rank, ppid=1)
+    assert process.inspect(rec, {rank['pid']: orphan})['alive']
+    with patch.object(process, 'processes', return_value=tree), patch.object(os, 'killpg') as kill:
+        process.signal_group(rec, signal.SIGKILL)
+    assert [c.args[0] for c in kill.call_args_list] == [rank['pgid'], leader['pgid']]
+    with pytest.raises(ValueError, match='reused'):
+        process.inspect(rec, {rank['pid']: dict(orphan, token='reused')})
+
+
+def test_cgroup_ownership_all_sessions_and_reuse():
+    info = dict(InvocationID='unique', ControlGroup='/user.slice/fake', ActiveState='active',
+                KillMode='control-group', Restart='no')
+    with patch.object(process, 'unit_info', return_value=info), \
+            patch.object(process, 'cgroup_members', return_value=[111, 222]), \
+            patch.object(process, 'run_command') as command:
+        record = process.capture_unit('h3-training-test.service')
+        assert process.inspect(record)['alive']
+        process.signal_group(record, signal.SIGTERM)
+        assert command.call_args.args[0] == ['systemctl', '--user', 'kill', '--kill-whom=all',
+                                             '--signal=SIGTERM', record['unit']]
+        process.signal_group(record, signal.SIGKILL)
+        assert command.call_args.args[0][-2:] == ['stop', record['unit']]
+        info['InvocationID'] = 'reused'
+        with pytest.raises(ValueError, match='invocation changed'):
+            process.signal_group(record, signal.SIGKILL)
+    with pytest.raises(ValueError): process.unit_name('hps.service')
+
+
+def test_systemd_launch_claim_and_no_replay(tmp_path):
+    store = Store(tmp_path / 'state')
+    store.save('spec.json', dict(launch_id='test', unit='h3-training-test.service'))
+    with patch.object(process, 'run_command') as command, \
+            patch.object(process, 'capture_unit', return_value=dict(unit='test')):
+        process.supervise(store.root, 'spec.json')
+        argv = command.call_args.args[0]
+        assert argv[:2] == ['systemd-run', '--user']
+        assert '--property=KillMode=control-group' in argv and '--property=Restart=no' in argv
+        assert 'execute' in argv
+        with pytest.raises(FileExistsError): process.supervise(store.root, 'spec.json')
+        assert command.call_count == 1
+
+
 def test_user_unit_contract():
     units = Path(__file__).resolve().parents[1] / 'ops/h3_formal_watch/systemd'
     watchdog = (units / 'h3-formal-watchdog.service').read_text()
