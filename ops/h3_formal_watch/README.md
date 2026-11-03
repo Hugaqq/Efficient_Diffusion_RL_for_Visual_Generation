@@ -67,8 +67,11 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   unrelated error cannot borrow a later NCCL substring, even on the same line.
   Torch NCCL watchdog `exception:` messages and native `c10::Error::Error` stack
   frames are supported; a bare word "error" in metrics/diagnostics is not a failure
-  record. Elastic `SignalException: Process ... got signal: 15` requires a matching
-  SIGTERM exit receipt (-15/143) to avoid a veto, and does not itself authorize retry.
+  record. Elastic `SignalException: Process ... got signal: 15` is exempt only as
+  the sole failure record, with a matching exit receipt (-15/143 or torchrun's 1)
+  and the watchdog's own same-launch TERM record (`phase=term`, `last_signal=SIGTERM`,
+  saved checkpoint, monitor/disk stop). Code 1 without that exception never proves
+  TERM; stale/missing stop ownership, other errors and other signals still veto retry.
   Log matching is conservative and bounded to the attempt's
   last 256 KiB; missing evidence never authorizes retry.
 * Resume requires healthy prerequisites, latest complete checkpoint metadata and

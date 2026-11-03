@@ -457,7 +457,13 @@ class Watchdog:
                 r'exception \(either an error or timeout\) detected by watchdog at work:[^\n]*nccl')
         monitor = r'card(?:/process)? monitor[^\n]*(?:unhealthy|stale)'
         receipt = self.exit_receipt()
-        term_exit = bool(receipt and type(receipt.get('exit_code')) is int and receipt['exit_code'] in (-15, 143))
+        stop = self.s.get('stop') or {}
+        checkpoint_stop = bool(stop.get('cause') in ('monitor_stop', 'disk_low') and stop.get('checkpoint_saved')
+            and stop.get('launch_id') == self.s['process']['launch_id'])
+        watchdog_term = checkpoint_stop and stop.get('phase') == 'term' and stop.get('last_signal') == 'SIGTERM'
+        exit_code = receipt.get('exit_code') if receipt else None
+        term_exit = watchdog_term and type(exit_code) is int and exit_code in (-15, 143, 1)
+        saw_term_exception, other_failure = False, False
         for line in text.splitlines():
             # Normal structured launcher metadata is not a failure record.
             try:
@@ -488,26 +494,28 @@ class Watchdog:
                 message = re.sub(r'^(?:\[[^\]]*\]\s*)*', '', message)
                 if (exc[1] == 'torch.distributed.elastic.multiprocessing.api.signalexception' and term_exit and
                         re.fullmatch(r'process [0-9]+ got signal: 15\s*', message)):
-                    signal_exception = True
-                    continue  # exit receipt proves TERM; this alone never authorizes retry
+                    signal_exception = saw_term_exception = True
+                    continue  # torchrun @record turns the watchdog's TERM into exit code 1
                 if not (kind in ('runtimeerror', 'distbackenderror', 'exception') and
                         re.match(r'(?:nccl|processgroupnccl|watchdog|card(?:/process)? monitor)\b', message) and
                         re.search(nccl + '|' + monitor, message)):
                     return 'correctness_or_permanent_error'
             # Elastic's aggregate wrapper is not an additional application failure.
             wrapper = re.search(r'\b(?:torch\.distributed\.elastic\.multiprocessing\.errors\.)?childfailederror:\s*$', line)
-            if failure and not wrapper and not signal_exception and not re.search(nccl + '|' + monitor + '|h3safeboundarypause', line):
-                return 'correctness_or_permanent_error'
-        stop = self.s.get('stop') or {}
+            if failure and not wrapper and not signal_exception:
+                other_failure = True
+                if not re.search(nccl + '|' + monitor + '|h3safeboundarypause', line):
+                    return 'correctness_or_permanent_error'
+        if saw_term_exception and other_failure:
+            return 'correctness_or_permanent_error'  # TERM exemption must be the only failure record
         if stop.get('cause') == 'hps_identity_change':
             return 'hps_identity_change'
         if self.s.get('operator_pause_seen') or self.operator_pause():
             return 'operator_pause'
         if stop.get('cause') in ('hps_failure', 'no_progress'):
             return stop['cause']
-        if (stop.get('cause') in ('monitor_stop', 'disk_low') and stop.get('checkpoint_saved')
-                and (('h3safeboundarypause' in text) or (receipt and receipt['exit_code'] in (-15, 143)
-                     and stop.get('last_signal') == 'SIGTERM'))):
+        if checkpoint_stop and ('h3safeboundarypause' in text or
+                (term_exit and (exit_code in (-15, 143) or saw_term_exception))):
             return 'watchdog_checkpoint_stop'
         if re.search(nccl, text):
             return 'nccl_watchdog_timeout'

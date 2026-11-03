@@ -1247,34 +1247,99 @@ def test_torchrun_sigterm_tail_requires_matching_term_receipt(box, code):
     if code is not None:
         box.watch.store.save('exit-' + rec['launch_id'] + '.json',
             dict(launch_id=rec['launch_id'], pgid=rec['pgid'], exit_code=code))
-    box.watch.s['stop'] = dict(cause='monitor_stop', checkpoint_saved=1,
+    box.watch.s['stop'] = dict(cause='monitor_stop', checkpoint_saved=1, phase='term',
                               last_signal='SIGTERM', launch_id=rec['launch_id'])
     box.die()
     state = box.tick()
     assert state['incidents'][-1]['cause'] == (
-        'watchdog_checkpoint_stop' if code in (-15, 143) else 'correctness_or_permanent_error')
-    assert state['state'] == ('RECOVERING' if code in (-15, 143) else 'NEEDS_HUMAN')
+        'watchdog_checkpoint_stop' if code in (-15, 143, 1) else 'correctness_or_permanent_error')
+    assert state['state'] == ('RECOVERING' if code in (-15, 143, 1) else 'NEEDS_HUMAN')
 
 
-@pytest.mark.parametrize('case', ['no-stop', 'no-checkpoint', 'wrong-signal', 'wrong-owner', 'application'])
-def test_torchrun_signal_exception_does_not_grant_retry(box, case):
+@pytest.mark.parametrize('cause', ['monitor_stop', 'disk_low'])
+@pytest.mark.parametrize('restart', [False, True])
+def test_torchrun_exit_one_after_watchdog_checkpoint_term(box, cause, restart):
+    box.tick()
+    watch = box.watch
+    watch.request_stop(cause, watch.s['last_checks'])
+    fake_checkpoint(box.root / 'output')
+    box.tick()
+    assert watch.s['stop']['checkpoint_saved'] == 1
+    box.advance(.2)
+    box.monitor()
+    # Exercise the real watchdog TERM bookkeeping; only the OS signal is mocked.
+    with patch.object(process, 'signal_group') as send:
+        box.tick()
+        send.assert_called_once_with(watch.s['process'], signal.SIGTERM)
+    assert watch.s['stop']['phase'] == 'term'
+    assert watch.s['stop']['last_signal'] == 'SIGTERM'
+    rec = watch.s['process']
+    assert watch.s['stop']['launch_id'] == rec['launch_id']
+    # torchrun's @record wrapper exits 1 on SignalException, not -15/143.
+    box.log((WATCH_LOGS / 'torchrun_sigterm.log').read_text())
+    box.die()
+    watch.store.save('exit-' + rec['launch_id'] + '.json',
+        dict(launch_id=rec['launch_id'], pgid=rec['pgid'], exit_code=1))
+    if restart:
+        box.watch = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+    state = box.tick()
+    assert state['incidents'][-1]['cause'] == 'watchdog_checkpoint_stop'
+    assert state['state'] == 'RECOVERING'
+    assert not state['resumes']
+
+
+@pytest.mark.parametrize('code', [-15, 143, 1])
+@pytest.mark.parametrize('case', ['no-stop', 'no-checkpoint', 'wrong-signal', 'wrong-owner',
+    'wrong-launch', 'no-launch', 'no-signal', 'pause-phase', 'kill-phase', 'no-phase',
+    'application', 'same-line-application', 'signal9', 'oom', 'nccl-error'])
+def test_torchrun_signal_exception_does_not_grant_retry(box, case, code):
     box.tick()
     text = (WATCH_LOGS / 'torchrun_sigterm.log').read_text()
     if case == 'application':
         text += 'ValueError: sampled/replayed old score mismatch beyond the declared batched-rollout tolerance\n'
+    if case == 'same-line-application':
+        text = text.rstrip() + ' ValueError: invalid application state\n'
+    if case == 'signal9':
+        text = text.replace('signal: 15', 'signal: 9')
+    if case == 'oom':
+        text += 'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n'
+    if case == 'nccl-error':
+        text += '[rank0]: RuntimeError: NCCL watchdog timed out\n'
     box.log(text)
     rec = box.watch.s['process']
     box.watch.store.save('exit-' + rec['launch_id'] + '.json',
-        dict(launch_id=rec['launch_id'], pgid=rec['pgid'] + (case == 'wrong-owner'), exit_code=-15))
-    stop = dict(cause='monitor_stop', checkpoint_saved=1, last_signal='SIGTERM', launch_id=rec['launch_id'])
+        dict(launch_id=rec['launch_id'], pgid=rec['pgid'] + (case == 'wrong-owner'), exit_code=code))
+    stop = dict(cause='monitor_stop', checkpoint_saved=1, phase='term',
+                last_signal='SIGTERM', launch_id=rec['launch_id'])
     if case == 'no-checkpoint':
         stop.pop('checkpoint_saved')
     if case == 'wrong-signal':
         stop['last_signal'] = 'SIGKILL'
+    if case == 'wrong-launch':
+        stop['launch_id'] = 'different-launch'
+    for missing, key in [('no-launch', 'launch_id'), ('no-signal', 'last_signal'), ('no-phase', 'phase')]:
+        if case == missing:
+            stop.pop(key)
+    if case in ('pause-phase', 'kill-phase'):
+        stop['phase'] = case.split('-')[0]
     box.watch.s['stop'] = None if case == 'no-stop' else stop
     box.die()
     assert box.tick()['state'] == 'NEEDS_HUMAN'
     assert not box.watch.s['resumes']
+
+
+@pytest.mark.parametrize('code,expected', [(-15, 'watchdog_checkpoint_stop'),
+    (143, 'watchdog_checkpoint_stop'), (1, 'unknown_exit')])
+def test_watchdog_term_exit_without_signal_exception(box, code, expected):
+    box.tick()
+    rec = box.watch.s['process']
+    box.watch.s['stop'] = dict(cause='monitor_stop', checkpoint_saved=1, phase='term',
+                              last_signal='SIGTERM', launch_id=rec['launch_id'])
+    box.watch.store.save('exit-' + rec['launch_id'] + '.json',
+        dict(launch_id=rec['launch_id'], pgid=rec['pgid'], exit_code=code))
+    box.log('W1103 torch/distributed/elastic/agent/server/api.py:704] '
+            'Received Signals.SIGTERM death signal, shutting down workers\n')
+    assert box.watch.death_cause() == expected
 
 
 @pytest.mark.parametrize('line', ['Exception: card/process monitor unhealthy',
