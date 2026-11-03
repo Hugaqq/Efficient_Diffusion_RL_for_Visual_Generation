@@ -1253,6 +1253,30 @@ def test_torch2_nccl_tail_preserves_application_veto(box, failure):
     assert not state['resumes']
 
 
+@pytest.mark.parametrize('level', ['ERROR', 'CRITICAL', 'FATAL'])
+@pytest.mark.parametrize('prefix', ['', '[rank0]: ', 'worker-0 | '])
+def test_midline_logging_levels_veto_nccl_retry(box, level, prefix):
+    box.tick()
+    failure = (WATCH_LOGS / 'python_logging_application_error.log').read_text().replace('ERROR', level)
+    box.log(prefix + failure + (WATCH_LOGS / 'torch2_nccl_timeout.log').read_text())
+    box.die()
+    state = box.tick()
+    assert state['incidents'][-1]['cause'] == 'correctness_or_permanent_error'
+    assert state['state'] == 'NEEDS_HUMAN'
+    assert not state['resumes']
+
+
+@pytest.mark.parametrize('metric,expected', [
+    ('step 3 max abs error 1e-3 within tolerance', 'nccl_watchdog_timeout'),
+    ('ERROR_RATE=0.01', 'nccl_watchdog_timeout'),
+    # Preserve the pre-existing conservative vetoes; do not broaden this fix.
+    ('error bars computed', 'correctness_or_permanent_error'),
+    ('loss_error: 0.1', 'correctness_or_permanent_error')])
+def test_error_words_keep_existing_classification(box, metric, expected):
+    box.log(metric + '\n' + (WATCH_LOGS / 'torch2_nccl_timeout.log').read_text())
+    assert box.watch.death_cause() == expected
+
+
 @pytest.mark.parametrize('code', [-15, 143, 1, None])
 def test_torchrun_sigterm_tail_requires_matching_term_receipt(box, code):
     box.tick()
@@ -1305,7 +1329,7 @@ def test_torchrun_exit_one_after_watchdog_checkpoint_term(box, cause, restart):
 @pytest.mark.parametrize('code', [-15, 143, 1])
 @pytest.mark.parametrize('case', ['no-stop', 'no-checkpoint', 'wrong-signal', 'wrong-owner',
     'wrong-launch', 'no-launch', 'no-signal', 'pause-phase', 'kill-phase', 'no-phase',
-    'application', 'same-line-application', 'signal9', 'oom', 'nccl-error'])
+    'application', 'same-line-application', 'signal9', 'oom', 'nccl-error', 'logging-error'])
 def test_torchrun_signal_exception_does_not_grant_retry(box, case, code):
     box.tick()
     text = (WATCH_LOGS / 'torchrun_sigterm.log').read_text()
@@ -1319,6 +1343,8 @@ def test_torchrun_signal_exception_does_not_grant_retry(box, case, code):
         text += 'torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n'
     if case == 'nccl-error':
         text += '[rank0]: RuntimeError: NCCL watchdog timed out\n'
+    if case == 'logging-error':
+        text += (WATCH_LOGS / 'python_logging_application_error.log').read_text()
     box.log(text)
     rec = box.watch.s['process']
     box.watch.store.save('exit-' + rec['launch_id'] + '.json',

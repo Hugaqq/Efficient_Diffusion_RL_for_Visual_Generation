@@ -447,7 +447,8 @@ class Watchdog:
     def death_cause(self):
         owned = self.store.path('training-' + self.s['process']['launch_id'] + '.log')
         log = owned if owned.is_file() else Path(self.config.get('training_log', owned))
-        text = tail(log, 256 * 1024).lower() if log.is_file() else ''
+        raw_text = tail(log, 256 * 1024) if log.is_file() else ''
+        text = raw_text.lower()
         # Correctness evidence takes precedence over EVERY transient pattern.
         permanent = ('audit failed', 'graph/count/release', 'adam counter', 'gradient not finite',
             'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged',
@@ -466,7 +467,8 @@ class Watchdog:
         exit_code = receipt.get('exit_code') if receipt else None
         term_exit = watchdog_term and type(exit_code) is int and exit_code in (-15, 143, 1)
         saw_term_exception, other_failure = False, False
-        for line in text.splitlines():
+        for raw_line in raw_text.splitlines():
+            line = raw_line.lower()
             # Normal structured launcher metadata is not a failure record.
             try:
                 row = json.loads(line)
@@ -479,9 +481,11 @@ class Watchdog:
             if any(word in line for word in permanent):
                 return 'correctness_or_permanent_error'
             # A C++ namespace (c10::Error::Error) is not an exception record;
-            # the bare word "error" in torch diagnostics/metrics is not a level.
+            # a mid-line uppercase level is a failure, unlike a lowercase metric
+            # word ("max abs error") or an identifier such as ERROR_RATE.
+            log_level = re.search(r'\b(?:ERROR|CRITICAL|FATAL)\b', raw_line)
             exception_pattern = r'\b([\w.]*(?:error|exception))\s*:(?!:)\s*'
-            failure = structured_failure or re.search(exception_pattern + r'|\b(?:fatal|critical)\b|'
+            failure = structured_failure or log_level or re.search(exception_pattern + r'|\b(?:fatal|critical)\b|'
                 r'^\s*(?:\[[^\]]*\]\s*:?\s*)*error\b|\[error\]|'
                 r'\b(?:audit|graph|gradient|identity)[^\n]*(?:failed|mismatch)', line)
             # An application exception cannot borrow a later NCCL substring on
