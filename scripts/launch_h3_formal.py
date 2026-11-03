@@ -51,6 +51,7 @@ JOURNAL_PROCESSES = 9            # 8 training ranks + the HPS service, each with
 OTHER_LOG_BYTES = 2 * 1024**3    # stdout/stderr and HPS service logs
 MONITOR_SECONDS_PER_UPDATE = 7200  # conservative: M1 measured 88 min/update (480x320, incl. save)
 MONITOR_ROW_BYTES = 32 * 1024    # conservative card-process.jsonl row; the observed mean is used if larger
+MONITOR_MAX_INTERVAL = 10.       # health age ~ interval + sample time (<= ~16 s on timeouts) must stay < 30 s
 DISK_MARGIN = 1.2
 IDENTITY_FILE = 'formal-run.json'
 
@@ -134,6 +135,9 @@ def monitor_budget(directory, *, remaining_updates, seconds_per_update=MONITOR_S
     missing = [k for k in keys if k not in health]
     if missing:
         raise RuntimeError(f'card monitor health lacks budget fields {missing}; restart it from this checkout')
+    if not 0 <= health['interval_seconds'] <= MONITOR_MAX_INTERVAL:
+        raise RuntimeError(f"card monitor --interval {health['interval_seconds']} s exceeds {MONITOR_MAX_INTERVAL} s; "
+                           f'health could go stale (> {FormalBackend.monitor_max_age} s) between samples')
     now = time.monotonic_ns() if now_ns is None else now_ns
     remaining_seconds = health['max_seconds'] - (now - health['started_monotonic_ns']) / 1e9
     remaining_bytes = health['max_bytes'] - health['bytes']
@@ -147,7 +151,7 @@ def monitor_budget(directory, *, remaining_updates, seconds_per_update=MONITOR_S
                   remaining_bytes=remaining_bytes, need_bytes=need_bytes, max_bytes=health['max_bytes'])
     if remaining_seconds < need_seconds or remaining_bytes < need_bytes:
         raise RuntimeError(f'card monitor budget cannot cover {remaining_updates} updates: {report}; '
-                           'restart the monitor with larger --max-seconds/--max-bytes (or a longer --interval)')
+                           'restart the monitor with larger --max-seconds/--max-bytes (keep --interval <= 10 s)')
     return report
 
 

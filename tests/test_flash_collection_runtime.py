@@ -3981,6 +3981,16 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match='cannot cover'):  # elapsed lifetime counts
         formal.monitor_budget(budget_dir, remaining_updates=10, now_ns=20000 * 10**9, row_bytes=1024)
     assert formal.monitor_budget(budget_dir, remaining_updates=0, now_ns=0)['need_bytes'] == 0  # finalize-only
+    for slow in (10.5, 30.):  # a longer interval would let the 30 s per-update health check go stale
+        budget_health(interval_seconds=slow)
+        for remaining in (200, 0):
+            with pytest.raises(RuntimeError, match='exceeds 10.0 s'):
+                formal.monitor_budget(budget_dir, remaining_updates=remaining, now_ns=0)
+    budget_health(interval_seconds=10., max_bytes=512 * 1024**2)
+    with pytest.raises(RuntimeError, match=r'larger --max-seconds/--max-bytes \(keep --interval <= 10 s\)') as hint:
+        formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert 'longer --interval' not in str(hint.value)
+    budget_health(interval_seconds=1., max_seconds=86400., max_bytes=512 * 1024**2)
     budget_health(bytes=100 * 10**6)  # observed rows (1 MB) larger than the default estimate are used
     with pytest.raises(RuntimeError, match='cannot cover'): formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
     (budget_dir / 'health.json').write_text(json.dumps(dict(healthy=True, sample_count=9, monotonic_ns=0)))
