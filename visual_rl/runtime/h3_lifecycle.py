@@ -134,11 +134,14 @@ class _Graph:
 
 
 class H3LifecycleBackend:
-    def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False):
+    def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False,
+                 reuse_rollout_anchor=False):
         if type(reward_pipeline) is not bool:
             raise TypeError('reward_pipeline must be bool')
         if type(reuse_video_vae) is not bool: raise TypeError('reuse_video_vae must be bool')
+        if type(reuse_rollout_anchor) is not bool: raise TypeError('reuse_rollout_anchor must be bool')
         self.reuse_video_vae=reuse_video_vae
+        self.reuse_rollout_anchor=reuse_rollout_anchor
         self.reward_pipeline=reward_pipeline
         self.inspection_only=inspection_only
         self.code_upgrade = code_upgrade
@@ -155,6 +158,8 @@ class H3LifecycleBackend:
             raise ConfigError(str(exc)) from exc
 
     def _check_reward_pipeline(self,profile):
+        if self.reuse_rollout_anchor and profile.training.algorithm!='dual_flash':
+            raise ValueError('rollout anchor reuse requires dual_flash')
         if self.reuse_video_vae and (profile.training.algorithm!='dual_flash'
                                      or profile.training.group_layout!='paired_4x8'):
             raise ValueError('video reuse requires paired_4x8 dual_flash')
@@ -311,7 +316,8 @@ class H3LifecycleBackend:
                     media_bytes=graph.profile.launch.budgets.media_bytes,
                     decode_bytes=graph.profile.launch.budgets.decode_bytes,
                     reuse_video_vae=self.reuse_video_vae,
-                    video_reuse_scope=binding.video_reuse_scope if self.reuse_video_vae else None,**options)
+                    video_reuse_scope=binding.video_reuse_scope if self.reuse_video_vae else None,
+                    reuse_rollout_anchor=self.reuse_rollout_anchor,**options)
             trainer = stages.trainer()
             return SimpleNamespace(graph=graph, prepared=prepared, binding=binding, stages=stages,
                 trainer=trainer, transaction=self.transaction, close=trainer.close)

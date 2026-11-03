@@ -41,10 +41,38 @@ class H3DualFlowSDE:
         std = diffusion * torch.sqrt(-dt)
         velocity_factor = (1 + diffusion.square() * (1-s)/(2*s)) * dt
         mean = x.float() * (1 + diffusion.square()/(2*s)*dt) + prediction.float()*velocity_factor
-        coefficient = 1 / (torch.sqrt(-dt)/diffusion + diffusion*torch.sqrt(-dt)*(1-s)/(2*s))
+        coefficient = H3DualFlowSDE._coefficient(s, u, maximum)
         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(std)) or std.item() <= 0 or not bool(torch.isfinite(coefficient)) or coefficient.item() <= 0:
             raise ValueError('invalid dual Flow-SDE statistics')
         return mean, std, coefficient
+
+    @staticmethod
+    def _coefficient(s, u, maximum):
+        """Flash correction coefficient: a pure schedule function of (sigma, next_sigma, sigma_max)."""
+        dt = u - s
+        diffusion = maximum * s
+        return 1 / (torch.sqrt(-dt)/diffusion + diffusion*torch.sqrt(-dt)*(1-s)/(2*s))
+
+    def coefficients(self, index, *, device):
+        """Per-stream Flash coefficients of one transition without any model forward.
+
+        Equal to the third ``evaluate`` output for the same index and device:
+        the coefficient never depends on the state, action or prediction.
+        """
+        device = torch.device(device)
+        vs, vu, aus, auu = self.schedule.transition(index)
+        grids = (self.schedule.video_sigmas, self.schedule.audio_sigmas)
+        out = []
+        for sigma, next_sigma, grid in zip((vs, aus), (vu, auu), grids):
+            s, u, maximum = (v.to(device=device, dtype=torch.float32) for v in (sigma, next_sigma, grid[1]))
+            dt = u - s
+            if not bool(torch.isfinite(dt)) or dt.item() >= 0 or s.item() <= 0 or maximum.item() <= 0:
+                raise ValueError('stochastic transition requires positive sigma and decreasing grid')
+            coefficient = self._coefficient(s, u, maximum)
+            if not bool(torch.isfinite(coefficient)) or coefficient.item() <= 0:
+                raise ValueError('invalid dual Flow-SDE statistics')
+            out.append(coefficient.detach())
+        return tuple(out)
 
     def _parts(self, x, prediction, index):
         if not isinstance(x, torch.Tensor) or not isinstance(prediction, torch.Tensor):

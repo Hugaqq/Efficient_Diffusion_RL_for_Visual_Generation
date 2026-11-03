@@ -38,7 +38,8 @@ from visual_rl.algorithms.trainer.interface import StageValue
 
 class H3DualIterationStages(H3IterationStages):
     def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
-                 rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None, **kwargs):
+                 rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None,
+                 reuse_rollout_anchor=False, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -52,6 +53,10 @@ class H3DualIterationStages(H3IterationStages):
         if reuse_video_vae and (mode!='dual_flash' or not callable(video_reuse_scope)):
             raise ValueError('video reuse requires dual_flash and a binding scope factory')
         self.reuse_video_vae,self.video_reuse_scope=reuse_video_vae,video_reuse_scope
+        if type(reuse_rollout_anchor) is not bool: raise TypeError('reuse_rollout_anchor must be bool')
+        if reuse_rollout_anchor and mode!='dual_flash':
+            raise ValueError('rollout anchor reuse requires dual_flash (flow records store no old score)')
+        self.reuse_rollout_anchor=reuse_rollout_anchor
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -161,8 +166,10 @@ class H3DualIterationStages(H3IterationStages):
     def optimize(self,value):
         ctx=self._context(value);r=ctx.request;c=ctx.coordinator;records=ctx.dual_records
         keys=tuple((record.sample_id,record.index) for record in records)
+        # Every rank must agree whether the anchor forward is skipped (off: 4 no-grad forwards/rank).
+        c.gate(f'dual/anchor/reuse/{int(self.reuse_rollout_anchor)}')
         anchor=_checked(c,'dual/anchor/prepare',lambda:H3DualReplayAnchor(dynamics=ctx.dual,
-            behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells))
+            behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells,reuse_rollout=self.reuse_rollout_anchor))
         _checked(c,'dual/anchor/records',lambda:anchor.validate_records(records))
         anchor.capture(records,device=self.device,predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/anchor/version'),gate=lambda event,**kw:c.gate('dual/'+event,**kw))

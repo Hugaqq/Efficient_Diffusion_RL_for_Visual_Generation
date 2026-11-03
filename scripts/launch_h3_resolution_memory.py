@@ -53,7 +53,10 @@ def phase(name):
 
 class TwoUpdateBackend(H3LifecycleBackend):
     def __init__(self,*,args):
-        super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae)
+        super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae,
+                         reuse_rollout_anchor=args.reuse_rollout_anchor)
+        # 4 samples x 10 rollout transitions, plus 4 anchor forwards unless the rollout anchor is reused.
+        self.nograd_forwards_per_update=40 if self.reuse_rollout_anchor else 44
         from visual_rl.runtime.h3_rollout_profile import configuration
         configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
         self.profile_rollout=args.profile_rollout;self.rollout_profile=None
@@ -113,7 +116,7 @@ class TwoUpdateBackend(H3LifecycleBackend):
                         raise ValueError('frozen base changed')
                     if before['hashes']['trainable']==after['hashes']['trainable']:
                         raise ValueError('local LoRA shard unchanged')
-                    if (len(graph_audit['grad_forward_indices'])!=4*(step+1) or graph_audit['nograd_forwards']!=44*(step+1)
+                    if (len(graph_audit['grad_forward_indices'])!=4*(step+1) or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*(step+1)
                             or not graph_audit['final_prediction_released']):
                         raise ValueError('single-cell graph/count/release audit failed')
                     if not prepared.optimizer.state or any(int(s['step'].item())!=step+1 for s in prepared.optimizer.state.values()):
@@ -155,6 +158,8 @@ def main():
                    help='opt-in owner-local pipeline; requires separately approved independent-HPS experiment')
     p.add_argument('--reuse-video-vae',action='store_true',
                    help='opt-in verified owner-local video VAE reuse; requires approved experiment')
+    p.add_argument('--reuse-rollout-anchor',action='store_true',
+                   help='opt-in: reuse the rollout-time old score instead of a second anchor no-grad forward')
     p.add_argument('--profile-rollout',action='store_true',
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     args=p.parse_args()

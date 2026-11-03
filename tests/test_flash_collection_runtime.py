@@ -143,6 +143,33 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     with pytest.raises(ValueError,match='sampled/replayed old score mismatch'):
         bad_anchor.capture(bad_records,device='cpu',predict=lambda sid,x,index:torch.zeros_like(x),
             read_behavior_id=lambda:'behavior',gate=lambda *a,**kw:None)
+    # O1: opt-in anchor reuse performs zero no-grad forwards and reproduces the
+    # recompute path bit-for-bit (rollout-time old score, schedule-only coefficients).
+    forwards=[];anchor_gates=[]
+    def counted_predict(sid,x,index):
+        forwards.append((sid,index));return torch.zeros_like(x)
+    def captured(rows=records,version='behavior',**options):
+        owner=H3DualReplayAnchor(dynamics=dynamics,behavior_id='behavior',expected_keys=keys,max_records=2,**options)
+        owner.capture(rows,device='cpu',predict=counted_predict,read_behavior_id=lambda:version,
+            gate=lambda event,**kw:anchor_gates.append((event,kw.get('local_error'))))
+        return owner
+    recompute=captured();assert len(forwards)==2 and recompute.reuse_rollout is False
+    assert anchor_gates==[(f'anchor/{i}/{name}',err) for i in range(2) for name,err in (('forward',None),('prepare',False),('result',False))]
+    del anchor_gates[:]
+    reused=captured(reuse_rollout=True);assert len(forwards)==2 and reused.reuse_rollout is True
+    assert anchor_gates==[(f'anchor/{i}/reuse',False) for i in range(2)]
+    for record in records:
+        (score,anchor_coefs),(old,reuse_coefs)=recompute.get(record.sample_id,record.index),reused.get(record.sample_id,record.index)
+        assert torch.equal(score,old) and torch.equal(old,record.old_joint) and (score.dtype,score.shape)==(old.dtype,old.shape)
+        assert len(reuse_coefs)==2 and all(torch.equal(a,b) and (a.dtype,a.shape)==(b.dtype,b.shape) for a,b in zip(anchor_coefs,reuse_coefs))
+        assert all(torch.equal(a,b) for a,b in zip(reuse_coefs,dynamics.coefficients(record.index,device='cpu')))
+        old.fill_(99);assert torch.equal(reused.get(record.sample_id,record.index)[0],record.old_joint)
+    with pytest.raises(TypeError,match='bool'):captured(reuse_rollout=1)
+    with pytest.raises(ValueError,match='old score missing'):
+        captured(rows=(replace(records[0],old_joint=None),records[1]),reuse_rollout=True)
+    assert anchor_gates[-1]==('anchor/0/reuse',True)
+    with pytest.raises(ValueError,match='behavior changed'):captured(version='other',reuse_rollout=True)
+    assert len(forwards)==2
     from tests.test_h3_dual_rollout import test_stable_group_selection_and_full_vs_single_step
     test_stable_group_selection_and_full_vs_single_step()
     # Independent Gaussian derivative for each stream (not two calls to a
@@ -322,7 +349,7 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
         mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
         mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]]*8)
-        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False,reuse_video_vae=False))
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False))
         backend.bind(None,runtime,graph,prepared,None)
         bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
         assert len(backend.audits)==2
@@ -2361,17 +2388,20 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'):
             H3DualIterationStages(mode='dual_flash', seed=42, reward_pipeline=bad)
+        with pytest.raises(TypeError, match='bool'):
+            H3DualIterationStages(mode='dual_flash', seed=42, reuse_rollout_anchor=bad)
+        with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reuse_rollout_anchor=bad)
     with pytest.raises(ValueError, match='dual_flash'):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is True
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False)).reward_pipeline is False
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False)).reward_pipeline is False
     # V1v flag: strict bool, default off, paired_4x8 dual_flash only, real binding scope factory required.
     assert H3LifecycleBackend().reuse_video_vae is False
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reuse_video_vae=bad)
         with pytest.raises(TypeError, match='bool'): H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=bad)
         with pytest.raises(TypeError, match='bool'):
-            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False, reuse_video_vae=bad))
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False, reuse_video_vae=bad, reuse_rollout_anchor=False))
     with pytest.raises(ValueError, match='binding scope factory'):
         H3DualIterationStages(mode='dual_flash', seed=42, reuse_video_vae=True)
     with pytest.raises(ValueError, match='dual_flash'):
@@ -2380,7 +2410,17 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for algorithm, layout in (('cps', 'rank_local'), ('dual_flow', 'paired_4x8'), ('dual_flash', 'rank_local')):
         with pytest.raises(ValueError, match='video reuse requires paired_4x8'):
             reuse_backend._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(algorithm=algorithm, group_layout=layout)))
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=True)).reuse_video_vae is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=True,reuse_rollout_anchor=False)).reuse_video_vae is True
+    with pytest.raises(ValueError, match='dual_flash'):
+        H3DualIterationStages(mode='dual_flow', seed=42, reuse_rollout_anchor=True)
+    with pytest.raises(ValueError, match='dual_flash'):
+        H3LifecycleBackend(reuse_rollout_anchor=True)._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(
+            algorithm='dual_flow', group_layout='paired_4x8')))
+    # O1 audit constant: 44 no-grad forwards per update by default (40 rollout + 4 anchor), 40 when reused.
+    for reuse, expected in ((False, 44), (True, 40)):
+        backend = two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False,
+                                                                   reuse_video_vae=False, reuse_rollout_anchor=reuse))
+        assert backend.reuse_rollout_anchor is reuse and backend.nograd_forwards_per_update == expected
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
@@ -2397,6 +2437,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert bound.stages.reward_pipeline is True
         assert (bound.stages.media_bytes, bound.stages.decode_bytes) == (1024, 2048)
         assert bound.stages.score_one is backend.binding.score_one
+        assert bound.stages.reuse_rollout_anchor is False
         bound.close()
         backend = H3LifecycleBackend(reward_pipeline=True, reuse_video_vae=True)
         backend.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf, video_reuse_scope=leaf)
@@ -2404,9 +2445,14 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         bound = backend.bind(None, runtime, graph, object(), None)
         assert bound.stages.reuse_video_vae is True and bound.stages.video_reuse_scope is leaf
         bound.close()
+        reuse_backend = H3LifecycleBackend(reward_pipeline=True, reuse_rollout_anchor=True)
+        reuse_backend.binding = backend.binding; reuse_backend.transaction = backend.transaction
+        reuse_bound = reuse_backend.bind(None, runtime, graph, object(), None)
+        assert reuse_bound.stages.reuse_rollout_anchor is True and reuse_bound.stages.reward_pipeline is True
+        reuse_bound.close()
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys
-        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--help'])
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
     with monkeypatch.context() as patch:
@@ -2645,6 +2691,43 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         stage.rollout(StageValue(identity, ctx))
         rec.assert_complete()
         assert rec.hits == 1 and len(predictions) == 20 and len(ctx.dual_records) == 2
+        # O1: the real optimize stage with the real anchor on the records above.
+        # Off path: one anchor no-grad forward per record before the grad forward;
+        # on path: zero, with a bit-identical loss/update, the rank-consistent
+        # 'dual/anchor/reuse/1' gate and the unchanged initial-ratio audit.
+        import io, contextlib
+        patch.setattr(torch.distributed, 'all_reduce', lambda value, **kwargs: value)
+        def optimize_once(reuse):
+            lora = torch.nn.Parameter(torch.zeros(5)); optimizer = torch.optim.AdamW([lora], lr=1e-2)
+            calls, gates, out = [], [], io.StringIO()
+            def predict_lora(prepared, *, sample_id, x, index, **kwargs):
+                calls.append((sample_id, index, torch.is_grad_enabled())); return x.float()*0 + lora
+            trained = H3DualIterationStages(mode='dual_flash', seed=42, data=data, predict=predict_lora,
+                prepared=SimpleNamespace(optimizer=optimizer, prepared_root=torch.nn.Identity(), reducer_divisor=8, scheduler=None),
+                decode=lambda t: None, score_one=lambda **kw: 1., coordination_factory=lambda plan: None,
+                process_group=None, rank=0, device='cpu', read_behavior_id=lambda: 'behavior', reuse_rollout_anchor=reuse)
+            run = SimpleNamespace(request=SimpleNamespace(identity=identity, samples=request.samples, behavior_id='behavior',
+                    conditions=request.conditions, dynamics=dynamics, max_cells=2, collection_id='c', next_behavior_id='n'),
+                dual=dynamics, dual_records=ctx.dual_records, plan=SimpleNamespace(samples=request.samples),
+                advantages={'a': torch.tensor(.5), 'b': torch.tensor(-.5)},
+                coordinator=SimpleNamespace(gate=lambda event, **kw: gates.append((event, kw.get('local_error', False))),
+                                            clip_grad_norm=lambda prepared, max_norm: float(lora.grad.norm())))
+            trained._active = run
+            with contextlib.redirect_stdout(out): result = trained.optimize(StageValue(identity, run))
+            return calls, gates, out.getvalue(), result.payload, lora.detach().clone()
+        off, on = optimize_once(False), optimize_once(True)
+        nograd = lambda calls: [(sid, i) for sid, i, grad in calls if not grad]
+        assert nograd(off[0]) == [(r.sample_id, r.index) for r in ctx.dual_records] and nograd(on[0]) == []
+        assert [c for c in off[0] if c[2]] == [c for c in on[0] if c[2]] and len(on[0]) == 2
+        assert ('dual/anchor/reuse/0', False) in off[1] and ('dual/anchor/reuse/1', False) in on[1]
+        per_record = lambda gates: [e for e, _ in gates if e.startswith('dual/anchor/') and e.split('/')[2].isdigit()]
+        assert per_record(off[1]) == [f'dual/anchor/{i}/{name}' for i in range(2) for name in ('forward', 'prepare', 'result')]
+        assert per_record(on[1]) == ['dual/anchor/0/reuse', 'dual/anchor/1/reuse']
+        assert [e for e, _ in off[1] if e.startswith('dual/current/')] == [e for e, _ in on[1] if e.startswith('dual/current/')]
+        assert off[2].count('h3_initial_policy_ratio') == 2 == on[2].count('h3_initial_policy_ratio')
+        assert 'h3_rollout_replay_score_check' in off[2] and 'h3_rollout_replay_score_check' not in on[2]
+        assert off[3].scaled_loss == on[3].scaled_loss and off[3].grad_norm == on[3].grad_norm and torch.equal(off[4], on[4])
+        assert off[3].local_cells == 2 and off[3].grad_norm > 0
 
     # Actual two-update binding, including off/no-probe, peer agreement,
     # installation and missed-window final gate. Parent model construction
@@ -2667,7 +2750,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             output = tmp_path / ('profile-backend-' + str(enabled)); output.mkdir()
             graph = SimpleNamespace(session=runtime, source=SimpleNamespace(),
                                     profile=SimpleNamespace(launch=SimpleNamespace(output_dir=output)))
-            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, reuse_video_vae=False, expected_sha='e'*40,
+            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, reuse_video_vae=False, reuse_rollout_anchor=False, expected_sha='e'*40,
                 ffmpeg=Path('unused'), ffprobe=Path('unused'), monitor_dir=tmp_path / 'unused')
             backend = two_update.TwoUpdateBackend(args=args)
             assert backend.reward_pipeline is True
@@ -2697,7 +2780,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for bad in (1, 'yes', None):
         with pytest.raises(TypeError, match='bool'): profiling.configuration(bad)
         with pytest.raises(TypeError, match='bool'):
-            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad, reuse_video_vae=False))
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad, reuse_video_vae=False, reuse_rollout_anchor=False))
 
     # H1: actual backend constructor/identity/_score and offline Handler. Only
     # the heavy inferencer, CUDA observations/transfers/clock/host admission
