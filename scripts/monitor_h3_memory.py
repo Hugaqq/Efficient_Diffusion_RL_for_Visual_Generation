@@ -72,6 +72,9 @@ def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_secon
         raise ValueError('max_consecutive_failures must be an int >= 1')
     directory.mkdir(parents=True, exist_ok=True)
     started=time.monotonic();size=0;count=0;failures=0
+    # Budgets travel with every health file so a long-run launcher can check the remaining lifetime.
+    budget=dict(interval_seconds=interval,max_seconds=max_seconds,max_bytes=max_bytes,
+                started_monotonic_ns=time.monotonic_ns())
     try:
         with (directory/'card-process.jsonl').open('x',buffering=1) as stream:
             def write(row):
@@ -92,12 +95,12 @@ def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_secon
                     write(dict(schema='h3.card-sample.v1',utc=utc,monotonic_ns=now,monitor_pid=os.getpid(),
                                degraded=True,error=repr(exc),consecutive_failures=failures))
                     atomic(directory/'health.json',dict(healthy=True,degraded=True,pid=os.getpid(),sample_count=count,
-                           consecutive_failures=failures,last_error=repr(exc),monotonic_ns=now,utc=utc,bytes=size))
+                           consecutive_failures=failures,last_error=repr(exc),monotonic_ns=now,utc=utc,bytes=size,**budget))
                 else:
                     failures=0
                     write(row);count+=1
                     atomic(directory/'health.json',dict(healthy=True,degraded=False,pid=os.getpid(),sample_count=count,
-                           consecutive_failures=0,monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size))
+                           consecutive_failures=0,monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size,**budget))
                 time.sleep(max(0.,interval-(time.monotonic()-tick)))
             os.fsync(stream.fileno())
         atomic(directory/'exit.json',dict(exit_code=0,sample_count=count,bytes=size))
@@ -113,11 +116,29 @@ def failure_limit(value):
     return int(value)
 
 
+def positive_number(value):
+    try:
+        number=float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a positive finite number') from None
+    if not 0<number<float('inf'):
+        raise argparse.ArgumentTypeError('expected a positive finite number')
+    return number
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory',type=Path);parser.add_argument('--journal-dir',type=Path,required=True)
     parser.add_argument('--max-consecutive-failures',type=failure_limit,default=3)
-    args=parser.parse_args();run(args.directory,args.journal_dir,max_consecutive_failures=args.max_consecutive_failures)
+    # Defaults keep the short-acceptance budgets; a multi-day run must raise them explicitly.
+    parser.add_argument('--interval',type=positive_number,default=1.,help='seconds between samples (default 1)')
+    parser.add_argument('--max-seconds',type=positive_number,default=24*3600.,
+                        help='monitor lifetime before it exits unhealthy (default 86400)')
+    parser.add_argument('--max-bytes',type=failure_limit,default=512*1024**2,
+                        help='card-process.jsonl byte budget (default 512 MiB)')
+    args=parser.parse_args()
+    run(args.directory,args.journal_dir,interval=args.interval,max_bytes=args.max_bytes,
+        max_seconds=args.max_seconds,max_consecutive_failures=args.max_consecutive_failures)
 
 
 if __name__=='__main__':main()

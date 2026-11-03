@@ -3682,3 +3682,478 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             lifecycle_events.clear(); close_failure = False; idle_failure = True
             with pytest.raises(RuntimeError, match='main idle failed'): service.main()
             assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
+
+    # Formal 200-update run: long-run observation budgets are explicit opt-ins;
+    # unset environment / default CLI keep the short-acceptance limits.
+    from visual_rl.runtime import h3_memory as budget_memory
+    from scripts import monitor_h3_memory as budget_monitor
+    import sys
+    with monkeypatch.context() as patch:
+        patch.delenv('H3_MEMORY_MAX_BYTES', raising=False)
+        assert budget_memory.max_bytes_from_environment() == 64 * 1024**2
+        patch.setenv('H3_MEMORY_MAX_BYTES', str(512 * 1024**2))
+        assert budget_memory.max_bytes_from_environment() == 512 * 1024**2
+        for bad in ('0', '-1', '1e9', ' 5', str(2**40 + 1)):
+            patch.setenv('H3_MEMORY_MAX_BYTES', bad)
+            with pytest.raises(ValueError, match='H3_MEMORY_MAX_BYTES'): budget_memory.max_bytes_from_environment()
+        runs = []
+        patch.setattr(budget_monitor, 'run', lambda *a, **kw: runs.append(kw))
+        base = ['monitor_h3_memory', str(tmp_path / 'm'), '--journal-dir', str(tmp_path / 'j')]
+        patch.setattr(sys, 'argv', base); budget_monitor.main()
+        patch.setattr(sys, 'argv', base + ['--interval', '5', '--max-seconds', '1728000', '--max-bytes', str(8 * 1024**3)])
+        budget_monitor.main()
+        assert runs == [dict(interval=1., max_bytes=512 * 1024**2, max_seconds=86400., max_consecutive_failures=3),
+                        dict(interval=5., max_bytes=8 * 1024**3, max_seconds=1728000., max_consecutive_failures=3)]
+        for bad in (['--interval', '0'], ['--max-seconds', 'inf'], ['--max-bytes', '0'], ['--interval', 'nan']):
+            patch.setattr(sys, 'argv', base + bad)
+            with pytest.raises(SystemExit): budget_monitor.main()
+
+    # Formal reward-ranked video retention: cadence, tie-break, real CPU encode
+    # on 8 simulated owner ranks, global selection, and temp cleanup.
+    from scripts import h3_video_retention as retention
+    from visual_rl.models.implementations.h3_decode import H3AVMedia
+    import shutil
+    assert retention.export_steps(every=5, terminal_step=200) == list(range(5, 201, 5))
+    assert retention.export_steps(every=5, terminal_step=203)[-2:] == [200, 203]
+    assert retention.export_steps(every=5, terminal_step=200, after=20)[0] == 25
+    assert retention.export_steps(every=5, terminal_step=200, also=(1,))[:3] == [1, 5, 10]
+    assert len(retention.export_steps(every=5, terminal_step=200, also=(1,))) == 41
+    assert retention.export_steps(every=5, terminal_step=200, after=1, also=(1,))[0] == 5
+    with pytest.raises(ValueError, match='also'): retention.export_step(1, every=5, terminal_step=200, also=(0,))
+    for bad in ((0, 5, 200), (5, 0, 200), (5, 5, True), (1.0, 5, 200)):
+        with pytest.raises(ValueError): retention.export_step(bad[0], every=bad[1], terminal_step=bad[2])
+    tie_rows = [(f's{g}-{m}', f'g{g}', m, float(m % 3)) for g in range(4) for m in range(8)]
+    roles, ranks = retention.select_roles(tie_rows)
+    # Members 2 and 5 tie at the max (2.0), members 0/3/6 tie at the min (0.0): smallest sample_id wins.
+    assert roles['s0-0'] == ('member0', 'worst') and roles['s0-2'] == ('best',)
+    assert ranks['s0-2'] == 1 and ranks['s0-5'] == 2 and ranks['s0-6'] == 8
+    assert sum(len(v) for v in roles.values()) == 12
+    flat_rows = [(f's{g}-{m}', f'g{g}', m, 1.5) for g in range(4) for m in range(8)]
+    assert retention.select_roles(flat_rows)[0]['s1-0'] == ('member0', 'best', 'worst')
+    for broken in (tie_rows[:-1], tie_rows[:-1] + [tie_rows[0]], tie_rows[:-1] + [('x', 'g3', 7, float('nan'))],
+                   tie_rows[:-1] + [('x', 'g3', 7, 1)], tie_rows[:-1] + [('x', 'g3', 0, 1.0)]):
+        with pytest.raises(ValueError): retention.select_roles(broken)
+    assert retention.sample_dirname('h3-sample:ab') == 'h3-sample:ab'
+    assert retention.sample_dirname('../x') == hashlib.sha256(b'../x').hexdigest()
+    ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
+    assert ffmpeg and ffprobe, 'CPU media gate requires ffmpeg and ffprobe'
+    video_root = tmp_path / 'formal-videos'
+    reward_of = {f'h3-sample:{g}-{m}': float((m * 7 + g) % 8) / 4 for g in range(4) for m in range(8)}
+    def owner(rank, step):
+        g, half = rank // 2, rank % 2
+        local = tuple((f'h3-sample:{g}-{m}', f'h3-group:{g}', m) for m in range(4 * half, 4 * half + 4))
+        request = SimpleNamespace(identity=SimpleNamespace(optimizer_step=step - 1), group_layout='paired_4x8',
+            samples=local, prompts={sid: f'prompt {g}' for sid, _, _ in local}, collection_id='c', behavior_id='b')
+        return SimpleNamespace(_pending=request)
+    media = H3AVMedia(torch.linspace(0, 1, 3 * 3 * 16 * 16).reshape(3, 3, 16, 16), torch.zeros(8000, 2), 12, 32000)
+    scored = []
+    def original(*, sample_id, prompt, media):
+        scored.append(sample_id); return reward_of[sample_id]
+    def owners(step, ffmpeg_path=ffmpeg):
+        rows = []
+        for rank in range(8):
+            keep = retention.RolloutRetention(root=video_root, rank=rank, ffmpeg=ffmpeg_path, ffprobe=ffprobe,
+                launcher_sha='test', every=5, terminal_step=200, run_seed=42, also=(1,),
+                identity=lambda sid: dict(stochastic_index=3, initial_noise_sha256='n' * 64))
+            source = owner(rank, step)
+            callback = keep.observe(original, source=source)
+            for sid, _, _ in source._pending.samples:
+                assert callback(sample_id=sid, prompt=source._pending.prompts[sid], media=media) == reward_of[sid]
+            rows.append(keep)
+        return rows
+    before = media.video.clone()
+    quiet = owners(4)  # non-export update: scored, never encoded or staged
+    assert len(scored) == 32 and not video_root.exists() and all(not k.pending for k in quiet)
+    keepers = owners(5)
+    assert len(scored) == 64 and torch.equal(media.video, before)
+    tables = [k.local_rows(5) for k in keepers]
+    published = [path for k in keepers for path in k.publish(5, tables)]
+    roles, ranks = retention.select_roles([tuple(r) for t in tables for r in t])
+    assert len(published) == sum(len(v) for v in roles.values()) == 12
+    step_dir = video_root / 'step-0005'
+    assert sorted(p.name for p in step_dir.iterdir()) == ['best', 'member0', 'selection.json', 'worst']
+    for role in retention.ROLES:
+        assert len(list((step_dir / role).iterdir())) == 4
+    best = [sid for sid, value in roles.items() if 'best' in value]
+    for sid in best:
+        group = sid.split(':')[1].split('-')[0]
+        assert reward_of[sid] == max(v for s, v in reward_of.items() if s.split(':')[1].split('-')[0] == group)
+        receipt = json.loads((step_dir / 'best' / sid / 'receipt.json').read_text())
+        assert (receipt['role'], receipt['reward'], receipt['group_reward_rank'], receipt['run_seed']) == ('best', reward_of[sid], 1, 42)
+        assert receipt['roles'] == list(roles[sid])
+        assert receipt['prompt'].startswith('prompt ') and receipt['stochastic_index'] == 3 and receipt['frames'] == 3
+        assert receipt['video_sha256'] == hashlib.sha256((step_dir / 'best' / sid / 'video.mp4').read_bytes()).hexdigest()
+    selection_rows = json.loads((step_dir / 'selection.json').read_text())['samples']
+    assert len(selection_rows) == 32 and sum(len(r['roles']) for r in selection_rows) == 12
+    assert not (video_root / '.staging').exists() or not any((video_root / '.staging').rglob('*.mp4'))
+    with pytest.raises(FileExistsError):  # an export step is never silently overwritten
+        again = owners(5)
+        for k in again: k.publish(5, [k2.local_rows(5) for k2 in again])
+    for k in again: k.discard()
+    assert not any((video_root / '.staging').rglob('*.mp4'))
+    # Update 1 (untrained base) is exported too; an all-equal group keeps one sample in all three roles.
+    distinct = dict(reward_of)
+    reward_of.update((sid, 1.5) for sid in reward_of)
+    tied = owners(1)
+    tied_tables = [k.local_rows(1) for k in tied]
+    assert sum(len(k.publish(1, tied_tables)) for k in tied) == 12
+    reward_of.update(distinct)
+    for g in range(4):
+        sid = f'h3-sample:{g}-0'
+        for role in retention.ROLES:
+            tied_receipt = json.loads((video_root / 'step-0001' / role / sid / 'receipt.json').read_text())
+            assert tied_receipt['role'] == role and tied_receipt['roles'] == ['member0', 'best', 'worst']
+            assert tied_receipt['step'] == 1 and tied_receipt['reward'] == 1.5
+        assert all(len(list((video_root / 'step-0001' / role).iterdir())) == 4 for role in retention.ROLES)
+    # Failure: a broken encoder fails the score call AFTER the original reward; no temp survives.
+    with pytest.raises(Exception):
+        owners(10, ffmpeg_path=str(tmp_path / 'missing-ffmpeg'))
+    assert not any((video_root / '.staging').rglob('.encode-*')) and not (video_root / 'step-0010').exists()
+    retention.RolloutRetention(root=video_root, rank=0, ffmpeg=ffmpeg, ffprobe=ffprobe, launcher_sha='t',
+        every=5, terminal_step=200, run_seed=42).discard()
+    assert not (video_root / '.staging' / 'rank-0').exists()
+    # Resume: step dirs after the restored boundary move aside (kept), earlier ones stay.
+    keeper = retention.RolloutRetention(root=video_root, rank=0, ffmpeg=ffmpeg, ffprobe=ffprobe, launcher_sha='t',
+        every=5, terminal_step=200, run_seed=42)
+    (video_root / 'step-0010').mkdir()
+    assert keeper.supersede(first_step=5, label='attempt-x') == ['step-0010']
+    assert (video_root / 'step-0005').is_dir() and (video_root / 'superseded' / 'attempt-x' / 'step-0010').is_dir()
+
+    # Formal 200-update launcher: validation, resume identity, disk preflight,
+    # 30 s monitor staleness with degraded non-fatal, and the real backend
+    # hooks around tiny CPU iterations (no GPU, no controller.run).
+    from scripts import launch_h3_formal as formal
+    from scripts import launch_h3_resolution_memory as two_entry
+    from scripts.launch_h3_one_update import TRAIN_SHA as FORMAL_TRAIN, TEST_SHA as FORMAL_TEST
+    from tests.test_h3_mvp_cpu_profile import _fixture as formal_fixture, _save as formal_save
+    from visual_rl.composition.config.h3_profile import compile_h3_profile as formal_compile
+    from visual_rl.runtime import h3_lifecycle as formal_lifecycle
+    from visual_rl.runtime import h3_memory as formal_memory
+    import io, math, threading, time
+    from contextlib import contextmanager, redirect_stdout
+    profile_path, raw = formal_fixture(tmp_path / 'formal-profile')
+    raw['overrides']['training'] = dict(group_size=8, num_steps=10, algorithm='dual_flash', group_layout='paired_4x8')
+    raw['overrides']['model'] = dict(params=dict(width=384, height=256, frames=124, fps=24, lora_rank=32, lora_alpha=64))
+    raw['launch'].update(max_optimizer_steps=200, checkpoint_every_optimizer_steps=5)
+    raw['launch']['expected'].update(train_sha256=FORMAL_TRAIN, eval_sha256=FORMAL_TEST)
+    def compiled(**changes):
+        data = json.loads(json.dumps(raw))
+        for key, value in changes.items():
+            if key in ('width', 'height'): data['overrides']['model']['params'][key] = value
+            else: data['launch'][key] = value
+        return formal_compile(formal_save(profile_path.parent, data))
+    accepted = compiled()
+    assert formal.validate_formal(accepted) is accepted
+    for changes in (dict(width=480, height=320), dict(width=384, height=320), dict(max_optimizer_steps=2),
+                    dict(max_optimizer_steps=199), dict(max_optimizer_steps=205),
+                    dict(checkpoint_every_optimizer_steps=10), dict(checkpoint_every_optimizer_steps=1)):
+        with pytest.raises(ValueError, match='formal run requires'): formal.validate_formal(compiled(**changes))
+    for bad in (199, 2, '200', 200.0, True):
+        with pytest.raises(ValueError, match='accepts max_optimizer_steps'):
+            formal.validate_formal(accepted, max_optimizer_steps=bad)
+    with pytest.raises(ValueError, match='max2'): two_entry.validate_fresh(accepted)  # old launcher unchanged
+    # Resume target: only this run's checkpoints/step-N with 0 < N <= 200 (200 = finalize-only).
+    out = tmp_path / 'formal-out'
+    def at(path):
+        return SimpleNamespace(launch=SimpleNamespace(resume_from=path, output_dir=out, max_optimizer_steps=200))
+    assert formal.resume_step(at(None)) is None and formal.resume_step(at(out / 'checkpoints' / 'step-20')) == 20
+    assert formal.resume_step(at(out / 'checkpoints' / 'step-200')) == 200
+    for bad in (out / 'checkpoints' / 'step-201', out / 'checkpoints' / 'latest', tmp_path / 'other' / 'checkpoints' / 'step-5',
+                out / 'checkpoints' / 'step-0'):
+        with pytest.raises(ValueError, match='resume_from'): formal.resume_step(at(bad))
+    # Finalize-only: the lifecycle run loop executes no update and returns the restored checkpoint.
+    finalize_out = tmp_path / 'formal-finalize'; finalize_out.mkdir()
+    (finalize_out / 'h3-last-metrics.json').write_text(json.dumps(dict(step=199, loss=0.5)))
+    finalize_bound = SimpleNamespace(graph=SimpleNamespace(profile=SimpleNamespace(launch=SimpleNamespace(
+            max_optimizer_steps=200, resume_from=finalize_out / 'checkpoints' / 'step-200', output_dir=finalize_out))),
+        transaction=SimpleNamespace(manager=SimpleNamespace(inspect_complete=lambda path: SimpleNamespace(checkpoint=('ck', path.name)))),
+        trainer=SimpleNamespace(run_iteration=lambda step: pytest.fail('finalize-only resume must not update')))
+    finalizer = formal.FormalBackend.__new__(formal.FormalBackend)
+    finalizer.inspection_only, finalizer.start_step = False, 200
+    assert formal.FormalBackend.run(finalizer, finalize_bound) == (('ck', 'step-200'), dict(step=199, loss=0.5))
+    args = formal.build_parser().parse_args(['cfg.json', '--expected-sha', 'a' * 40, '--ffmpeg', 'f',
+                                             '--ffprobe', 'p', '--monitor-dir', 'm'])
+    assert (args.max_optimizer_steps, args.audit_weights, args.reward_pipeline, args.reuse_video_vae,
+            args.reuse_rollout_anchor, args.profile_rollout, args.checkpoint_threads,
+            args.boundary_content_check, args.journal_max_mib) == (200, False, False, False, False, False, 1, 'full', 512)
+    identity_profile = SimpleNamespace(launch=SimpleNamespace(output_dir=out, max_optimizer_steps=200))
+    with pytest.raises(ValueError, match='formal-run.json'): formal.check_resume_identity(identity_profile, args)
+    out.mkdir()
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
+    assert formal.check_resume_identity(identity_profile, args) is None
+    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8)):
+        changed = SimpleNamespace(**dict(vars(args), **{name: value}))
+        with pytest.raises(ValueError, match='changed formal-run identity'): formal.check_resume_identity(identity_profile, changed)
+    observed = SimpleNamespace(**dict(vars(args), audit_weights=True))  # observation-only: not identity
+    assert formal.check_resume_identity(identity_profile, observed) is None
+    # Launcher upgrade: a new SHA is refused by default; allowed only with flag + reason and
+    # only for scripts/ and tests/ changes (visual_rl/ is the lifecycle-hashed training core).
+    def with_args(**kw): return SimpleNamespace(**dict(vars(args), **kw))
+    def diff(*files): return lambda old, new: (old, new) == ('a' * 40, 'b' * 40) and list(files) or pytest.fail('wrong range')
+    scripts_only = diff('scripts/launch_h3_formal.py', 'tests/test_flash_collection_runtime.py')
+    with pytest.raises(ValueError, match='different launcher SHA'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40), changed_files=scripts_only)
+    with pytest.raises(ValueError, match='upgrade-reason'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True),
+                                     changed_files=scripts_only)
+    for outside in ('visual_rl/runtime/h3_lifecycle.py', 'docs/notes.md', 'experiments/x.yaml'):
+        with pytest.raises(ValueError, match='only scripts/ and tests/'):
+            formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True,
+                upgrade_reason='fix'), changed_files=diff('scripts/a.py', outside))
+    with pytest.raises(ValueError, match='unchanged'):
+        formal.check_resume_identity(identity_profile, with_args(allow_launcher_upgrade=True, upgrade_reason='x'))
+    with pytest.raises(ValueError, match='unchanged'):
+        formal.check_resume_identity(identity_profile, with_args(upgrade_reason='x'))
+    upgrade = formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True,
+        upgrade_reason=' export fix '), changed_files=scripts_only, now='2026-11-04T00:00:00+00:00', attempt='A1')
+    assert upgrade == dict(old_sha='a' * 40, new_sha='b' * 40, utc='2026-11-04T00:00:00+00:00', reason='export fix',
+                           changed_scripts=['scripts/launch_h3_formal.py'], changed_tests=['tests/test_flash_collection_runtime.py'],
+                           status='attempt', attempt='A1')
+    formal.record_launcher_upgrade(out, upgrade)
+    history = json.loads((out / formal.IDENTITY_FILE).read_text())
+    assert history['launcher_sha'] == 'a' * 40 and history['launcher_upgrades'] == [upgrade]
+    # An unapplied attempt (e.g. restore failed) never changes the current launcher SHA.
+    assert formal.check_resume_identity(identity_profile, args) is None
+    with pytest.raises(ValueError, match='different launcher SHA'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40))
+    formal.mark_launcher_upgrade_applied(out, 'A1', now='2026-11-04T00:05:00+00:00')
+    applied = json.loads((out / formal.IDENTITY_FILE).read_text())['launcher_upgrades']
+    assert applied == [dict(upgrade, status='applied', applied_utc='2026-11-04T00:05:00+00:00')]
+    assert formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40)) is None  # now current
+    with pytest.raises(ValueError, match='different launcher SHA'): formal.check_resume_identity(identity_profile, args)
+    with pytest.raises(ValueError, match='changed since'): formal.record_launcher_upgrade(out, upgrade)
+    with pytest.raises(ValueError, match='pending'): formal.mark_launcher_upgrade_applied(out, 'A1')
+    # Real Git: --no-renames lists both sides of a rename, so moving a protected file into
+    # scripts/ is refused; a scripts-only change passes; an absent old commit refuses cleanly.
+    import subprocess
+    repo = tmp_path / 'upgrade-repo'; repo.mkdir()
+    def run_git(*argv): return subprocess.check_output(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                                                         '-c', 'commit.gpgsign=false', *argv], text=True).strip()
+    run_git('init', '-q')
+    (repo / 'experiments').mkdir(); (repo / 'scripts').mkdir()
+    (repo / 'experiments' / 'x.yaml').write_text('lr: 1e-4\n' * 20); (repo / 'scripts' / 'a.py').write_text('A = 1\n')
+    run_git('add', '-A'); run_git('commit', '-q', '-m', 'base'); base_sha = run_git('rev-parse', 'HEAD')
+    (repo / 'scripts' / 'a.py').write_text('A = 2\n'); run_git('commit', '-qam', 'scripts only')
+    scripts_sha = run_git('rev-parse', 'HEAD')
+    run_git('mv', 'experiments/x.yaml', 'scripts/x.yaml'); run_git('commit', '-qm', 'rename'); renamed_sha = run_git('rev-parse', 'HEAD')
+    in_repo = lambda old, new: formal.git_changed_files(old, new, root=repo)
+    assert in_repo(scripts_sha, renamed_sha) == ['experiments/x.yaml', 'scripts/x.yaml']
+    git_out = tmp_path / 'formal-git-out'; git_out.mkdir()
+    git_profile = SimpleNamespace(launch=SimpleNamespace(output_dir=git_out, max_optimizer_steps=200))
+    (git_out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(git_profile, with_args(expected_sha=base_sha))))
+    upgrade_args = dict(allow_launcher_upgrade=True, upgrade_reason='review fix')
+    with pytest.raises(ValueError, match="experiments/x.yaml"):
+        formal.check_resume_identity(git_profile, with_args(expected_sha=renamed_sha, **upgrade_args), changed_files=in_repo)
+    allowed = formal.check_resume_identity(git_profile, with_args(expected_sha=scripts_sha, **upgrade_args), changed_files=in_repo)
+    assert allowed['changed_scripts'] == ['scripts/a.py'] and allowed['old_sha'] == base_sha
+    with pytest.raises(ValueError, match='not present'): in_repo('0' * 40, scripts_sha)
+    assert formal.git_changed_files('HEAD', 'HEAD') == []  # this deployed checkout
+    # Disk: 41 checkpoints (step1, every 5, terminal), 41 video exports (update 1, every 5), bytes and inodes.
+    assert formal.checkpoint_steps(total=200)[:3] == [1, 5, 10] and len(formal.checkpoint_steps(total=200)) == 41
+    logs = formal.JOURNAL_PROCESSES * 512 * 1024**2 + 8 * 1024**3 + formal.OTHER_LOG_BYTES
+    need = formal.disk_need(total=200, log_bytes=logs)
+    assert (need['checkpoints'], need['export_updates']) == (41, 41)
+    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 492 * formal.VIDEO_BYTES + logs))
+    assert need['need_inodes'] == math.ceil(1.2 * (41 * 15025 + 41 * formal.FILES_PER_EXPORT))
+    assert formal.disk_need(total=200, after=100, log_bytes=0)['checkpoints'] == 20
+    finalize_need = formal.disk_need(total=200, after=200, log_bytes=0)
+    assert (finalize_need['checkpoints'], finalize_need['export_updates'], finalize_need['need_bytes']) == (0, 0, 0)
+    def fs(free, inodes=10**7, total_inodes=10**8):
+        return lambda path: SimpleNamespace(f_bavail=free // 4096, f_frsize=4096, f_favail=inodes, f_files=total_inodes)
+    deep = SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / 'missing' / 'run', max_optimizer_steps=200))
+    report = formal.disk_preflight(deep, statvfs=fs(160 * 10**9), log_bytes=logs)
+    assert report['filesystem_probe'] == str(tmp_path) and report['free_bytes'] <= 160 * 10**9
+    with pytest.raises(RuntimeError, match='insufficient disk'): formal.disk_preflight(deep, statvfs=fs(100 * 10**9), log_bytes=logs)
+    with pytest.raises(RuntimeError, match='inodes'): formal.disk_preflight(deep, statvfs=fs(160 * 10**9, inodes=500_000), log_bytes=logs)
+    assert formal.disk_preflight(deep, statvfs=fs(160 * 10**9, inodes=0, total_inodes=0), log_bytes=logs)['free_inodes'] is None
+    assert formal.disk_preflight(deep, after=150, statvfs=fs(50 * 10**9), log_bytes=logs)['checkpoints'] == 10
+    # Card-monitor lifetime/bytes must cover the remaining updates; budgets come from health.json.
+    budget_dir = tmp_path / 'formal-monitor-budget'; budget_dir.mkdir()
+    def budget_health(**fields):
+        (budget_dir / 'health.json').write_text(json.dumps(dict(dict(healthy=True, sample_count=100, bytes=100 * 4096,
+            interval_seconds=5., max_seconds=1728000., max_bytes=12 * 1024**3, started_monotonic_ns=0, monotonic_ns=0), **fields)))
+    budget_health()
+    covered = formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert covered['need_seconds'] == 200 * 7200 and covered['row_bytes'] == formal.MONITOR_ROW_BYTES
+    budget_health(max_seconds=86400., max_bytes=512 * 1024**2, interval_seconds=1.)  # old defaults: 24 h
+    with pytest.raises(RuntimeError, match='cannot cover 200 updates'): formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert formal.monitor_budget(budget_dir, remaining_updates=10, now_ns=0, row_bytes=1024)['need_seconds'] == 72000
+    with pytest.raises(RuntimeError, match='cannot cover'):  # elapsed lifetime counts
+        formal.monitor_budget(budget_dir, remaining_updates=10, now_ns=20000 * 10**9, row_bytes=1024)
+    assert formal.monitor_budget(budget_dir, remaining_updates=0, now_ns=0)['need_bytes'] == 0  # finalize-only
+    for slow in (10.5, 30.):  # a longer interval would let the 30 s per-update health check go stale
+        budget_health(interval_seconds=slow)
+        for remaining in (200, 0):
+            with pytest.raises(RuntimeError, match='exceeds 10.0 s'):
+                formal.monitor_budget(budget_dir, remaining_updates=remaining, now_ns=0)
+    budget_health(interval_seconds=10., max_bytes=512 * 1024**2)
+    with pytest.raises(RuntimeError, match=r'larger --max-seconds/--max-bytes \(keep --interval <= 10 s\)') as hint:
+        formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert 'longer --interval' not in str(hint.value)
+    budget_health(interval_seconds=1., max_seconds=86400., max_bytes=512 * 1024**2)
+    budget_health(bytes=100 * 10**6)  # observed rows (1 MB) larger than the default estimate are used
+    with pytest.raises(RuntimeError, match='cannot cover'): formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    (budget_dir / 'health.json').write_text(json.dumps(dict(healthy=True, sample_count=9, monotonic_ns=0)))
+    with pytest.raises(RuntimeError, match='budget fields'): formal.monitor_budget(budget_dir, remaining_updates=1)
+    budget_health(healthy=False)
+    with pytest.raises(RuntimeError, match='unhealthy'): formal.monitor_budget(budget_dir, remaining_updates=1)
+    card_budget_dir = tmp_path / 'formal-card-monitor'
+    from scripts import monitor_h3_memory as card_budget_monitor
+    with monkeypatch.context() as patch:
+        patch.setattr(card_budget_monitor, 'sample', lambda journal: (card_budget_dir / 'STOP').touch() or dict(
+            monotonic_ns=time.monotonic_ns(), utc='u'))
+        card_budget_monitor.run(card_budget_dir, tmp_path / 'j', interval=0., max_seconds=1728000., max_bytes=8 * 1024**3)
+    written_health = json.loads((card_budget_dir / 'health.json').read_text())
+    assert (written_health['interval_seconds'], written_health['max_seconds'], written_health['max_bytes']) == (0., 1728000., 8 * 1024**3)
+    assert formal.monitor_budget(card_budget_dir, remaining_updates=0)['remaining_bytes'] > 0
+    # Monitor: degraded is non-fatal; stale beyond 30 s or healthy=false stops the next update.
+    health_dir = tmp_path / 'formal-monitor'; health_dir.mkdir()
+    def health(**fields):
+        (health_dir / 'health.json').write_text(json.dumps(dict(dict(healthy=True, monotonic_ns=10**12, sample_count=9), **fields)))
+    health(degraded=True, consecutive_failures=2)
+    assert two_entry.monitor_healthy(health_dir, now_ns=10**12 + 20 * 10**9, max_age=formal.FormalBackend.monitor_max_age)['degraded'] is True
+    with pytest.raises(RuntimeError, match='stale'): two_entry.monitor_healthy(health_dir, now_ns=10**12 + 20 * 10**9)
+    with pytest.raises(RuntimeError, match='stale'):
+        two_entry.monitor_healthy(health_dir, now_ns=10**12 + 31 * 10**9, max_age=formal.FormalBackend.monitor_max_age)
+    health(healthy=False)
+    with pytest.raises(RuntimeError, match='unhealthy'): two_entry.monitor_healthy(health_dir, now_ns=10**12, max_age=30)
+    # Journal budget is explicit and must agree with any pre-set environment.
+    with monkeypatch.context() as patch:
+        patch.delenv('H3_MEMORY_MAX_BYTES', raising=False)
+        assert formal.journal_budget(512) == 512 * 1024**2 == int(os.environ['H3_MEMORY_MAX_BYTES'])
+        with pytest.raises(ValueError, match='differs'): formal.journal_budget(256)
+        for bad in (63, 16385, 512.0, True):
+            with pytest.raises(ValueError, match='journal-max-mib'): formal.journal_budget(bad)
+    # Backend hooks over tiny CPU iterations: fresh 0..4 exports at 5, then a resume at 5.
+    class FakeJournal:
+        lock = threading.RLock(); base = {}
+        def assert_healthy(self): pass
+        def event(self, *a, **kw): pass
+        @contextmanager
+        def span(self, *a, **kw): yield self
+    calls = []
+    class SpyRetention:
+        def __init__(self, **kw): self.kw = kw; calls.append(('init', kw['rank'], kw['terminal_step'], kw['every']))
+        def observe(self, original, *, source): return original
+        def is_export(self, step): return formal.retention.export_step(step, every=5, terminal_step=200, also=self.kw['also'])
+        def local_rows(self, step): calls.append(('rows', step)); return [['s', 'g', 0, 1.0]]
+        def publish(self, step, tables): calls.append(('publish', step, len(tables)))
+        def discard(self): calls.append(('discard',))
+        def supersede(self, *, first_step, label): calls.append(('supersede', first_step)); return []
+    def tiny_backend(start_step, audit_weights, adam_step=0):
+        model = torch.nn.Module()
+        model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
+        model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
+        optimizer = torch.optim.AdamW([model.lora], lr=1e-4)
+        if adam_step:
+            model.lora.grad = torch.ones(2)
+            for _ in range(adam_step): optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
+        stages = SimpleNamespace(predict=lambda **kw: model.lora * 2, score_one=lambda **kw: 1.)
+        def tiny_iteration(step):
+            if step == 7: raise RuntimeError('injected update failure')
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(44):
+                with torch.no_grad(): stages.predict(index=2)
+            for _ in range(4):
+                value = stages.predict(index=2); value.sum().backward(); del value
+            norm = float(model.lora.grad.norm()); optimizer.step(); optimizer.zero_grad(set_to_none=True)
+            return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
+        bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
+        graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=start_step)),
+            profile=SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / f'formal-wrapper-{start_step}',
+                max_optimizer_steps=200, seed=42), expected={'model_sha256': 'm'}))
+        graph.profile.launch.output_dir.mkdir(exist_ok=True)
+        options = dict(vars(args), monitor_dir=health_dir, audit_weights=audit_weights)
+        backend = formal.FormalBackend(args=SimpleNamespace(**options), manifest=dict(launch_stamp='t'))
+        backend.start_step = start_step
+        bound_holder[0] = bound
+        backend.bind(None, SimpleNamespace(rank=0, process_group=None), graph, prepared, None)
+        return backend, bound, graph
+    with monkeypatch.context() as patch:
+        patch.setattr(formal_memory, 'journal', lambda: FakeJournal())
+        bound_holder = [None]
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'bind', lambda self, *a: bound_holder[0])
+        for module in (formal, two_entry):
+            patch.setattr(module, '_phase', lambda session, label, work: work())
+            patch.setattr(module, '_exchange', lambda *a: [a[3]] * 8)
+        patch.setattr(formal.retention, 'RolloutRetention', SpyRetention)
+        health(degraded=True, consecutive_failures=2, monotonic_ns=time.monotonic_ns())  # degraded, fresh (<30 s)
+        fresh_backend, fresh_bound, fresh_graph = tiny_backend(0, False)
+        assert calls[0] == ('init', 0, 200, 5) and fresh_backend.audit_weights is False
+        for step in range(5): fresh_bound.trainer.run_iteration(step)
+        # Start: stale staging deleted and later step dirs set aside; export only after update 5.
+        assert calls[1:3] == [('discard',), ('supersede', 0)]
+        assert [c for c in calls if c[0] in ('rows', 'publish')] == [('rows', 1), ('publish', 1, 8), ('rows', 5), ('publish', 5, 8)]
+        assert calls[-1] == ('discard',) and len(fresh_backend.audits) == 5
+        assert fresh_backend.audits[-1]['lora_changed'] is None and fresh_backend.audits[-1]['after'] is None
+        assert json.loads((fresh_graph.profile.launch.output_dir / 'update-5-audit.json').read_text())['optimizer_updates'] == 5
+        # Resume at 5 with weight audit on: counts restart for this process; Adam counter must match.
+        calls.clear()
+        resumed, resumed_bound, _ = tiny_backend(5, True, adam_step=5)
+        resumed_bound.trainer.run_iteration(5); resumed_bound.trainer.run_iteration(6)
+        assert resumed.audits[-1]['graph']['nograd_forwards'] == 88 and resumed.audits[-1]['lora_changed'] is True
+        assert ('supersede', 5) in calls and not any(c[0] == 'publish' for c in calls)
+        calls.clear()
+        with pytest.raises(RuntimeError, match='injected'): resumed_bound.trainer.run_iteration(7)
+        assert calls == [('discard',)]  # failed update: staging removed, error re-raised
+        mismatch, mismatch_bound, _ = tiny_backend(10, False, adam_step=9)
+        with pytest.raises(ValueError, match='resume checkpoint'): mismatch_bound.trainer.run_iteration(10)
+        fresh_wrong, fresh_wrong_bound, _ = tiny_backend(0, False, adam_step=1)
+        with pytest.raises(ValueError, match='not fresh'): fresh_wrong_bound.trainer.run_iteration(0)
+        health(healthy=False)
+        stopped, stopped_bound, _ = tiny_backend(0, False)
+        with pytest.raises(RuntimeError, match='unhealthy'): stopped_bound.trainer.run_iteration(0)
+        # Construct: identity + per-launch manifest after admission; disk logged around each save.
+        graph_out = tmp_path / 'formal-graph'; graph_out.mkdir()
+        closed = []
+        fake_graph = SimpleNamespace(run_id='r', close=lambda: closed.append(1), profile=SimpleNamespace(
+            launch=SimpleNamespace(output_dir=graph_out, resume_from=None, max_optimizer_steps=200)))
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: fake_graph)
+        maker = formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
+                                     manifest=dict(launch_stamp='20261103T000000Z', started_utc='x'))
+        maker.transaction = SimpleNamespace(checkpoint=lambda *a, **kw: SimpleNamespace(step=5))
+        preflight = SimpleNamespace(facts=SimpleNamespace(semantic_id='sem', binding_id='bind'), code_hash='code')
+        assert maker.construct_graph(preflight, SimpleNamespace(rank=0)) is fake_graph
+        written = json.loads((graph_out / formal.IDENTITY_FILE).read_text())
+        assert written['identity']['max_optimizer_steps'] == 200 and written['launcher_upgrades'] == []
+        launches = list((graph_out / 'formal-launches').iterdir())
+        assert len(launches) == 1 and json.loads(launches[0].read_text())['semantic_id'] == 'sem'
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            assert maker.transaction.checkpoint(progress=SimpleNamespace(next_optimizer_step=5)).step == 5
+        disk_rows = [json.loads(line) for line in printed.getvalue().splitlines()]
+        assert [r['when'] for r in disk_rows] == ['before_save', 'after_save'] and disk_rows[1]['free_bytes'] > 0
+        assert disk_rows[1]['remaining_need_bytes'] == formal.disk_need(total=200, after=5, log_bytes=0)['need_bytes']
+        assert (disk_rows[0]['remaining_checkpoints'], disk_rows[1]['remaining_checkpoints']) == (40, 39)  # in-progress save counted
+        # Rank0-only reporting around the collective save never raises (peers would hang).
+        patch.setattr(formal, 'disk_free', lambda path: (_ for _ in ()).throw(OSError('statvfs failed')))
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            assert maker.transaction.checkpoint(progress=SimpleNamespace(next_optimizer_step=10)).step == 5
+        assert [json.loads(line)['error'] for line in printed.getvalue().splitlines()] == ["OSError('statvfs failed')"] * 2
+        # Launcher upgrade: recorded as an attempt at construct, applied only after restore_bound succeeded.
+        upgrade_out = tmp_path / 'formal-upgrade-graph'; upgrade_out.mkdir()
+        (upgrade_out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
+        pending = dict(upgrade, attempt='U1')
+        upgraded_graph = SimpleNamespace(run_id='r', close=lambda: None, profile=SimpleNamespace(launch=SimpleNamespace(
+            output_dir=upgrade_out, resume_from=upgrade_out / 'checkpoints' / 'step-5', max_optimizer_steps=200)))
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: upgraded_graph)
+        upgrader = formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir, expected_sha='b' * 40)),
+                                        manifest=dict(launch_stamp='U1', started_utc='z', launcher_upgrade=pending))
+        upgrader.transaction = SimpleNamespace(checkpoint=lambda *a, **kw: None)
+        upgrader.construct_graph(preflight, SimpleNamespace(rank=0))
+        assert [u['status'] for u in json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades']] == ['attempt']
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'restore_bound', lambda self, *a: (_ for _ in ()).throw(ValueError('restore failed')))
+        with pytest.raises(ValueError, match='restore failed'):
+            upgrader.restore_bound(None, SimpleNamespace(rank=0), upgraded_graph, None, None, None)
+        assert json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades'][0]['status'] == 'attempt'
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'restore_bound', lambda self, *a: None)
+        upgrader.restore_bound(None, SimpleNamespace(rank=0), upgraded_graph, None, None, None)
+        assert json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades'][0]['status'] == 'applied'
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: fake_graph)
+        with pytest.raises(FileExistsError, match='identity'):
+            formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
+                                 manifest=dict(launch_stamp='later', started_utc='y')).construct_graph(preflight, SimpleNamespace(rank=0))
+        assert closed == [1]
