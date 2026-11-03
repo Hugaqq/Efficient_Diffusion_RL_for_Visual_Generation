@@ -1193,6 +1193,97 @@ def test_launcher_identity_json_does_not_veto_nccl(box):
     assert box.watch.death_cause() == 'nccl_watchdog_timeout'
 
 
+# Sanitized torch 2.x/elastic excerpts quoted by the independent re-review probes.
+WATCH_LOGS = Path(__file__).parent / 'fixtures' / 'h3_formal_watch'
+
+
+@pytest.mark.parametrize('line', [
+    '[rank3]:[E1103 16:40:01.124 ProcessGroupNCCL.cpp:1664] [PG 0 (default_pg) Rank 3] '
+    'Exception (either an error or timeout) detected by watchdog at work: 5, '
+    'last enqueued NCCL work: 5, last completed NCCL work: 4.',
+    '[rank3]:[E1103 16:40:01.125 ProcessGroupNCCL.cpp:1515] [PG 0 (default_pg) Rank 3] '
+    'Process group watchdog thread terminated with exception: [Rank 3] Watchdog caught '
+    'collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLREDUCE) ran for '
+    '600043 milliseconds before timing out.',
+    "terminate called after throwing an instance of 'c10::DistBackendError'\n"
+    '  what():  [PG 0 (default_pg) Rank 3] Process group watchdog thread terminated with '
+    'exception: [Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5) '
+    'ran for 600043 milliseconds before timing out.',
+    '[Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5) ran for '
+    '600043 milliseconds before timing out.\n'
+    'Exception raised from ncclCommWatchdog at ../torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:1521 '
+    '(most recent call first):\n'
+    'frame #0: c10::Error::Error(c10::SourceLocation, std::string) + 0x96 (0x7f in /x/libc10.so)',
+    'step 12 reward_mean=0.3 max abs error 1e-3 within tolerance\nNCCL watchdog timed out',
+])
+def test_torch2_timeout_records_are_transient(box, line):
+    box.log(line)
+    assert box.watch.death_cause() == 'nccl_watchdog_timeout'
+
+
+@pytest.mark.parametrize('failure', ['',
+    'ValueError: sampled/replayed old score mismatch beyond the declared batched-rollout tolerance\n',
+    'ValueError: NCCL watchdog timed out\n',
+    'RuntimeError: missing cache; NCCL watchdog timed out\n',
+    '{"error": "unrecognized application failure"}\n',
+    'ERROR application invariant violated\n',
+])
+def test_torch2_nccl_tail_preserves_application_veto(box, failure):
+    box.tick()
+    box.log(failure + (WATCH_LOGS / 'torch2_nccl_timeout.log').read_text())
+    box.die()
+    state = box.tick()
+    assert state['state'] == ('NEEDS_HUMAN' if failure else 'RECOVERING')
+    assert state['incidents'][-1]['cause'] == (
+        'correctness_or_permanent_error' if failure else 'nccl_watchdog_timeout')
+    assert not state['resumes']
+
+
+@pytest.mark.parametrize('code', [-15, 143, 1, None])
+def test_torchrun_sigterm_tail_requires_matching_term_receipt(box, code):
+    box.tick()
+    box.log((WATCH_LOGS / 'torchrun_sigterm.log').read_text())
+    rec = box.watch.s['process']
+    if code is not None:
+        box.watch.store.save('exit-' + rec['launch_id'] + '.json',
+            dict(launch_id=rec['launch_id'], pgid=rec['pgid'], exit_code=code))
+    box.watch.s['stop'] = dict(cause='monitor_stop', checkpoint_saved=1,
+                              last_signal='SIGTERM', launch_id=rec['launch_id'])
+    box.die()
+    state = box.tick()
+    assert state['incidents'][-1]['cause'] == (
+        'watchdog_checkpoint_stop' if code in (-15, 143) else 'correctness_or_permanent_error')
+    assert state['state'] == ('RECOVERING' if code in (-15, 143) else 'NEEDS_HUMAN')
+
+
+@pytest.mark.parametrize('case', ['no-stop', 'no-checkpoint', 'wrong-signal', 'wrong-owner', 'application'])
+def test_torchrun_signal_exception_does_not_grant_retry(box, case):
+    box.tick()
+    text = (WATCH_LOGS / 'torchrun_sigterm.log').read_text()
+    if case == 'application':
+        text += 'ValueError: sampled/replayed old score mismatch beyond the declared batched-rollout tolerance\n'
+    box.log(text)
+    rec = box.watch.s['process']
+    box.watch.store.save('exit-' + rec['launch_id'] + '.json',
+        dict(launch_id=rec['launch_id'], pgid=rec['pgid'] + (case == 'wrong-owner'), exit_code=-15))
+    stop = dict(cause='monitor_stop', checkpoint_saved=1, last_signal='SIGTERM', launch_id=rec['launch_id'])
+    if case == 'no-checkpoint':
+        stop.pop('checkpoint_saved')
+    if case == 'wrong-signal':
+        stop['last_signal'] = 'SIGKILL'
+    box.watch.s['stop'] = None if case == 'no-stop' else stop
+    box.die()
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert not box.watch.s['resumes']
+
+
+@pytest.mark.parametrize('line', ['Exception: card/process monitor unhealthy',
+                                  'RuntimeError: card monitor stale'])
+def test_monitor_exception_record_is_transient(box, line):
+    box.log(line)
+    assert box.watch.death_cause() == 'card_monitor_stop'
+
+
 @pytest.mark.parametrize('listed', [False, True])
 def test_exact_tree_nested_metadata_names(box, listed):
     import hashlib

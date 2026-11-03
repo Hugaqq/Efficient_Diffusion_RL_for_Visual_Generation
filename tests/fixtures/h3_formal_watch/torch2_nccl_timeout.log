@@ -1,0 +1,11 @@
+[rank3]:[E1103 16:40:01.123 ProcessGroupNCCL.cpp:632] [Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, Timeout(ms)=600000) ran for 600043 milliseconds before timing out.
+[rank3]:[E1103 16:40:01.124 ProcessGroupNCCL.cpp:1664] [PG 0 (default_pg) Rank 3] Exception (either an error or timeout) detected by watchdog at work: 5, last enqueued NCCL work: 5, last completed NCCL work: 4.
+[rank3]:[E1103 16:40:01.125 ProcessGroupNCCL.cpp:1515] [PG 0 (default_pg) Rank 3] Process group watchdog thread terminated with exception: [Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLREDUCE) ran for 600043 milliseconds before timing out.
+terminate called after throwing an instance of 'c10::DistBackendError'
+  what():  [PG 0 (default_pg) Rank 3] Process group watchdog thread terminated with exception: [Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5) ran for 600043 milliseconds before timing out.
+Exception raised from ncclCommWatchdog at ../torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:1521 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::string) + 0x96 (0x7f in /x/libc10.so)
+E1103 16:40:05 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: -6) local_rank: 3 (pid: 1234) of binary: /usr/bin/python
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+  error_file: <N/A>
+  traceback : Signal 6 (SIGABRT) received by PID 1234

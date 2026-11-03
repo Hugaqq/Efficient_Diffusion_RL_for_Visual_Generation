@@ -1,0 +1,4 @@
+W1103 torch/distributed/elastic/agent/server/api.py:704] Received Signals.SIGTERM death signal, shutting down workers
+Traceback (most recent call last):
+  File "/x/torchrun", line 8, in <module>
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 4321 got signal: 15
