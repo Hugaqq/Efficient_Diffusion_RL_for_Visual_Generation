@@ -327,9 +327,40 @@ class Watchdog:
         link = self.output / 'PAUSE_REQUESTED'
         return link.is_symlink() and link.resolve() == self.store.path('pause-request')
 
+    def owns_pause_intent(self):
+        stop = self.s.get('stop') or {}
+        return bool(stop.get('pause_issued') and stop.get('pause_token') and
+                    stop.get('launch_id') == (self.s.get('process') or {}).get('launch_id'))
+
+    def pause_payload(self):
+        stop = self.s['stop']
+        return dict(launch_id=stop['launch_id'], pause_token=stop['pause_token'])
+
+    def owns_pause(self):
+        if not self.owns_pause_intent() or not self.pause_supported():
+            return False
+        try:
+            return self.store.load('pause-request') == self.pause_payload()
+        except (OSError, ValueError):
+            return False
+
     def operator_pause(self):
-        return (self.output / 'PAUSE_REQUESTED').exists() and not (
-            self.s.get('stop', {}).get('pause_issued') if self.s.get('stop') else False)
+        return (self.output / 'PAUSE_REQUESTED').exists() and not self.owns_pause()
+
+    def publish_pause(self, *, replay=False):
+        stop = self.s['stop']
+        if not self.owns_pause_intent() or not self.pause_supported() or self.operator_pause():
+            raise ValueError('cannot replay pause: ownership/link changed')
+        self.action('pause_request')
+        if not self.dry_run and not self.owns_pause():
+            self.store.save('pause-request', self.pause_payload())
+        # A restart replay gives training a full boundary opportunity, even if the
+        # old intent's deadline elapsed before the request reached training.
+        stop['pause_published'] = True
+        if replay:
+            stop['deadline'] = max(stop['deadline'], self.mono() + self.thresholds['max_update_seconds'] +
+                                   self.thresholds['checkpoint_allowance_seconds'])
+        self.persist()
 
     def request_stop(self, cause, checks):
         self.incident(cause, checks)
@@ -341,6 +372,7 @@ class Watchdog:
             self.human('operator pause active; no watchdog intervention')
             return
         self.s['stop'] = dict(cause=cause, phase='pause' if pause else 'term', pause_issued=pause,
+            pause_published=False, launch_id=self.s['process']['launch_id'], pause_token=uuid.uuid4().hex,
             target_step=self.s['optimizer_step'], checkpoint_before=checks['progress'].get('checkpoint_step', 0),
             deadline=(self.s['last_progress_mono'] + self.thresholds['max_update_seconds'] +
                       self.thresholds['checkpoint_allowance_seconds']) if pause else
@@ -348,9 +380,7 @@ class Watchdog:
         self.state('STOPPING')
         self.persist()  # ownership/intent durable BEFORE writing request or signalling
         if pause:
-            self.action('pause_request')
-            if not self.dry_run:
-                self.store.text('pause-request', 'watchdog requested safe optimizer boundary\n')
+            self.publish_pause()
         else:
             self.send(signal.SIGTERM)
 
@@ -362,6 +392,12 @@ class Watchdog:
 
     def stopped_tick(self, checks):
         stop = self.s['stop']
+        if stop.get('launch_id') != self.s['process']['launch_id']:
+            self.human('stop ownership does not match current launch')
+            return
+        if stop['phase'] == 'pause' and not stop.get('pause_published') and checks['process']['alive']:
+            self.publish_pause(replay=True)
+            return  # never publish and escalate on the same tick
         if checks['hps'].get('identity_changed'):
             stop['cause'] = 'hps_identity_change'
             if checks['process']['alive'] and stop['phase'] == 'pause':
@@ -556,9 +592,9 @@ class Watchdog:
                       ignored_metrics=checks['progress']['fingerprint'])
         self.state('LAUNCHING')
         self.persist()  # ambiguous submission is NEVER replayed
-        if (self.s.get('stop') or {}).get('pause_issued'):
-            if not self.pause_supported():
-                raise ValueError('pause link changed before resume')
+        if self.owns_pause_intent():
+            if not self.pause_supported() or self.operator_pause():
+                raise ValueError('pause ownership/link changed before resume')
             if self.store.path('pause-request').exists():
                 self.store.path('pause-request').rename(self.store.path('pause-archived-' + launch_id))
         self.s['stop'] = None
@@ -571,9 +607,56 @@ class Watchdog:
             'supervise', str(self.store.root), spec_name], cwd=root, env={**os.environ, 'PYTHONPATH': str(root)},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
+    def adopt_pending(self, record):
+        pending = self.s['pending_launch']
+        if record['launch_id'] != pending['launch_id']:
+            raise ValueError('pending launch receipt mismatch')
+        process.inspect(record)  # ownership proof, not merely a JSON file
+        resume = next(r for r in self.s['resumes'] if r['launch_id'] == record['launch_id'])
+        self.s.update(process=record, pending_launch=None, stop=None, operator_pause_seen=False,
+                      last_progress_at=self.clock(), last_progress_mono=self.mono(), attempt_step=resume['step'])
+        resume['performed'] = True
+        self.worker, self.worker_result = None, {}
+        self.s['debounce'] = {}
+        self.event('auto_resume', launch_id=record['launch_id'])
+
+    def reconcile_launch(self, action, reason):
+        """Explicit human reconciliation only; never submits or signals training."""
+        if self.s['state'] != 'NEEDS_HUMAN' or not self.s.get('pending_launch') or not reason.strip():
+            raise ValueError('reconciliation requires a pending launch, NEEDS_HUMAN and reason')
+        if self.s['boot_id'] != self.boot:
+            raise ValueError('boot changed: manual identity reconciliation required')
+        launch_id = self.s['pending_launch']['launch_id']
+        spec = self.store.load('launch-' + launch_id + '.json')
+        if not spec or spec['launch_id'] != launch_id or spec['unit'] != 'h3-training-' + launch_id + '.service':
+            raise ValueError('pending launch spec mismatch')
+        with self.store.lock('supervisor.lock'):
+            if action == 'adopt':
+                record = process.reconcile_unit(self.store, spec)
+                self.store.save('process-' + launch_id + '.json', record)
+                self.adopt_pending(record)
+            elif action == 'abandon':
+                if process.inspect(self.s['process'])['alive']:
+                    raise ValueError('old training still alive; cannot abandon')
+                info = process.unit_info(spec['unit'])
+                if info.get('LoadState') != 'not-found':
+                    record = process.reconcile_unit(self.store, spec)
+                    if process.inspect(record)['alive']:
+                        raise ValueError('pending training still alive; cannot abandon')
+                self.store.save('abandoned-' + launch_id + '.json', dict(reason=reason, at=self.clock()))
+                self.s.update(pending_launch=None, stop=None)
+            else:
+                raise ValueError('reconcile action must be adopt or abandon')
+            self.event('launch_reconciled', launch_id=launch_id, action=action, reason=reason)
+            self.s['reason'] = 'launch reconciled; acknowledge to rearm only'
+            self.persist()
+
     def acknowledge(self):
         ack = self.store.load('acknowledge.json')
         if not ack or ack.get('token') != self.s.get('human_token'):
+            return
+        if self.s.get('pending_launch'):
+            self.s['reason'] = 'launch outcome unknown; use --reconcile-launch adopt|abandon before acknowledgement'
             return
         if self.s.get('boot_id') != self.boot or (self.output / 'PAUSE_REQUESTED').exists():
             return  # acknowledgement does not authorize bypassing identity/pause gates
@@ -581,6 +664,7 @@ class Watchdog:
         self.s.pop('human_token', None)
         self.s.pop('reason', None)
         self.s['operator_pause_seen'] = False
+        self.s['rearm_only'] = True
         self.s['stop'] = None
         self.s['debounce'] = {}
         self.needs_arm = True
@@ -601,13 +685,8 @@ class Watchdog:
                 pending = self.s['pending_launch']
                 record = self.store.load('process-' + pending['launch_id'] + '.json')
                 if record:
-                    self.s.update(process=record, pending_launch=None, last_progress_at=self.clock(),
-                                  last_progress_mono=self.mono(), attempt_step=self.s['resumes'][-1]['step'])
-                    self.s['resumes'][-1]['performed'] = True
-                    self.worker, self.worker_result = None, {}
-                    self.s['debounce'] = {}
+                    self.adopt_pending(record)
                     self.state('WATCHING')
-                    self.event('auto_resume', launch_id=record['launch_id'])
                 elif self.mono() - pending['mono'] >= self.thresholds['launch_wait_seconds']:
                     self.human('launch outcome unknown; no automatic replay')
                 return self.s
@@ -616,8 +695,15 @@ class Watchdog:
                     self.human('cannot prove training ownership for consecutive ticks; no signal/resume')
                 return self.s
             alive = checks['process']['alive']
+            if self.s.pop('rearm_only', False) and not alive:
+                self.human('acknowledged but training is dead; manual launch decision required')
+                return self.s
             if self.operator_pause():
                 self.s['operator_pause_seen'] = True
+            elif self.s.get('operator_pause_seen') and alive:
+                self.event('operator_pause_cancelled')
+                self.human('operator pause cancelled before boundary; acknowledge to rearm checks')
+                return self.s
             if not alive and (self.output / 'SUCCESS').exists() and not self.s.get('operator_pause_seen'):
                 if not self.exit_receipt():
                     since = self.s.setdefault('success_seen_mono', self.mono())
@@ -666,8 +752,17 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--acknowledge', metavar='REASON', help='acknowledge current NEEDS_HUMAN; rearm only, never force resume')
+    parser.add_argument('--reconcile-launch', choices=('adopt', 'abandon'), help='resolve pending launch; never submit')
+    parser.add_argument('--reason', help='required explanation for launch reconciliation')
     args = parser.parse_args()
     config = read_json(existing_absolute(args.config))
+    if args.reconcile_launch:
+        if args.acknowledge or not args.reason or not args.reason.strip():
+            parser.error('reconciliation requires --reason and a separate acknowledgement')
+        store = Store(config['state_dir'])
+        with store.lock('watchdog.lock'):
+            Watchdog(config, dry_run=args.dry_run).reconcile_launch(args.reconcile_launch, args.reason)
+        return
     if args.acknowledge:
         store = Store(config['state_dir'])
         status = store.load('status.json')

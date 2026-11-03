@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 
-from .common import Store
+from .common import Store, digest
 from .commands import run_command
 
 
@@ -56,7 +56,7 @@ def unit_name(name):
 
 def unit_info(name):
     result = run_command(['systemctl', '--user', 'show', unit_name(name),
-                          '--property=InvocationID,ControlGroup,ActiveState,SubState,KillMode,Restart'], timeout=10)
+                          '--property=InvocationID,ControlGroup,ActiveState,SubState,KillMode,Restart,LoadState'], timeout=10)
     return dict(line.split('=', 1) for line in result['stdout'].splitlines() if '=' in line)
 
 
@@ -169,10 +169,30 @@ def signal_group(record, sig):
                 pass
 
 
+def reconcile_unit(store, spec):
+    """Recover an ambiguous submission only from durable, invocation-bound proof."""
+    launch_id = spec['launch_id']
+    record = store.load('process-' + launch_id + '.json')
+    if record is None:
+        receipt = store.load('execution-' + launch_id + '.json')
+        if not receipt or not store.path('claimed-' + launch_id + '.json').exists():
+            raise ValueError('no execution receipt proving this unit is ours')
+        record = capture_unit(spec['unit'], launch_id)
+        if (receipt.get('spec_id') != digest(spec) or
+                any(receipt.get(k) != record[k] for k in ('launch_id', 'unit', 'boot_id', 'invocation_id'))):
+            raise ValueError('execution receipt identity mismatch')
+    if record.get('launch_id') != launch_id or record.get('unit') != spec['unit']:
+        raise ValueError('process receipt identity mismatch')
+    inspect(record)
+    return record
+
+
 def execute(state_dir, spec_name):
     """Inside the training unit: capture the exact training exit, never restart."""
     store = Store(state_dir)
     spec = store.load(spec_name)
+    store.save('execution-' + spec['launch_id'] + '.json', dict(launch_id=spec['launch_id'],
+               unit=spec['unit'], invocation_id=os.environ['INVOCATION_ID'], boot_id=boot_id(), spec_id=digest(spec)))
     with store.path('training-' + spec['launch_id'] + '.log').open('ab') as log:
         child = subprocess.Popen(spec['argv'], cwd=spec['cwd'], env=spec['env'],
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -193,6 +213,8 @@ def supervise(state_dir, spec_name):
     unit = unit_name(spec['unit'])
     root = Path(__file__).resolve().parents[2]
     with store.lock('supervisor.lock'):
+        if store.path('abandoned-' + launch_id + '.json').exists():
+            raise ValueError('launch explicitly abandoned; never submit')
         with store.path('claimed-' + launch_id + '.json').open('x', encoding='utf-8') as stream:
             stream.write('{}\n')
             stream.flush()

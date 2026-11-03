@@ -1261,6 +1261,123 @@ def test_verification_done_on_deadline_is_accepted(box):
     watch.worker = None
 
 
+def test_new_launch_adoption_clears_stale_pause_ownership(box):
+    box.tick()
+    watch = box.watch
+    old = watch.s['process']['launch_id']
+    watch.s.update(state='LAUNCHING', pending_launch=dict(launch_id='new', mono=watch.mono()),
+                   stop=dict(pause_issued=True, launch_id=old, pause_token='old'))
+    watch.s['resumes'].append(dict(launch_id='new', step=1))
+    watch.store.save('process-new.json', dict(watch.s['process'], launch_id='new'))
+    assert box.tick()['state'] == 'WATCHING'
+    assert watch.s['stop'] is None
+    watch.store.text('pause-request', 'operator pause for new launch')
+    assert watch.operator_pause()
+
+
+def test_pause_ownership_requires_launch_and_token(box):
+    box.tick()
+    watch = box.watch
+    watch.s['stop'] = dict(pause_issued=True, launch_id='old', pause_token='old')
+    watch.store.text('pause-request', 'operator')
+    assert watch.operator_pause()
+
+
+def test_cancelled_operator_pause_latches_human(box):
+    box.tick()
+    box.watch.store.text('pause-request', 'operator')
+    box.tick()
+    box.watch.store.path('pause-request').unlink()
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        assert 'cancel' in box.watch.s['reason']
+        send.assert_not_called()
+
+
+def test_acknowledge_dead_process_cannot_resume(box):
+    box.tick()
+    box.log('NCCL watchdog timed out')
+    box.watch.human('manual review')
+    old = box.watch.s['human_token']
+    box.die()
+    box.watch.store.save('acknowledge.json', dict(token=old, reason='rearm only'))
+    box.tick()
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert box.watch.s['human_token'] != old
+    assert not box.watch.s['resumes']
+
+
+def test_unpublished_pause_replayed_before_escalation(box):
+    box.tick()
+    watch = box.watch
+    # Crash after intent persistence, before target publication.
+    class Crash(BaseException): pass
+    real_text = watch.store.text
+    def crash(name, text):
+        if name == 'pause-request': raise Crash()
+        return real_text(name, text)
+    with patch.object(watch.store, 'text', side_effect=crash):
+        with pytest.raises(Crash):
+            watch.request_stop('disk_low', watch.s['last_checks'])
+    box.advance(13000); box.monitor()
+    box.watch = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'STOPPING'
+        assert box.watch.store.path('pause-request').exists()
+        assert box.watch.s['stop']['pause_published']
+        assert box.watch.s['stop']['deadline'] > box.watch.mono()
+        send.assert_not_called()
+
+
+def pending_unknown(box):
+    box.tick()
+    watch = box.watch
+    watch.s['pending_launch'] = dict(launch_id='unknown', mono=watch.mono())
+    watch.s['resumes'].append(dict(launch_id='unknown', step=1))
+    spec = dict(launch_id='unknown', unit='h3-training-unknown.service', argv=['/fake'], cwd='/fake', env={})
+    watch.store.save('launch-unknown.json', spec)
+    watch.store.text('claimed-unknown.json', '{}')
+    watch.human('launch outcome unknown')
+    watch.persist()
+    return watch, spec
+
+
+def test_unknown_launch_reconcile_adopt_or_abandon(box):
+    from ops.h3_formal_watch.common import digest
+    watch, spec = pending_unknown(box)
+    info = dict(InvocationID='ours', ControlGroup='/fake', KillMode='control-group', Restart='no')
+    watch.store.save('execution-unknown.json', dict(launch_id='unknown', unit=spec['unit'],
+        invocation_id='ours', boot_id=watch.boot, spec_id=digest(spec)))
+    with patch.object(process, 'unit_info', return_value=info), \
+            patch.object(process, 'cgroup_members', return_value=[123]):
+        watch.reconcile_launch('adopt', 'verified live unit')
+    assert watch.s['pending_launch'] is None and watch.s['stop'] is None
+    assert watch.s['process']['invocation_id'] == 'ours'
+    assert watch.s['state'] == 'NEEDS_HUMAN'  # separate rearm, never submission
+
+
+def test_unknown_launch_abandon_prevents_delayed_submission(box):
+    watch, spec = pending_unknown(box)
+    box.die()
+    with patch.object(process, 'unit_info', return_value={'LoadState': 'not-found'}):
+        watch.reconcile_launch('abandon', 'verified absent unit')
+    assert watch.s['pending_launch'] is None
+    assert watch.store.path('abandoned-unknown.json').exists()
+    with patch.object(process, 'run_command') as command:
+        with pytest.raises(ValueError, match='abandoned'):
+            process.supervise(watch.store.root, 'launch-unknown.json')
+        command.assert_not_called()
+
+
+def test_unknown_launch_reconcile_rejects_foreign_unit(box):
+    watch, spec = pending_unknown(box)
+    with patch.object(process, 'unit_info', return_value=dict(InvocationID='foreign', ControlGroup='/fake',
+                      KillMode='control-group', Restart='no')):
+        with pytest.raises(ValueError, match='receipt'):
+            watch.reconcile_launch('adopt', 'not proven')
+    assert watch.s['pending_launch']
+
+
 def test_user_unit_contract():
     units = Path(__file__).resolve().parents[1] / 'ops/h3_formal_watch/systemd'
     watchdog = (units / 'h3-formal-watchdog.service').read_text()

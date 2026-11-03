@@ -40,7 +40,13 @@ need separately authorized acceptance. All development tests/drills are offline.
 * Pause requires the operator-provisioned dangling symlink below. Missing/wrong
   link on a boundary fault means NEEDS_HUMAN, not a surprise hard stop. A request
   that exists without a watchdog STOPPING ownership record is an **operator pause**.
-  It is never removed or auto-resumed, including when it uses the same symlink.
+  Ownership requires the current launch ID and matching durable token in the request;
+  adopting any new attempt clears the previous stop record. Unpublished pause intent
+  is replayed before escalation, with a fresh full boundary allowance. It is never
+  assumed published merely because STOPPING was persisted.
+  Operator pauses are never removed or auto-resumed, including via the same symlink.
+  If an observed operator request disappears while training lives, latch NEEDS_HUMAN:
+  cancellation intent is ambiguous, so checks require explicit rearming.
 * Resume allowlist: explicit NCCL watchdog timeout, actual card/process-monitor
   unhealthy/stale exit log, or watchdog monitor/disk boundary stop with a new
   successful checkpoint and H3SafeBoundaryPause/log or matching TERM exit receipt.
@@ -179,7 +185,26 @@ python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --acknowledge 'Reviewed
 This writes a token-bound acknowledgement consumed by the running watchdog on its
 next tick. It does not clear retry limits, remove pause requests, bypass a reboot,
 change ownership, or force a resume. Active pause requests must be resolved by the
-operator first; a failed rearming gate returns to NEEDS_HUMAN with a new token.
+operator first; a failed rearming gate or a dead process returns to NEEDS_HUMAN
+with a new token. Acknowledgement never reclassifies a dead process for auto-resume.
+
+An unknown pending launch requires reconciliation, not repeated acknowledgements.
+Stop **only the watchdog service** first (its lock must be free; training is separate),
+then use one of:
+
+```sh
+python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --reconcile-launch adopt --reason 'Verified attempt identity'
+python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --reconcile-launch abandon --reason 'Verified absent/dead attempt'
+```
+
+Adoption requires a matching process receipt, or the in-unit execution receipt
+(binding spec digest, launch ID, boot and InvocationID) plus current unit ownership.
+A unit without proof is refused, never guessed from its name. Abandonment requires
+empty old ownership and an absent unit or a proven owned empty unit; an abandonment
+receipt prevents delayed supervisor submission. Both operations serialize against
+supervision, retain claims/retry counts, stay NEEDS_HUMAN and never submit or signal.
+Then acknowledge separately and restart the watchdog. Legacy ambiguous units without
+receipts require manual identity investigation; acknowledgement cannot bypass this.
 
 ## Observer / notifications
 
