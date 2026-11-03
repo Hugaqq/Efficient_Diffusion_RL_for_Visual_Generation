@@ -31,17 +31,17 @@ _SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}')
 _STEP_DIR = re.compile(r'step-(\d{4,})')
 
 
-def export_step(step, *, every, terminal_step):
-    """True on updates every, 2*every, ... and on the terminal update."""
-    for name, value in (('step', step), ('every', every), ('terminal_step', terminal_step)):
+def export_step(step, *, every, terminal_step, also=()):
+    """True on updates every, 2*every, ..., on the terminal update and on the extra updates `also`."""
+    for name, value in (('step', step), ('every', every), ('terminal_step', terminal_step), *(('also', a) for a in also)):
         if type(value) is not int or value < 1:
             raise ValueError(f'{name} must be a positive integer')
-    return step % every == 0 or step == terminal_step
+    return step % every == 0 or step == terminal_step or step in also
 
 
-def export_steps(*, every, terminal_step, after=0):
+def export_steps(*, every, terminal_step, after=0, also=()):
     return [step for step in range(after + 1, terminal_step + 1)
-            if export_step(step, every=every, terminal_step=terminal_step)]
+            if export_step(step, every=every, terminal_step=terminal_step, also=also)]
 
 
 def sample_dirname(sample_id):
@@ -85,19 +85,20 @@ def _fsync_dir(path):
 
 class RolloutRetention:
     def __init__(self, *, root, rank, ffmpeg, ffprobe, launcher_sha, every, terminal_step,
-                 run_seed, identity=lambda sample_id: {}):
-        export_step(1, every=every, terminal_step=terminal_step)  # strict ints
+                 run_seed, identity=lambda sample_id: {}, also=()):
+        also = tuple(also)
+        export_step(1, every=every, terminal_step=terminal_step, also=also)  # strict ints
         if type(rank) is not int or not 0 <= rank < 8:
             raise ValueError('rank must be in 0..7')
         self.root, self.rank = Path(root), rank
         self.staging = self.root / '.staging' / f'rank-{rank}'
         self.ffmpeg, self.ffprobe, self.launcher_sha = ffmpeg, ffprobe, launcher_sha
-        self.every, self.terminal_step, self.run_seed = every, terminal_step, run_seed
+        self.every, self.terminal_step, self.run_seed, self.also = every, terminal_step, run_seed, also
         self.identity = identity
         self.pending, self.step = {}, None
 
     def is_export(self, step):
-        return export_step(step, every=self.every, terminal_step=self.terminal_step)
+        return export_step(step, every=self.every, terminal_step=self.terminal_step, also=self.also)
 
     def observe(self, original, *, source):
         """Wrap score_one: original first (unchanged order/value), then stage on export updates."""
@@ -158,7 +159,7 @@ class RolloutRetention:
         for sid, pending in sorted(self.pending.items()):
             for role in roles.get(sid, ()):
                 published.append(self._publish_one(step_dir / role / sample_dirname(sid), pending,
-                                                   role=role, group_rank=ranks[sid]))
+                                                   role=role, roles=roles[sid], group_rank=ranks[sid]))
         if self.rank == 0:
             flat = sorted(tuple(row) for table in tables for row in table)
             summary = dict(step=step, policy=POLICY, launcher_sha=self.launcher_sha,
@@ -186,7 +187,7 @@ class RolloutRetention:
             raise
         _fsync_dir(path.parent)
 
-    def _publish_one(self, target, pending, *, role, group_rank):
+    def _publish_one(self, target, pending, *, role, roles, group_rank):
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             raise FileExistsError('refusing to overwrite an existing rollout sample')
@@ -199,7 +200,9 @@ class RolloutRetention:
                 shutil.copyfile(source, video)
             if sha256_file(video) != pending['facts']['video_sha256']:
                 raise ValueError('staged rollout video changed before publication')
-            receipt = dict(pending['metadata'], role=role, reward=pending['reward'], group_reward_rank=group_rank,
+            # roles: every role this sample holds (all three when its whole group ties).
+            receipt = dict(pending['metadata'], role=role, roles=list(roles), reward=pending['reward'],
+                           group_reward_rank=group_rank,
                            selection_policy=POLICY, launcher_sha=self.launcher_sha,
                            encode_seconds=pending['encode_seconds'], **pending['facts'])
             (temporary / 'receipt.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2))

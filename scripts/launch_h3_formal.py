@@ -1,12 +1,13 @@
 """Formal H3 Flash-GRPO run (experiment card F1): 200 optimizer updates at 384x256.
 
-Fresh start, or resume of the SAME run (same output dir, Git SHA and opt-in
-flags; the lifecycle additionally enforces run/code/topology ownership and
-the latest complete checkpoint). Reuses the two-update acceptance backend:
+Fresh start, or resume of the SAME run (same output dir and opt-in flags; the
+lifecycle enforces run/visual_rl-code/topology ownership and the latest complete
+checkpoint; a different launcher Git SHA needs --allow-launcher-upgrade and may
+change only scripts/ and tests/). Reuses the two-update acceptance backend:
 per-update graph/count/Adam audit, journal and card-monitor health before
 every update (degraded is non-fatal; stop only on healthy=false or a health
 file older than 30 s), terminal save validation. Adds reward-ranked rollout
-video retention every 5 updates plus the terminal one, a disk preflight, a
+video retention at update 1, every 5 updates and the terminal one, a disk preflight, a
 per-launch manifest, and optional (default off) per-update weight hashing.
 """
 from pathlib import Path
@@ -33,6 +34,8 @@ FORMAL_UPDATES = (200,)          # the only authorized target; kept a validated 
 FORMAL_GEOMETRY = (384, 256, 124, 24, 32, 64)  # width, height, frames, fps, LoRA rank, alpha
 CHECKPOINT_EVERY = 5
 EXPORT_EVERY = 5
+EXPORT_ALSO = (1,)               # update 1: rollout of the untrained base (zero LoRA)
+UPGRADE_SCOPE = ('scripts/', 'tests/')  # launcher-only upgrades; visual_rl/ and all else refused
 VIDEOS_PER_EXPORT = 12           # member0 + best + worst for each of 4 prompt groups
 CHECKPOINT_BYTES = 2_023_338_320  # measured M1 step-1 checkpoint (15,025 files)
 VIDEO_BYTES = 2 * 1024**2        # conservative per retained MP4 (M1 480x320: about 0.6 MB)
@@ -76,7 +79,7 @@ def checkpoint_steps(*, total, after=0):
 def disk_need(*, total, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
               log_bytes=LOG_BYTES, margin=DISK_MARGIN):
     checkpoints = len(checkpoint_steps(total=total, after=after))
-    exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after))
+    exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after, also=EXPORT_ALSO))
     raw = checkpoints * checkpoint_bytes + exports * VIDEOS_PER_EXPORT * video_bytes + log_bytes
     return dict(checkpoints=checkpoints, export_updates=exports, checkpoint_bytes=checkpoint_bytes,
                 video_bytes=video_bytes, log_bytes=log_bytes, margin=margin, need_bytes=math.ceil(margin * raw))
@@ -111,10 +114,13 @@ def extension_flags(args):
 
 
 def formal_identity(profile, args):
-    """What a resume must not change (observation-only switches excluded)."""
-    return dict(schema='h3.formal-run.v1', expected_sha=args.expected_sha,
+    """What a resume must not change (observation-only switches excluded). The training
+    core (visual_rl code hash, semantics, topology) is enforced by the lifecycle owner check;
+    the launcher Git SHA is tracked separately in formal-run.json (see check_resume_identity)."""
+    return dict(schema='h3.formal-run.v2',
                 max_optimizer_steps=profile.launch.max_optimizer_steps,
-                checkpoint_every=CHECKPOINT_EVERY, export_every=EXPORT_EVERY, retention=retention.POLICY,
+                checkpoint_every=CHECKPOINT_EVERY, export_every=EXPORT_EVERY, export_also=list(EXPORT_ALSO),
+                retention=retention.POLICY,
                 geometry=list(FORMAL_GEOMETRY), flags=dict(
                     reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae,
                     reuse_rollout_anchor=args.reuse_rollout_anchor,
@@ -122,15 +128,62 @@ def formal_identity(profile, args):
                     checkpoint_threads=args.checkpoint_threads, **extension_flags(args)))
 
 
-def check_resume_identity(profile, args):
+def fresh_record(profile, args):
+    """formal-run.json at the fresh start: identity, launcher SHA, empty upgrade history."""
+    return dict(identity=formal_identity(profile, args), launcher_sha=args.expected_sha, launcher_upgrades=[])
+
+
+def current_launcher_sha(record):
+    return record['launcher_upgrades'][-1]['new_sha'] if record['launcher_upgrades'] else record['launcher_sha']
+
+
+def git_changed_files(old, new, *, root=ROOT):
+    """Files that differ between two commits of the deployed checkout (old must be present)."""
+    for sha in (old, new):
+        subprocess.check_output(['git', '-C', str(root), 'cat-file', '-e', sha + '^{commit}'])
+    return subprocess.check_output(['git', '-C', str(root), 'diff', '--name-only', old, new], text=True).split()
+
+
+def check_resume_identity(profile, args, *, changed_files=git_changed_files, now=None):
+    """Refuse a changed identity. A different launcher SHA is refused unless
+    --allow-launcher-upgrade with --upgrade-reason, and only when every changed file is
+    under scripts/ or tests/. Returns the upgrade history entry to append, or None."""
     path = profile.launch.output_dir / IDENTITY_FILE
     if not path.is_file():
         raise ValueError(f'resume requires {IDENTITY_FILE} written by this run\'s fresh start')
-    saved, current = json.loads(path.read_text()), formal_identity(profile, args)
+    record = json.loads(path.read_text())
+    saved, current = record.get('identity'), formal_identity(profile, args)
     if saved != current:
-        changed = sorted(k for k in set(saved) | set(current) if saved.get(k) != current.get(k))
+        keys = set(saved or {}) | set(current)
+        changed = sorted(k for k in keys if (saved or {}).get(k) != current.get(k))
         raise ValueError(f'refusing resume across a changed formal-run identity: {changed}')
-    return current
+    old, new = current_launcher_sha(record), args.expected_sha
+    if old == new:
+        if args.allow_launcher_upgrade or args.upgrade_reason is not None:
+            raise ValueError('--allow-launcher-upgrade/--upgrade-reason given but the launcher SHA is unchanged')
+        return None
+    if not args.allow_launcher_upgrade:
+        raise ValueError(f'refusing resume with a different launcher SHA ({old} -> {new}); '
+                         'pass --allow-launcher-upgrade with --upgrade-reason for a scripts/-only change')
+    if type(args.upgrade_reason) is not str or not args.upgrade_reason.strip():
+        raise ValueError('--allow-launcher-upgrade requires a nonempty --upgrade-reason')
+    files = sorted(changed_files(old, new))
+    outside = [f for f in files if not f.startswith(UPGRADE_SCOPE)]
+    if outside:
+        raise ValueError(f'launcher upgrade may change only scripts/ and tests/; also changed: {outside}')
+    stamp = now or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    return dict(old_sha=old, new_sha=new, utc=stamp, reason=args.upgrade_reason.strip(),
+                changed_scripts=[f for f in files if f.startswith('scripts/')],
+                changed_tests=[f for f in files if f.startswith('tests/')])
+
+
+def record_launcher_upgrade(output, upgrade):
+    """Rank0, after the lifecycle admitted the resume: append the upgrade to formal-run.json."""
+    path = output / IDENTITY_FILE
+    record = json.loads(path.read_text())
+    if current_launcher_sha(record) != upgrade['old_sha']:
+        raise ValueError('formal-run.json launcher SHA changed since the resume check')
+    _write_json(path, dict(record, launcher_upgrades=[*record['launcher_upgrades'], upgrade]))
 
 
 class FormalBackend(TwoUpdateBackend):
@@ -155,7 +208,9 @@ class FormalBackend(TwoUpdateBackend):
                 identity = output / IDENTITY_FILE
                 if identity.exists():
                     raise FileExistsError('fresh formal run found an existing identity file')
-                _write_json(identity, formal_identity(graph.profile, self.args))
+                _write_json(identity, fresh_record(graph.profile, self.args))
+            elif self.manifest.get('launcher_upgrade') is not None:
+                record_launcher_upgrade(output, self.manifest['launcher_upgrade'])
             (output / 'formal-launches').mkdir(exist_ok=True)
             _write_json(output / 'formal-launches' / f"launch-{self.manifest['launch_stamp']}-pid{os.getpid()}.json",
                         dict(self.manifest, run_id=graph.run_id, semantic_id=preflight.facts.semantic_id,
@@ -193,7 +248,7 @@ class FormalBackend(TwoUpdateBackend):
         launch = graph.profile.launch
         self.retention = retention.RolloutRetention(root=launch.output_dir / 'rollout-videos', rank=runtime.rank,
             ffmpeg=self.args.ffmpeg, ffprobe=self.args.ffprobe, launcher_sha=self.args.expected_sha,
-            every=EXPORT_EVERY, terminal_step=launch.max_optimizer_steps, run_seed=launch.seed,
+            every=EXPORT_EVERY, also=EXPORT_ALSO, terminal_step=launch.max_optimizer_steps, run_seed=launch.seed,
             identity=lambda sid: self.rollout_identity(bound, graph, sid))
         self.rank = runtime.rank
         bound.stages.score_one = self.retention.observe(bound.stages.score_one, source=graph.source)
@@ -253,6 +308,9 @@ def build_parser():
                    help='disk preflight: bytes per checkpoint (default: measured M1 step-1)')
     p.add_argument('--video-bytes', type=int, default=VIDEO_BYTES, help='disk preflight: bytes per retained MP4')
     p.add_argument('--log-bytes', type=int, default=LOG_BYTES, help='disk preflight: monitor/journal/stdout budget')
+    p.add_argument('--allow-launcher-upgrade', action='store_true',
+                   help='resume only: accept a different launcher Git SHA whose changes are confined to scripts/ and tests/')
+    p.add_argument('--upgrade-reason', default=None, help='required with --allow-launcher-upgrade; recorded in formal-run.json')
     return p
 
 
@@ -267,16 +325,19 @@ def main():
     if not memory.enabled() or not args.ffmpeg.is_file() or not args.ffprobe.is_file():
         raise ValueError('requires memory journal and real media tools')
     start = resume_step(profile)
+    upgrade = None
+    if start is None and (args.allow_launcher_upgrade or args.upgrade_reason is not None):
+        raise ValueError('--allow-launcher-upgrade/--upgrade-reason apply to a resume only')
     if start is not None:
         if args.profile_rollout:
             raise ValueError('--profile-rollout targets update 2 and is accepted on a fresh start only')
-        check_resume_identity(profile, args)
+        upgrade = check_resume_identity(profile, args)
     disk = disk_preflight(profile, after=start or 0, checkpoint_bytes=args.checkpoint_bytes,
                           video_bytes=args.video_bytes, log_bytes=args.log_bytes)
     journal_bytes = journal_budget(args.journal_max_mib)
     manifest = dict(schema='h3.formal-launch.v1', started_utc=started, launch_stamp=stamp, git_sha=args.expected_sha,
                     mode='fresh' if start is None else 'resume', resume_from=str(profile.launch.resume_from),
-                    resume_step=start, config=str(args.config),
+                    resume_step=start, launcher_upgrade=upgrade, config=str(args.config),
                     config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(),
                     profile_source_id=profile.source_id, identity=formal_identity(profile, args),
                     audit_weights=args.audit_weights, profile_rollout=args.profile_rollout,

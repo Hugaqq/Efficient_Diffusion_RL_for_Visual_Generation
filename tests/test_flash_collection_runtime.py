@@ -3716,6 +3716,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     assert retention.export_steps(every=5, terminal_step=200) == list(range(5, 201, 5))
     assert retention.export_steps(every=5, terminal_step=203)[-2:] == [200, 203]
     assert retention.export_steps(every=5, terminal_step=200, after=20)[0] == 25
+    assert retention.export_steps(every=5, terminal_step=200, also=(1,))[:3] == [1, 5, 10]
+    assert len(retention.export_steps(every=5, terminal_step=200, also=(1,))) == 41
+    assert retention.export_steps(every=5, terminal_step=200, after=1, also=(1,))[0] == 5
+    with pytest.raises(ValueError, match='also'): retention.export_step(1, every=5, terminal_step=200, also=(0,))
     for bad in ((0, 5, 200), (5, 0, 200), (5, 5, True), (1.0, 5, 200)):
         with pytest.raises(ValueError): retention.export_step(bad[0], every=bad[1], terminal_step=bad[2])
     tie_rows = [(f's{g}-{m}', f'g{g}', m, float(m % 3)) for g in range(4) for m in range(8)]
@@ -3749,7 +3753,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         rows = []
         for rank in range(8):
             keep = retention.RolloutRetention(root=video_root, rank=rank, ffmpeg=ffmpeg_path, ffprobe=ffprobe,
-                launcher_sha='test', every=5, terminal_step=200, run_seed=42,
+                launcher_sha='test', every=5, terminal_step=200, run_seed=42, also=(1,),
                 identity=lambda sid: dict(stochastic_index=3, initial_noise_sha256='n' * 64))
             source = owner(rank, step)
             callback = keep.observe(original, source=source)
@@ -3776,6 +3780,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert reward_of[sid] == max(v for s, v in reward_of.items() if s.split(':')[1].split('-')[0] == group)
         receipt = json.loads((step_dir / 'best' / sid / 'receipt.json').read_text())
         assert (receipt['role'], receipt['reward'], receipt['group_reward_rank'], receipt['run_seed']) == ('best', reward_of[sid], 1, 42)
+        assert receipt['roles'] == list(roles[sid])
         assert receipt['prompt'].startswith('prompt ') and receipt['stochastic_index'] == 3 and receipt['frames'] == 3
         assert receipt['video_sha256'] == hashlib.sha256((step_dir / 'best' / sid / 'video.mp4').read_bytes()).hexdigest()
     selection_rows = json.loads((step_dir / 'selection.json').read_text())['samples']
@@ -3786,6 +3791,20 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         for k in again: k.publish(5, [k2.local_rows(5) for k2 in again])
     for k in again: k.discard()
     assert not any((video_root / '.staging').rglob('*.mp4'))
+    # Update 1 (untrained base) is exported too; an all-equal group keeps one sample in all three roles.
+    distinct = dict(reward_of)
+    reward_of.update((sid, 1.5) for sid in reward_of)
+    tied = owners(1)
+    tied_tables = [k.local_rows(1) for k in tied]
+    assert sum(len(k.publish(1, tied_tables)) for k in tied) == 12
+    reward_of.update(distinct)
+    for g in range(4):
+        sid = f'h3-sample:{g}-0'
+        for role in retention.ROLES:
+            tied_receipt = json.loads((video_root / 'step-0001' / role / sid / 'receipt.json').read_text())
+            assert tied_receipt['role'] == role and tied_receipt['roles'] == ['member0', 'best', 'worst']
+            assert tied_receipt['step'] == 1 and tied_receipt['reward'] == 1.5
+        assert all(len(list((video_root / 'step-0001' / role).iterdir())) == 4 for role in retention.ROLES)
     # Failure: a broken encoder fails the score call AFTER the original reward; no temp survives.
     with pytest.raises(Exception):
         owners(10, ffmpeg_path=str(tmp_path / 'missing-ffmpeg'))
@@ -3849,18 +3868,50 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     identity_profile = SimpleNamespace(launch=SimpleNamespace(output_dir=out, max_optimizer_steps=200))
     with pytest.raises(ValueError, match='formal-run.json'): formal.check_resume_identity(identity_profile, args)
     out.mkdir()
-    (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.formal_identity(identity_profile, args)))
-    assert formal.check_resume_identity(identity_profile, args)['flags']['checkpoint_threads'] == 1
-    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8), ('expected_sha', 'b' * 40)):
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
+    assert formal.check_resume_identity(identity_profile, args) is None
+    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8)):
         changed = SimpleNamespace(**dict(vars(args), **{name: value}))
         with pytest.raises(ValueError, match='changed formal-run identity'): formal.check_resume_identity(identity_profile, changed)
     observed = SimpleNamespace(**dict(vars(args), audit_weights=True))  # observation-only: not identity
-    formal.check_resume_identity(identity_profile, observed)
-    # Disk: 41 checkpoints (step1, every 5, terminal) and 40 video exports for a fresh run.
+    assert formal.check_resume_identity(identity_profile, observed) is None
+    # Launcher upgrade: a new SHA is refused by default; allowed only with flag + reason and
+    # only for scripts/ and tests/ changes (visual_rl/ is the lifecycle-hashed training core).
+    def with_args(**kw): return SimpleNamespace(**dict(vars(args), **kw))
+    def diff(*files): return lambda old, new: (old, new) == ('a' * 40, 'b' * 40) and list(files) or pytest.fail('wrong range')
+    scripts_only = diff('scripts/launch_h3_formal.py', 'tests/test_flash_collection_runtime.py')
+    with pytest.raises(ValueError, match='different launcher SHA'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40), changed_files=scripts_only)
+    with pytest.raises(ValueError, match='upgrade-reason'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True),
+                                     changed_files=scripts_only)
+    for outside in ('visual_rl/runtime/h3_lifecycle.py', 'docs/notes.md', 'experiments/x.yaml'):
+        with pytest.raises(ValueError, match='only scripts/ and tests/'):
+            formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True,
+                upgrade_reason='fix'), changed_files=diff('scripts/a.py', outside))
+    with pytest.raises(ValueError, match='unchanged'):
+        formal.check_resume_identity(identity_profile, with_args(allow_launcher_upgrade=True, upgrade_reason='x'))
+    with pytest.raises(ValueError, match='unchanged'):
+        formal.check_resume_identity(identity_profile, with_args(upgrade_reason='x'))
+    upgrade = formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True,
+        upgrade_reason=' export fix '), changed_files=scripts_only, now='2026-11-04T00:00:00+00:00')
+    assert upgrade == dict(old_sha='a' * 40, new_sha='b' * 40, utc='2026-11-04T00:00:00+00:00', reason='export fix',
+                           changed_scripts=['scripts/launch_h3_formal.py'], changed_tests=['tests/test_flash_collection_runtime.py'])
+    formal.record_launcher_upgrade(out, upgrade)
+    history = json.loads((out / formal.IDENTITY_FILE).read_text())
+    assert history['launcher_sha'] == 'a' * 40 and history['launcher_upgrades'] == [upgrade]
+    assert formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40)) is None  # now current
+    with pytest.raises(ValueError, match='different launcher SHA'): formal.check_resume_identity(identity_profile, args)
+    with pytest.raises(ValueError, match='changed since'): formal.record_launcher_upgrade(out, upgrade)
+    import subprocess
+    assert formal.git_changed_files('HEAD', 'HEAD') == []  # real Git on the deployed checkout
+    with pytest.raises(subprocess.CalledProcessError):  # an absent old commit refuses, never guesses
+        formal.git_changed_files('0' * 40, 'HEAD')
+    # Disk: 41 checkpoints (step1, every 5, terminal) and 41 video exports (update 1, every 5) for a fresh run.
     assert formal.checkpoint_steps(total=200)[:3] == [1, 5, 10] and len(formal.checkpoint_steps(total=200)) == 41
     need = formal.disk_need(total=200)
-    assert (need['checkpoints'], need['export_updates']) == (41, 40)
-    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 480 * formal.VIDEO_BYTES + formal.LOG_BYTES))
+    assert (need['checkpoints'], need['export_updates']) == (41, 41)
+    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 492 * formal.VIDEO_BYTES + formal.LOG_BYTES))
     assert formal.disk_need(total=200, after=100)['checkpoints'] == 20
     fs = lambda free: (lambda path: SimpleNamespace(f_bavail=free // 4096, f_frsize=4096))
     deep = SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / 'missing' / 'run', max_optimizer_steps=200))
@@ -3897,7 +3948,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     class SpyRetention:
         def __init__(self, **kw): self.kw = kw; calls.append(('init', kw['rank'], kw['terminal_step'], kw['every']))
         def observe(self, original, *, source): return original
-        def is_export(self, step): return formal.retention.export_step(step, every=5, terminal_step=200)
+        def is_export(self, step): return formal.retention.export_step(step, every=5, terminal_step=200, also=self.kw['also'])
         def local_rows(self, step): calls.append(('rows', step)); return [['s', 'g', 0, 1.0]]
         def publish(self, step, tables): calls.append(('publish', step, len(tables)))
         def discard(self): calls.append(('discard',))
@@ -3947,7 +3998,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         for step in range(5): fresh_bound.trainer.run_iteration(step)
         # Start: stale staging deleted and later step dirs set aside; export only after update 5.
         assert calls[1:3] == [('discard',), ('supersede', 0)]
-        assert [c for c in calls if c[0] in ('rows', 'publish')] == [('rows', 5), ('publish', 5, 8)]
+        assert [c for c in calls if c[0] in ('rows', 'publish')] == [('rows', 1), ('publish', 1, 8), ('rows', 5), ('publish', 5, 8)]
         assert calls[-1] == ('discard',) and len(fresh_backend.audits) == 5
         assert fresh_backend.audits[-1]['lora_changed'] is None and fresh_backend.audits[-1]['after'] is None
         assert json.loads((fresh_graph.profile.launch.output_dir / 'update-5-audit.json').read_text())['optimizer_updates'] == 5
@@ -3978,7 +4029,8 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         maker.transaction = SimpleNamespace(checkpoint=lambda *a, **kw: SimpleNamespace(step=5))
         preflight = SimpleNamespace(facts=SimpleNamespace(semantic_id='sem', binding_id='bind'), code_hash='code')
         assert maker.construct_graph(preflight, SimpleNamespace(rank=0)) is fake_graph
-        assert json.loads((graph_out / formal.IDENTITY_FILE).read_text())['max_optimizer_steps'] == 200
+        written = json.loads((graph_out / formal.IDENTITY_FILE).read_text())
+        assert written['identity']['max_optimizer_steps'] == 200 and written['launcher_upgrades'] == []
         launches = list((graph_out / 'formal-launches').iterdir())
         assert len(launches) == 1 and json.loads(launches[0].read_text())['semantic_id'] == 'sem'
         printed = io.StringIO()
