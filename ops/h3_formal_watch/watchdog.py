@@ -131,7 +131,10 @@ def hps_check(url, expected, timeout=8):
 
 def disk_check(output, byte_floor, inode_floor):
     stat = os.statvfs(output)
-    free, inodes = stat.f_bavail * stat.f_frsize, stat.f_favail if stat.f_files else None
+    if stat.f_bavail < 0 or stat.f_frsize <= 0:
+        raise ValueError('unknown disk byte capacity')
+    free = stat.f_bavail * stat.f_frsize
+    inodes = stat.f_favail if stat.f_files > 0 and stat.f_favail is not None and 0 <= stat.f_favail < 2**63 else None
     ok = False if free < byte_floor or (inodes is not None and inodes < inode_floor) else (
         None if inodes is None and inode_floor else True)
     return dict(ok=ok, free_bytes=free, free_inodes=inodes)
@@ -251,8 +254,13 @@ class Watchdog:
         if not argv or argv.count('{resume_config}') != 1:
             raise ValueError('one standalone {resume_config} required')
         existing_absolute(argv[0])
-        for arg in argv[1:]:
-            if arg != '{resume_config}' and Path(arg).suffix in ('.json', '.yaml', '.yml', '.py'):
+        for index, arg in enumerate(argv[1:], 1):
+            option, _, inline = arg.partition('=')
+            if (option.startswith('--') and option.endswith(('-config', '-dir', '-path', '-file'))) or option == '--config':
+                value = inline if '=' in arg else argv[index + 1]
+                if value != '{resume_config}':
+                    existing_absolute(value)
+            elif arg != '{resume_config}' and Path(arg).suffix in ('.json', '.yaml', '.yml', '.py'):
                 existing_absolute(arg.split('=', 1)[-1])
         if not isinstance(launch['env'], dict) or not all(isinstance(k, str) and isinstance(v, str)
                                                        for k, v in launch['env'].items()):
@@ -358,6 +366,7 @@ class Watchdog:
             if self.s['optimizer_step'] > stop['target_step']:
                 stop.update(target_step=self.s['optimizer_step'], deadline=self.s['last_progress_mono'] +
                     self.thresholds['max_update_seconds'] + self.thresholds['checkpoint_allowance_seconds'])
+                stop.pop('checkpoint_saved', None)
             if p['checkpoint_step'] >= stop['target_step'] and p['checkpoint_step'] > stop['checkpoint_before']:
                 if not stop.get('checkpoint_saved'):
                     stop.update(checkpoint_saved=p['checkpoint_step'], deadline=self.mono() + self.thresholds['term_wait_seconds'])
@@ -400,7 +409,9 @@ class Watchdog:
         permanent = ('audit failed', 'graph/count/release', 'adam counter', 'gradient not finite',
             'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged', 'identity',
             'different h3 run', 'out of memory', 'insufficient disk', 'refusing resume', 'digest mismatch')
-        if any(word in text for word in permanent):
+        if (any(word in text for word in permanent) or re.search(
+                r'(?:graph|adam|gradient|audit)[^\n]*(?:error|failed|mismatch|not finite)|'
+                r'(?:error|assertion)[^\n]*(?:graph|adam|gradient|audit)', text)):
             return 'correctness_or_permanent_error'
         stop = self.s.get('stop') or {}
         if stop.get('cause') == 'hps_identity_change':
@@ -426,6 +437,10 @@ class Watchdog:
         if cause not in TRANSIENT:
             self.human('non-allowlisted exit: ' + cause)
         else:
+            if self.worker is not None and self.worker.is_alive():
+                self.human('previous read-only verifier still running; reconcile before recovery')
+                return
+            self.worker, self.worker_result = None, {}
             self.s['recovery_since'] = self.mono()
             self.state('RECOVERING')
 
@@ -610,7 +625,7 @@ class Watchdog:
             if 'hps' in self.s['debounce'] and self.mono() - self.s['debounce']['hps']['since'] >= self.thresholds['hps_grace_seconds']:
                 self.request_stop('hps_failure', checks)
             return self.s
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
             self.event('watch_error', error=repr(exc))
             self.human('watchdog safety gate: ' + repr(exc))
             return self.s

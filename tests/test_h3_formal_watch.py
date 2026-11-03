@@ -505,6 +505,50 @@ def test_long_history_is_archived_but_status_and_reload_are_bounded(box):
     Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
 
 
+@pytest.mark.parametrize('files,available', [(0, 0), (10, -1), (-1, 4), (10, 2**64 - 1)])
+def test_unknown_inode_sentinels_never_become_disk_low(box, files, available):
+    stat = SimpleNamespace(f_bavail=100, f_frsize=4096, f_favail=available, f_files=files)
+    with patch('os.statvfs', return_value=stat):
+        assert disk_check(box.root, 1, 10)['ok'] is None
+        assert disk_check(box.root, 999999, 10)['ok'] is False  # independently known byte shortage
+
+
+@pytest.mark.parametrize('argv', [['--monitor-dir', 'relative-monitor'], ['--config=relative-no-extension'], ['--monitor-dir']])
+def test_arming_checks_all_config_arguments_without_signalling(box, argv):
+    box.config['launcher']['argv'].extend(argv)
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        send.assert_not_called()
+
+
+def test_boundary_fault_without_pause_provision_needs_human(box):
+    box.tick()
+    (box.root / 'output' / 'PAUSE_REQUESTED').unlink()
+    box.monitor(healthy=False)
+    box.tick(); box.tick()
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        send.assert_not_called()
+
+
+def test_successful_checkpoint_and_own_term_receipt_allowlist(box):
+    box.tick()
+    box.monitor(healthy=False)
+    box.tick(); box.tick(); box.tick()
+    fake_checkpoint(box.root / 'output')
+    box.tick()
+    box.advance(.2)
+    box.tick()
+    box.child.wait(5)
+    record = box.watch.s['process']
+    box.watch.store.save('exit-' + record['launch_id'] + '.json',
+        dict(launch_id=record['launch_id'], pgid=record['pgid'], exit_code=-15))
+    assert box.tick()['state'] == 'RECOVERING'
+    assert box.watch.s['incidents'][-1]['cause'] == 'watchdog_checkpoint_stop'
+    box.log('NCCL watchdog timed out\nRuntimeError: Adam state audit error')
+    assert box.watch.death_cause() == 'correctness_or_permanent_error'
+
+
 def test_resume_artifacts_rechecked_and_original_paths_unchanged(box):
     box.tick()
     fake_checkpoint(box.root / 'output')
