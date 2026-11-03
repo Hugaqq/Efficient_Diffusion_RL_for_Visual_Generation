@@ -730,9 +730,6 @@ class Watchdog:
                     self.human('cannot prove training ownership for consecutive ticks; no signal/resume')
                 return self.s
             alive = checks['process']['alive']
-            if self.s.pop('rearm_only', False) and not alive:
-                self.human('acknowledged but training is dead; manual launch decision required')
-                return self.s
             if self.operator_pause():
                 self.s['operator_pause_seen'] = True
             elif self.s.get('operator_pause_seen') and alive:
@@ -745,6 +742,11 @@ class Watchdog:
                     if self.mono() - since < self.thresholds['launch_wait_seconds']:
                         return self.s
                 self.state('DONE') if self.complete() else self.human('SUCCESS lacks matching exit/checkpoint receipt')
+                return self.s
+            # Completion (including a pending exit receipt) is read-only, not a
+            # retry. Check it before the acknowledged-dead-process resume veto.
+            if self.s.pop('rearm_only', False) and not alive:
+                self.human('acknowledged but training is dead; manual launch decision required')
                 return self.s
             if self.s['state'] == 'STOPPING':
                 self.stopped_tick(checks)

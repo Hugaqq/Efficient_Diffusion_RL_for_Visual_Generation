@@ -1404,6 +1404,46 @@ def test_acknowledge_dead_process_cannot_resume(box):
     assert not box.watch.s['resumes']
 
 
+@pytest.mark.parametrize('restart', [False, True])
+@pytest.mark.parametrize('receipt_case', ['matching', 'delayed', 'nonzero', 'wrong-owner', 'wrong-success'])
+def test_acknowledged_completed_run_reaches_done_without_resume(box, restart, receipt_case):
+    box.tick()
+    (box.root / 'monitor' / 'health.json').unlink()
+    box.tick(); box.tick()
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    box.monitor()
+    out = box.root / 'output'
+    marker = fake_checkpoint(out)
+    box.die()
+    Store(out).save('SUCCESS', dict(kind='visual_rl_h3_run_success',
+        run_id='other-run' if receipt_case == 'wrong-success' else 'fake-run',
+        committed_steps=1, checkpoint_relative_path='checkpoints/step-1',
+        **{k: marker[k] for k in ('checkpoint_contract_id', 'progress_id', 'state_tree_id')}))
+    rec = box.watch.s['process']
+    receipt = dict(launch_id=rec['launch_id'], pgid=rec['pgid'] + (receipt_case == 'wrong-owner'),
+                   exit_code=1 if receipt_case == 'nonzero' else 0)
+    if receipt_case != 'delayed':
+        box.watch.store.save('exit-' + rec['launch_id'] + '.json', receipt)
+    # Completion does not silently clear the human latch.
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    box.watch.store.save('acknowledge.json', dict(token=box.watch.s['human_token'], reason='reviewed completion'))
+    assert box.tick()['state'] == 'ARMING'
+    if restart:
+        box.watch = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+    with patch.object(process, 'inspect', return_value=dict(alive=False, members=[])), \
+            patch.object(process, 'signal_group') as send, patch('subprocess.Popen') as launch:
+        state = box.tick()
+        if receipt_case == 'delayed':
+            assert state['state'] == 'WATCHING' and state['rearm_only']
+            box.watch.store.save('exit-' + rec['launch_id'] + '.json', receipt)
+            state = box.tick()
+        expected = 'DONE' if receipt_case in ('matching', 'delayed') else 'NEEDS_HUMAN'
+        assert state['state'] == expected
+        assert not state['resumes']
+        send.assert_not_called()
+        launch.assert_not_called()
+
+
 def test_unpublished_pause_replayed_before_escalation(box):
     box.tick()
     watch = box.watch
