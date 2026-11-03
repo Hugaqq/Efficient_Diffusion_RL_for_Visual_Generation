@@ -3852,14 +3852,25 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match='accepts max_optimizer_steps'):
             formal.validate_formal(accepted, max_optimizer_steps=bad)
     with pytest.raises(ValueError, match='max2'): two_entry.validate_fresh(accepted)  # old launcher unchanged
-    # Resume target: only this run's checkpoints/step-N with 0 < N < 200.
+    # Resume target: only this run's checkpoints/step-N with 0 < N <= 200 (200 = finalize-only).
     out = tmp_path / 'formal-out'
     def at(path):
         return SimpleNamespace(launch=SimpleNamespace(resume_from=path, output_dir=out, max_optimizer_steps=200))
     assert formal.resume_step(at(None)) is None and formal.resume_step(at(out / 'checkpoints' / 'step-20')) == 20
-    for bad in (out / 'checkpoints' / 'step-200', out / 'checkpoints' / 'latest', tmp_path / 'other' / 'checkpoints' / 'step-5',
+    assert formal.resume_step(at(out / 'checkpoints' / 'step-200')) == 200
+    for bad in (out / 'checkpoints' / 'step-201', out / 'checkpoints' / 'latest', tmp_path / 'other' / 'checkpoints' / 'step-5',
                 out / 'checkpoints' / 'step-0'):
         with pytest.raises(ValueError, match='resume_from'): formal.resume_step(at(bad))
+    # Finalize-only: the lifecycle run loop executes no update and returns the restored checkpoint.
+    finalize_out = tmp_path / 'formal-finalize'; finalize_out.mkdir()
+    (finalize_out / 'h3-last-metrics.json').write_text(json.dumps(dict(step=199, loss=0.5)))
+    finalize_bound = SimpleNamespace(graph=SimpleNamespace(profile=SimpleNamespace(launch=SimpleNamespace(
+            max_optimizer_steps=200, resume_from=finalize_out / 'checkpoints' / 'step-200', output_dir=finalize_out))),
+        transaction=SimpleNamespace(manager=SimpleNamespace(inspect_complete=lambda path: SimpleNamespace(checkpoint=('ck', path.name)))),
+        trainer=SimpleNamespace(run_iteration=lambda step: pytest.fail('finalize-only resume must not update')))
+    finalizer = formal.FormalBackend.__new__(formal.FormalBackend)
+    finalizer.inspection_only, finalizer.start_step = False, 200
+    assert formal.FormalBackend.run(finalizer, finalize_bound) == (('ck', 'step-200'), dict(step=199, loss=0.5))
     args = formal.build_parser().parse_args(['cfg.json', '--expected-sha', 'a' * 40, '--ffmpeg', 'f',
                                              '--ffprobe', 'p', '--monitor-dir', 'm'])
     assert (args.max_optimizer_steps, args.audit_weights, args.reward_pipeline, args.reuse_video_vae,
@@ -3894,31 +3905,97 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='unchanged'):
         formal.check_resume_identity(identity_profile, with_args(upgrade_reason='x'))
     upgrade = formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40, allow_launcher_upgrade=True,
-        upgrade_reason=' export fix '), changed_files=scripts_only, now='2026-11-04T00:00:00+00:00')
+        upgrade_reason=' export fix '), changed_files=scripts_only, now='2026-11-04T00:00:00+00:00', attempt='A1')
     assert upgrade == dict(old_sha='a' * 40, new_sha='b' * 40, utc='2026-11-04T00:00:00+00:00', reason='export fix',
-                           changed_scripts=['scripts/launch_h3_formal.py'], changed_tests=['tests/test_flash_collection_runtime.py'])
+                           changed_scripts=['scripts/launch_h3_formal.py'], changed_tests=['tests/test_flash_collection_runtime.py'],
+                           status='attempt', attempt='A1')
     formal.record_launcher_upgrade(out, upgrade)
     history = json.loads((out / formal.IDENTITY_FILE).read_text())
     assert history['launcher_sha'] == 'a' * 40 and history['launcher_upgrades'] == [upgrade]
+    # An unapplied attempt (e.g. restore failed) never changes the current launcher SHA.
+    assert formal.check_resume_identity(identity_profile, args) is None
+    with pytest.raises(ValueError, match='different launcher SHA'):
+        formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40))
+    formal.mark_launcher_upgrade_applied(out, 'A1', now='2026-11-04T00:05:00+00:00')
+    applied = json.loads((out / formal.IDENTITY_FILE).read_text())['launcher_upgrades']
+    assert applied == [dict(upgrade, status='applied', applied_utc='2026-11-04T00:05:00+00:00')]
     assert formal.check_resume_identity(identity_profile, with_args(expected_sha='b' * 40)) is None  # now current
     with pytest.raises(ValueError, match='different launcher SHA'): formal.check_resume_identity(identity_profile, args)
     with pytest.raises(ValueError, match='changed since'): formal.record_launcher_upgrade(out, upgrade)
+    with pytest.raises(ValueError, match='pending'): formal.mark_launcher_upgrade_applied(out, 'A1')
+    # Real Git: --no-renames lists both sides of a rename, so moving a protected file into
+    # scripts/ is refused; a scripts-only change passes; an absent old commit refuses cleanly.
     import subprocess
-    assert formal.git_changed_files('HEAD', 'HEAD') == []  # real Git on the deployed checkout
-    with pytest.raises(subprocess.CalledProcessError):  # an absent old commit refuses, never guesses
-        formal.git_changed_files('0' * 40, 'HEAD')
-    # Disk: 41 checkpoints (step1, every 5, terminal) and 41 video exports (update 1, every 5) for a fresh run.
+    repo = tmp_path / 'upgrade-repo'; repo.mkdir()
+    def run_git(*argv): return subprocess.check_output(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                                                         '-c', 'commit.gpgsign=false', *argv], text=True).strip()
+    run_git('init', '-q')
+    (repo / 'experiments').mkdir(); (repo / 'scripts').mkdir()
+    (repo / 'experiments' / 'x.yaml').write_text('lr: 1e-4\n' * 20); (repo / 'scripts' / 'a.py').write_text('A = 1\n')
+    run_git('add', '-A'); run_git('commit', '-q', '-m', 'base'); base_sha = run_git('rev-parse', 'HEAD')
+    (repo / 'scripts' / 'a.py').write_text('A = 2\n'); run_git('commit', '-qam', 'scripts only')
+    scripts_sha = run_git('rev-parse', 'HEAD')
+    run_git('mv', 'experiments/x.yaml', 'scripts/x.yaml'); run_git('commit', '-qm', 'rename'); renamed_sha = run_git('rev-parse', 'HEAD')
+    in_repo = lambda old, new: formal.git_changed_files(old, new, root=repo)
+    assert in_repo(scripts_sha, renamed_sha) == ['experiments/x.yaml', 'scripts/x.yaml']
+    git_out = tmp_path / 'formal-git-out'; git_out.mkdir()
+    git_profile = SimpleNamespace(launch=SimpleNamespace(output_dir=git_out, max_optimizer_steps=200))
+    (git_out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(git_profile, with_args(expected_sha=base_sha))))
+    upgrade_args = dict(allow_launcher_upgrade=True, upgrade_reason='review fix')
+    with pytest.raises(ValueError, match="experiments/x.yaml"):
+        formal.check_resume_identity(git_profile, with_args(expected_sha=renamed_sha, **upgrade_args), changed_files=in_repo)
+    allowed = formal.check_resume_identity(git_profile, with_args(expected_sha=scripts_sha, **upgrade_args), changed_files=in_repo)
+    assert allowed['changed_scripts'] == ['scripts/a.py'] and allowed['old_sha'] == base_sha
+    with pytest.raises(ValueError, match='not present'): in_repo('0' * 40, scripts_sha)
+    assert formal.git_changed_files('HEAD', 'HEAD') == []  # this deployed checkout
+    # Disk: 41 checkpoints (step1, every 5, terminal), 41 video exports (update 1, every 5), bytes and inodes.
     assert formal.checkpoint_steps(total=200)[:3] == [1, 5, 10] and len(formal.checkpoint_steps(total=200)) == 41
-    need = formal.disk_need(total=200)
+    logs = formal.JOURNAL_PROCESSES * 512 * 1024**2 + 8 * 1024**3 + formal.OTHER_LOG_BYTES
+    need = formal.disk_need(total=200, log_bytes=logs)
     assert (need['checkpoints'], need['export_updates']) == (41, 41)
-    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 492 * formal.VIDEO_BYTES + formal.LOG_BYTES))
-    assert formal.disk_need(total=200, after=100)['checkpoints'] == 20
-    fs = lambda free: (lambda path: SimpleNamespace(f_bavail=free // 4096, f_frsize=4096))
+    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 492 * formal.VIDEO_BYTES + logs))
+    assert need['need_inodes'] == math.ceil(1.2 * (41 * 15025 + 41 * formal.FILES_PER_EXPORT))
+    assert formal.disk_need(total=200, after=100, log_bytes=0)['checkpoints'] == 20
+    finalize_need = formal.disk_need(total=200, after=200, log_bytes=0)
+    assert (finalize_need['checkpoints'], finalize_need['export_updates'], finalize_need['need_bytes']) == (0, 0, 0)
+    def fs(free, inodes=10**7, total_inodes=10**8):
+        return lambda path: SimpleNamespace(f_bavail=free // 4096, f_frsize=4096, f_favail=inodes, f_files=total_inodes)
     deep = SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / 'missing' / 'run', max_optimizer_steps=200))
-    report = formal.disk_preflight(deep, statvfs=fs(160 * 10**9))
+    report = formal.disk_preflight(deep, statvfs=fs(160 * 10**9), log_bytes=logs)
     assert report['filesystem_probe'] == str(tmp_path) and report['free_bytes'] <= 160 * 10**9
-    with pytest.raises(RuntimeError, match='insufficient disk'): formal.disk_preflight(deep, statvfs=fs(100 * 10**9))
-    assert formal.disk_preflight(deep, after=150, statvfs=fs(50 * 10**9))['checkpoints'] == 10
+    with pytest.raises(RuntimeError, match='insufficient disk'): formal.disk_preflight(deep, statvfs=fs(100 * 10**9), log_bytes=logs)
+    with pytest.raises(RuntimeError, match='inodes'): formal.disk_preflight(deep, statvfs=fs(160 * 10**9, inodes=500_000), log_bytes=logs)
+    assert formal.disk_preflight(deep, statvfs=fs(160 * 10**9, inodes=0, total_inodes=0), log_bytes=logs)['free_inodes'] is None
+    assert formal.disk_preflight(deep, after=150, statvfs=fs(50 * 10**9), log_bytes=logs)['checkpoints'] == 10
+    # Card-monitor lifetime/bytes must cover the remaining updates; budgets come from health.json.
+    budget_dir = tmp_path / 'formal-monitor-budget'; budget_dir.mkdir()
+    def budget_health(**fields):
+        (budget_dir / 'health.json').write_text(json.dumps(dict(dict(healthy=True, sample_count=100, bytes=100 * 4096,
+            interval_seconds=5., max_seconds=1728000., max_bytes=12 * 1024**3, started_monotonic_ns=0, monotonic_ns=0), **fields)))
+    budget_health()
+    covered = formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert covered['need_seconds'] == 200 * 7200 and covered['row_bytes'] == formal.MONITOR_ROW_BYTES
+    budget_health(max_seconds=86400., max_bytes=512 * 1024**2, interval_seconds=1.)  # old defaults: 24 h
+    with pytest.raises(RuntimeError, match='cannot cover 200 updates'): formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    assert formal.monitor_budget(budget_dir, remaining_updates=10, now_ns=0, row_bytes=1024)['need_seconds'] == 72000
+    with pytest.raises(RuntimeError, match='cannot cover'):  # elapsed lifetime counts
+        formal.monitor_budget(budget_dir, remaining_updates=10, now_ns=20000 * 10**9, row_bytes=1024)
+    assert formal.monitor_budget(budget_dir, remaining_updates=0, now_ns=0)['need_bytes'] == 0  # finalize-only
+    budget_health(bytes=100 * 10**6)  # observed rows (1 MB) larger than the default estimate are used
+    with pytest.raises(RuntimeError, match='cannot cover'): formal.monitor_budget(budget_dir, remaining_updates=200, now_ns=0)
+    (budget_dir / 'health.json').write_text(json.dumps(dict(healthy=True, sample_count=9, monotonic_ns=0)))
+    with pytest.raises(RuntimeError, match='budget fields'): formal.monitor_budget(budget_dir, remaining_updates=1)
+    budget_health(healthy=False)
+    with pytest.raises(RuntimeError, match='unhealthy'): formal.monitor_budget(budget_dir, remaining_updates=1)
+    card_budget_dir = tmp_path / 'formal-card-monitor'
+    from scripts import monitor_h3_memory as card_budget_monitor
+    with monkeypatch.context() as patch:
+        patch.setattr(card_budget_monitor, 'sample', lambda journal: (card_budget_dir / 'STOP').touch() or dict(
+            monotonic_ns=time.monotonic_ns(), utc='u'))
+        card_budget_monitor.run(card_budget_dir, tmp_path / 'j', interval=0., max_seconds=1728000., max_bytes=8 * 1024**3)
+    written_health = json.loads((card_budget_dir / 'health.json').read_text())
+    assert (written_health['interval_seconds'], written_health['max_seconds'], written_health['max_bytes']) == (0., 1728000., 8 * 1024**3)
+    assert formal.monitor_budget(card_budget_dir, remaining_updates=0)['remaining_bytes'] > 0
     # Monitor: degraded is non-fatal; stale beyond 30 s or healthy=false stops the next update.
     health_dir = tmp_path / 'formal-monitor'; health_dir.mkdir()
     def health(**fields):
@@ -4039,6 +4116,33 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         disk_rows = [json.loads(line) for line in printed.getvalue().splitlines()]
         assert [r['when'] for r in disk_rows] == ['before_save', 'after_save'] and disk_rows[1]['free_bytes'] > 0
         assert disk_rows[1]['remaining_need_bytes'] == formal.disk_need(total=200, after=5, log_bytes=0)['need_bytes']
+        assert (disk_rows[0]['remaining_checkpoints'], disk_rows[1]['remaining_checkpoints']) == (40, 39)  # in-progress save counted
+        # Rank0-only reporting around the collective save never raises (peers would hang).
+        patch.setattr(formal, 'disk_free', lambda path: (_ for _ in ()).throw(OSError('statvfs failed')))
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            assert maker.transaction.checkpoint(progress=SimpleNamespace(next_optimizer_step=10)).step == 5
+        assert [json.loads(line)['error'] for line in printed.getvalue().splitlines()] == ["OSError('statvfs failed')"] * 2
+        # Launcher upgrade: recorded as an attempt at construct, applied only after restore_bound succeeded.
+        upgrade_out = tmp_path / 'formal-upgrade-graph'; upgrade_out.mkdir()
+        (upgrade_out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
+        pending = dict(upgrade, attempt='U1')
+        upgraded_graph = SimpleNamespace(run_id='r', close=lambda: None, profile=SimpleNamespace(launch=SimpleNamespace(
+            output_dir=upgrade_out, resume_from=upgrade_out / 'checkpoints' / 'step-5', max_optimizer_steps=200)))
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: upgraded_graph)
+        upgrader = formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir, expected_sha='b' * 40)),
+                                        manifest=dict(launch_stamp='U1', started_utc='z', launcher_upgrade=pending))
+        upgrader.transaction = SimpleNamespace(checkpoint=lambda *a, **kw: None)
+        upgrader.construct_graph(preflight, SimpleNamespace(rank=0))
+        assert [u['status'] for u in json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades']] == ['attempt']
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'restore_bound', lambda self, *a: (_ for _ in ()).throw(ValueError('restore failed')))
+        with pytest.raises(ValueError, match='restore failed'):
+            upgrader.restore_bound(None, SimpleNamespace(rank=0), upgraded_graph, None, None, None)
+        assert json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades'][0]['status'] == 'attempt'
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'restore_bound', lambda self, *a: None)
+        upgrader.restore_bound(None, SimpleNamespace(rank=0), upgraded_graph, None, None, None)
+        assert json.loads((upgrade_out / formal.IDENTITY_FILE).read_text())['launcher_upgrades'][0]['status'] == 'applied'
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: fake_graph)
         with pytest.raises(FileExistsError, match='identity'):
             formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
                                  manifest=dict(launch_stamp='later', started_utc='y')).construct_graph(preflight, SimpleNamespace(rank=0))

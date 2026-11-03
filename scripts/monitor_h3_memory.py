@@ -72,6 +72,9 @@ def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_secon
         raise ValueError('max_consecutive_failures must be an int >= 1')
     directory.mkdir(parents=True, exist_ok=True)
     started=time.monotonic();size=0;count=0;failures=0
+    # Budgets travel with every health file so a long-run launcher can check the remaining lifetime.
+    budget=dict(interval_seconds=interval,max_seconds=max_seconds,max_bytes=max_bytes,
+                started_monotonic_ns=time.monotonic_ns())
     try:
         with (directory/'card-process.jsonl').open('x',buffering=1) as stream:
             def write(row):
@@ -92,12 +95,12 @@ def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_secon
                     write(dict(schema='h3.card-sample.v1',utc=utc,monotonic_ns=now,monitor_pid=os.getpid(),
                                degraded=True,error=repr(exc),consecutive_failures=failures))
                     atomic(directory/'health.json',dict(healthy=True,degraded=True,pid=os.getpid(),sample_count=count,
-                           consecutive_failures=failures,last_error=repr(exc),monotonic_ns=now,utc=utc,bytes=size))
+                           consecutive_failures=failures,last_error=repr(exc),monotonic_ns=now,utc=utc,bytes=size,**budget))
                 else:
                     failures=0
                     write(row);count+=1
                     atomic(directory/'health.json',dict(healthy=True,degraded=False,pid=os.getpid(),sample_count=count,
-                           consecutive_failures=0,monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size))
+                           consecutive_failures=0,monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size,**budget))
                 time.sleep(max(0.,interval-(time.monotonic()-tick)))
             os.fsync(stream.fileno())
         atomic(directory/'exit.json',dict(exit_code=0,sample_count=count,bytes=size))

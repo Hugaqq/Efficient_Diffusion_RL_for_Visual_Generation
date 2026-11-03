@@ -3,10 +3,15 @@
 Fresh start, or resume of the SAME run (same output dir and opt-in flags; the
 lifecycle enforces run/visual_rl-code/topology ownership and the latest complete
 checkpoint; a different launcher Git SHA needs --allow-launcher-upgrade and may
-change only scripts/ and tests/). Reuses the two-update acceptance backend:
+change only scripts/ and tests/; such an upgrade can still change training-side
+wrappers kept in scripts/ -- iteration/score wrappers, audits -- so every upgrade
+must be reviewed before use). A checkpoint at the target is a finalize-only resume
+(no updates; terminal validation and SUCCESS). Reuses the two-update acceptance backend:
 per-update graph/count/Adam audit, journal and card-monitor health before
 every update (degraded is non-fatal; stop only on healthy=false or a health
-file older than 30 s), terminal save validation. Adds reward-ranked rollout
+file older than 30 s), terminal save validation. Refuses to start when the card
+monitor's remaining lifetime/bytes or the output filesystem's space/inodes cannot
+cover the remaining updates. Adds reward-ranked rollout
 video retention at update 1, every 5 updates and the terminal one, a disk preflight, a
 per-launch manifest, and optional (default off) per-update weight hashing.
 """
@@ -19,6 +24,7 @@ import math
 import os
 import re
 import subprocess
+import time
 
 from scripts.launch_h3_one_update import TRAIN_SHA, TEST_SHA
 from scripts.launch_h3_resolution_memory import TwoUpdateBackend, add_common_arguments
@@ -37,9 +43,14 @@ EXPORT_EVERY = 5
 EXPORT_ALSO = (1,)               # update 1: rollout of the untrained base (zero LoRA)
 UPGRADE_SCOPE = ('scripts/', 'tests/')  # launcher-only upgrades; visual_rl/ and all else refused
 VIDEOS_PER_EXPORT = 12           # member0 + best + worst for each of 4 prompt groups
-CHECKPOINT_BYTES = 2_023_338_320  # measured M1 step-1 checkpoint (15,025 files)
+CHECKPOINT_BYTES = 2_023_338_320  # measured M1 step-1 checkpoint
+CHECKPOINT_FILES = 15_025        # measured M1 step-1 checkpoint file count
 VIDEO_BYTES = 2 * 1024**2        # conservative per retained MP4 (M1 480x320: about 0.6 MB)
-LOG_BYTES = 14 * 1024**3         # 8 GiB card monitor + 8 x 512 MiB journals + 2 GiB stdout/HPS logs
+FILES_PER_EXPORT = 64            # 12 x (dir + mp4 + receipt) + step/role dirs + selection.json, rounded up
+JOURNAL_PROCESSES = 9            # 8 training ranks + the HPS service, each with its own journal budget
+OTHER_LOG_BYTES = 2 * 1024**3    # stdout/stderr and HPS service logs
+MONITOR_SECONDS_PER_UPDATE = 7200  # conservative: M1 measured 88 min/update (480x320, incl. save)
+MONITOR_ROW_BYTES = 32 * 1024    # conservative card-process.jsonl row; the observed mean is used if larger
 DISK_MARGIN = 1.2
 IDENTITY_FILE = 'formal-run.json'
 
@@ -66,8 +77,9 @@ def resume_step(profile):
         return None
     match = re.fullmatch(r'step-(\d+)', path.name)
     if (match is None or path.parent != profile.launch.output_dir / 'checkpoints'
-            or not 0 < int(match.group(1)) < profile.launch.max_optimizer_steps):
-        raise ValueError('resume_from must be <output_dir>/checkpoints/step-N of this run, 0 < N < target')
+            or not 0 < int(match.group(1)) <= profile.launch.max_optimizer_steps):
+        raise ValueError('resume_from must be <output_dir>/checkpoints/step-N of this run, 0 < N <= target '
+                         '(N == target: finalize-only, no updates)')
     return int(match.group(1))
 
 
@@ -76,32 +88,66 @@ def checkpoint_steps(*, total, after=0):
     return [s for s in range(after + 1, total + 1) if s == 1 or s % CHECKPOINT_EVERY == 0 or s == total]
 
 
-def disk_need(*, total, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
-              log_bytes=LOG_BYTES, margin=DISK_MARGIN):
+def disk_need(*, total, log_bytes, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
+              checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN):
+    """Bytes and inodes for the checkpoints/exports AFTER update `after`, plus logs, times margin."""
     checkpoints = len(checkpoint_steps(total=total, after=after))
     exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after, also=EXPORT_ALSO))
     raw = checkpoints * checkpoint_bytes + exports * VIDEOS_PER_EXPORT * video_bytes + log_bytes
+    files = checkpoints * checkpoint_files + exports * FILES_PER_EXPORT
     return dict(checkpoints=checkpoints, export_updates=exports, checkpoint_bytes=checkpoint_bytes,
-                video_bytes=video_bytes, log_bytes=log_bytes, margin=margin, need_bytes=math.ceil(margin * raw))
+                checkpoint_files=checkpoint_files, video_bytes=video_bytes, log_bytes=log_bytes, margin=margin,
+                need_bytes=math.ceil(margin * raw), need_inodes=math.ceil(margin * files))
 
 
 def disk_free(path, *, statvfs=os.statvfs):
+    """Free bytes/inodes of the filesystem holding path; free_inodes None when not reported."""
     probe = Path(path)
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     stat = statvfs(probe)
-    return str(probe), stat.f_bavail * stat.f_frsize
+    return dict(filesystem_probe=str(probe), free_bytes=stat.f_bavail * stat.f_frsize,
+                free_inodes=stat.f_favail if stat.f_files else None)
 
 
 def disk_preflight(profile, *, after=0, statvfs=os.statvfs, **sizes):
     """Refuse to start when the output filesystem cannot hold the remaining run."""
     need = disk_need(total=profile.launch.max_optimizer_steps, after=after, **sizes)
-    probe, free = disk_free(profile.launch.output_dir, statvfs=statvfs)
-    report = dict(need, filesystem_probe=probe, free_bytes=free)
-    if free < need['need_bytes']:
-        raise RuntimeError(f'insufficient disk on {probe}: free {free} B < need {need["need_bytes"]} B '
-                           f'({need["checkpoints"]} checkpoints, {need["export_updates"]} video exports, logs, '
-                           f'{need["margin"]}x margin)')
+    report = dict(need, **disk_free(profile.launch.output_dir, statvfs=statvfs))
+    short = report['free_bytes'] < need['need_bytes']
+    short_inodes = report['free_inodes'] is not None and report['free_inodes'] < need['need_inodes']
+    if short or short_inodes:
+        raise RuntimeError(f'insufficient disk on {report["filesystem_probe"]}: free {report["free_bytes"]} B / '
+                           f'{report["free_inodes"]} inodes < need {need["need_bytes"]} B / {need["need_inodes"]} '
+                           f'inodes ({need["checkpoints"]} checkpoints, {need["export_updates"]} video exports, '
+                           f'logs, {need["margin"]}x margin)')
+    return report
+
+
+def monitor_budget(directory, *, remaining_updates, seconds_per_update=MONITOR_SECONDS_PER_UPDATE,
+                   row_bytes=MONITOR_ROW_BYTES, now_ns=None):
+    """Refuse when the card monitor would exhaust its lifetime/byte budget before the run ends."""
+    health = json.loads((Path(directory) / 'health.json').read_text())
+    if health.get('healthy') is not True:
+        raise RuntimeError('card monitor unhealthy; cannot start the formal run')
+    keys = ('interval_seconds', 'max_seconds', 'max_bytes', 'started_monotonic_ns', 'bytes', 'sample_count')
+    missing = [k for k in keys if k not in health]
+    if missing:
+        raise RuntimeError(f'card monitor health lacks budget fields {missing}; restart it from this checkout')
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    remaining_seconds = health['max_seconds'] - (now - health['started_monotonic_ns']) / 1e9
+    remaining_bytes = health['max_bytes'] - health['bytes']
+    row = max(row_bytes, health['bytes'] / health['sample_count'] if health['sample_count'] else 0)
+    need_seconds = remaining_updates * seconds_per_update
+    if need_seconds and not health['interval_seconds'] > 0:
+        raise RuntimeError('card monitor interval must be positive for a run with remaining updates')
+    need_bytes = math.ceil(math.ceil(need_seconds / health['interval_seconds']) * row) if need_seconds else 0
+    report = dict(remaining_updates=remaining_updates, seconds_per_update=seconds_per_update, row_bytes=row,
+                  remaining_seconds=remaining_seconds, need_seconds=need_seconds,
+                  remaining_bytes=remaining_bytes, need_bytes=need_bytes, max_bytes=health['max_bytes'])
+    if remaining_seconds < need_seconds or remaining_bytes < need_bytes:
+        raise RuntimeError(f'card monitor budget cannot cover {remaining_updates} updates: {report}; '
+                           'restart the monitor with larger --max-seconds/--max-bytes (or a longer --interval)')
     return report
 
 
@@ -134,17 +180,22 @@ def fresh_record(profile, args):
 
 
 def current_launcher_sha(record):
-    return record['launcher_upgrades'][-1]['new_sha'] if record['launcher_upgrades'] else record['launcher_sha']
+    """The launcher SHA of the last APPLIED upgrade; unapplied attempts never count."""
+    applied = [u for u in record['launcher_upgrades'] if u.get('status') == 'applied']
+    return applied[-1]['new_sha'] if applied else record['launcher_sha']
 
 
 def git_changed_files(old, new, *, root=ROOT):
-    """Files that differ between two commits of the deployed checkout (old must be present)."""
+    """Paths differing between two commits, both sides of every rename (--no-renames, NUL-split)."""
     for sha in (old, new):
-        subprocess.check_output(['git', '-C', str(root), 'cat-file', '-e', sha + '^{commit}'])
-    return subprocess.check_output(['git', '-C', str(root), 'diff', '--name-only', old, new], text=True).split()
+        if subprocess.run(['git', '-C', str(root), 'cat-file', '-e', sha + '^{commit}'],
+                          capture_output=True).returncode:
+            raise ValueError(f'commit {sha} is not present in {root}; fetch it before a launcher upgrade')
+    raw = subprocess.check_output(['git', '-C', str(root), 'diff', '--no-renames', '--name-only', '-z', old, new])
+    return [name.decode() for name in raw.split(b'\0') if name]
 
 
-def check_resume_identity(profile, args, *, changed_files=git_changed_files, now=None):
+def check_resume_identity(profile, args, *, changed_files=git_changed_files, now=None, attempt=None):
     """Refuse a changed identity. A different launcher SHA is refused unless
     --allow-launcher-upgrade with --upgrade-reason, and only when every changed file is
     under scripts/ or tests/. Returns the upgrade history entry to append, or None."""
@@ -174,16 +225,29 @@ def check_resume_identity(profile, args, *, changed_files=git_changed_files, now
     stamp = now or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
     return dict(old_sha=old, new_sha=new, utc=stamp, reason=args.upgrade_reason.strip(),
                 changed_scripts=[f for f in files if f.startswith('scripts/')],
-                changed_tests=[f for f in files if f.startswith('tests/')])
+                changed_tests=[f for f in files if f.startswith('tests/')], status='attempt', attempt=attempt)
 
 
 def record_launcher_upgrade(output, upgrade):
-    """Rank0, after the lifecycle admitted the resume: append the upgrade to formal-run.json."""
+    """Rank0, after the lifecycle admitted the resume: append the upgrade as an 'attempt'."""
     path = output / IDENTITY_FILE
     record = json.loads(path.read_text())
-    if current_launcher_sha(record) != upgrade['old_sha']:
+    if current_launcher_sha(record) != upgrade['old_sha'] or upgrade.get('status') != 'attempt':
         raise ValueError('formal-run.json launcher SHA changed since the resume check')
     _write_json(path, dict(record, launcher_upgrades=[*record['launcher_upgrades'], upgrade]))
+
+
+def mark_launcher_upgrade_applied(output, attempt, *, now=None):
+    """Rank0, after restore_bound succeeded: the attempt becomes the current launcher SHA."""
+    path = output / IDENTITY_FILE
+    record = json.loads(path.read_text())
+    rows = record['launcher_upgrades']
+    match = [i for i, u in enumerate(rows) if u.get('attempt') == attempt and u.get('status') == 'attempt']
+    if len(match) != 1:
+        raise ValueError('no unique pending launcher upgrade attempt to apply')
+    stamp = now or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    rows = [dict(u, status='applied', applied_utc=stamp) if i == match[0] else u for i, u in enumerate(rows)]
+    _write_json(path, dict(record, launcher_upgrades=rows))
 
 
 class FormalBackend(TwoUpdateBackend):
@@ -223,24 +287,41 @@ class FormalBackend(TwoUpdateBackend):
             raise
         return graph
 
+    def restore_bound(self, preflight, runtime, graph, prepared, bound, prepared_restore):
+        result = super().restore_bound(preflight, runtime, graph, prepared, bound, prepared_restore)
+        upgrade = self.manifest.get('launcher_upgrade')
+        if upgrade is not None:
+            def applied():
+                if runtime.rank == 0:
+                    mark_launcher_upgrade_applied(graph.profile.launch.output_dir, upgrade['attempt'])
+            _phase(runtime, 'formal/launcher-upgrade-applied', applied)
+        return result
+
     def _log_disk_at_checkpoints(self, graph, runtime):
         launch, save = graph.profile.launch, self.transaction.checkpoint
-        def report(when, step):
+        def report(when, step, after):
+            """Rank0-only observation around a collective save: never raises (peers would hang)."""
             if runtime.rank != 0:
                 return
-            probe, free = disk_free(launch.output_dir)
-            need = disk_need(total=launch.max_optimizer_steps, after=step,
-                             checkpoint_bytes=self.args.checkpoint_bytes, video_bytes=self.args.video_bytes,
-                             log_bytes=0)['need_bytes']
-            row = dict(when=when, step=step, filesystem_probe=probe, free_bytes=free,
-                       remaining_need_bytes=need, sufficient_for_remaining=free >= need)
-            memory.event('formal_disk', **row)
+            try:
+                free = disk_free(launch.output_dir)
+                need = disk_need(total=launch.max_optimizer_steps, after=after, log_bytes=0,
+                                 checkpoint_bytes=self.args.checkpoint_bytes, video_bytes=self.args.video_bytes,
+                                 checkpoint_files=self.args.checkpoint_files)
+                row = dict(free, when=when, step=step, remaining_checkpoints=need['checkpoints'],
+                           remaining_need_bytes=need['need_bytes'], remaining_need_inodes=need['need_inodes'],
+                           sufficient_for_remaining=free['free_bytes'] >= need['need_bytes'] and (
+                               free['free_inodes'] is None or free['free_inodes'] >= need['need_inodes']))
+                memory.event('formal_disk', **row)
+            except Exception as exc:
+                row = dict(when=when, step=step, error=repr(exc))
             print(json.dumps(dict(event='h3_formal_disk', **row)), flush=True)
         def checkpoint(*args, **kwargs):
             step = getattr(kwargs.get('progress'), 'next_optimizer_step', None)
-            report('before_save', step)
+            # In-progress save: its own checkpoint is still part of the remaining need.
+            report('before_save', step, step - 1 if type(step) is int else launch.max_optimizer_steps)
             committed = save(*args, **kwargs)
-            report('after_save', committed.step)
+            report('after_save', committed.step, committed.step)
             return committed
         self.transaction.checkpoint = checkpoint
 
@@ -307,7 +388,14 @@ def build_parser():
     p.add_argument('--checkpoint-bytes', type=int, default=CHECKPOINT_BYTES,
                    help='disk preflight: bytes per checkpoint (default: measured M1 step-1)')
     p.add_argument('--video-bytes', type=int, default=VIDEO_BYTES, help='disk preflight: bytes per retained MP4')
-    p.add_argument('--log-bytes', type=int, default=LOG_BYTES, help='disk preflight: monitor/journal/stdout budget')
+    p.add_argument('--checkpoint-files', type=int, default=CHECKPOINT_FILES,
+                   help='disk preflight: files (inodes) per checkpoint (default: measured M1 step-1)')
+    p.add_argument('--other-log-bytes', type=int, default=OTHER_LOG_BYTES,
+                   help='disk preflight: stdout/HPS logs, added to 9 journal budgets and the monitor max-bytes')
+    p.add_argument('--monitor-seconds-per-update', type=int, default=MONITOR_SECONDS_PER_UPDATE,
+                   help='conservative wall time per update used to check the card monitor lifetime (default 7200)')
+    p.add_argument('--monitor-row-bytes', type=int, default=MONITOR_ROW_BYTES,
+                   help='conservative bytes per monitor sample (the observed mean is used when larger)')
     p.add_argument('--allow-launcher-upgrade', action='store_true',
                    help='resume only: accept a different launcher Git SHA whose changes are confined to scripts/ and tests/')
     p.add_argument('--upgrade-reason', default=None, help='required with --allow-launcher-upgrade; recorded in formal-run.json')
@@ -331,12 +419,17 @@ def main():
     if start is not None:
         if args.profile_rollout:
             raise ValueError('--profile-rollout targets update 2 and is accepted on a fresh start only')
-        upgrade = check_resume_identity(profile, args)
-    disk = disk_preflight(profile, after=start or 0, checkpoint_bytes=args.checkpoint_bytes,
-                          video_bytes=args.video_bytes, log_bytes=args.log_bytes)
+        upgrade = check_resume_identity(profile, args, attempt=stamp)
     journal_bytes = journal_budget(args.journal_max_mib)
+    done = start or 0
+    monitor = monitor_budget(args.monitor_dir, remaining_updates=profile.launch.max_optimizer_steps - done,
+                             seconds_per_update=args.monitor_seconds_per_update, row_bytes=args.monitor_row_bytes)
+    disk = disk_preflight(profile, after=done, checkpoint_bytes=args.checkpoint_bytes,
+                          checkpoint_files=args.checkpoint_files, video_bytes=args.video_bytes,
+                          log_bytes=JOURNAL_PROCESSES * journal_bytes + monitor['max_bytes'] + args.other_log_bytes)
+    mode = 'fresh' if start is None else ('finalize' if start == profile.launch.max_optimizer_steps else 'resume')
     manifest = dict(schema='h3.formal-launch.v1', started_utc=started, launch_stamp=stamp, git_sha=args.expected_sha,
-                    mode='fresh' if start is None else 'resume', resume_from=str(profile.launch.resume_from),
+                    mode=mode, resume_from=str(profile.launch.resume_from), monitor_budget=monitor,
                     resume_step=start, launcher_upgrade=upgrade, config=str(args.config),
                     config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(),
                     profile_source_id=profile.source_id, identity=formal_identity(profile, args),
