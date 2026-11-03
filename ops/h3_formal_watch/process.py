@@ -56,13 +56,13 @@ def unit_name(name):
 
 def unit_info(name):
     result = run_command(['systemctl', '--user', 'show', unit_name(name),
-                          '--property=InvocationID,ControlGroup,ActiveState,KillMode,Restart'], timeout=10)
+                          '--property=InvocationID,ControlGroup,ActiveState,SubState,KillMode,Restart'], timeout=10)
     return dict(line.split('=', 1) for line in result['stdout'].splitlines() if '=' in line)
 
 
 def capture_unit(name, launch_id=None):
     info = unit_info(name)
-    if (not info.get('InvocationID') or not info.get('ControlGroup')
+    if (not info.get('InvocationID') or (not info.get('ControlGroup') and info.get('SubState') != 'exited')
             or info.get('KillMode') != 'control-group' or info.get('Restart') != 'no'):
         raise ValueError('unit must exist, own a cgroup, and have KillMode=control-group, Restart=no')
     return dict(kind='cgroup', unit=unit_name(name), invocation_id=info['InvocationID'],
@@ -72,12 +72,16 @@ def capture_unit(name, launch_id=None):
 def cgroup_members(group):
     root = Path('/sys/fs/cgroup')
     path = root / group.lstrip('/')
-    if not group.startswith('/') or path.resolve() != path or not path.is_relative_to(root):
+    if not group.startswith('/') or path == root or path.resolve() != path or not path.is_relative_to(root):
         raise ValueError('unsafe cgroup path')
-    if not path.is_dir():
-        raise ValueError('active cgroup missing')
-    return sorted({int(pid) for file in [path / 'cgroup.procs', *path.rglob('*/cgroup.procs')]
-                   for pid in file.read_text().split()})
+    # Root disappearance is reconciled against a fresh manager snapshot by inspect.
+    members = {int(pid) for pid in (path / 'cgroup.procs').read_text().split()}
+    for file in path.rglob('*/cgroup.procs'):
+        try:
+            members.update(int(pid) for pid in file.read_text().split())
+        except FileNotFoundError:
+            pass  # a pruned descendant cgroup contains no surviving processes
+    return sorted(members)
 
 
 def capture(pid, launch_id=None):
@@ -100,9 +104,26 @@ def inspect(record, rows=None):
             raise ValueError('unit invocation changed or disappeared; reconcile manually')
         if info.get('KillMode') != 'control-group' or info.get('Restart') != 'no':
             raise ValueError('unit ownership policy changed')
-        members = cgroup_members(info['ControlGroup']) if info.get('ControlGroup') else []
-        if not info.get('ControlGroup') and info.get('ActiveState') not in ('inactive', 'failed'):
-            raise ValueError('unit cgroup unknown')
+        group = info.get('ControlGroup')
+        if not group:
+            # RemainAfterExit=yes deliberately retains the invocation/exit identity,
+            # but systemd may prune its empty cgroup while active (exited).
+            if info.get('SubState') != 'exited' and info.get('ActiveState') not in ('inactive', 'failed'):
+                raise ValueError('unit cgroup unknown')
+            return dict(alive=False, members=[])
+        try:
+            members = cgroup_members(group)
+        except FileNotFoundError:
+            again = unit_info(record['unit'])
+            if (again.get('InvocationID') != record['invocation_id'] or again.get('SubState') != 'exited'
+                    or again.get('KillMode') != 'control-group' or again.get('Restart') != 'no'):
+                raise ValueError('cgroup disappeared without a matching exited invocation')
+            # If the manager still publishes a cgroup path, re-read it; permission
+            # failures stay unknown, not death. A pruned exited group is empty.
+            try:
+                members = cgroup_members(again['ControlGroup']) if again.get('ControlGroup') else []
+            except FileNotFoundError:
+                members = []
         return dict(alive=bool(members), members=members)
     if record['pgid'] <= 1 or record['pgid'] == os.getpgrp():
         raise ValueError('unsafe training group')
@@ -179,7 +200,7 @@ def supervise(state_dir, spec_name):
         run_command(['systemd-run', '--user', '--unit=' + unit, '--service-type=exec',
                      '--property=KillMode=control-group', '--property=Restart=no',
                      '--property=RemainAfterExit=yes', '--working-directory=' + str(root),
-                     '--setenv=PYTHONPATH=' + str(root), sys.executable,
+                     '--setenv=PYTHONPATH=' + str(root), '--setenv=PYTHONDONTWRITEBYTECODE=1', sys.executable,
                      '-m', 'ops.h3_formal_watch.process', 'execute', str(store.root), spec_name], timeout=30)
         store.save('process-' + launch_id + '.json', capture_unit(unit, launch_id))
 

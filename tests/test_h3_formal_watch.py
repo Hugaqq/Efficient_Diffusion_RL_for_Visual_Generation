@@ -895,6 +895,34 @@ def test_cgroup_ownership_all_sessions_and_reuse():
     with pytest.raises(ValueError): process.unit_name('hps.service')
 
 
+def test_exited_unit_without_cgroup_is_dead_but_surviving_ranks_are_live():
+    info = dict(InvocationID='unique', ControlGroup='', ActiveState='active', SubState='exited',
+                KillMode='control-group', Restart='no')
+    with patch.object(process, 'unit_info', return_value=info):
+        record = process.capture_unit('h3-training-complete.service')
+        assert not process.inspect(record)['alive']
+        info['ControlGroup'] = '/user.slice/remaining-ranks'
+        with patch.object(process, 'cgroup_members', return_value=[222]):
+            assert process.inspect(record)['alive']
+        info.update(ControlGroup='', SubState='running')
+        with pytest.raises(ValueError, match='unknown'):
+            process.inspect(record)
+
+
+def test_cgroup_prune_race_requires_exited_same_invocation():
+    info = dict(InvocationID='unique', ControlGroup='/user.slice/pruned', ActiveState='active',
+                SubState='exited', KillMode='control-group', Restart='no')
+    with patch.object(process, 'unit_info', return_value=info), \
+            patch.object(process, 'cgroup_members', side_effect=FileNotFoundError):
+        record = process.capture_unit('h3-training-pruned.service')
+        assert not process.inspect(record)['alive']
+        info['SubState'] = 'running'
+        with pytest.raises(ValueError, match='disappeared'):
+            process.inspect(record)
+    with pytest.raises(ValueError, match='unsafe'):
+        process.cgroup_members('/')
+
+
 def test_systemd_launch_claim_and_no_replay(tmp_path):
     store = Store(tmp_path / 'state')
     store.save('spec.json', dict(launch_id='test', unit='h3-training-test.service'))
