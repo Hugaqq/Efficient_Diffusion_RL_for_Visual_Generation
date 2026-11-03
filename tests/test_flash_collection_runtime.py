@@ -3682,3 +3682,185 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             lifecycle_events.clear(); close_failure = False; idle_failure = True
             with pytest.raises(RuntimeError, match='main idle failed'): service.main()
             assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
+
+        # P2 HPS: opt-in bounded FIFO admission. Real Handler/ScoreQueue/backend
+        # on handler threads (no socket); default make_handler(backend) above is
+        # unchanged and never threads. Queue-full is answered before scoring.
+        assert service.queue_policy(0) is None
+        for bad in (-1, 65, True, 1.0, '2', None):
+            with pytest.raises(ValueError, match='max_queue'): service.queue_policy(bad)
+        with pytest.raises(ValueError, match='capacity'): service.ScoreQueue(0)
+        def queued_backend(capacity):
+            clock[0] = 0.
+            backend = service.HpsBackend(checkpoint, config, contract, 40., gpu_resident=True,
+                                         resident_gpu_uuid=uuid, max_queue=capacity)
+            backend.cuda = CudaLeaf(backend); backend.inferencer.model.controller = backend.cuda
+            active[0] = backend
+            return backend
+        def frames_for(k):
+            frames = []
+            for i in range(124):
+                stream = BytesIO(); Image.new('RGB', (32, 32), ((7*k+i) % 97, 10+k, 20)).save(stream, format='JPEG')
+                frames.append(base64.b64encode(stream.getvalue()).decode())
+            return frames
+        def qpost(backend, queue, sample_id, out):
+            k = ord(sample_id[-1]) - ord('A')
+            raw = canonical_json(dict(protocol=service.PROTOCOL, protocol_version=service.VERSION,
+                service_identity=backend.health['service_identity'], sample_id=sample_id,
+                prompt=f'prompt {sample_id}', jpeg_frames=frames_for(k)))
+            handler = object.__new__(service.make_handler(backend, queue))
+            handler.path = '/score'; handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(raw))}
+            handler.rfile = BytesIO(raw); handler.wfile = BytesIO()
+            handler.connection = SimpleNamespace(settimeout=lambda seconds: None)
+            statuses, headers = [], []
+            handler.send_response = statuses.append; handler.send_header = lambda *a: headers.append(a)
+            handler.end_headers = lambda: None
+            handler.do_POST()
+            out[sample_id] = (statuses[0], dict(headers), json.loads(handler.wfile.getvalue()))
+        queued = queued_backend(3)
+        facts = queued.health['identity_facts']
+        assert facts['request_queue_policy'] == dict(version='hps.bounded-fifo-queue.v1', max_queue=3,
+            scoring_concurrency=1, order='admission', full='503-retry-after-before-scoring')
+        assert {k: v for k, v in facts.items() if k != 'request_queue_policy'} == warm._health['identity_facts']
+        assert 'request_queue_policy' not in warm._health['identity_facts']
+        assert queued.health['service_identity'] != warm._health['service_identity']
+        validate_health(queued.health, queued.health['service_identity'], contract)
+        score_queue = service.ScoreQueue(3)
+        real_reward = queued.inferencer.reward
+        release_first, first_entered = Event(), Event()
+        running, overlap = [0], [0]
+        running_lock = threading.Lock()
+        def gated_reward(*, prompts, image_paths):
+            with running_lock:
+                running[0] += 1; overlap[0] = max(overlap[0], running[0])
+            try:
+                first_entered.set()
+                assert release_first.wait(5), 'test never released the first score'
+                return real_reward(prompts=prompts, image_paths=image_paths)
+            finally:
+                with running_lock: running[0] -= 1
+        queued.inferencer.reward = gated_reward
+        responses, threads = {}, []
+        def wait_for(predicate):
+            for _ in range(500):  # time.monotonic is the fake HPS clock here
+                if predicate(): return
+                Event().wait(.01)
+            pytest.fail('queue state not reached')
+        for sid, expected_outstanding in (('q-A', 1), ('q-B', 2), ('q-C', 3)):
+            worker = Thread(target=qpost, args=(queued, score_queue, sid, responses), name='hps-handler-' + sid)
+            worker.start(); threads.append(worker)
+            wait_for(lambda: score_queue.outstanding == expected_outstanding)
+            if sid == 'q-A': assert first_entered.wait(5)
+        qpost(queued, score_queue, 'q-D', responses)  # full: rejected before any scoring
+        status, headers, body = responses['q-D']
+        assert (status, body, headers['Retry-After']) == (503, {'error': 'hpsv3_queue_full'}, '1')
+        assert len(queued.inferencer.calls) == 0 and score_queue.outstanding == 3
+        release_first.set()
+        for worker in threads: worker.join(10); assert not worker.is_alive()
+        assert overlap == [1] and score_queue.outstanding == 0
+        assert list(score_queue.admitted_order) == ['q-A', 'q-B', 'q-C']
+        assert [p for p, _ in queued.inferencer.calls[::124]] == ['prompt q-A', 'prompt q-B', 'prompt q-C']
+        assert len(queued.inferencer.calls) == 3*124  # rejected q-D never scored, nothing scored twice
+        serial_backend = new_backend(True); serial = {}
+        for sid in ('q-A', 'q-B', 'q-C'):
+            qpost(serial_backend, None, sid, serial)
+        active[0] = queued
+        for sid in ('q-A', 'q-B', 'q-C'):
+            assert responses[sid][0] == serial[sid][0] == 200
+            got, want = responses[sid][2], serial[sid][2]
+            assert got['service_identity'] == queued.health['service_identity']
+            assert {k: v for k, v in got.items() if k != 'service_identity'} == {k: v for k, v in want.items() if k != 'service_identity'}
+            assert validate_score(got, sample_id=sid, identity=queued.health['service_identity'], contract=contract)
+        serial_backend.close()
+        # Idle housekeeping takes a ticket: skipped while any request is admitted.
+        housekeeping = []
+        queued.idle_housekeeping = lambda: housekeeping.append(score_queue.outstanding)
+        queued_server = object.__new__(service.HpsQueuedHTTPServer)
+        queued_server.backend, queued_server.score_queue = queued, score_queue
+        with score_queue.turn('busy'):
+            queued_server.service_actions(); assert housekeeping == []
+        queued_server.service_actions(); assert housekeeping == [1] and score_queue.outstanding == 0
+        # A failed queued request releases its ticket; a later queued request
+        # sees the poisoned backend as 503 unready, never a second inference.
+        queued.inferencer.reward = real_reward; queued.inferencer.failure = 'reward'
+        failed = {}
+        qpost(queued, score_queue, 'q-E', failed); assert failed['q-E'][0] == 500
+        qpost(queued, score_queue, 'q-F', failed)
+        assert failed['q-F'][:1] == (503,) and failed['q-F'][2] == {'error': 'hpsv3_unready'}
+        assert score_queue.outstanding == 0 and len(queued.inferencer.calls) == 3*124 + 1
+        queued.close()
+        # Client: retries ONLY the explicit pre-admission queue-full 503, inside
+        # the one timeout budget; other 503s / exhaustion never resend a POST.
+        from tests.test_h3_mvp_cpu_hps import _Response, _media
+        from visual_rl.algorithms.rewards.clients import hpsv3 as hps_client
+        from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
+        for scenario in ('one-full', 'exhausted', 'gpu-503', 'no-retry-after'):
+            scorer, inner, _ = _scorer(tmp_path / f'queue-client-{scenario}', hp, contract)
+            sent, sleeps, now = [], [], [100.]
+            class QueueFullTransport:
+                full = {'one-full': 1, 'exhausted': 9, 'gpu-503': 1, 'no-retry-after': 1}[scenario]
+                def request(self, method, url, **kwargs):
+                    sent.append((method, kwargs['timeout']))
+                    if method == 'POST' and self.full:
+                        self.full -= 1
+                        body = {'error': 'gpu_admission_or_margin' if scenario == 'gpu-503' else 'hpsv3_queue_full'}
+                        response = _Response(body, status=503)
+                        if scenario != 'no-retry-after': response.headers['Retry-After'] = '1'
+                        return response
+                    return inner.request(method, url, **dict(kwargs, timeout=2.5))
+                def close(self): inner.close()
+            hp.setattr(hps_client, 'requests_session', lambda: QueueFullTransport())
+            hp.setattr(hps_client, 'time', SimpleNamespace(monotonic=lambda: now[0],
+                sleep=lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s))))
+            scorer.acquire()
+            media = _media(contract)
+            if scenario == 'one-full':
+                value = scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert sent == [('GET', 2.5), ('POST', 2.5), ('POST', 1.5)] and sleeps == [1.]
+                assert len(inner.frame_scores) == 1  # exactly one accepted request was scored
+                assert value == service.aggregate_frame_scores(inner.frame_scores[0], contract)[0]
+            else:
+                with pytest.raises(RuntimeError, match='never admitted' if scenario == 'exhausted' else 'no automatic POST retry'):
+                    scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert inner.frame_scores == []
+                assert [m for m, _ in sent].count('POST') == (2 if scenario == 'exhausted' else 1)
+                assert sleeps == ([1.] if scenario == 'exhausted' else [])
+            media._release(); scorer.close()
+        stub = object.__new__(H3HPSReward); stub._check_manifest = lambda: None
+        for health, expected in ((warm._health, 0), (queued._health, 3)):
+            stub._manifest_bytes = lambda health=health: canonical_json(health)
+            assert stub.declared_queue_capacity() == expected
+        bad_policy = dict(queued._health, identity_facts=dict(queued._health['identity_facts'],
+                          request_queue_policy=dict(version='other', max_queue=3)))
+        stub._manifest_bytes = lambda: canonical_json(bad_policy)
+        with pytest.raises(ValueError, match='queue policy'): stub.declared_queue_capacity()
+        # CLI: strict --max-queue bound before loading; N>0 selects the queued
+        # server and declares the policy, 0 keeps HpsHTTPServer (asserted above).
+        with hp.context() as cli:
+            cli.setattr(service, 'HpsBackend', lambda *a, **kw: pytest.fail('invalid queue CLI loaded model'))
+            for bad in ('65', '-1', 'x'):
+                cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                    '--artifact-output', str(hps_root/'unused'), '--max-queue', bad])
+                with pytest.raises(SystemExit): service.main()
+        queue_events, queued_idle = [], service.HpsQueuedHTTPServer.service_actions
+        class QueuedBackendLeaf:
+            def __init__(self, *args, **kwargs):
+                assert kwargs == dict(gpu_resident=False, resident_gpu_uuid=None, max_queue=8)
+                self.health = queued._health; queue_events.append('construct')
+            def idle_housekeeping(self): queue_events.append('idle')
+            def close(self): queue_events.append('backend-close')
+        class QueuedServerLeaf:
+            def __init__(self, address, handler, score_queue):
+                assert address == ('127.0.0.1', 18820) and score_queue.capacity == 8
+                self.score_queue = score_queue; queue_events.append('queued-socket-leaf')
+            def serve_forever(self, *, poll_interval):
+                queued_idle(self); raise KeyboardInterrupt('fake loop exit')
+            def server_close(self): queue_events.append('server-close')
+        with hp.context() as cli:
+            cli.setattr(service, 'HpsBackend', QueuedBackendLeaf)
+            cli.setattr(service, 'HpsQueuedHTTPServer', QueuedServerLeaf)
+            cli.setattr(service, 'HpsHTTPServer', lambda *a: pytest.fail('queued CLI built the serial server'))
+            cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                '--artifact-output', str(hps_root / 'queued-manifest.json'), '--max-queue', '8'])
+            with pytest.raises(KeyboardInterrupt, match='fake loop exit'): service.main()
+        assert queue_events == ['construct', 'queued-socket-leaf', 'idle', 'server-close', 'backend-close']

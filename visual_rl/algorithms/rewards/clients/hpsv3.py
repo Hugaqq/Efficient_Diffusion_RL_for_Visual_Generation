@@ -8,6 +8,7 @@ from __future__ import annotations
 from io import BytesIO
 import math
 from pathlib import Path
+import time
 from urllib.parse import urlsplit
 
 from visual_rl.core.protocols.flash_hpsv3 import (
@@ -22,6 +23,10 @@ from visual_rl.algorithms.rewards.clients.mock import (
     close_http_response, read_bounded_http_response, requests_session,
     validate_max_response_bytes,
 )
+
+
+QUEUE_FULL_ERROR = 'hpsv3_queue_full'
+QUEUE_RETRY_MAX_DELAY_S = 10.
 
 
 def loopback_origin(value: str) -> str:
@@ -96,20 +101,57 @@ class Hpsv3VideoClient:
         raw = None if payload is None else canonical_json(payload)
         if raw is not None and len(raw) > MAX_REQUEST_BYTES:
             raise ValueError('HPSv3 video request exceeds bounded transport size')
-        response = self.transport.request(
-            method, self.origin + route, data=raw,
-            headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
-            timeout=self.timeout_s, allow_redirects=False, stream=True,
-        )
+        # The whole call, including queue-full backoff, stays inside timeout_s.
+        # Only an explicit pre-admission queue-full 503 is retried; any other
+        # status, transport error or timeout may follow acceptance and is final.
+        deadline = time.monotonic() + self.timeout_s
+        timeout, attempt = self.timeout_s, 0
+        while True:
+            response = self.transport.request(
+                method, self.origin + route, data=raw,
+                headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                timeout=timeout, allow_redirects=False, stream=True,
+            )
+            try:
+                if response.status_code != 200:
+                    delay = self._queue_full_delay(response, method, route, attempt)
+                    if delay is None:
+                        raise RuntimeError(f'HPSv3 returned HTTP {response.status_code}; no automatic POST retry')
+                else:
+                    if response.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
+                        raise ValueError('HPSv3 response must be JSON')
+                    body = read_bounded_http_response(response, max_response_bytes=self.max_response_bytes)
+                    return decode_json(body, self.max_response_bytes)
+            finally:
+                close_http_response(response)
+            remaining = deadline - time.monotonic()
+            if delay >= remaining:
+                raise RuntimeError('HPSv3 queue stayed full for the request timeout budget; never admitted')
+            progress("hpsv3_queue_full_backoff", attempt=attempt, delay_s=delay)
+            time.sleep(delay)
+            attempt += 1
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise RuntimeError('HPSv3 queue stayed full for the request timeout budget; never admitted')
+
+    def _queue_full_delay(self, response, method, route, attempt):
+        """Backoff seconds ONLY for the service's explicit pre-admission rejection."""
+        if (method, route, response.status_code) != ('POST', '/score', 503):
+            return None
+        retry_after = response.headers.get('Retry-After', '')
+        if not isinstance(retry_after, str) or not retry_after.strip().isdigit():
+            return None
+        if response.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
+            return None
         try:
-            if response.status_code != 200:
-                raise RuntimeError(f'HPSv3 returned HTTP {response.status_code}; no automatic POST retry')
-            if response.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
-                raise ValueError('HPSv3 response must be JSON')
-            body = read_bounded_http_response(response, max_response_bytes=self.max_response_bytes)
-            return decode_json(body, self.max_response_bytes)
-        finally:
-            close_http_response(response)
+            body = decode_json(read_bounded_http_response(response, max_response_bytes=self.max_response_bytes),
+                               self.max_response_bytes)
+        except Exception:  # noqa: BLE001 - an unreadable 503 is simply not retryable
+            return None
+        if body != {'error': QUEUE_FULL_ERROR}:
+            return None
+        base = max(.25, min(float(int(retry_after.strip())), QUEUE_RETRY_MAX_DELAY_S))
+        return min(base * 2 ** min(attempt, 6), QUEUE_RETRY_MAX_DELAY_S)
 
     def healthcheck(self):
         return validate_health(self._request('GET', '/healthz'), self.service_identity, self.contract)
