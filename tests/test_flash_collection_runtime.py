@@ -2421,6 +2421,53 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         backend = two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=False,
                                                                    reuse_video_vae=False, reuse_rollout_anchor=reuse))
         assert backend.reuse_rollout_anchor is reuse and backend.nograd_forwards_per_update == expected
+    # O1: the real iteration() audit wrapper (not only the constant) with the flag
+    # on. Exactly 40 no-grad predicts per update pass for two updates (40, 80);
+    # 44 with the flag on, or 40 with it off, is rejected by the same audit.
+    import time
+    def audited_nograd_counts(*, reuse, nograd):
+        model = torch.nn.Module()
+        model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
+        model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
+        optimizer = torch.optim.AdamW([model.lora], lr=1e-4)
+        prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
+        stages = SimpleNamespace(predict=lambda **kw: model.lora*2, score_one=lambda **kw: 1.)
+        def tiny_iteration(step):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(nograd):
+                with torch.no_grad(): stages.predict(index=2)
+            for _ in range(4):
+                value = stages.predict(index=2); value.sum().backward(); del value
+            norm = float(model.lora.grad.norm()); optimizer.step(); optimizer.zero_grad(set_to_none=True)
+            return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
+        bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
+        root = tmp_path / f'o1-audit-{int(reuse)}-{nograd}'; monitor = root / 'monitor'; monitor.mkdir(parents=True)
+        (monitor / 'health.json').write_text(json.dumps(dict(healthy=True, monotonic_ns=time.monotonic_ns(), sample_count=2)))
+        graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=0)),
+                                profile=SimpleNamespace(launch=SimpleNamespace(output_dir=root)))
+        journal = memory.Journal(root / 'memory', rank=0, role='test', device=0, counters=Counters())
+        try:
+            with monkeypatch.context() as mp:
+                mp.setattr(memory, 'journal', lambda: journal)
+                mp.setattr(two_update.H3LifecycleBackend, 'bind', lambda *a: bound)
+                mp.setattr(two_update, '_phase', lambda session, label, work: work())
+                mp.setattr(two_update, '_exchange', lambda *a: [a[3]]*8)
+                backend = two_update.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'), ffprobe=Path('ffprobe'),
+                    expected_sha='test', monitor_dir=monitor, reward_pipeline=False, profile_rollout=False,
+                    reuse_video_vae=False, reuse_rollout_anchor=reuse))
+                backend.bind(None, SimpleNamespace(rank=0, process_group=None), graph, prepared, None)
+                bound.trainer.run_iteration(0); bound.trainer.run_iteration(1)
+                assert len(backend.audits) == 2 and all(row['graph']['final_prediction_released'] for row in backend.audits)
+                assert len(backend.audits[-1]['graph']['grad_forward_indices']) == 8  # cumulative PredictAudit list
+                assert json.loads((root / 'update-2-audit.json').read_text())['optimizer_updates'] == 2
+                return [row['graph']['nograd_forwards'] for row in backend.audits]
+        finally:
+            journal.close()
+    assert audited_nograd_counts(reuse=True, nograd=40) == [40, 80]
+    assert audited_nograd_counts(reuse=False, nograd=44) == [44, 88]
+    for reuse, nograd in ((True, 44), (False, 40)):
+        with pytest.raises(ValueError, match='graph/count/release audit'):
+            audited_nograd_counts(reuse=reuse, nograd=nograd)
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
