@@ -58,7 +58,7 @@ def prepare(args):
     save_file({"t0": video, "t1": audio}, os.path.join(args.out, f"noise_{args.width}x{args.height}_seed{args.seed}.safetensors"))
     cfg = _cfg(args.config)
     cache = H3TextCache(cfg["launch"]["artifacts"]["text_cache"], expected_identity=cfg["launch"]["expected"]["cache_identity"],
-                        max_tokens=cfg["budgets"]["max_tokens"], max_embedding_bytes=cfg["budgets"]["embedding_bytes"])
+                        max_tokens=cfg["launch"]["budgets"]["max_tokens"], max_embedding_bytes=cfg["launch"]["budgets"]["embedding_bytes"])
     prompts = [json.loads(line) for line in open(args.prompts)]
     p = next(x for x in prompts if x["eval_id"] == args.eval_id)
     emb = cache.get(p["prompt"]).float().contiguous()
