@@ -1,5 +1,10 @@
 # 已核对的P1恢复点（不是已完成代码）
 
+## resolved — 已恢复并修复，禁止重复应用补丁
+
+本角色恢复后先确认源码 diff 为空，再依次成功执行一次获准的 git apply --check / git apply。随后修复测试夹具缺失 reward_pipeline=False 与非 IterationIdentity 两处失败；补充真实rank模式/预算门、backend bind、日志/多重清理失败回归。短入口实跑原七项先后 7 passed（55.22s、50.52s、52.32s），无跳过或测试数量变化。本轮最终代码/报告/原子提交详见 coder/round-003.md 与提交后 coder/round-003-commit.md；以下失败原文仅作历史证据，不是当前通过声明。恢复补丁已应用且后续有修复，不得重复应用。
+
+
 原attempt在七项CPU命令抄错时被白名单拒绝，命令未执行。主会话随后运行正确原七项：5 passed/2 failed（43.26s），错误为SimpleNamespace缺reward_pipeline及identity必须为IterationIdentity；完整输出附后。
 
 为遵守原子commit，未通过测试的源码没有提交为功能commit，而是逐文件hash备份并保存为recovery-003.patch；生产源文件已恢复到原HEAD315d71a，工具将只保存恢复材料快照。没有丢弃P1工作。

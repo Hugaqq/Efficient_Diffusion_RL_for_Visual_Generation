@@ -134,7 +134,10 @@ class _Graph:
 
 
 class H3LifecycleBackend:
-    def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False):
+    def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False):
+        if type(reward_pipeline) is not bool:
+            raise TypeError('reward_pipeline must be bool')
+        self.reward_pipeline=reward_pipeline
         self.inspection_only=inspection_only
         self.code_upgrade = code_upgrade
         self.code_root = Path(code_root or Path(__file__).resolve().parents[1]).resolve()
@@ -143,9 +146,16 @@ class H3LifecycleBackend:
 
     def compile(self, source):
         try:
-            return compile_h3_profile(source)
+            profile=compile_h3_profile(source)
+            self._check_reward_pipeline(profile)
+            return profile
         except (ValueError, TypeError, OSError) as exc:
             raise ConfigError(str(exc)) from exc
+
+    def _check_reward_pipeline(self,profile):
+        if self.reward_pipeline and (profile.training.algorithm!='dual_flash'
+                                     or profile.training.group_layout!='paired_4x8'):
+            raise ValueError('reward pipeline requires paired_4x8 dual_flash')
 
     def preflight(self, profile):
         from visual_rl.composition.preflight.artifacts import _hash_artifact
@@ -282,6 +292,7 @@ class H3LifecycleBackend:
         from visual_rl.algorithms.trainer.h3_stages import H3IterationStages
         binding = self.binding
         def assemble():
+            self._check_reward_pipeline(graph.profile)
             options = dict(data=graph.source, prepared=prepared,
                 predict=binding.predict, decode=binding.decode, score_one=binding.score_one,
                 coordination_factory=binding.coordination_factory, process_group=runtime.process_group,
@@ -291,7 +302,9 @@ class H3LifecycleBackend:
             else:
                 from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
                 stages = H3DualIterationStages(mode=graph.profile.training.algorithm,
-                                               seed=graph.profile.launch.seed, **options)
+                    seed=graph.profile.launch.seed,reward_pipeline=self.reward_pipeline,
+                    media_bytes=graph.profile.launch.budgets.media_bytes,
+                    decode_bytes=graph.profile.launch.budgets.decode_bytes,**options)
             trainer = stages.trainer()
             return SimpleNamespace(graph=graph, prepared=prepared, binding=binding, stages=stages,
                 trainer=trainer, transaction=self.transaction, close=trainer.close)

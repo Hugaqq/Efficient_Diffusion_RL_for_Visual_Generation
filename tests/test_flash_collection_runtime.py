@@ -322,7 +322,7 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
         mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
         mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]])
-        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor))
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False))
         backend.bind(None,runtime,graph,prepared,None)
         bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
         assert len(backend.audits)==2
@@ -1715,3 +1715,408 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match='snapshot rejected'):
             backend.run(bound)
         assert len(saves) == 2 and exchanges[-1] == ('lifecycle/checkpoint-boundary', False)
+
+    # P1 ownership: real tiny CPU decoder, original lease locking and storage.
+    from tests.test_h3_mvp_cpu_decode import _artifacts, _leaf_setup, _decoder, _terminal
+    from visual_rl.models.implementations.h3_geometry import H3T2VAGeometry
+    from visual_rl.models.implementations.h3_decode import H3AVMedia, H3OwnedAVMedia
+    from contextlib import contextmanager
+    from threading import Event, Thread
+    import threading
+    from visual_rl.algorithms.trainer import h3_reward_pipeline as pipeline
+    from visual_rl.runtime import h3_memory as memory
+    with monkeypatch.context() as patch:
+        root = tmp_path / 'pipeline-decoder'; root.mkdir()
+        geometry = H3T2VAGeometry(32, 32, 124)
+        _artifacts(root); _leaf_setup(patch, geometry)
+        decoder = _decoder(root, geometry)
+        terminal = _terminal(geometry)
+        before_terminal = terminal.clone()
+        with decoder.decode_one(terminal, geometry) as leased:
+            video_ptr, audio_ptr, metadata = leased.video.data_ptr(), leased.audio.data_ptr(), leased.metadata
+            with pytest.raises(RuntimeError, match='one media lease'):
+                with decoder.decode_one(terminal, geometry):
+                    pytest.fail('normal lease lock was weakened')
+            owned = leased.handoff()
+            assert owned.video.data_ptr() == video_ptr and owned.audio.data_ptr() == audio_ptr
+            assert owned.metadata == metadata
+            with pytest.raises(RuntimeError, match='expired'):
+                leased.handoff()
+        with decoder.decode_one(terminal, geometry) as next_media:
+            assert next_media.video.shape == owned.video.shape  # previous owner still alive
+        with pytest.raises(RuntimeError, match='expired'):
+            _ = leased.video
+        with pytest.raises(RuntimeError, match='again'):
+            owned.handoff()
+        video_ref, audio_ref = weakref.ref(owned.video), weakref.ref(owned.audio)
+        with pytest.raises(RuntimeError, match='consumer exception'):
+            with owned:
+                raise RuntimeError('consumer exception')
+        owned.close()
+        assert video_ref() is None and audio_ref() is None
+        with pytest.raises(RuntimeError, match='expired'):
+            _ = owned.audio
+        assert torch.equal(terminal, before_terminal)
+
+    samples = tuple(pipeline.RewardSample(i, f'pipe-{i}', 'g', i, f'prompt {i}', i) for i in range(4))
+    # Deterministic capacity/overlap and cancellation: score0 blocks, decode1
+    # completes, packet1 queues, producer attempts permit3 but cannot decode2.
+    from visual_rl.models.implementations import h3_loading
+    for failure in (None, 'score', 'nonfinite', 'saver', 'decode', 'transfer', 'cleanup', 'decode-cleanup'):
+        with monkeypatch.context() as patch:
+            budgets = []
+            patch.setattr(h3_loading, '_admit_host_memory', lambda n: budgets.append(n))
+            decoded, scored, tensor_refs, owners = [], [], [], []
+            score_started, second_queued, third_permit, release = Event(), Event(), Event(), Event()
+            real_queue, real_semaphore, real_event = pipeline.Queue, pipeline.Semaphore, pipeline.Event
+            signals = []
+            def pipeline_event():
+                signal = real_event(); signals.append(signal)
+                return signal
+            patch.setattr(pipeline, 'Event', pipeline_event)
+            class QueueSpy(real_queue):
+                def put(self, packet, **kwargs):
+                    assert self.maxsize == 1
+                    super().put(packet, **kwargs)
+                    if packet[0].ordinal == 1: second_queued.set()
+            class Permits:
+                def __init__(self, count):
+                    assert count == 2
+                    self.semaphore = real_semaphore(count)
+                    self.attempts = 0
+                def acquire(self, **kwargs):
+                    self.attempts += 1
+                    if self.attempts >= 3: third_permit.set()
+                    return self.semaphore.acquire(**kwargs)
+                def release(self): self.semaphore.release()
+            patch.setattr(pipeline, 'Queue', QueueSpy)
+            patch.setattr(pipeline, 'Semaphore', Permits)
+            real_handoff = H3AVMedia.handoff
+            def handoff(media):
+                if failure == 'transfer' and len(decoded) == 2:
+                    raise RuntimeError('transfer failed')
+                result = real_handoff(media)
+                owners.append(weakref.ref(result))
+                if failure in ('cleanup', 'decode-cleanup'):
+                    def close():
+                        result._release()
+                        raise RuntimeError('cleanup failed')
+                    result.close = close
+                return result
+            patch.setattr(H3AVMedia, 'handoff', handoff)
+            @contextmanager
+            def decode(sample):
+                decoded.append(sample.ordinal)
+                if sample.ordinal == 1:
+                    assert score_started.wait(5), 'first score never started'
+                    if failure in ('decode', 'decode-cleanup'): raise RuntimeError('decode failed')
+                video, audio = torch.zeros(2, 3, 2, 2), torch.zeros(4, 2)
+                tensor_refs.extend((weakref.ref(video), weakref.ref(audio)))
+                media = H3AVMedia(video, audio, 24, 32000)
+                del video, audio
+                try: yield media
+                finally: media._release()
+            def score(sample, media):
+                scored.append(sample.ordinal)
+                assert media.video.device.type == 'cpu'
+                if sample.ordinal == 0:
+                    score_started.set()
+                    assert release.wait(5), 'test did not release score'
+                    if failure in ('score', 'saver'): raise RuntimeError(f'{failure} failed')
+                    if failure == 'nonfinite': return float('nan')
+                return float(sample.ordinal)
+            result, errors = [], []
+            def run_pipeline():
+                try:
+                    result.append(pipeline.reward_pipeline(samples, decode=decode, score=score,
+                                                          media_bytes=1024, decode_bytes=2048))
+                except BaseException as exc: errors.append(exc)
+            runner = Thread(target=run_pipeline, name='cpu-pipeline-test')
+            runner.start()
+            try:
+                assert score_started.wait(5)
+                if failure not in ('decode', 'transfer', 'decode-cleanup'):
+                    assert second_queued.wait(5)
+                    assert third_permit.wait(5)
+                    assert decoded == [0, 1] and scored == [0]
+                else:
+                    assert signals[0].wait(5), 'producer never reported cancellation'
+                # Even on decode/transfer failure, join must wait for the
+                # already-running operation, not close its active owner.
+                assert runner.is_alive()
+            finally:
+                release.set(); runner.join(10)
+            assert not runner.is_alive()
+            assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+            assert budgets == [3072]
+            if failure is None:
+                assert not errors and decoded == scored == list(range(4))
+                assert result[0] == tuple((s.sample_id, s.group_id, s.member, float(s.ordinal), True) for s in samples)
+            else:
+                assert not result and len(errors) == 1
+                assert failure.split('-')[0] in str(errors[0]) or (failure == 'nonfinite' and 'finite' in str(errors[0]))
+                if failure == 'decode-cleanup':
+                    assert 'decode failed' in str(errors[0])
+                    assert any('cleanup failed' in note for note in errors[0].__notes__)
+                # No new POST once the blocked first operation fails.
+                if failure in ('score', 'nonfinite', 'saver', 'cleanup'): assert scored == [0]
+            assert all(ref() is None for ref in tensor_refs)
+            assert all(ref() is None or ref()._video is None for ref in owners)
+
+    # Real dual reward -> original H3HPSReward/JPEG/validation/observed saver.
+    # No helper/reward mock: only decode model/HTTP/coordination leaves.
+    from tests.test_h3_mvp_cpu_hps import _scorer, _media
+    from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
+    from visual_rl.algorithms.trainer.interface import StageValue, IterationIdentity
+    from visual_rl.core.protocols.flash_hpsv3 import VideoContract
+    from scripts.launch_h3_media import observed_score
+    from visual_rl.artifacts.checkpoint.state import RankRNGSnapshot
+    with monkeypatch.context() as patch:
+        patch.setattr(h3_loading, '_admit_host_memory', lambda n: None)
+        contract = VideoContract(124, 32, 32)
+        scorer, transport, _ = _scorer(tmp_path / 'pipeline-hps', patch, contract)
+        scorer.acquire()
+        source = SimpleNamespace()
+        identity = IterationIdentity(0, 'source', 'train', tuple(s.sample_id for s in samples),
+                                     tuple(s.group_id for s in samples), tuple(s.member for s in samples))
+        request = SimpleNamespace(identity=identity, group_layout='paired_4x8',
+            samples=tuple((s.sample_id, s.group_id, s.member) for s in samples),
+            prompts={s.sample_id: s.prompt for s in samples}, collection_id='c', behavior_id='b')
+        source._pending = request
+        tensors = []
+        for i in range(4):
+            item = _media(contract, offset=i*.01)
+            tensors.append((item.video, item.audio)); item._release()
+        terminals = {s.sample_id: torch.full((1, 2), float(s.ordinal), dtype=torch.float16) for s in samples}
+        original_terminals = {sid: t.clone() for sid, t in terminals.items()}
+        context = SimpleNamespace(request=request, dual_terminals=terminals,
+            dual_selection={s.sample_id: s.selected_index for s in samples})
+        gates, aux, exported = [], [], []
+        class Coordinator:
+            mismatch = False
+            def gate(self, event, **kwargs):
+                gates.append(event)
+                if self.mismatch and event.startswith('dual/reward-pipeline/'):
+                    raise ValueError('configuration mismatch')
+                if kwargs.get('local_error'): raise ValueError('local pipeline admission rejected')
+            def aux_turns(self, work):
+                aux.append(True)
+                return work()
+        context.coordinator = Coordinator()
+        stage = object.__new__(H3DualIterationStages)
+        stage._active = context; stage.rank = 0; stage.mode = 'dual_flash'
+        stage.media_bytes = 10**7; stage.decode_bytes = 2*10**7
+        stage.read_behavior_id = lambda: 'b'
+        @contextmanager
+        def decode(terminal):
+            video, audio = tensors[int(terminal[0, 0])]
+            media = H3AVMedia(video, audio, 24, 32000)
+            try: yield media
+            finally: media._release()
+        def saver(**kwargs):
+            # Export sees original active storage, not an MP4 readback/copy.
+            sid = kwargs['metadata']['sample_id']; i = int(sid.split('-')[1])
+            assert kwargs['media'].video.data_ptr() == tensors[i][0].data_ptr()
+            assert kwargs['media'].audio.data_ptr() == tensors[i][1].data_ptr()
+            with memory.span('video_save', sample_id=sid): exported.append(sid)
+        stage.decode = decode
+        stage.score_one = observed_score(scorer.score_one, source=source, root=tmp_path / 'view',
+            ffmpeg='unused', ffprobe='unused', launcher_sha='cpu', every=1, saver=saver)
+        before_rng = RankRNGSnapshot.capture_current(0)
+        stage.reward_pipeline = False
+        value = StageValue(request.identity, context)
+        stage.reward(value); serial = context.rewards
+        serial_payloads = [call[2]['data'] for call in transport.calls if call[0] == 'POST']
+        stage.reward_pipeline = True
+        stage.reward(value)
+        payloads = [call[2]['data'] for call in transport.calls if call[0] == 'POST']
+        assert context.rewards == serial and payloads[4:] == serial_payloads
+        assert len(payloads) == 8 and all(len(json.loads(p)['jpeg_frames']) == 124 for p in payloads)
+        assert scorer.identity.video_contract.top_k == 37
+        assert exported == [samples[0].sample_id]*2  # existing member0-only selection
+        assert RankRNGSnapshot.capture_current(0) == before_rng
+        assert all(torch.equal(t, original_terminals[sid]) for sid, t in terminals.items())
+        assert len(aux) == 2 and gates[-1].startswith('dual/reward-pipeline/1/queue1/total2/')
+        context.coordinator.mismatch = True
+        with pytest.raises(ValueError, match='mismatch'): stage.reward(value)
+        assert len(aux) == 2 and len(payloads) == 8
+        context.coordinator.mismatch = False
+        request.group_layout = 'rank_local'
+        with pytest.raises(ValueError, match='admission'): stage.reward(value)
+        assert len(aux) == 2
+        request.group_layout = 'paired_4x8'
+        # Real gate and receipt decoder reject a peer's differing mode/budget
+        # BEFORE aux work, not merely a fake coordinator raising on demand.
+        from visual_rl.models.lifecycle import h3_coordination
+        with patch.context() as world:
+            world.setattr(h3_coordination, '_world_rank', lambda group: 0)
+            world.setattr(h3_coordination, '_cuda_device', lambda device: torch.device('cpu'))
+            for peer_config in ('dual/reward-pipeline/0/queue1/total2/10000000/20000000',
+                                'dual/reward-pipeline/1/queue1/total2/10000001/20000000'):
+                def gather(output, raw, **kwargs):
+                    for rank in range(8):
+                        row = json.loads(raw); row[2] = rank
+                        if rank == 7 and row[4][2].startswith('dual/reward-pipeline/1/'):
+                            row[4][2] = peer_config
+                        output[rank] = json.dumps(row).encode()
+                world.setattr(torch.distributed, 'all_gather_object', gather)
+                coordinator = h3_coordination.H3Coordination(plan, process_group=object(), device='cuda:0')
+                world.setattr(coordinator, 'aux_turns', lambda work: pytest.fail('mismatched rank entered aux'))
+                context.coordinator = coordinator
+                with pytest.raises(h3_coordination.H3CoordinationError, match='gate failed'):
+                    stage.reward(value)
+                assert coordinator._poisoned
+        # A real trainer cannot reach credit/update or the next owner after an
+        # observed export fails. The first fake HTTP operation finishes normally;
+        # its saver then fails, and every consumer is joined before propagation.
+        from visual_rl.algorithms.trainer.grpo import GRPOTrainer
+        owner_events, aborts = [], []
+        context.coordinator = Coordinator()
+        def owner_turn(work):
+            owner_events.append('owner0')
+            result = work()
+            owner_events.append('next-owner')
+            return result
+        context.coordinator.aux_turns = owner_turn
+        def failed_saver(**kwargs): raise RuntimeError('actual observed saver failed')
+        stage.score_one = observed_score(scorer.score_one, source=source, root=tmp_path / 'bad-view',
+            ffmpeg='unused', ffprobe='unused', launcher_sha='cpu', every=1, saver=failed_saver)
+        def no_update(value): pytest.fail('reward failure reached credit/update')
+        trainer = GRPOTrainer(prelude=SimpleNamespace(build=lambda step: value,
+            abort_iteration=lambda identity: aborts.append(identity)), rollout=lambda v: v,
+            reward=stage.reward, advantage=no_update, credit=no_update, optimize=no_update)
+        trainer.prepare_run(PrepareRunContext('pipeline-failure', 'h3', 0))
+        with pytest.raises(RuntimeError, match='actual observed saver failed'): trainer.run_iteration(0)
+        assert owner_events == ['owner0'] and aborts == [request.identity]
+        assert trainer.next_optimizer_step == 0
+        assert len([c for c in transport.calls if c[0] == 'POST']) == 9
+        assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+        trainer.close(); scorer.close()
+
+    # Concurrent observation: CPU score encloses GPU decode in wall time but
+    # must NOT enclose it in the GPU stack or reset/synchronize its counters.
+    class Counters:
+        def __init__(self): self.resets = self.syncs = self.snapshots = 0
+        def snapshot(self):
+            assert threading.current_thread().name not in ('cpu-observer', 'h3-reward-consumer')
+            self.snapshots += 1
+            return dict(allocated=1, reserved=2, max_allocated=3, max_reserved=4, device_uuid='GPU-cpu')
+        def reset(self): self.resets += 1
+        def synchronize(self): self.syncs += 1
+    counters = Counters()
+    journal = memory.Journal(tmp_path / 'concurrent-memory', rank=0, role='test', device=0, counters=counters)
+    entered, decode_done = Event(), Event()
+    observer_errors = []
+    try:
+        with journal.span('reward', step=1):
+            scope = journal.capture_cpu_scope()
+            def observe():
+                try:
+                    with scope():
+                        with journal.span('reward_score', synchronize=True, sample_id='score-0'):
+                            entered.set()
+                            assert decode_done.wait(5)
+                            with journal.span('video_save', sample_id='score-0'): pass
+                except BaseException as exc: observer_errors.append(exc)
+            observer = Thread(target=observe, name='cpu-observer'); observer.start()
+            try:
+                assert entered.wait(5)
+                with journal.span('vae_decode', sample_id='decode-1'): pass
+            finally:
+                decode_done.set(); observer.join(10)
+            assert not observer.is_alive() and not observer_errors
+        events = [json.loads(line) for line in journal.path.read_text().splitlines()]
+        cpu_events = [e for e in events if e.get('observation') == 'cpu-consumer']
+        assert [e['kind'] for e in cpu_events] == ['cpu_span_begin', 'cpu_span_begin', 'cpu_span_end', 'cpu_span_end']
+        assert all(e['context']['sample_id'] == 'score-0' and e['context']['step'] == 1
+                   and e['counters'] is None and not e['synchronized'] for e in cpu_events)
+        assert cpu_events[1]['ancestors'] == ['reward', 'reward_score', 'video_save']
+        assert all(e['thread'] != 'cpu-observer' for e in events if 'unified_reset' in e['kind'])
+        assert counters.resets == 4 and counters.syncs == 0 and journal.stack == []
+        assert all(e['context'].get('sample_id') != 'score-0' for e in events if e['thread'] != 'cpu-observer')
+        with journal.capture_cpu_scope()():
+            with pytest.raises(OSError, match='byte budget'):
+                old_limit = journal.limit; journal.limit = journal.bytes
+                try:
+                    with journal.span('reward_score'): pass
+                finally: journal.limit = old_limit
+        assert not journal.healthy
+    finally: journal.close()
+
+    # Journal and payload failures propagate through the actual pipeline and
+    # leave neither a media owner nor consumer behind.
+    for fault_kind in ('journal', 'payload'):
+        with monkeypatch.context() as patch:
+            patch.setattr(h3_loading, '_admit_host_memory', lambda n: None)
+            journal = memory.Journal(tmp_path / f'pipeline-{fault_kind}-log', rank=0,
+                                     role='test', device=0, counters=Counters())
+            patch.setattr(memory, 'journal', lambda: journal)
+            media_refs, posts = [], []
+            @contextmanager
+            def decode_one(sample):
+                media = H3AVMedia(torch.zeros(2, 3, 2, 2), torch.zeros(4, 2), 24, 32000)
+                media_refs.append(weakref.ref(media.video))
+                try: yield media
+                finally: media._release()
+            def consume_one(sample, media):
+                with memory.span('reward_score', sample_id=sample.sample_id): posts.append(sample.sample_id)
+                return 1.
+            if fault_kind == 'journal': journal.limit = journal.bytes
+            try:
+                with pytest.raises((OSError, ValueError), match='byte budget'):
+                    pipeline.reward_pipeline(samples[:1], decode=decode_one, score=consume_one,
+                        media_bytes=1 if fault_kind == 'payload' else 1024, decode_bytes=2048)
+                assert not posts and all(ref() is None for ref in media_refs)
+                assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+            finally:
+                journal.limit = 64*1024**2; journal.close()
+
+    # Backend/launcher wiring is offline: no controller.run or GPU entrypoint.
+    from visual_rl.runtime.h3_lifecycle import H3LifecycleBackend
+    from scripts import launch_h3_resolution_memory as two_update
+    assert H3LifecycleBackend().reward_pipeline is False
+    for bad in (1, 'yes', None):
+        with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reward_pipeline=bad)
+    enabled_backend = H3LifecycleBackend(reward_pipeline=True)
+    for algorithm, layout in (('cps', 'rank_local'), ('dual_flow', 'rank_local'), ('dual_flash', 'rank_local')):
+        with pytest.raises(ValueError, match='paired_4x8'):
+            enabled_backend._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(
+                algorithm=algorithm, group_layout=layout)))
+    enabled_backend._check_reward_pipeline(SimpleNamespace(training=SimpleNamespace(
+        algorithm='dual_flash', group_layout='paired_4x8')))
+    for bad in (1, 'yes', None):
+        with pytest.raises(TypeError, match='bool'):
+            H3DualIterationStages(mode='dual_flash', seed=42, reward_pipeline=bad)
+    with pytest.raises(ValueError, match='dual_flash'):
+        H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False)).reward_pipeline is False
+    with monkeypatch.context() as patch:
+        patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
+        source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
+                                 read_behavior_id=lambda: 'b')
+        leaf = lambda *args, **kwargs: None
+        backend = H3LifecycleBackend(reward_pipeline=True)
+        backend.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf)
+        backend.transaction = object()
+        graph = SimpleNamespace(source=source, profile=SimpleNamespace(training=SimpleNamespace(
+            algorithm='dual_flash', group_layout='paired_4x8'), launch=SimpleNamespace(seed=42,
+                budgets=SimpleNamespace(media_bytes=1024, decode_bytes=2048))))
+        runtime = SimpleNamespace(rank=0, process_group=object(), device='cpu')
+        bound = backend.bind(None, runtime, graph, object(), None)
+        assert bound.stages.reward_pipeline is True
+        assert (bound.stages.media_bytes, bound.stages.decode_bytes) == (1024, 2048)
+        assert bound.stages.score_one is backend.binding.score_one
+        bound.close()
+        # Real CLI parser, help exits before any Git/preflight/GPU side effect.
+        import sys
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--help'])
+        with pytest.raises(SystemExit) as help_result: two_update.main()
+        assert help_result.value.code == 0
+    with monkeypatch.context() as patch:
+        def no_memory(n): raise BlockingIOError('host pipeline budget insufficient')
+        patch.setattr(h3_loading, '_admit_host_memory', no_memory)
+        with pytest.raises(BlockingIOError, match='budget'):
+            pipeline.reward_pipeline(samples, decode=lambda s: pytest.fail('decode before admission'),
+                score=lambda *a: pytest.fail('score before admission'), media_bytes=1024, decode_bytes=2048)
+    assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())

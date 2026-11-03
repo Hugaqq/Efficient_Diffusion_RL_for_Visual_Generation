@@ -1,14 +1,23 @@
-perf(h3): share fresh live validation at checkpoint boundaries
+perf(h3): pipeline owner-local decode and reward with bounded media ownership
 
-Return the checkpoint boundary and its freshly validated live bindings from
-one narrow snapshot API. Keep the legacy boundary API self-validating and
-recheck owned source/tail state after the long scan. Do not cache validation
-across boundaries or change full content, finite, identity or restore gates.
+Add an off-by-default paired-Flash pipeline inside each existing auxiliary
+owner turn. Transfer completed CPU AV storage without copies; acquire two
+total permits before decode and queue at most one packet. Preserve FIFO
+sample/prompt/index binding, the original scorer/exporter and owner/update
+barriers. Admit host work before starting, cancel on failure, drain/close
+and join the consumer without retrying requests or returning partial rows.
 
-Use the snapshot once in the existing synchronous lifecycle save phase.
-Extend the original seven CPU tests with real binding scan counts, repeated
-boundaries, read-only state/RNG, VAE byte drift, source advancement/reservation
-rejection, and lifecycle exact-result forwarding/failure-before-save checks.
+Keep CPU consumer journal scopes separate from the GPU peak-reset stack,
+with durable bounded events and no CUDA statistics/synchronization there.
+Wire strict boolean backend admission, rank mode/budget agreement and the
+optional two-update launcher flag without changing scientific protocols,
+VAE GPU safety gates, HPS clients/services or checkpoint semantics.
 
-Validation: original CPU gate 7 passed, 3 warnings in 53.30s;
-git diff --check passed. No GPU execution or measured speedup claim.
+Extend the original seven CPU tests for ownership/overlap/capacity, actual
+JPEG equality, RNG, cooperative rejection, failures/cleanup/join, logging
+and real reward/backend/trainer integration. Resolve the saved P1 recovery
+point without accepting its earlier 5/7 result or replaying its bad command.
+
+Validation: original CPU gate 7 passed, 3 warnings in 51.68s;
+git diff --check passed. GPU performance and real service equivalence are
+unmeasured; enabling requires a separately approved experiment card.

@@ -38,6 +38,7 @@ class Journal:
         self.rank=rank;self.role=role;self.device=device;self.pid=os.getpid()
         self.counters=counters or TorchCounters(device);self.limit=max_bytes
         self.lock=threading.RLock();self.stack=[];self.base={};self.seq=0;self.reset_id=0
+        self.cpu_local=threading.local()
         self.hwm=dict(allocated=0,reserved=0);self.healthy=True;self.bytes=0
         root=Path(directory);root.mkdir(parents=True,exist_ok=True)
         self.path=root/f'{role}-rank{rank}-pid{self.pid}.jsonl';self.stream=self.path.open('x',buffering=1)
@@ -67,6 +68,25 @@ class Journal:
         return stats,synced,sync_seconds
     def event(self,kind,*,synchronize=False,flush=True,**fields):
         with self.lock:
+            cpu=getattr(self.cpu_local,'scope',None)
+            if cpu is not None:
+                cpu_rss=None
+                try:
+                    for line in Path('/proc/self/status').read_text().splitlines():
+                        if line.startswith('VmRSS:'):cpu_rss=int(line.split()[1])*1024;break
+                except OSError:pass
+                context=dict(cpu['parent_context'])
+                for _,frame in cpu['stack']:context.update(frame)
+                event=dict(schema='h3.memory-event.v1',seq=self.seq,
+                    utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),monotonic_ns=time.monotonic_ns(),
+                    pid=self.pid,rank=self.rank,role=self.role,device=self.device,expected_uuid=self.expected_uuid,
+                    thread=threading.current_thread().name,kind=kind,observation='cpu-consumer',
+                    phase=cpu['stack'][-1][0] if cpu['stack'] else 'cpu-consumer',
+                    ancestors=cpu['parent_phases']+[s[0] for s in cpu['stack']],context=context,
+                    counters=None,whole_run_high_water=dict(self.hwm),reset_id=self.reset_id,
+                    synchronized=False,synchronization_seconds=0.,cpu_rss_bytes=cpu_rss,**fields)
+                self._write(event,flush=flush);self.seq+=1
+                return event
             stats,synced,seconds=self._snapshot(synchronize)
             cpu_rss=None
             try:
@@ -89,8 +109,47 @@ class Journal:
         if event['counters'] is not None:
             self.counters.reset();self.reset_id+=1
             self.event('after_unified_reset',reason=reason,flush=True)
+    def capture_cpu_scope(self):
+        with self.lock:
+            parent_context=dict(self.base)
+            for _,frame in self.stack:parent_context.update(frame)
+            parent_phases=[s[0] for s in self.stack]
+        @contextmanager
+        def scope():
+            if getattr(self.cpu_local,'scope',None) is not None:
+                raise RuntimeError('CPU observer scope already active')
+            self.cpu_local.scope=dict(parent_context=parent_context,parent_phases=parent_phases,stack=[])
+            try:yield
+            finally:del self.cpu_local.scope
+        return scope
+
+    @contextmanager
+    def _cpu_span(self,phase,context):
+        stack=self.cpu_local.scope['stack']
+        stack.append((phase,context))
+        started=time.monotonic()
+        primary=None
+        try:
+            self.event('cpu_span_begin')
+            yield self
+        except BaseException as exc:
+            primary=exc
+            raise
+        finally:
+            try:
+                self.event('cpu_span_end',wall_seconds=time.monotonic()-started,
+                           exception_type=None if primary is None else type(primary).__name__)
+            except BaseException as cleanup:
+                self.healthy=False
+                if primary is None:raise
+                primary.add_note('CPU memory cleanup failed: '+repr(cleanup))
+            finally:stack.pop()
+
     @contextmanager
     def span(self,phase,*,synchronize=False,**context):
+        if getattr(self.cpu_local,'scope',None) is not None:
+            with self._cpu_span(phase,context):yield self
+            return
         with self.lock:
             self.event('segment_end',synchronize=synchronize,next_phase=phase)
             self._reset('enter:'+phase)
@@ -165,6 +224,15 @@ def span(phase,**fields):
     if value is None:yield None
     else:
         with value.span(phase,**fields):yield value
+
+
+def capture_cpu_scope():
+    """Capture the reward parent now; consumer events never touch GPU counters."""
+    value=journal()
+    if value is not None:return value.capture_cpu_scope()
+    @contextmanager
+    def inactive():yield
+    return inactive
 
 
 def set_context(**fields):

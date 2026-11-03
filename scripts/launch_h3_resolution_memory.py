@@ -53,7 +53,8 @@ def phase(name):
 
 class TwoUpdateBackend(H3LifecycleBackend):
     def __init__(self,*,args):
-        super().__init__();self.args=args;self.previous=None;self.audits=[]
+        super().__init__(reward_pipeline=args.reward_pipeline)
+        self.args=args;self.previous=None;self.audits=[]
     def compile(self,source):return validate_fresh(super().compile(source))
     @phase('runtime_initialization')
     def create_runtime(self,*args):return super().create_runtime(*args)
@@ -129,7 +130,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('config',type=Path);p.add_argument('--expected-sha',required=True)
     p.add_argument('--ffmpeg',type=Path,required=True);p.add_argument('--ffprobe',type=Path,required=True)
-    p.add_argument('--monitor-dir',type=Path,required=True);args=p.parse_args()
+    p.add_argument('--monitor-dir',type=Path,required=True)
+    p.add_argument('--reward-pipeline',action='store_true',
+                   help='opt-in owner-local pipeline; requires separately approved independent-HPS experiment')
+    args=p.parse_args()
     def git(*argv):return subprocess.check_output(['git','-C',str(ROOT),*argv],text=True).strip()
     if git('status','--porcelain') or git('rev-parse','HEAD')!=args.expected_sha:
         raise ValueError('requires exact clean deployed Git SHA')

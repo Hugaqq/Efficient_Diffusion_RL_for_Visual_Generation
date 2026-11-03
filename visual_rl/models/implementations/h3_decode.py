@@ -9,7 +9,8 @@ No vendor imports, fallback media, scalar scaling_factor or audio clipping.
 Budgets bound the single returned media payload and a conservative tensor
 working-set estimate. They EXCLUDE VAE weights, loader copies and internal VAE
 activations/workspace; real host resource admission still requires measurement.
-The caller must serialize aux across ranks and consume media inside its lease.
+The caller must serialize aux across ranks and consume media inside its lease
+or explicitly hand off the completed CPU storage to one bounded consumer.
 """
 
 from __future__ import annotations
@@ -106,8 +107,34 @@ class H3AVMedia:
             raise RuntimeError("AV media lease has expired")
         return self._audio
 
+    def handoff(self) -> H3OwnedAVMedia:
+        """Move completed detached CPU storage, without copying, exactly once."""
+        video, audio = self.video, self.audio
+        if any(t.device.type != 'cpu' or t.dtype != torch.float32
+               or t.requires_grad or t.grad_fn is not None for t in (video, audio)):
+            raise ValueError('handoff requires completed detached CPU FP32 media')
+        owned = H3OwnedAVMedia(video, audio, self.metadata.fps, self.metadata.sample_rate)
+        self._release()
+        return owned
+
     def _release(self) -> None:
         self._video = self._audio = None
+
+
+class H3OwnedAVMedia(H3AVMedia):
+    """Single consumer owner; close releases references, not arbitrary aliases."""
+    def handoff(self):
+        raise RuntimeError('owned AV media cannot be handed off again')
+
+    def close(self):
+        self._release()
+
+    def __enter__(self):
+        self.video  # fail closed on an expired owner
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
 
 
 class _DecodeLease:

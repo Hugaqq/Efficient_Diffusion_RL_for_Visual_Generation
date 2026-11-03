@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 import functools,json,time,weakref
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from visual_rl.runtime import h3_memory as memory
 
 
@@ -37,9 +37,16 @@ from visual_rl.algorithms.trainer.interface import StageValue
 
 
 class H3DualIterationStages(H3IterationStages):
-    def __init__(self, *, mode, seed, **kwargs):
+    def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
+        if type(reward_pipeline) is not bool:
+            raise TypeError('reward_pipeline must be bool')
+        if reward_pipeline and (mode!='dual_flash' or any(type(n) is not int or n<=0
+                                                        for n in (media_bytes,decode_bytes))):
+            raise ValueError('reward pipeline requires dual_flash and explicit byte budgets')
+        self.reward_pipeline=reward_pipeline
+        self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
         self.mode=mode
         self.seed=seed
         super().__init__(**kwargs)
@@ -74,31 +81,55 @@ class H3DualIterationStages(H3IterationStages):
     @_timed
     def reward(self,value):
         ctx=self._context(value);r=ctx.request
+        def admission():
+            if self.reward_pipeline and (self.mode!='dual_flash' or r.group_layout!='paired_4x8'):
+                raise ValueError('reward pipeline requires paired_4x8 dual_flash')
+        _checked(ctx.coordinator,'dual/reward-pipeline/ready',admission)
+        ctx.coordinator.gate(f'dual/reward-pipeline/{int(self.reward_pipeline)}/queue1/total2/'
+                             f'{self.media_bytes}/{self.decode_bytes}')
         def work():
             import math
-            import json
-            import time
-            rows=[]
-            for sid,gid,member in r.samples:
+            from visual_rl.algorithms.trainer.h3_reward_pipeline import RewardSample, reward_pipeline
+            samples=tuple(RewardSample(i,sid,gid,member,r.prompts[sid],ctx.dual_selection[sid])
+                          for i,(sid,gid,member) in enumerate(r.samples))
+            @contextmanager
+            def decode(sample):
+                sid=sample.sample_id
                 terminal=ctx.dual_terminals[sid].clone()
                 started=time.monotonic()
                 print(json.dumps(dict(event='h3_reward_decode_begin',sample_id=sid)),flush=True)
                 with ExitStack() as stack:
-                    with memory.span('vae_decode',sample_id=sid,selected_index=ctx.dual_selection[sid]):
+                    with memory.span('vae_decode',sample_id=sid,selected_index=sample.selected_index):
                         media=stack.enter_context(self.decode(terminal))
                     print(json.dumps(dict(event='h3_reward_decode_end',sample_id=sid,
                                           seconds=time.monotonic()-started)),flush=True)
-                    started=time.monotonic()
-                    print(json.dumps(dict(event='h3_reward_score_begin',sample_id=sid)),flush=True)
-                    with memory.span('reward_score',sample_id=sid,selected_index=ctx.dual_selection[sid]):
-                        score=self.score_one(sample_id=sid,prompt=r.prompts[sid],media=media)
-                    if type(score) is not float or not math.isfinite(score):
-                        raise ValueError('reward must be a finite Python float')
-                    print(json.dumps(dict(event='h3_reward_score_end',sample_id=sid,
-                                          seconds=time.monotonic()-started,score=score,
-                                          optimizer_step=r.identity.optimizer_step,group_id=gid,member=member,
-                                          stochastic_index=ctx.dual_selection[sid])),flush=True)
-                rows.append((sid,gid,member,score,True))
+                    yield media
+            def score(sample,media):
+                sid=sample.sample_id
+                started=time.monotonic()
+                print(json.dumps(dict(event='h3_reward_score_begin',sample_id=sid)),flush=True)
+                with memory.span('reward_score',sample_id=sid,selected_index=sample.selected_index):
+                    result=self.score_one(sample_id=sid,prompt=sample.prompt,media=media)
+                if type(result) is not float or not math.isfinite(result):
+                    raise ValueError('reward must be a finite Python float')
+                print(json.dumps(dict(event='h3_reward_score_end',sample_id=sid,
+                                      seconds=time.monotonic()-started,score=result,
+                                      optimizer_step=r.identity.optimizer_step,group_id=sample.group_id,
+                                      member=sample.member,stochastic_index=sample.selected_index)),flush=True)
+                return result
+            if self.reward_pipeline:
+                if self.read_behavior_id()!=r.behavior_id:
+                    raise ValueError('reward pipeline behavior changed before work')
+                rows=reward_pipeline(samples,decode=decode,score=score,
+                                     media_bytes=self.media_bytes,decode_bytes=self.decode_bytes)
+                if self.read_behavior_id()!=r.behavior_id:
+                    raise ValueError('reward pipeline behavior changed during work')
+                return rows
+            rows=[]
+            for sample in samples:
+                with decode(sample) as media:
+                    result=score(sample,media)
+                rows.append((sample.sample_id,sample.group_id,sample.member,result,True))
             return tuple(rows)
         ctx.rewards=ctx.coordinator.aux_turns(work)
         return StageValue(value.identity,ctx)
