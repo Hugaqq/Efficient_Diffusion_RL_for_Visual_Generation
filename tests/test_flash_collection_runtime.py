@@ -321,8 +321,8 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         mp.setattr(h3_memory,'journal',lambda:journal)
         mp.setattr(resolution_entry.H3LifecycleBackend,'bind',lambda *a:bound)
         mp.setattr(resolution_entry,'_phase',lambda session,label,work:work())
-        mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]])
-        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False))
+        mp.setattr(resolution_entry,'_exchange',lambda *a:[a[3]]*8)
+        backend=resolution_entry.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'),ffprobe=Path('ffprobe'),expected_sha='test',monitor_dir=monitor,reward_pipeline=False,profile_rollout=False))
         backend.bind(None,runtime,graph,prepared,None)
         bound.trainer.run_iteration(0);bound.trainer.run_iteration(1)
         assert len(backend.audits)==2
@@ -2089,8 +2089,8 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             H3DualIterationStages(mode='dual_flash', seed=42, reward_pipeline=bad)
     with pytest.raises(ValueError, match='dual_flash'):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True)).reward_pipeline is True
-    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False)).reward_pipeline is False
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False)).reward_pipeline is True
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False)).reward_pipeline is False
     with monkeypatch.context() as patch:
         patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
         source = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None,
@@ -2110,7 +2110,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         bound.close()
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys
-        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--help'])
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
     with monkeypatch.context() as patch:
@@ -2120,3 +2120,285 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             pipeline.reward_pipeline(samples, decode=lambda s: pytest.fail('decode before admission'),
                 score=lambda *a: pytest.fail('score before admission'), media_bytes=1024, decode_bytes=2048)
     assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+
+    # F0: real rollout math with only CUDA/CUPTI profiler and file-wait leaves
+    # substituted. These synthetic activity events are NOT GPU evidence.
+    from visual_rl.runtime import h3_rollout_profile as profiling
+    from visual_rl.algorithms.trainer.h3_dual_rollout import collect
+    from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
+    from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+    from visual_rl.models.h3_joint import H3JointLayout
+    import hashlib
+    uuid = 'GPU-0e1cd165-126d-e889-2b87-240d8faddddb'
+    trace_raw = '{"test_only_synthetic_activity_leaf":true,"traceEvents":[]}'
+    profile_calls, profile_gates = [], []
+    fault = None
+    class ProfilerLeaf:
+        def start(self):
+            assert threading.current_thread() is threading.main_thread()
+            profile_calls.append('start')
+            if fault == 'start': raise RuntimeError('start failed')
+        def stop(self):
+            assert threading.current_thread() is threading.main_thread()
+            profile_calls.append('stop')
+            if fault in ('stop', 'body-stop'): raise RuntimeError('stop failed')
+        def events(self):
+            assert threading.current_thread() is threading.main_thread()
+            kinds = [torch.autograd.DeviceType.CPU]
+            if fault != 'cpu-only': kinds.append(torch.autograd.DeviceType.CUDA)
+            return [SimpleNamespace(device_type=k) for k in kinds]
+        def export_chrome_trace(self, path):
+            assert threading.current_thread().name == 'cpu-profile-export'
+            profile_calls.append('export')
+            Path(path).write_text(trace_raw)
+            if fault == 'export': raise OSError('export failed')
+    def factory():
+        assert threading.current_thread() is threading.main_thread()
+        profile_calls.append('factory')
+        return ProfilerLeaf()
+    def file_worker(action, **kwargs):
+        assert threading.current_thread() is threading.main_thread()
+        results, errors = [], []
+        def execute():
+            try: results.append(action())
+            except BaseException as exc: errors.append(exc)
+        worker = Thread(target=execute, name='cpu-profile-export'); worker.start(); worker.join(10)
+        assert not worker.is_alive()
+        if errors: raise errors[0]
+        return results[0]
+    def profile_gate(event, **kwargs):
+        profile_gates.append((event, kwargs.get('local_error', False)))
+        if kwargs.get('local_error'): raise RuntimeError('profile peer rejected')
+        if (fault, event) in (('peer-start', 'rollout-profile/start'), ('peer-stop', 'rollout-profile/stop')):
+            raise RuntimeError('another rank failed profiling')
+    def recorder(label):
+        output = tmp_path / label; output.mkdir()
+        return profiling.RolloutCellProfile(output_dir=output, rank=0, gpu_uuid=uuid,
+            launcher_sha='e'*40, process_group=object())
+    target = dict(optimizer_step=1, row=1, index=0, sample_id='sample-second', selected_index=3,
+                  gate=profile_gate)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.profiler, 'supported_activities', lambda: {
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA})
+        patch.setattr(profiling, '_new_profiler', factory)
+        patch.setattr(profiling, 'file_phase', file_worker)
+        dynamics = H3DualFlowSDE(H3JointLayout(1, 2, 1, 3), H3ScheduleSnapshot.build(10))
+        initial = {s: torch.full((1, 5), .25, dtype=torch.float16) for s in ('a', 'b')}
+        def run_rollouts(scope):
+            generators = {s: (torch.Generator().manual_seed(i*2), torch.Generator().manual_seed(i*2+1))
+                          for i, s in enumerate(('a', 'b'))}
+            outputs, calls, gates = [], [], []
+            def predict(sid, x, index):
+                calls.append((sid, index)); return torch.zeros_like(x)
+            def gate(event, **kwargs):
+                gates.append((event, kwargs.get('local_error', False)))
+                profile_gate(event, **kwargs)
+            for step in range(2):
+                outputs.append(collect(dynamics=dynamics, samples=(('a', 'g'), ('b', 'g')),
+                    initial_states=initial, generators=generators, mode='flash', seed=42, optimizer_step=step,
+                    device='cpu', predict=predict, read_behavior_id=lambda: 'behavior', behavior_id='behavior',
+                    gate=gate, cell_scope=scope))
+            states = {sid: tuple(g.get_state() for g in pair) for sid, pair in generators.items()}
+            return outputs, states, calls, gates
+        def forbidden_factory(): pytest.fail('disabled profile constructed/probed profiler')
+        with patch.context() as off:
+            off.setattr(profiling, '_new_profiler', forbidden_factory)
+            off.setattr(torch.profiler, 'supported_activities', forbidden_factory)
+            before_rng = RankRNGSnapshot.capture_current(0)
+            baseline = run_rollouts(None)
+            assert RankRNGSnapshot.capture_current(0) == before_rng
+            assert not (tmp_path / 'disabled-profile').exists()
+        rec = recorder('profile-success')
+        before_rng = RankRNGSnapshot.capture_current(0)
+        observed = run_rollouts(rec.cell)
+        assert RankRNGSnapshot.capture_current(0) == before_rng
+        assert profile_calls == ['factory', 'start', 'stop', 'export']
+        assert rec.hits == 1
+        rec.assert_complete()
+        for (records_a, terminal_a, choices_a), (records_b, terminal_b, choices_b) in zip(baseline[0], observed[0]):
+            assert choices_a == choices_b and len(records_a) == len(records_b) == 2
+            for a, b in zip(records_a, records_b):
+                assert (a.sample_id, a.index) == (b.sample_id, b.index)
+                assert all(torch.equal(getattr(a, k), getattr(b, k)) for k in ('x', 'action', 'old_joint'))
+            assert all(torch.equal(terminal_a[s], terminal_b[s]) for s in initial)
+        assert baseline[2] == observed[2] and len(observed[2]) == 40
+        assert baseline[3] == [g for g in observed[3] if not g[0].startswith('rollout-profile/')]
+        assert all(torch.equal(a, b) for sid in initial for a, b in zip(baseline[1][sid], observed[1][sid]))
+        receipt = json.loads(rec.receipt.read_text())
+        assert receipt['actual']['sample_id'] == 'b' and receipt['target'] == profiling.TARGET
+        assert receipt['admitted_gpu_uuid'] == uuid and receipt['launcher_sha'] == 'e'*40
+        assert receipt['trace_sha256'] == hashlib.sha256(trace_raw.encode()).hexdigest()
+        assert receipt['trace_bytes'] == len(trace_raw) and receipt['observed_device_events'] == {'CPU': 1, 'CUDA': 1}
+        assert receipt['settings'] == profiling.SETTINGS and not receipt['coverage']['row_initial_h2d']
+        assert set(p.name for p in rec.directory.iterdir()) == {rec.trace.name, rec.receipt.name}
+        with pytest.raises(RuntimeError, match='already attempted'):
+            with rec.cell(**target): pytest.fail('duplicate target replayed')
+        with pytest.raises(RuntimeError, match='exactly one'): rec.assert_complete()
+        with pytest.raises(FileExistsError):
+            profiling.RolloutCellProfile(output_dir=rec.directory.parent.parent, rank=0, gpu_uuid=uuid,
+                                         launcher_sha='e'*40, process_group=object())
+        missed = recorder('profile-missed')
+        with missed.cell(**dict(target, optimizer_step=0)): pass
+        with pytest.raises(RuntimeError, match='exactly one'): missed.assert_complete()
+        # Public support failure cannot become an automatic CPU fallback.
+        with patch.context() as unsupported:
+            unsupported.setattr(torch.profiler, 'supported_activities', lambda: {torch.profiler.ProfilerActivity.CPU})
+            with pytest.raises(RuntimeError, match='no CPU fallback'): recorder('profile-unsupported')
+        for fault in ('start', 'stop', 'peer-start', 'peer-stop', 'body-stop', 'cpu-only', 'export', 'oversize', 'receipt-size', 'receipt-io'):
+            profile_calls.clear(); profile_gates.clear()
+            rec = recorder('profile-failure-' + fault)
+            body, after = [], []
+            with patch.context() as fail_patch:
+                if fault == 'oversize': fail_patch.setattr(profiling, 'TRACE_LIMIT', 1)
+                if fault == 'receipt-size': fail_patch.setattr(profiling, 'RECEIPT_LIMIT', 1)
+                if fault == 'receipt-io':
+                    link = profiling.os.link
+                    def failed_link(src, dst, **kwargs):
+                        if str(dst).endswith('.receipt.json'): raise OSError('receipt IO failed')
+                        return link(src, dst, **kwargs)
+                    fail_patch.setattr(profiling.os, 'link', failed_link)
+                with pytest.raises((RuntimeError, ValueError, OSError)) as error:
+                    with rec.cell(**target):
+                        body.append(True)
+                        if fault == 'body-stop': raise ValueError('original model error')
+                    after.append(True)
+                assert not after and len(body) == (0 if fault in ('start', 'peer-start') else 1)
+                assert profile_calls.count('stop') == 1  # cleanup never retries/replays
+                if fault == 'body-stop':
+                    assert isinstance(error.value, ValueError) and 'original model error' in str(error.value)
+                    assert any('stop failed' in note for note in error.value.__notes__)
+                    assert profile_gates == [('rollout-profile/start', False)]  # no rescue collective
+                if fault == 'start': assert profile_gates[0] == ('rollout-profile/start', True)
+                if fault in ('stop', 'cpu-only'): assert profile_gates[-1] == ('rollout-profile/stop', True)
+                assert not rec.receipt.exists() and not rec.trace.exists()
+                assert list(rec.directory.iterdir()) == []
+                assert rec.receipt_sha is None
+        fault = None
+        for symlink in (False, True):
+            rec = recorder('profile-existing-' + str(symlink))
+            unknown = tmp_path / ('unknown-profile-' + str(symlink)); unknown.write_text('preserve me')
+            if symlink: rec.trace.symlink_to(unknown)
+            else: rec.trace.write_text('preserve me')
+            with pytest.raises(FileExistsError):
+                with rec.cell(**target): pass
+            assert rec.trace.read_text() == unknown.read_text() == 'preserve me'
+            assert not rec.receipt.exists()
+        output = tmp_path / 'profile-symlink-root'; output.mkdir()
+        outside = tmp_path / 'preserved-profile-directory'; outside.mkdir()
+        (output / 'rollout-profile').symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match='symlink'):
+            profiling.RolloutCellProfile(output_dir=output, rank=0, gpu_uuid=uuid,
+                                         launcher_sha='e'*40, process_group=object())
+        assert list(outside.iterdir()) == []
+        # No large trace read_bytes: publication already streamed/hash-checked;
+        # final receipt read is bounded and detects tampering.
+        rec = recorder('profile-no-readbytes')
+        with patch.context() as bounded:
+            bounded.setattr(Path, 'read_bytes', lambda path: pytest.fail('unbounded profile read_bytes'))
+            with rec.cell(**target): pass
+            rec.assert_complete()
+        rec.receipt.write_text('{}')
+        with pytest.raises(ValueError, match='integrity'): rec.assert_complete()
+        # Only the main thread may enter the target; no body execution/replay.
+        rec = recorder('profile-thread')
+        errors = []
+        def wrong_thread():
+            try:
+                with rec.cell(**target): pytest.fail('profile ran in file/consumer thread')
+            except BaseException as exc: errors.append(exc)
+        worker = Thread(target=wrong_thread); worker.start(); worker.join(5)
+        assert not worker.is_alive() and len(errors) == 1 and 'main training thread' in str(errors[0])
+    # Start/stop failures at the actual collect target never advance to the
+    # following prediction. No replay or extra warmup/model call is introduced.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.profiler, 'supported_activities', lambda: {
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA})
+        patch.setattr(profiling, '_new_profiler', factory)
+        for fault, expected in (('start', 10), ('stop', 11)):
+            rec = recorder('collect-profile-' + fault)
+            predictions = []
+            def predict(sid, x, index):
+                predictions.append((sid, index)); return torch.zeros_like(x)
+            generators = {s: (torch.Generator().manual_seed(i*2), torch.Generator().manual_seed(i*2+1))
+                          for i, s in enumerate(('a', 'b'))}
+            with pytest.raises(RuntimeError, match=f'{fault} failed'):
+                collect(dynamics=dynamics, samples=(('a', 'g'), ('b', 'g')),
+                    initial_states=initial, generators=generators, mode='flash', seed=42, optimizer_step=1,
+                    device='cpu', predict=predict, read_behavior_id=lambda: 'behavior', behavior_id='behavior',
+                    gate=profile_gate, cell_scope=rec.cell)
+            assert len(predictions) == expected
+        fault = None
+        patch.setattr(profiling, 'file_phase', file_worker)
+        rec = recorder('profile-dual-stage')
+        predictions = []
+        data = SimpleNamespace(reserve=lambda step: None, commit=lambda r: None, abort=lambda r: None)
+        prepared = SimpleNamespace(prepared_root=torch.nn.Identity())
+        def predict(prepared, *, sample_id, x, index, **kwargs):
+            predictions.append((sample_id, index)); return torch.zeros_like(x)
+        stage = H3DualIterationStages(mode='dual_flash', seed=42, data=data, prepared=prepared,
+            predict=predict, decode=lambda t: None, score_one=lambda **kw: 1.,
+            coordination_factory=lambda plan: None, process_group=None, rank=0, device='cpu',
+            read_behavior_id=lambda: 'behavior', rollout_cell_scope=rec.cell)
+        identity = IterationIdentity(1, 'source', 'train', ('a', 'b'), ('g', 'g'), (0, 1))
+        request = SimpleNamespace(identity=identity, samples=(('a', 'g', 0), ('b', 'g', 1)),
+            initial_states=initial, generators={s: (torch.Generator().manual_seed(i*2),
+            torch.Generator().manual_seed(i*2+1)) for i, s in enumerate(('a', 'b'))},
+            behavior_id='behavior', conditions={s: torch.zeros(1) for s in initial}, dynamics=dynamics)
+        ctx = SimpleNamespace(request=request, dual=dynamics, coordinator=SimpleNamespace(gate=profile_gate))
+        stage._active = ctx
+        stage.rollout(StageValue(identity, ctx))
+        rec.assert_complete()
+        assert rec.hits == 1 and len(predictions) == 20 and len(ctx.dual_records) == 2
+
+    # Actual two-update binding, including off/no-probe, peer agreement,
+    # installation and missed-window final gate. Parent model construction
+    # and transport alone are CPU leaves; bind itself is not mocked.
+    with monkeypatch.context() as patch:
+        parent_calls, configs = [], []
+        def parent_bind(self, preflight, runtime, graph, prepared, transformed):
+            return SimpleNamespace(graph=graph, stages=SimpleNamespace(predict=lambda **kw: None,
+                score_one=lambda **kw: 1., rollout_cell_scope=None),
+                trainer=SimpleNamespace(run_iteration=lambda step: None))
+        patch.setattr(two_update.H3LifecycleBackend, 'bind', parent_bind)
+        patch.setattr(two_update.H3LifecycleBackend, 'checkpoint', lambda *args: parent_calls.append('finalized'))
+        patch.setattr(two_update, '_phase', lambda session, label, work: work())
+        def exchange(label, rank, group, payload, ok):
+            configs.append(payload)
+            return [payload]*8
+        patch.setattr(two_update, '_exchange', exchange)
+        runtime = SimpleNamespace(rank=0, process_group=object(), gpu_uuids=(uuid,)*8)
+        for enabled in (False, True):
+            output = tmp_path / ('profile-backend-' + str(enabled)); output.mkdir()
+            graph = SimpleNamespace(session=runtime, source=SimpleNamespace(),
+                                    profile=SimpleNamespace(launch=SimpleNamespace(output_dir=output)))
+            args = SimpleNamespace(reward_pipeline=True, profile_rollout=enabled, expected_sha='e'*40,
+                ffmpeg=Path('unused'), ffprobe=Path('unused'), monitor_dir=tmp_path / 'unused')
+            backend = two_update.TwoUpdateBackend(args=args)
+            assert backend.reward_pipeline is True
+            with patch.context() as capability:
+                if not enabled:
+                    capability.setattr(torch.profiler, 'supported_activities', forbidden_factory)
+                else:
+                    capability.setattr(torch.profiler, 'supported_activities', lambda: {
+                        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA})
+                bound = backend.bind(None, runtime, graph, object(), None)
+                assert configs[-1] == profiling.configuration(enabled)
+                if not enabled:
+                    assert bound.stages.rollout_cell_scope is None and not (output / 'rollout-profile').exists()
+                    backend.checkpoint(bound, None)
+                else:
+                    assert bound.stages.rollout_cell_scope.__self__ is backend.rollout_profile
+                    assert isinstance(bound.stages.predict, two_update.PredictAudit)
+                    with pytest.raises(RuntimeError, match='exactly one'): backend.checkpoint(bound, None)
+        assert parent_calls == ['finalized']
+        # A peer's different flag must fail before attach/profiler support.
+        def disagree(label, rank, group, payload, ok):
+            return [payload]*7 + [dict(payload, enabled=not payload['enabled'])]
+        patch.setattr(two_update, '_exchange', disagree)
+        patch.setattr(torch.profiler, 'supported_activities', forbidden_factory)
+        with pytest.raises(ValueError, match='configuration mismatch'):
+            backend.bind(None, runtime, graph, object(), None)
+    for bad in (1, 'yes', None):
+        with pytest.raises(TypeError, match='bool'): profiling.configuration(bad)
+        with pytest.raises(TypeError, match='bool'):
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad))

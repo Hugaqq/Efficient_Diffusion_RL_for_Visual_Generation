@@ -1,23 +1,21 @@
-perf(h3): pipeline owner-local decode and reward with bounded media ownership
+feat(h3): add opt-in one-cell rollout profiling for communication analysis
 
-Add an off-by-default paired-Flash pipeline inside each existing auxiliary
-owner turn. Transfer completed CPU AV storage without copies; acquire two
-total permits before decode and queue at most one packet. Preserve FIFO
-sample/prompt/index binding, the original scorer/exporter and owner/update
-barriers. Admit host work before starting, cancel on failure, drain/close
-and join the consumer without retrying requests or returning partial rows.
+Add a fixed one-shot CPU+CUDA recorder for update2/local-row1/index0.
+Keep profiling off by default, without new warmup or forward/update calls.
+Pass a small optional scope through the real dual rollout and install it
+only from the guarded two-update launcher after rank configuration agreement.
 
-Keep CPU consumer journal scopes separate from the GPU peak-reset stack,
-with durable bounded events and no CUDA statistics/synchronization there.
-Wire strict boolean backend admission, rank mode/budget agreement and the
-optional two-update launcher flag without changing scientific protocols,
-VAE GPU safety gates, HPS clients/services or checkpoint semantics.
+Start/stop on main, cooperate on local profiler failures, and preserve model
+errors without rescue collectives or replay. Export only after stop through
+the existing CPU file phase. Publish bounded, stream-hashed trace/receipt
+artifacts in new per-rank run directories without overwriting unknown files.
+Reject CPU-only capture, duplicate/missed targets and incomplete receipts.
 
-Extend the original seven CPU tests for ownership/overlap/capacity, actual
-JPEG equality, RNG, cooperative rejection, failures/cleanup/join, logging
-and real reward/backend/trainer integration. Resolve the saved P1 recovery
-point without accepting its earlier 5/7 result or replaying its bad command.
+Extend the original seven CPU regressions for real collect/stage/backend
+wiring, RNG/output/count equivalence, thread boundaries, rank/failure gates,
+metadata and no-overwrite/size/IO cleanup. Synthetic CUDA activity leaves
+are test-only, not GPU evidence; no CPU fallback is exposed in production.
 
-Validation: original CPU gate 7 passed, 3 warnings in 51.68s;
-git diff --check passed. GPU performance and real service equivalence are
-unmeasured; enabling requires a separately approved experiment card.
+Validation: original CPU gate 7 passed, 3 warnings in 51.52s;
+git diff --check passed. This is a measurement prerequisite, not a speedup.
+Real CUDA profiling and final two-update validation require new authorization.

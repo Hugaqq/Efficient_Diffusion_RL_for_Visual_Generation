@@ -54,6 +54,9 @@ def phase(name):
 class TwoUpdateBackend(H3LifecycleBackend):
     def __init__(self,*,args):
         super().__init__(reward_pipeline=args.reward_pipeline)
+        from visual_rl.runtime.h3_rollout_profile import configuration
+        configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
+        self.profile_rollout=args.profile_rollout;self.rollout_profile=None
         self.args=args;self.previous=None;self.audits=[]
     def compile(self,source):return validate_fresh(super().compile(source))
     @phase('runtime_initialization')
@@ -65,7 +68,17 @@ class TwoUpdateBackend(H3LifecycleBackend):
     @phase('bind')
     def bind(self,preflight,runtime,graph,prepared,transformed):
         bound=super().bind(preflight,runtime,graph,prepared,transformed)
+        from visual_rl.runtime.h3_rollout_profile import configuration, RolloutCellProfile
+        config=configuration(self.profile_rollout)
+        configs=_exchange('rollout-profile/config',runtime.rank,runtime.process_group,config,True)
+        if len(configs)!=8 or any(row!=config for row in configs):
+            raise ValueError('rank rollout profile configuration mismatch')
         def attach():
+            if self.profile_rollout:
+                self.rollout_profile=RolloutCellProfile(output_dir=graph.profile.launch.output_dir,
+                    rank=runtime.rank,gpu_uuid=runtime.gpu_uuids[runtime.rank],
+                    launcher_sha=self.args.expected_sha,process_group=runtime.process_group)
+                bound.stages.rollout_cell_scope=self.rollout_profile.cell
             self.predict_audit=PredictAudit(bound.stages.predict)
             bound.stages.predict=self.predict_audit
             def exporter(**kwargs):
@@ -123,7 +136,14 @@ class TwoUpdateBackend(H3LifecycleBackend):
         _phase(runtime,'attach-two-update-memory-observer',attach)
         return bound
     @phase('terminal_save_validation')
-    def checkpoint(self,*args):return super().checkpoint(*args)
+    def checkpoint(self,bound,result):
+        if self.profile_rollout:
+            def complete():
+                if self.rollout_profile is None:
+                    raise RuntimeError('enabled rollout profile was not installed')
+                self.rollout_profile.assert_complete()
+            _phase(bound.graph.session,'rollout-profile/complete',complete)
+        return super().checkpoint(bound,result)
 
 
 def main():
@@ -133,6 +153,8 @@ def main():
     p.add_argument('--monitor-dir',type=Path,required=True)
     p.add_argument('--reward-pipeline',action='store_true',
                    help='opt-in owner-local pipeline; requires separately approved independent-HPS experiment')
+    p.add_argument('--profile-rollout',action='store_true',
+                   help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     args=p.parse_args()
     def git(*argv):return subprocess.check_output(['git','-C',str(ROOT),*argv],text=True).strip()
     if git('status','--porcelain') or git('rev-parse','HEAD')!=args.expected_sha:

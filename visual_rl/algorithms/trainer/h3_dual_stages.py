@@ -37,7 +37,8 @@ from visual_rl.algorithms.trainer.interface import StageValue
 
 
 class H3DualIterationStages(H3IterationStages):
-    def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None, **kwargs):
+    def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
+                 rollout_cell_scope=None, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -45,6 +46,9 @@ class H3DualIterationStages(H3IterationStages):
         if reward_pipeline and (mode!='dual_flash' or any(type(n) is not int or n<=0
                                                         for n in (media_bytes,decode_bytes))):
             raise ValueError('reward pipeline requires dual_flash and explicit byte budgets')
+        if rollout_cell_scope is not None and not callable(rollout_cell_scope):
+            raise TypeError('optional rollout cell scope must be callable')
+        self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
         self.mode=mode
@@ -73,7 +77,8 @@ class H3DualIterationStages(H3IterationStages):
             seed=self.seed,optimizer_step=r.identity.optimizer_step,device=self.device,
             predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/rollout/version'),
-            behavior_id=r.behavior_id,gate=lambda event,**kw:c.gate('dual/'+event,**kw))
+            behavior_id=r.behavior_id,gate=lambda event,**kw:c.gate('dual/'+event,**kw),
+            cell_scope=self.rollout_cell_scope)
         ctx.dual_records,ctx.dual_terminals,ctx.dual_selection=records,terminals,selected
         c.gate('dual/rollout/complete')
         return StageValue(value.identity,ctx)

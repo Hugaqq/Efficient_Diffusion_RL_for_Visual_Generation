@@ -7,6 +7,7 @@ reward, credit, loss and durable checkpoint publication.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import hashlib
 
 import torch
@@ -71,7 +72,7 @@ class H3DualRecord:
 
 def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
             mode: str, seed: int, optimizer_step: int, device, predict, read_behavior_id,
-            behavior_id: str, gate, window_size: int = FLASH_WINDOW_SIZE):
+            behavior_id: str, gate, window_size: int = FLASH_WINDOW_SIZE, cell_scope=None):
     """Flow: all stochastic transitions. Flash: one stochastic, rest Euler.
 
     Exactly one sample group stays rank-local. Flow/Flash share the same SDE
@@ -88,6 +89,8 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
         raise ValueError('state/generator bindings must cover sample IDs')
     if not all(callable(fn) for fn in (predict, read_behavior_id,gate)) or not behavior_id:
         raise ValueError('model, version and collective gates required')
+    if cell_scope is not None and not callable(cell_scope):
+        raise TypeError('optional rollout cell scope must be callable')
     device=torch.device(device)
     records=[]; terminals={}; choices={}
     with torch.no_grad():
@@ -114,25 +117,29 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
                 raise
             gate(f'rollout/{row}/prepare',local_error=False)
             for index in range(dynamics.schedule.num_steps):
-                gate(f'rollout/{row}/{index}/forward')
-                with memory.span('rollout_forward',synchronize=True,sample_id=sid,selected_index=choice,transition_index=index):
-                    prediction=predict(sid,x,index)
-                stochastic=mode=='flow' or index==choice
-                try:
-                    with memory.span('rollout_transition',synchronize=True,sample_id=sid,selected_index=choice,transition_index=index,stochastic=stochastic):
-                        if stochastic:
-                            action=dynamics.sample(x,prediction,index,video_generator=pair[0],audio_generator=pair[1])
-                            old=(dynamics.evaluate(x,action,prediction,index)[0].detach().cpu()
-                                 if mode=='flash' else None)
-                            records.append(H3DualRecord(sid,index,x.cpu(),action.cpu(),old))
-                        else:
-                            action=dynamics.deterministic_step(x,prediction,index)
-                except Exception:
-                    gate(f'rollout/{row}/{index}/result', local_error=True)
-                    raise
-                gate(f'rollout/{row}/{index}/result', local_error=False)
-                x=action
-                del prediction
+                scope=(nullcontext() if cell_scope is None else cell_scope(
+                    optimizer_step=optimizer_step,row=row,index=index,sample_id=sid,
+                    selected_index=choice,gate=gate))
+                with scope:
+                    gate(f'rollout/{row}/{index}/forward')
+                    with memory.span('rollout_forward',synchronize=True,sample_id=sid,selected_index=choice,transition_index=index):
+                        prediction=predict(sid,x,index)
+                    stochastic=mode=='flow' or index==choice
+                    try:
+                        with memory.span('rollout_transition',synchronize=True,sample_id=sid,selected_index=choice,transition_index=index,stochastic=stochastic):
+                            if stochastic:
+                                action=dynamics.sample(x,prediction,index,video_generator=pair[0],audio_generator=pair[1])
+                                old=(dynamics.evaluate(x,action,prediction,index)[0].detach().cpu()
+                                     if mode=='flash' else None)
+                                records.append(H3DualRecord(sid,index,x.cpu(),action.cpu(),old))
+                            else:
+                                action=dynamics.deterministic_step(x,prediction,index)
+                    except Exception:
+                        gate(f'rollout/{row}/{index}/result', local_error=True)
+                        raise
+                    gate(f'rollout/{row}/{index}/result', local_error=False)
+                    x=action
+                    del prediction
             terminals[sid]=x.detach().cpu().clone()
         if read_behavior_id()!=behavior_id:
             raise ValueError('behavior version changed during rollout')
