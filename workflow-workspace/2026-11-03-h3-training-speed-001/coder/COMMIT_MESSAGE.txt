@@ -1,21 +1,24 @@
-feat(h3): add opt-in one-cell rollout profiling for communication analysis
+perf(hps): reuse dedicated GPU weights with guarded idle residency
 
-Add a fixed one-shot CPU+CUDA recorder for update2/local-row1/index0.
-Keep profiling off by default, without new warmup or forward/update calls.
-Pass a small optional scope through the real dual rollout and install it
-only from the guarded two-update launcher after rank configuration agreement.
+Add off-by-default, strict UUID-declared single-model residency to the
+serial HPS worker. Revalidate logical0/current/observed UUID and actual
+headroom for reuse; keep the original 40GiB admission and 16GiB request
+margin. On low headroom/expiry, really offload before a fresh cold admission.
+Never retry POSTs, batch frames, cast weights or fall back to CPU scoring.
 
-Start/stop on main, cooperate on local profiler failures, and preserve model
-errors without rescue collectives or replay. Export only after stop through
-the existing CPU file phase. Publish bounded, stream-hashed trace/receipt
-artifacts in new per-rank run directories without overwriting unknown files.
-Reject CPU-only capture, duplicate/missed targets and incomplete receipts.
+Use the existing HTTP thread for 60s idle/headroom housekeeping and close
+owned resources in main finally. Stop/join request monitors on transfer and
+business errors, preserve primary exceptions with cleanup notes, and make
+unknown/failed state unready instead of reusable. Keep true transfer spans,
+unused-cache release and distinguish attempted/completed moves in telemetry.
 
-Extend the original seven CPU regressions for real collect/stage/backend
-wiring, RNG/output/count equivalence, thread boundaries, rank/failure gates,
-metadata and no-overwrite/size/IO cleanup. Synthetic CUDA activity leaves
-are test-only, not GPU evidence; no CPU fallback is exposed in production.
+Include declared residency policy in the real loaded-service identity;
+retain original tensor/processor/code hashing and immutable manifest checks.
+Extend the original seven CPU tests with real backend/offline Handler paths,
+124-frame FP32/top37 equivalence with ties, failure/UUID/budget/TTL lifecycle,
+client identity rejection and socket-free main cleanup regression coverage.
 
-Validation: original CPU gate 7 passed, 3 warnings in 51.52s;
-git diff --check passed. This is a measurement prerequisite, not a speedup.
-Real CUDA profiling and final two-update validation require new authorization.
+Validation: original CPU gate 7 passed, 3 warnings in 53.69s;
+git diff --check passed. No GPU or existing service operation was performed.
+GPU numerical equivalence, resources and speedup remain unmeasured and need
+a separately approved dedicated instance/endpoint/manifest experiment.

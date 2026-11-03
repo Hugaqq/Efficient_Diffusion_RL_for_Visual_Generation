@@ -2402,3 +2402,364 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(TypeError, match='bool'): profiling.configuration(bad)
         with pytest.raises(TypeError, match='bool'):
             two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False, profile_rollout=bad))
+
+    # H1: actual backend constructor/identity/_score and offline Handler. Only
+    # the heavy inferencer, CUDA observations/transfers/clock/host admission
+    # and HTTP socket are leaves. No GPU or service request occurs here.
+    from scripts import serve_hpsv3_video as service
+    from visual_rl.core.protocols.flash_hpsv3 import canonical_json, validate_health, validate_score, aggregate_frame_scores
+    from io import BytesIO
+    from PIL import Image
+    import base64, sys, types
+    hps_root = tmp_path / 'hps-residency'; hps_root.mkdir()
+    checkpoint, config = hps_root / 'tiny.safetensors', hps_root / 'config.json'
+    checkpoint.write_bytes(b'CPU inferencer leaf'); config.write_text('{}')
+    module_file = hps_root / '__init__.py'; module_file.write_text('# CPU-only HPS heavy-model leaf\n')
+    active, clock = [None], [0.]
+    class TinyHpsModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fp32 = torch.nn.Parameter(torch.tensor([.25], dtype=torch.float32))
+            self.fp16 = torch.nn.Parameter(torch.tensor([.5], dtype=torch.float16))
+            self.logical = 'cpu'; self.moves = []; self.fail_move = None
+        def parameters(self, recurse=True):
+            for p in super().parameters(recurse=recurse):
+                yield p if self.logical == 'cpu' else SimpleNamespace(
+                    device=torch.device('cuda:0'), dtype=p.dtype, requires_grad=p.requires_grad)
+        def buffers(self, recurse=True): return iter(())
+        def to(self, device):
+            assert device in ('cuda', 'cpu')  # no dtype/cast/batch/CPU inference fallback
+            self.moves.append(device)
+            if self.fail_move == device: raise RuntimeError('model transfer ' + device + ' failed')
+            self.logical = device
+            if device == 'cpu' and hasattr(self, 'controller'): self.controller.low_until_offload = False
+            return self
+    class InferencerLeaf:
+        def __init__(self, *, device, checkpoint_path, config_path):
+            assert device == 'cpu'
+            self.device = device; self.model = TinyHpsModel(); self.calls = []; self.failure = None
+            self.processor = SimpleNamespace(tokenizer=SimpleNamespace(
+                backend_tokenizer=SimpleNamespace(to_str=lambda: '{}'), special_tokens_map={}),
+                chat_template='test', image_processor=SimpleNamespace(to_dict=lambda: {'cpu_test': True}))
+            self.use_special_tokens = False; self.data_config = SimpleNamespace(test=True)
+        def reward(self, *, prompts, image_paths):
+            assert self.device == 'cuda' and len(prompts) == len(image_paths) == 1
+            assert torch.is_inference_mode_enabled() and not self.model.training
+            self.calls.append((prompts[0], image_paths[0].tobytes()))
+            if self.failure == 'reward': raise ValueError('original reward failed')
+            if self.failure == 'monitor':
+                assert self.model.controller.monitor_checked.wait(5)
+            if self.failure == 'margin': self.model.controller.free_gpu = 15.
+            if self.failure == 'runtime-telemetry': self.model.controller.bad_memory = True
+            value = float(image_paths[0].getpixel((0, 0))[0]) / 255
+            return (torch.tensor([[value]], dtype=torch.float32) + self.model.fp32 + self.model.fp16.float(),)
+    class CudaLeaf:
+        def __init__(self, backend):
+            self.backend = backend; self.free_cpu = 60.; self.free_gpu = 48.
+            self.low_until_offload = False; self.empty = 0; self.bad_memory = False
+            self.uuid = uuid; self.device = 0; self.monitor_error = False; self.monitor_checked = Event()
+        def memory(self):
+            if threading.current_thread().name == 'hps-request-memory' and self.monitor_error:
+                self.monitor_checked.set(); raise RuntimeError('monitor observation failed')
+            if self.bad_memory: return float('nan'), 64*1024**3
+            free = self.free_cpu if self.backend.inferencer.model.logical == 'cpu' else (
+                39. if self.low_until_offload else self.free_gpu)
+            return int(free*1024**3), 64*1024**3
+        def empty_cache(self): self.empty += 1
+    with monkeypatch.context() as hp:
+        hp.setenv('CUDA_VISIBLE_DEVICES', uuid)
+        hp.setenv('HF_HUB_OFFLINE', '1'); hp.setenv('TRANSFORMERS_OFFLINE', '1')
+        module = types.ModuleType('hpsv3'); module.__file__ = str(module_file)
+        module.HPSv3RewardInferencer = InferencerLeaf
+        hp.setitem(sys.modules, 'hpsv3', module)
+        read_text = Path.read_text
+        def host_memory(path, *args, **kwargs):
+            if path == Path('/proc/meminfo'): return 'MemAvailable: 104857600 kB\n'
+            return read_text(path, *args, **kwargs)
+        hp.setattr(Path, 'read_text', host_memory)
+        hp.setattr(service.time, 'monotonic', lambda: clock[0])
+        hp.setattr(torch.cuda, 'mem_get_info', lambda: active[0].cuda.memory())
+        hp.setattr(torch.cuda, 'current_device', lambda: active[0].cuda.device)
+        hp.setattr(torch.cuda, 'get_device_properties', lambda n: SimpleNamespace(uuid=active[0].cuda.uuid))
+        hp.setattr(torch.cuda, 'synchronize', lambda: None)
+        hp.setattr(torch.cuda, 'reset_peak_memory_stats', lambda: None)
+        hp.setattr(torch.cuda, 'max_memory_allocated', lambda: 1024**3)
+        hp.setattr(torch.cuda, 'empty_cache', lambda: active[0].cuda.empty_cache())
+        contract = VideoContract(124, 32, 32)
+        def new_backend(enabled):
+            clock[0] = 0.
+            backend = service.HpsBackend(checkpoint, config, contract, 40., gpu_resident=enabled,
+                                         resident_gpu_uuid=uuid if enabled else None)
+            backend.cuda = CudaLeaf(backend); backend.inferencer.model.controller = backend.cuda
+            active[0] = backend
+            return backend
+        jpeg_frames = []
+        for i in range(124):
+            stream = BytesIO(); Image.new('RGB', (32, 32), (i%31, 10, 20)).save(stream, format='JPEG')
+            jpeg_frames.append(base64.b64encode(stream.getvalue()).decode())
+        def post(backend, *, identity=None):
+            active[0] = backend
+            data = dict(protocol=service.PROTOCOL, protocol_version=service.VERSION,
+                service_identity=identity or backend.health['service_identity'], sample_id='sample',
+                prompt=' exact prompt ', jpeg_frames=jpeg_frames)
+            raw = canonical_json(data)
+            handler = object.__new__(service.make_handler(backend))
+            handler.path = '/score'; handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(raw))}
+            handler.rfile = BytesIO(raw); handler.wfile = BytesIO()
+            handler.connection = SimpleNamespace(settimeout=lambda seconds: None)
+            statuses = []
+            handler.send_response = statuses.append; handler.send_header = lambda *a: None
+            handler.end_headers = lambda: None
+            handler.do_POST()
+            return statuses[0], json.loads(handler.wfile.getvalue())
+        off = new_backend(False)
+        off_health = canonical_json(off.health)
+        expected_hash = service.loaded_tensor_sha(off.inferencer.model)
+        before = {n: p.clone() for n, p in off.inferencer.model.state_dict().items()}
+        rng = RankRNGSnapshot.capture_current(0)
+        status, serial1 = post(off); assert status == 200
+        status, serial2 = post(off); assert status == 200
+        assert off.inferencer.model.moves == ['cuda', 'cpu', 'cuda', 'cpu'] and off.cuda.empty == 2
+        assert off._onloads == off._offloads == 2 and len(off.inferencer.calls) == 248
+        assert canonical_json(off.health) == off_health
+        with hp.context() as idle_off:
+            idle_off.setattr(torch.cuda, 'mem_get_info', lambda: pytest.fail('off idle/close probed CUDA'))
+            off.idle_housekeeping(); off.close(); off.close()
+        warm = new_backend(True)
+        warm_health = canonical_json(warm.health)
+        status, resident1 = post(warm); assert status == 200
+        status, resident2 = post(warm); assert status == 200
+        assert warm.inferencer.model.moves == ['cuda'] and warm._hits == 1
+        assert warm._onloads == 1 and warm._offloads == 0 and warm.cuda.empty == 2
+        assert warm._onload_attempts == 1 and warm._offload_attempts == 0
+        assert len(warm.inferencer.calls) == 248 and warm.inferencer.calls == off.inferencer.calls
+        assert RankRNGSnapshot.capture_current(0) == rng
+        for response, backend in ((serial1, off), (serial2, off), (resident1, warm), (resident2, warm)):
+            score, indices = validate_score(response, sample_id='sample', identity=backend._health['service_identity'], contract=contract)
+            assert response['frame_scores'] == resident1['frame_scores']
+            import struct
+            assert b''.join(struct.pack('!f', x) for x in response['frame_scores']) == b''.join(
+                struct.pack('!f', x) for x in resident1['frame_scores'])
+            assert struct.pack('!f', score) == struct.pack('!f', resident1['video_score'])
+            assert (score, indices) == aggregate_frame_scores(resident1['frame_scores'], contract)
+        assert len(indices) == 37 and len(set(resident1['frame_scores'])) < 124  # includes ties
+        assert all(torch.equal(before[n], p) and before[n].dtype == p.dtype
+                   for n, p in warm.inferencer.model.state_dict().items())
+        assert warm.health['identity_facts']['loaded_model_state_sha256'] == expected_hash
+        assert warm.health['service_identity'] != off._health['service_identity']
+        validate_health(warm.health, warm.health['service_identity'], contract)
+        assert canonical_json(warm.health) == warm_health
+        assert post(warm, identity=off._health['service_identity'])[0] == 400
+        assert len(warm.inferencer.calls) == 248
+        # Actual server housekeeping hook on the current HTTP thread, fake clock.
+        server = object.__new__(service.HpsHTTPServer); server.backend = warm
+        clock[0] = 59.; server.service_actions(); assert warm._offloads == 0
+        warm._active = True; clock[0] = 70.; server.service_actions(); assert warm._offloads == 0
+        warm._active = False; clock[0] = 60.; server.service_actions()
+        assert warm._offloads == 1 and warm._location == 'cpu'
+        assert canonical_json(warm.health) == warm_health
+        warm.close(); warm.close(); assert warm._offloads == 1
+        # Expiry is rechecked at request entry even if an idle tick was missed.
+        expired = new_backend(True); assert post(expired)[0] == 200
+        clock[0] = 60.; assert post(expired)[0] == 200
+        assert expired.inferencer.model.moves == ['cuda', 'cpu', 'cuda']
+        expired.close(); assert expired.inferencer.model.moves[-1] == 'cpu'
+        # Low warm headroom first releases its real weights, then reads real free.
+        fallback = new_backend(True); assert post(fallback)[0] == 200
+        fallback.cuda.low_until_offload = True
+        assert post(fallback)[0] == 200
+        assert fallback.inferencer.model.moves == ['cuda', 'cpu', 'cuda']
+        assert len(fallback.inferencer.calls) == 248  # not a POST/inference retry
+        fallback.cuda.low_until_offload = True; fallback.cuda.free_cpu = 35.
+        assert post(fallback)[0] == 503 and len(fallback.inferencer.calls) == 248
+        assert fallback._location == 'cpu'; fallback.close()
+        cold = new_backend(True); cold.cuda.free_cpu = 39.
+        assert post(cold)[0] == 503 and not cold.inferencer.calls and not cold.inferencer.model.moves
+        cold.close()
+        low_idle = new_backend(True); assert post(low_idle)[0] == 200
+        low_idle.cuda.low_until_offload = True
+        server.backend = low_idle; server.service_actions()
+        assert low_idle._location == 'cpu' and low_idle._offloads == 1
+        low_idle.close()
+        # Identity declaration/observation errors poison; future health/POST must
+        # not claim ready or reuse an unknown GPU position.
+        for problem in ('uuid', 'current', 'cvd', 'telemetry', 'stringable'):
+            backend = new_backend(True)
+            if problem == 'uuid': backend.cuda.uuid = 'GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab'
+            if problem == 'current': backend.cuda.device = 1
+            if problem == 'telemetry': backend.cuda.bad_memory = True
+            if problem == 'stringable':
+                class UUIDStringable:
+                    def __str__(self): return uuid
+                backend.cuda.uuid = UUIDStringable()
+            with hp.context() as env:
+                if problem == 'cvd': env.setenv('CUDA_VISIBLE_DEVICES', '0')
+                assert post(backend)[0] == 500
+                assert not backend.ready and not backend.inferencer.calls
+                assert post(backend)[0] == 503
+                handler = object.__new__(service.make_handler(backend)); handler.path = '/healthz'
+                replies = []; handler.reply = lambda status, data: replies.append((status, data))
+                handler.do_GET(); assert replies[0][0] == 503 and replies[0][1]['status'] == 'unready'
+                with pytest.raises(ValueError, match='unready'):
+                    validate_health(backend.health, backend.health['service_identity'], contract)
+                backend.close()
+        for lifecycle in ('warm', 'idle', 'close'):
+            backend = new_backend(True); assert post(backend)[0] == 200
+            backend.cuda.uuid = 'GPU-4a964c9b-4342-56a1-e7d7-84067d4a83ab'
+            if lifecycle == 'warm': assert post(backend)[0] == 500
+            else:
+                clock[0] = 61.
+                with pytest.raises(ValueError, match='UUID'):
+                    backend.idle_housekeeping() if lifecycle == 'idle' else backend.close()
+            assert not backend.ready and backend.inferencer.model.moves == ['cuda']
+            assert post(backend)[0] == 503  # no wrong-device transfer or reuse
+            if not backend._closed:
+                with pytest.raises(RuntimeError, match='release failed'): backend.close()
+            backend.close()
+        # Known PyTorch CUuuid representation is normalized, but arbitrary
+        # stringable observations above were rejected.
+        class KnownCUuuid:
+            def __str__(self): return uuid.removeprefix('GPU-')
+        with hp.context() as observation:
+            observation.setattr(torch._C, '_CUuuid', KnownCUuuid, raising=False)
+            backend = new_backend(True); backend.cuda.uuid = KnownCUuuid()
+            assert post(backend)[0] == 200
+            backend.close()
+        # All request failure paths stop/join the actual monitor. Model transfers
+        # are observable CPU leaves; failed .to(cpu) is never blindly replayed.
+        for failure in ('reward', 'onload', 'offload', 'both', 'margin', 'monitor', 'runtime-telemetry', 'journal'):
+            backend = new_backend(True)
+            if failure in ('reward', 'both'): backend.inferencer.failure = 'reward'
+            if failure == 'onload': backend.inferencer.model.fail_move = 'cuda'
+            if failure in ('offload', 'both'): backend.inferencer.model.fail_move = 'cpu'
+            if failure == 'offload': backend.cuda.free_gpu = 39.
+            if failure in ('margin', 'runtime-telemetry'): backend.inferencer.failure = failure
+            if failure == 'monitor':
+                backend.cuda.monitor_error = True; backend.inferencer.failure = 'monitor'
+            images = [Image.new('RGB', (32, 32)) for _ in range(124)]
+            with hp.context() as journal_fault:
+                if failure == 'journal':
+                    assert post(backend)[0] == 200  # warm before logger fails at score scope entry
+                    @contextmanager
+                    def broken_span(*args, **kwargs):
+                        raise OSError('journal failed')
+                        yield
+                    journal_fault.setattr(memory, 'span', broken_span)
+                with pytest.raises((RuntimeError, ValueError, BlockingIOError, OSError)) as error:
+                    backend.score('failure', 'prompt', images)
+            if failure == 'both':
+                assert isinstance(error.value, ValueError) and 'original reward' in str(error.value)
+                assert any('cpu failed' in note for note in error.value.__notes__)
+            if failure == 'journal': assert 'journal failed' in str(error.value)
+            assert not backend.ready and not backend._active
+            assert not any(t.name == 'hps-request-memory' for t in threading.enumerate())
+            assert post(backend)[0] == 503
+            moves = list(backend.inferencer.model.moves)
+            if backend._release_failed:
+                with pytest.raises(RuntimeError, match='release failed'): backend.close()
+                assert backend.inferencer.model.moves == moves
+            else: backend.close()
+            backend.close()
+        for business_failure in (False, True):
+            backend = new_backend(True)
+            assert post(backend)[0] == 200
+            empty_before = backend.cuda.empty
+            with hp.context() as logging_fault:
+                original_event = memory.event
+                def event(kind, **fields):
+                    if kind == 'empty_cache_before': raise OSError('cache journal failed')
+                    return original_event(kind, **fields)
+                logging_fault.setattr(memory, 'event', event)
+                if business_failure:
+                    backend.inferencer.failure = 'reward'
+                    with pytest.raises(ValueError, match='original reward') as primary:
+                        backend.score('failure', 'prompt', [Image.new('RGB', (32, 32))]*124)
+                    assert any('cache journal failed' in note for note in primary.value.__notes__)
+                else:
+                    with pytest.raises(OSError, match='cache journal failed'): backend.close()
+            assert backend.cuda.empty == empty_before + 1 and backend._location == 'cpu'
+            assert not backend.ready and not any(t.name == 'hps-request-memory' for t in threading.enumerate())
+            backend.close()
+        for context in ('idle', 'close'):
+            backend = new_backend(True); assert post(backend)[0] == 200
+            backend.inferencer.model.fail_move = 'cpu'; clock[0] = 61.
+            with pytest.raises(RuntimeError, match='cpu failed'):
+                backend.idle_housekeeping() if context == 'idle' else backend.close()
+            assert not backend.ready and backend._release_failed
+            assert backend.inferencer.model.moves == ['cuda', 'cpu']
+            if context == 'idle':
+                with pytest.raises(RuntimeError, match='release failed'): backend.close()
+            backend.close()
+        # Original client acquisition rejects a new policy identity when its
+        # immutable artifact expects another one; no validator code changed.
+        scorer, transport, _ = _scorer(tmp_path / 'hps-policy-mismatch', hp, contract)
+        transport.health = warm._health
+        with pytest.raises(ValueError, match='identity'): scorer.acquire()
+        assert not any(t.name == 'hps-request-memory' for t in threading.enumerate())
+
+        # CLI checks run before heavy loading/socket; main finally/idle wiring
+        # is exercised with explicit fake server/backend, never a listening port.
+        for argv in (['--help'], ['--checkpoint', str(checkpoint), '--config', str(config),
+            '--artifact-output', str(hps_root/'unused'), '--gpu-resident'],
+            ['--checkpoint', str(checkpoint), '--config', str(config), '--artifact-output', str(hps_root/'unused'),
+             '--resident-gpu-uuid', uuid],
+            ['--checkpoint', str(checkpoint), '--config', str(config), '--artifact-output', str(hps_root/'unused'),
+             '--min-free-gib', '39']):
+            with hp.context() as cli:
+                cli.setattr(service, 'HpsBackend', lambda *a, **kw: pytest.fail('invalid/help CLI loaded model'))
+                cli.setattr(sys, 'argv', ['serve_hpsv3_video', *argv])
+                with pytest.raises(SystemExit): service.main()
+        with hp.context() as cli:
+            cli.setenv('CUDA_VISIBLE_DEVICES', '0')
+            cli.setattr(service, 'HpsBackend', lambda *a, **kw: pytest.fail('wrong CVD reached heavy loading'))
+            cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                '--artifact-output', str(hps_root/'unused'), '--gpu-resident', '--resident-gpu-uuid', uuid])
+            with pytest.raises(SystemExit): service.main()
+        for bad in (None, 1, 'yes'):
+            with pytest.raises(TypeError, match='bool'): service.residency_policy(bad)
+        for bad_uuid in ('0', uuid.removeprefix('GPU-'), 'GPU-00000000-0000-0000-0000-000000000000'):
+            with pytest.raises((ValueError, RuntimeError)): service.residency_policy(True, bad_uuid)
+        lifecycle_events = []
+        close_failure = False
+        idle_failure = False
+        idle_action = service.HpsHTTPServer.service_actions
+        class BackendLeaf:
+            def __init__(self, *args, **kwargs):
+                assert kwargs == dict(gpu_resident=True, resident_gpu_uuid=uuid)
+                lifecycle_events.append('construct'); self.health = warm._health
+            def idle_housekeeping(self):
+                lifecycle_events.append('idle')
+                if idle_failure: raise RuntimeError('main idle failed')
+            def close(self):
+                lifecycle_events.append('backend-close')
+                if close_failure: raise OSError('backend close failed')
+        class ServerLeaf:
+            def __init__(self, *args): lifecycle_events.append('socket-leaf')
+            def serve_forever(self, *, poll_interval):
+                assert poll_interval == .5
+                idle_action(self); raise KeyboardInterrupt('fake loop exit')
+            def server_close(self):
+                lifecycle_events.append('server-close')
+                if close_failure: raise OSError('server close failed')
+        with hp.context() as cli:
+            cli.setattr(service, 'HpsBackend', BackendLeaf); cli.setattr(service, 'HpsHTTPServer', ServerLeaf)
+            artifact = hps_root / 'new-manifest.json'
+            cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                '--artifact-output', str(artifact), '--gpu-resident', '--resident-gpu-uuid', uuid])
+            with pytest.raises(KeyboardInterrupt, match='fake loop exit'): service.main()
+            assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
+            artifact.write_text('old manifest preserved')
+            lifecycle_events.clear()
+            with pytest.raises(ValueError, match='refusing to overwrite'): service.main()
+            assert artifact.read_text() == 'old manifest preserved'
+            assert lifecycle_events == ['construct', 'socket-leaf', 'server-close', 'backend-close']
+            cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                '--artifact-output', str(hps_root / 'cleanup-manifest'), '--gpu-resident', '--resident-gpu-uuid', uuid])
+            lifecycle_events.clear(); close_failure = True
+            with pytest.raises(KeyboardInterrupt, match='fake loop exit') as primary:
+                service.main()
+            assert len(primary.value.__notes__) == 2
+            assert lifecycle_events[-2:] == ['server-close', 'backend-close']
+            lifecycle_events.clear(); close_failure = False; idle_failure = True
+            with pytest.raises(RuntimeError, match='main idle failed'): service.main()
+            assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
