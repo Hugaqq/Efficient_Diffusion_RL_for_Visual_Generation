@@ -52,7 +52,7 @@ class H3CodeUpgrade:
     def __init__(self,*,root,legacy_root,expected_sha):
         self.root=Path(root).resolve();self.legacy_root=Path(legacy_root).resolve()
         self.proof=prove(self.root,expected_sha)
-        if git(self.legacy_root,'rev-parse','HEAD')!=BASE_GIT_SHA or git(self.legacy_root,'status','--porcelain'):
+        if git(self.legacy_root,'rev-parse','HEAD') not in (BASE_SHA,BASE_GIT_SHA) or git(self.legacy_root,'status','--porcelain'):
             raise ValueError('legacy source must be the clean actual base checkout')
         from visual_rl.composition.preflight.artifacts import _hash_artifact
         self.legacy_code=_hash_artifact(self.legacy_root/'visual_rl',content_policy='python-code.v1')

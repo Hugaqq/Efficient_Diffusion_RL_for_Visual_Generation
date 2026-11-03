@@ -139,7 +139,11 @@ def test_h3_git_proofs_use_only_rewritten_base(monkeypatch, kind, failure):
 
 @pytest.mark.parametrize("legacy_head,code_hash,valid", [
     (upgrade.BASE_GIT_SHA, upgrade.OLD_CODE, True),
-    (H3_RECORDED_SHA, upgrade.OLD_CODE, False),
+    # An existing host checkout still on the pre-rewrite history reports the
+    # recorded SHA; it is admitted only together with the unchanged content hash.
+    (H3_RECORDED_SHA, upgrade.OLD_CODE, True),
+    (H3_RECORDED_SHA, "changed-code", False),
+    ("a" * 40, upgrade.OLD_CODE, False),
     (upgrade.BASE_GIT_SHA, "changed-code", False),
 ])
 def test_legacy_checkout_uses_new_git_pin_but_old_content_hash(
