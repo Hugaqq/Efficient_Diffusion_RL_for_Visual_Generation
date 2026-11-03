@@ -85,6 +85,12 @@ class H3Training:
     num_steps: int = 10
     algorithm: str = "cps"
     group_layout: str = "rank_local"
+    # S1 (opt-in, launcher/CLI only; never a YAML override): the four local
+    # paired_4x8 samples share one batched no-grad rollout forward per step.
+    # Batched bf16 GEMMs are not bitwise equal to B=1 forwards, so B=4 is a
+    # different run identity (payload below) and declares its replay tolerance.
+    rollout_batch: int = 1
+    rollout_batch_replay_tolerance: float = 1e-4
 
     @property
     def local_samples(self):
@@ -109,6 +115,15 @@ class H3Training:
             raise ValueError('Flash first-five window requires more than five total transitions')
         if self.algorithm != "cps" and self.num_steps < 2:
             raise ValueError("dual Flow-SDE requires at least two transitions")
+        if type(self.rollout_batch) is not int or self.rollout_batch not in (1, 4):
+            raise ValueError("rollout_batch must be the integer 1 or 4")
+        if self.rollout_batch == 4 and (self.algorithm != 'dual_flash' or self.group_layout != 'paired_4x8'):
+            raise ValueError("rollout_batch 4 requires paired_4x8 dual_flash")
+        tolerance = self.rollout_batch_replay_tolerance
+        if type(tolerance) is not float or not math.isfinite(tolerance) or not 0 < tolerance <= 1e-2:
+            raise ValueError("rollout_batch_replay_tolerance must be a float in (0, 1e-2]")
+        if self.rollout_batch == 1 and tolerance != 1e-4:
+            raise ValueError("a replay tolerance other than 1e-4 is only declared for batched rollout")
 
     def payload(self):
         from visual_rl.data import h3_source
@@ -140,6 +155,12 @@ class H3Training:
             from visual_rl.algorithms.trainer.h3_dual_rollout import SELECTION_VERSION, FLASH_WINDOW_SIZE
             result.update(selection=SELECTION_VERSION,stochastic_window_size=FLASH_WINDOW_SIZE,
                           stochastic_indices=tuple(range(FLASH_WINDOW_SIZE)),terminal_stochastic=False)
+        if self.rollout_batch != 1:
+            # Keys exist only for B=4, so the default semantic identity is unchanged.
+            # microbatch=1 above stays true: anchor/current forwards remain B=1.
+            from visual_rl.algorithms.trainer.h3_dual_rollout import ROLLOUT_BATCH_VERSION
+            result.update(rollout_microbatch=self.rollout_batch, rollout_batch=ROLLOUT_BATCH_VERSION,
+                          rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance)
         return result
 
 

@@ -210,7 +210,7 @@ class RolloutCellProfile:
         return receipt_sha
 
     @contextmanager
-    def cell(self, *, optimizer_step, row, index, sample_id, selected_index, gate):
+    def cell(self, *, optimizer_step, row, index, sample_id, selected_index, gate, batch_sample_ids=None):
         if (optimizer_step, row, index) != (TARGET['optimizer_step'], TARGET['row'], TARGET['index']):
             yield
             return
@@ -226,6 +226,9 @@ class RolloutCellProfile:
             if (not isinstance(sample_id, str) or not sample_id or len(sample_id.encode()) > 256
                     or type(selected_index) is not int or not 0 <= selected_index < 5):
                 raise ValueError('bounded sample identity and selected first-window index required')
+            if batch_sample_ids is not None and (type(batch_sample_ids) is not tuple or len(batch_sample_ids) < 2
+                    or sample_id not in batch_sample_ids or any(type(s) is not str or not s for s in batch_sample_ids)):
+                raise ValueError('batched profile cell requires the tuple of batched sample identities')
             profiler = _new_profiler()
             profiler.start()
             started = True
@@ -254,6 +257,8 @@ class RolloutCellProfile:
             wall = time.monotonic() - start
             metadata = dict(optimizer_step=optimizer_step, row=row, index=index,
                             sample_id=sample_id, selected_index=selected_index)
+            if batch_sample_ids is not None:  # S1: the traced cell is ONE batched forward over these rows
+                metadata.update(rollout_batch=len(batch_sample_ids), sample_ids=list(batch_sample_ids))
             self.receipt_sha = self._gate(gate, 'publish', lambda: file_phase(
                 lambda: self._publish(profiler, metadata, wall, counts), rank=self.rank,
                 group=self.process_group, label='rollout-profile-export'))

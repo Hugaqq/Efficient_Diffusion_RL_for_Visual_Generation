@@ -91,6 +91,8 @@ class H3IterationStages:
     predict(prepared, *, sample_id, x, index, condition, dynamics) uses the sole
     prepared model. decode(terminal) returns a single-sample media lease.
     """
+    rollout_batch = 1  # S1 opt-in lives only in the dual stages; B1 admission is unchanged
+
     def __init__(self, *, data, prepared, predict, decode, score_one,
                  coordination_factory, process_group, rank: int, device,
                  read_behavior_id):
@@ -208,7 +210,8 @@ class H3IterationStages:
                                  group_layout=request.group_layout)
             except Exception:
                 local_error = True
-            plan = admit_h3_world(process_group=self.process_group, **admission, local_error=local_error)
+            batched = {} if self.rollout_batch == 1 else dict(rollout_microbatch=self.rollout_batch)
+            plan = admit_h3_world(process_group=self.process_group, **admission, **batched, local_error=local_error)
             if local_error:
                 raise RuntimeError("world admission accepted an invalid local request")
             coordinator = self.coordination_factory(plan)

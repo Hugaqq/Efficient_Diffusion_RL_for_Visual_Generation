@@ -39,7 +39,8 @@ from visual_rl.algorithms.trainer.interface import StageValue
 class H3DualIterationStages(H3IterationStages):
     def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
                  rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None,
-                 reuse_rollout_anchor=False, **kwargs):
+                 reuse_rollout_anchor=False, rollout_batch=1, rollout_batch_replay_tolerance=1e-4,
+                 predict_batch=None, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -57,6 +58,25 @@ class H3DualIterationStages(H3IterationStages):
         if reuse_rollout_anchor and mode!='dual_flash':
             raise ValueError('rollout anchor reuse requires dual_flash (flow records store no old score)')
         self.reuse_rollout_anchor=reuse_rollout_anchor
+        # S1 (opt-in): one batched no-grad rollout forward for the four paired local samples.
+        import math
+        if type(rollout_batch) is not int or rollout_batch not in (1,4):
+            raise ValueError('rollout_batch must be the integer 1 or 4')
+        if (type(rollout_batch_replay_tolerance) is not float or not math.isfinite(rollout_batch_replay_tolerance)
+                or not 0 < rollout_batch_replay_tolerance <= 1e-2):
+            raise ValueError('rollout_batch_replay_tolerance must be a float in (0, 1e-2]')
+        if rollout_batch==4:
+            if mode!='dual_flash':
+                raise ValueError('batched rollout requires dual_flash')
+            if reuse_rollout_anchor:
+                raise ValueError('batched rollout requires the B=1 anchor forward; rollout anchor reuse is rejected')
+            if not callable(predict_batch):
+                raise ValueError('batched rollout requires a batch predict capability')
+        elif predict_batch is not None or rollout_batch_replay_tolerance!=1e-4:
+            raise ValueError('batch predict/replay tolerance are only declared for batched rollout')
+        self.rollout_batch,self.rollout_batch_replay_tolerance=rollout_batch,rollout_batch_replay_tolerance
+        self.predict_batch=predict_batch
+        self.rollout_batch_selfcheck=None  # S1: mandatory once-per-run row-mapping check receipt
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -76,10 +96,39 @@ class H3DualIterationStages(H3IterationStages):
         ctx.dual_terminals=None
         return value
 
+    def _predict_batch(self, ctx, sids, x, index):
+        return self.predict_batch(self.prepared, sample_ids=sids, x=x, index=index,
+            conditions=tuple(ctx.request.conditions[sid] for sid in sids), dynamics=ctx.request.dynamics)
+
+    def _rollout_batch_admission(self, ctx, index):
+        from visual_rl.algorithms.trainer.h3_dual_rollout import rollout_batch_admission
+        receipt=rollout_batch_admission(self.device,batch=self.rollout_batch,layout=ctx.dual.layout)
+        print(json.dumps(dict(event='h3_rollout_batch_admission',optimizer_step=ctx.request.identity.optimizer_step,
+                              transition_index=index,**receipt)),flush=True)
+        return receipt
+
     @_timed
     def rollout(self, value):
         ctx=self._context(value);r=ctx.request;c=ctx.coordinator
         _checked(c,'dual/rollout/prepare',self.prepared.prepared_root.eval)
+        batched={}
+        if self.rollout_batch!=1:
+            # Admission already exchanged B4; this gate also pins the declared tolerance.
+            c.gate(f'dual/rollout-batch/{self.rollout_batch}/{self.rollout_batch_replay_tolerance!r}')
+            if self.rollout_batch_selfcheck is None:
+                from visual_rl.algorithms.trainer.h3_dual_rollout import rollout_batch_selfcheck
+                receipt=rollout_batch_selfcheck(samples=tuple((sid,gid) for sid,gid,_ in r.samples),
+                    initial_states=r.initial_states,device=self.device,
+                    predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
+                    predict_batch=lambda sids,x,index:self._predict_batch(ctx,sids,x,index),
+                    admit=lambda index:self._rollout_batch_admission(ctx,index),
+                    gate=lambda event,**kw:c.gate('dual/'+event,**kw))
+                print(json.dumps(dict(event='h3_rollout_batch_selfcheck',
+                    optimizer_step=r.identity.optimizer_step,**receipt)),flush=True)
+                self.rollout_batch_selfcheck=receipt
+            batched=dict(rollout_batch=self.rollout_batch,
+                         predict_batch=lambda sids,x,index:self._predict_batch(ctx,sids,x,index),
+                         admit=lambda index:self._rollout_batch_admission(ctx,index))
         records,terminals,selected=collect(dynamics=ctx.dual,
             samples=tuple((sid,gid) for sid,gid,_ in r.samples),initial_states=r.initial_states,
             generators=r.generators,mode=('flow' if self.mode=='dual_flow' else 'flash'),
@@ -87,7 +136,7 @@ class H3DualIterationStages(H3IterationStages):
             predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/rollout/version'),
             behavior_id=r.behavior_id,gate=lambda event,**kw:c.gate('dual/'+event,**kw),
-            cell_scope=self.rollout_cell_scope)
+            cell_scope=self.rollout_cell_scope,**batched)
         ctx.dual_records,ctx.dual_terminals,ctx.dual_selection=records,terminals,selected
         c.gate('dual/rollout/complete')
         return StageValue(value.identity,ctx)
@@ -168,8 +217,9 @@ class H3DualIterationStages(H3IterationStages):
         keys=tuple((record.sample_id,record.index) for record in records)
         # Every rank must agree whether the anchor forward is skipped (off: 4 no-grad forwards/rank).
         c.gate(f'dual/anchor/reuse/{int(self.reuse_rollout_anchor)}')
+        replay={} if self.rollout_batch==1 else dict(batched_rollout_tolerance=self.rollout_batch_replay_tolerance)
         anchor=_checked(c,'dual/anchor/prepare',lambda:H3DualReplayAnchor(dynamics=ctx.dual,
-            behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells,reuse_rollout=self.reuse_rollout_anchor))
+            behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells,reuse_rollout=self.reuse_rollout_anchor,**replay))
         _checked(c,'dual/anchor/records',lambda:anchor.validate_records(records))
         anchor.capture(records,device=self.device,predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/anchor/version'),gate=lambda event,**kw:c.gate('dual/'+event,**kw))

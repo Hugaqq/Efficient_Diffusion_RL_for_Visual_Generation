@@ -382,6 +382,29 @@ class H3RuntimeBinding:
         with self.scope(mode):
             return self.adapter.predict(model_input).value
 
+    def predict_batch(self, prepared, *, sample_ids, x, index, conditions, dynamics):
+        """Opt-in S1 rollout: per-sample checks of ``predict``, then ONE no-grad forward."""
+        if prepared is not self.prepared or dynamics != self.dynamics:
+            raise ValueError("prediction uses foreign prepared/dynamics binding")
+        if (type(sample_ids) is not tuple or len(sample_ids) < 2 or len(set(sample_ids)) != len(sample_ids)
+                or type(conditions) is not tuple or len(conditions) != len(sample_ids)):
+            raise ValueError("batched prediction requires distinct sample IDs with one condition each")
+        if torch.is_grad_enabled():
+            raise ValueError("batched prediction is no-grad rollout only")
+        if not isinstance(x, torch.Tensor) or x.ndim != 2 or x.shape[0] != len(sample_ids):
+            raise ValueError("batched state must be [B,packed] with one row per sample")
+        vs, _, aus, _ = dynamics.schedule.transition(index)
+        inputs = []
+        for row, (sample_id, condition) in enumerate(zip(sample_ids, conditions)):
+            typed = self.source.conditioning_for(sample_id)
+            if typed.cache_identity != self.facts.cache_identity or not torch.equal(condition, typed.embeddings):
+                raise ValueError("prediction condition differs from source/cache identity")
+            spec = self.adapter.latent_spec_for_batch(H3PromptInput(typed.prompt), device=x.device, dtype=x.dtype)
+            inputs.append(H3ModelInput(x[row:row+1], vs.to(x.device), typed, None, spec, typed.condition_identity,
+                                       (H3_GUIDANCE_ID,), audio_sigma=aus.to(x.device)))
+        with self.scope(ExecutionMode.ROLLOUT):
+            return self.adapter.predict_batch(tuple(inputs))
+
     def decode(self, terminal):
         if self._closed:
             raise RuntimeError("H3 binding closed")

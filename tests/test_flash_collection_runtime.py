@@ -1739,6 +1739,22 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         boundary(local,local_request.collection_id)
         restored = H3PromptSource(**args); restored.load_state_dict(state)
         _same_request(sources[0].reserve(1), restored.reserve(1))
+        # S1: the source binding declares the rollout microbatch, so a B4 source
+        # has a new data identity and refuses a B1 checkpoint; sample IDs, groups,
+        # prompts, initial latents and generator streams are unchanged.
+        batched_source = H3PromptSource(**(args | dict(rollout_microbatch=4)))
+        assert batched_source.data_identity != restored.data_identity
+        with pytest.raises(ValueError, match='identity'):
+            H3PromptSource(**(args | dict(rollout_microbatch=4))).load_state_dict(state)
+        plain_request, batched_request = H3PromptSource(**args).reserve(0), batched_source.reserve(0)
+        assert plain_request.samples == batched_request.samples and plain_request.prompts == batched_request.prompts
+        assert all(torch.equal(plain_request.initial_states[s], batched_request.initial_states[s]) for s in plain_request.prompts)
+        assert all(torch.equal(a.get_state(), b.get_state()) for s in plain_request.prompts
+                   for a, b in zip(plain_request.generators[s], batched_request.generators[s]))
+        for bad in (2, True):
+            with pytest.raises(ValueError, match='rollout microbatch'): H3PromptSource(**(args | dict(rollout_microbatch=bad)))
+        with pytest.raises(ValueError, match='rollout microbatch'):
+            H3PromptSource(**(args | dict(group_layout='rank_local', group_size=2, rollout_microbatch=4)))
         with pytest.raises(ValueError):
             H3PromptSource(**(args | dict(group_layout='rank_local',max_samples=8,max_cells=24,max_trajectory_bytes=24*(4*width+4)+16*width))).load_state_dict(state)
         manager.close()
@@ -2886,15 +2902,20 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     # on. Exactly 40 no-grad predicts per update pass for two updates (40, 80);
     # 44 with the flag on, or 40 with it off, is rejected by the same audit.
     import time
-    def audited_nograd_counts(*, reuse, nograd):
+    def audited_nograd_counts(*, reuse, nograd, batched=0, rollout_batch=1, selfcheck=False):
         model = torch.nn.Module()
         model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
         model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
         optimizer = torch.optim.AdamW([model.lora], lr=1e-4)
         prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
         stages = SimpleNamespace(predict=lambda **kw: model.lora*2, score_one=lambda **kw: 1.)
+        if batched: stages.predict_batch = lambda **kw: (model.lora*2,)*4  # S1 batched rollout leaf
         def tiny_iteration(step):
             optimizer.zero_grad(set_to_none=True)
+            for _ in range(batched + (1 if step == 0 and selfcheck else 0)):
+                with torch.no_grad(): stages.predict_batch(index=2)
+            for _ in range(4 if step == 0 and selfcheck else 0):  # S1 startup self-check B=1 forwards
+                with torch.no_grad(): stages.predict(index=0)
             for _ in range(nograd):
                 with torch.no_grad(): stages.predict(index=2)
             for _ in range(4):
@@ -2902,7 +2923,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             norm = float(model.lora.grad.norm()); optimizer.step(); optimizer.zero_grad(set_to_none=True)
             return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
         bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
-        root = tmp_path / f'o1-audit-{int(reuse)}-{nograd}'; monitor = root / 'monitor'; monitor.mkdir(parents=True)
+        root = tmp_path / f'o1-audit-{int(reuse)}-{nograd}-{batched}-{rollout_batch}-{int(selfcheck)}'; monitor = root / 'monitor'; monitor.mkdir(parents=True)
         (monitor / 'health.json').write_text(json.dumps(dict(healthy=True, monotonic_ns=time.monotonic_ns(), sample_count=2)))
         graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=0)),
                                 profile=SimpleNamespace(launch=SimpleNamespace(output_dir=root)))
@@ -2915,8 +2936,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 mp.setattr(two_update, '_exchange', lambda *a: [a[3]]*8)
                 backend = two_update.TwoUpdateBackend(args=SimpleNamespace(ffmpeg=Path('ffmpeg'), ffprobe=Path('ffprobe'),
                     expected_sha='test', monitor_dir=monitor, reward_pipeline=False, profile_rollout=False,
-                    reuse_video_vae=False, reuse_rollout_anchor=reuse, checkpoint_threads=1))
+                    reuse_video_vae=False, reuse_rollout_anchor=reuse, checkpoint_threads=1, rollout_batch=rollout_batch))
                 backend.bind(None, SimpleNamespace(rank=0, process_group=None), graph, prepared, None)
+                if batched:  # the audit wrapper counts each batched call once and is no-grad only
+                    with pytest.raises(RuntimeError, match='no-grad'): stages.predict_batch(index=2)
                 bound.trainer.run_iteration(0); bound.trainer.run_iteration(1)
                 assert len(backend.audits) == 2 and all(row['graph']['final_prediction_released'] for row in backend.audits)
                 assert len(backend.audits[-1]['graph']['grad_forward_indices']) == 8  # cumulative PredictAudit list
@@ -2929,6 +2952,14 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     for reuse, nograd in ((True, 44), (False, 40)):
         with pytest.raises(ValueError, match='graph/count/release audit'):
             audited_nograd_counts(reuse=reuse, nograd=nograd)
+    # S1: 10 batched rollout forwards + 4 B=1 anchor forwards = 14 per update
+    # through the same real audit wrapper; B1 constants reject 14, B4 rejects 44.
+    # Plus the mandatory once-per-run S1 row self-check (1 batched + 4 B=1): [19, 33].
+    assert audited_nograd_counts(reuse=False, nograd=4, batched=10, rollout_batch=4, selfcheck=True) == [19, 33]
+    for nograd, batched, rollout_batch, selfcheck in ((44, 0, 4, False), (40, 4, 4, False), (4, 10, 1, False),
+                                                      (4, 10, 4, False), (4, 10, 1, True)):
+        with pytest.raises(ValueError, match='graph/count/release audit'):
+            audited_nograd_counts(reuse=False, nograd=nograd, batched=batched, rollout_batch=rollout_batch, selfcheck=selfcheck)
     launcher_args = dict(reward_pipeline=True, profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1)
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).reward_pipeline is True
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(launcher_args, reward_pipeline=False))).reward_pipeline is False
@@ -2963,6 +2994,21 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         reuse_bound = reuse_backend.bind(None, runtime, graph, object(), None)
         assert reuse_bound.stages.reuse_rollout_anchor is True and reuse_bound.stages.reward_pipeline is True
         reuse_bound.close()
+        # S1 bind threading: B=4 stages get the binding's batch predict and the
+        # declared tolerance; the default bind passes neither (unchanged B1 stages).
+        batch_leaf = lambda *args, **kwargs: None
+        s1_bind = H3LifecycleBackend(rollout_batch=4, rollout_batch_replay_tolerance=1e-3)
+        s1_bind.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf,
+                                          predict_batch=batch_leaf)
+        s1_bind.transaction = object()
+        s1_graph = SimpleNamespace(source=source, profile=SimpleNamespace(training=SimpleNamespace(
+            algorithm='dual_flash', group_layout='paired_4x8', rollout_batch=4, rollout_batch_replay_tolerance=1e-3),
+            launch=graph.profile.launch))
+        s1_bound = s1_bind.bind(None, runtime, s1_graph, object(), None)
+        assert (s1_bound.stages.rollout_batch, s1_bound.stages.rollout_batch_replay_tolerance) == (4, 1e-3)
+        assert s1_bound.stages.predict_batch is batch_leaf and s1_bound.stages.reuse_rollout_anchor is False
+        s1_bound.close()
+        assert (bound.stages.rollout_batch, bound.stages.predict_batch) == (1, None)
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys
         patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--help'])
@@ -2991,10 +3037,12 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         patch.setattr(argparse.ArgumentParser, 'parse_args', spy_parse_args)
         required = ['launch_h3_resolution_memory', 'profile.yaml', '--expected-sha', 'x',
                     '--ffmpeg', 'f', '--ffprobe', 'p', '--monitor-dir', 'm']
-        for argv in (required, required + ['--checkpoint-threads', '4']):
+        for argv in (required, required + ['--checkpoint-threads', '4'],
+                     required + ['--rollout-batch', '4', '--rollout-batch-replay-tolerance', '1e-3']):
             patch.setattr(sys, 'argv', argv)
             with pytest.raises(SystemExit): two_update.main()
-        assert [row.checkpoint_threads for row in parsed] == [1, 4]
+        assert [row.checkpoint_threads for row in parsed] == [1, 4, 1]
+        assert [(row.rollout_batch, row.rollout_batch_replay_tolerance) for row in parsed] == [(1, 1e-4), (1, 1e-4), (4, 1e-3)]
     with monkeypatch.context() as patch:
         def no_memory(n): raise BlockingIOError('host pipeline budget insufficient')
         patch.setattr(h3_loading, '_admit_host_memory', no_memory)
@@ -3179,8 +3227,19 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             bounded.setattr(Path, 'read_bytes', lambda path: pytest.fail('unbounded profile read_bytes'))
             with rec.cell(**target): pass
             rec.assert_complete()
+        assert {'rollout_batch', 'sample_ids'}.isdisjoint(json.loads(rec.receipt.read_text())['actual'])
         rec.receipt.write_text('{}')
         with pytest.raises(ValueError, match='integrity'): rec.assert_complete()
+        # S1: a batched target cell names its batch and every traced sample.
+        rec = recorder('profile-batched-cell')
+        batch_ids = ('s0', target['sample_id'], 's2', 's3')
+        with rec.cell(**target, batch_sample_ids=batch_ids): pass
+        rec.assert_complete()
+        actual = json.loads(rec.receipt.read_text())['actual']
+        assert (actual['rollout_batch'], actual['sample_ids'], actual['row']) == (4, list(batch_ids), target['row'])
+        rec = recorder('profile-batched-bad')
+        with pytest.raises(ValueError, match='batched sample identities'):
+            with rec.cell(**target, batch_sample_ids=('s0', 's2')): pass
         # Only the main thread may enter the target; no body execution/replay.
         rec = recorder('profile-thread')
         errors = []
@@ -4040,7 +4099,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         def publish(self, step, tables): calls.append(('publish', step, len(tables)))
         def discard(self): calls.append(('discard',))
         def supersede(self, *, first_step, label): calls.append(('supersede', first_step)); return []
-    def tiny_backend(start_step, audit_weights, adam_step=0):
+    def tiny_backend(start_step, audit_weights, adam_step=0, rollout_batch=1):
         model = torch.nn.Module()
         model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
         model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
@@ -4051,10 +4110,18 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             optimizer.zero_grad(set_to_none=True)
         prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
         stages = SimpleNamespace(predict=lambda **kw: model.lora * 2, score_one=lambda **kw: 1.)
+        if rollout_batch == 4: stages.predict_batch = lambda **kw: (model.lora * 2,) * 4
+        selfcheck = [rollout_batch == 4]  # S1 row self-check: first rollout of THIS process only
         def tiny_iteration(step):
             if step == 7: raise RuntimeError('injected update failure')
             optimizer.zero_grad(set_to_none=True)
-            for _ in range(44):
+            if rollout_batch == 4:
+                for _ in range(10 + selfcheck[0]):
+                    with torch.no_grad(): stages.predict_batch(index=2)
+                for _ in range(4 + 4 * selfcheck[0]):
+                    with torch.no_grad(): stages.predict(index=0)
+                selfcheck[0] = False
+            for _ in range(44 if rollout_batch == 1 else 0):
                 with torch.no_grad(): stages.predict(index=2)
             for _ in range(4):
                 value = stages.predict(index=2); value.sum().backward(); del value
@@ -4062,10 +4129,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
         bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
         graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=start_step)),
-            profile=SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / f'formal-wrapper-{start_step}',
+            profile=SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / f'formal-wrapper-{start_step}-{rollout_batch}',
                 max_optimizer_steps=200, seed=42), expected={'model_sha256': 'm'}))
         graph.profile.launch.output_dir.mkdir(exist_ok=True)
-        options = dict(vars(args), monitor_dir=health_dir, audit_weights=audit_weights)
+        options = dict(vars(args), monitor_dir=health_dir, audit_weights=audit_weights, rollout_batch=rollout_batch)
         backend = formal.FormalBackend(args=SimpleNamespace(**options), manifest=dict(launch_stamp='t'))
         backend.start_step = start_step
         bound_holder[0] = bound
@@ -4098,6 +4165,13 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         calls.clear()
         with pytest.raises(RuntimeError, match='injected'): resumed_bound.trainer.run_iteration(7)
         assert calls == [('discard',)]  # failed update: staging removed, error re-raised
+        # S1 x resume: no-grad audit = (10 batched + 4 anchor) x updates of THIS process
+        # + 5 once-per-process self-check forwards: 14*(step+1-first_step)+5 -> [19, 33], not 14*(step+1)+5.
+        s1_resumed, s1_bound, _ = tiny_backend(5, False, adam_step=5, rollout_batch=4)
+        s1_bound.trainer.run_iteration(5); s1_bound.trainer.run_iteration(6)
+        assert [row['graph']['nograd_forwards'] for row in s1_resumed.audits] == [19, 33]
+        assert (s1_resumed.nograd_forwards_per_update, s1_resumed.nograd_forwards_once) == (14, 5)
+        calls.clear()
         mismatch, mismatch_bound, _ = tiny_backend(10, False, adam_step=9)
         with pytest.raises(ValueError, match='resume checkpoint'): mismatch_bound.trainer.run_iteration(10)
         fresh_wrong, fresh_wrong_bound, _ = tiny_backend(0, False, adam_step=1)
@@ -4157,3 +4231,366 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
                                  manifest=dict(launch_stamp='later', started_utc='y')).construct_graph(preflight, SimpleNamespace(rank=0))
         assert closed == [1]
+
+    # ---- S1: opt-in batched rollout of the four paired_4x8 local samples ----
+    # Default B=1 untouched; B=4 batches only the no-grad rollout transformer
+    # forward (10 instead of 40 calls/round), keeps per-sample RNG/records,
+    # is a different run identity, and is rejected with rollout-anchor reuse.
+    import importlib.util, io, contextlib, math
+    from dataclasses import replace as dc_replace
+    from types import SimpleNamespace
+    from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
+    from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+    from visual_rl.algorithms.optimization.h3_dual_anchor import H3DualReplayAnchor
+    from visual_rl.algorithms.trainer import h3_dual_rollout as s1_rollout
+    from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
+    from visual_rl.algorithms.trainer.interface import StageValue, IterationIdentity
+    from visual_rl.models.h3_joint import H3JointLayout
+    from visual_rl.models.implementations.h3_forward import h3_t2va_forward
+    from visual_rl.models.implementations.h3_geometry import H3T2VAGeometry
+    from visual_rl.runtime.h3_lifecycle import H3LifecycleBackend
+    from scripts import launch_h3_resolution_memory as two_update
+    # (1) Training contract/identity: B=4 adds payload keys only when enabled.
+    paired = H3Training(group_size=8, algorithm='dual_flash', group_layout='paired_4x8')
+    batched_training = dc_replace(paired, rollout_batch=4)
+    assert paired.rollout_batch == 1 and 'rollout_microbatch' not in paired.payload()
+    s1_payload = batched_training.payload()
+    assert {k: v for k, v in s1_payload.items() if k not in ('rollout_microbatch', 'rollout_batch',
+            'rollout_batch_replay_tolerance')} == paired.payload()
+    assert (s1_payload['rollout_microbatch'], s1_payload['rollout_batch'], s1_payload['rollout_batch_replay_tolerance'],
+            s1_payload['microbatch']) == (4, s1_rollout.ROLLOUT_BATCH_VERSION, 1e-4, 1)
+    assert dc_replace(batched_training, rollout_batch_replay_tolerance=1e-3).payload()['rollout_batch_replay_tolerance'] == 1e-3
+    for bad in (dict(rollout_batch=True), dict(rollout_batch=4.0), dict(rollout_batch='4'), dict(rollout_batch=2),
+                dict(rollout_batch_replay_tolerance=1), dict(rollout_batch_replay_tolerance=float('nan')),
+                dict(rollout_batch_replay_tolerance=.1), dict(rollout_batch_replay_tolerance=0.)):
+        with pytest.raises(ValueError): dc_replace(batched_training, **bad)
+    with pytest.raises(ValueError, match='only declared for batched'):
+        dc_replace(paired, rollout_batch_replay_tolerance=1e-3)
+    for algorithm, layout in (('dual_flash', 'rank_local'), ('dual_flow', 'rank_local'), ('cps', 'rank_local')):
+        with pytest.raises(ValueError, match='paired_4x8 dual_flash'):
+            H3Training(algorithm=algorithm, group_layout=layout, rollout_batch=4)
+    # Real compiler + preflight: the backend records B=4 in the semantic ID
+    # (owner/resume admission and checkpoint contract math), default does not.
+    from tests.test_h3_mvp_cpu_profile import _fixture as s1_profile_fixture, _save as s1_save_profile
+    from visual_rl.composition.config.h3_profile import compile_h3_profile, preflight_h3_profile
+    s1_profile_path, s1_raw = s1_profile_fixture(tmp_path / 's1-profile')
+    s1_raw['overrides']['training'] = dict(group_size=8, num_steps=10, algorithm='dual_flash', group_layout='paired_4x8')
+    s1_profile_path = s1_save_profile(s1_profile_path.parent, s1_raw)
+    plain = compile_h3_profile(s1_profile_path)
+    assert H3LifecycleBackend().compile(s1_profile_path) == plain
+    batched_profile = H3LifecycleBackend(rollout_batch=4).compile(s1_profile_path)
+    assert batched_profile.training == batched_training and batched_profile.launch == plain.launch
+    plain_facts, batched_facts = preflight_h3_profile(plain), preflight_h3_profile(batched_profile)
+    assert plain_facts.semantic_id != batched_facts.semantic_id
+    assert batched_facts.semantic_payload['math']['rollout_microbatch'] == 4
+    assert 'rollout_microbatch' not in plain_facts.semantic_payload['math']
+    tolerant = preflight_h3_profile(H3LifecycleBackend(rollout_batch=4, rollout_batch_replay_tolerance=1e-3).compile(s1_profile_path))
+    assert tolerant.semantic_id not in (plain_facts.semantic_id, batched_facts.semantic_id)
+    # Backend/stage/CLI validation; B=4 + rollout-anchor reuse is rejected everywhere.
+    assert (H3LifecycleBackend().rollout_batch, H3LifecycleBackend().rollout_batch_replay_tolerance) == (1, 1e-4)
+    for bad in (True, 4.0, '4', 2, 0):
+        with pytest.raises(ValueError, match='1 or 4'): H3LifecycleBackend(rollout_batch=bad)
+        with pytest.raises(ValueError, match='1 or 4'): H3DualIterationStages(mode='dual_flash', seed=42, rollout_batch=bad)
+    for bad in (1, float('inf'), .5):
+        with pytest.raises(ValueError): H3LifecycleBackend(rollout_batch=4, rollout_batch_replay_tolerance=bad)
+    with pytest.raises(ValueError, match='only declared for batched'):
+        H3LifecycleBackend(rollout_batch_replay_tolerance=1e-3)
+    with pytest.raises(ValueError, match='anchor reuse is rejected'):
+        H3LifecycleBackend(rollout_batch=4, reuse_rollout_anchor=True)
+    with pytest.raises(ValueError, match='anchor reuse is rejected'):
+        H3DualIterationStages(mode='dual_flash', seed=42, rollout_batch=4, reuse_rollout_anchor=True, predict_batch=lambda **kw: None)
+    with pytest.raises(ValueError, match='batch predict'):
+        H3DualIterationStages(mode='dual_flash', seed=42, rollout_batch=4)
+    with pytest.raises(ValueError, match='dual_flash'):
+        H3DualIterationStages(mode='dual_flow', seed=42, rollout_batch=4, predict_batch=lambda **kw: None)
+    with pytest.raises(ValueError, match='only declared for batched'):
+        H3DualIterationStages(mode='dual_flash', seed=42, predict_batch=lambda **kw: None)
+    with pytest.raises(ValueError, match='compiled rollout batch'):
+        H3LifecycleBackend(rollout_batch=4)._check_reward_pipeline(SimpleNamespace(training=paired))
+    with pytest.raises(ValueError, match='compiled rollout batch'):
+        H3LifecycleBackend()._check_reward_pipeline(SimpleNamespace(training=batched_training))
+    s1_args = dict(reward_pipeline=False, profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1)
+    assert two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args)).nograd_forwards_per_update == 44
+    s1_backend = two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args, rollout_batch=4, rollout_batch_replay_tolerance=1e-3))
+    assert (s1_backend.rollout_batch, s1_backend.rollout_batch_replay_tolerance, s1_backend.nograd_forwards_per_update) == (4, 1e-3, 14)
+    assert (s1_backend.nograd_forwards_once, two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args)).nograd_forwards_once) == (5, 0)
+    with pytest.raises(ValueError, match='anchor reuse is rejected'):
+        two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(s1_args, reuse_rollout_anchor=True), rollout_batch=4))
+    # (2) World admission: B4 only for paired_4x8 and only if every rank agrees.
+    rank_rows = lambda r: [[f's{r}-{m}', f'g{r//2}', (r % 2)*4 + m] for m in range(4)]
+    s1_admission = dict(collection_id='c', behavior_id='b', samples=tuple(map(tuple, rank_rows(0))), group_size=8,
+                        num_steps=10, geometry_id='geo', schedule_id='sched', score_profile='score', group_layout='paired_4x8')
+    with monkeypatch.context() as patch:
+        patch.setattr(h3_world, '_world_rank', lambda group: 0)
+        tables = []
+        def s1_exchange(kind, rank, group, payload, valid):
+            if not valid: raise ValueError('H3 admission rejected local input')
+            tables.append(json.loads(json.dumps(payload)))  # transport round trip, as in _exchange
+            profiles = [tables[-1][0]]*8 if len(tables) % 2 else [tables[-1][0]]*7 + [tables[-2][0]]
+            return [[profile, rank_rows(r)] for r, profile in enumerate(profiles)]
+        patch.setattr(h3_world, '_exchange', s1_exchange)
+        b1 = h3_world.admit_h3_world(process_group=None, **s1_admission)  # odd call: all agree
+        with pytest.raises(ValueError, match='profile mismatch'):  # even call: rank7 still B1
+            h3_world.admit_h3_world(process_group=None, **s1_admission, rollout_microbatch=4)
+        b4 = h3_world.admit_h3_world(process_group=None, **s1_admission, rollout_microbatch=4)
+        assert b1 == b4 and tables[0][0][-1] == 'paired_4x8' and tables[2][0][-1] == 'rollout-microbatch-4'
+        for bad in (dict(rollout_microbatch=2), dict(rollout_microbatch=4, group_layout='rank_local',
+                    samples=tuple((f's{m}', 'g', m) for m in range(8)))):
+            tables.append(None)  # keep the odd/even agreement schedule aligned
+            with pytest.raises(ValueError, match='rejected local input'):
+                h3_world.admit_h3_world(process_group=None, **(s1_admission | bad))
+    # (3) Model port: one batched forward over one shared condition/sigma pair.
+    # Batch-invariant tiny forward -> bitwise; the real H3 transformer
+    # architecture (tiny fp32) -> per-item equal only to float tolerance.
+    geometry = H3T2VAGeometry(height=32, width=32, num_frames=124)
+    layout = geometry.joint_layout
+    states = [torch.randn(1, layout.packed_width, generator=torch.Generator().manual_seed(70+i)).half() for i in range(4)]
+    text = torch.randn(1, 3, 16, generator=torch.Generator().manual_seed(9))
+    sigmas = dict(video_sigma=torch.tensor(.7), audio_sigma=torch.tensor(.6))
+    seen = []
+    def invariant_forward(*, hidden_states, audio_hidden_states, encoder_hidden_states, timestep, timestep_indices, **attention):
+        seen.append((hidden_states.shape[0], encoder_hidden_states.shape, encoder_hidden_states.stride(0)))
+        assert timestep_indices.shape == attention['token_tags'].shape and attention['position_ids'].ndim == 2
+        context = encoder_hidden_states[:, :1, :1]  # per-item, no cross-item reduction
+        return (torch.sin(hidden_states.float()*1.3 + context) + timestep[0], audio_hidden_states.float().roll(1, dims=1) * context)
+    with torch.no_grad():
+        single = [h3_t2va_forward(invariant_forward, x=x, geometry=geometry, text_embeddings=text, **sigmas) for x in states]
+        stacked = h3_t2va_forward(invariant_forward, x=torch.cat(states), geometry=geometry, text_embeddings=text, batch_size=4, **sigmas)
+    assert all(torch.equal(stacked[i:i+1], single[i]) for i in range(4))
+    assert seen[-1][0] == 4 and seen[-1][1] == (4, 3, 16) and seen[-1][2] != 0  # owned replicated condition
+    with pytest.raises(ValueError, match='no-grad'):
+        h3_t2va_forward(invariant_forward, x=torch.cat(states), geometry=geometry, text_embeddings=text, batch_size=4, **sigmas)
+    with torch.no_grad(), pytest.raises(ValueError, match='declared batch'):
+        h3_t2va_forward(invariant_forward, x=torch.cat(states[:3]), geometry=geometry, text_embeddings=text, batch_size=4, **sigmas)
+    reference_path = Path(__file__).resolve().parents[1] / ('workflow-workspace/2026-10-27-h3-8gpu-mvp-dev-001/reference/'
+                                                           'UniRL/unirl/models/minimax_h3/vendor/transformer_minimax_h3.py')
+    try:  # the deployed diffusers module when present, else the tracked vendored reference
+        from diffusers.models.transformers import transformer_minimax_h3 as h3_reference
+    except ImportError:
+        spec = importlib.util.spec_from_file_location('s1_h3_reference', reference_path)
+        h3_reference = importlib.util.module_from_spec(spec); spec.loader.exec_module(h3_reference)
+    torch.manual_seed(0)
+    tiny_h3 = h3_reference.MiniMaxH3Transformer3DModel(num_attention_heads=2, attention_head_dim=96, hidden_size=32,
+        num_layers=2, num_refiner_layers=1, ffn_dim=48, text_dim=16, freq_dim=16, time_embed_hidden_dim=32,
+        time_embed_dim=16).float().eval()
+    with torch.no_grad():
+        real_single = [h3_t2va_forward(tiny_h3, x=x, geometry=geometry, text_embeddings=text, **sigmas) for x in states]
+        real_stacked = h3_t2va_forward(tiny_h3, x=torch.cat(states), geometry=geometry, text_embeddings=text, batch_size=4, **sigmas)
+    real_delta = max(float((real_stacked[i:i+1] - real_single[i]).abs().max()) for i in range(4))
+    assert real_delta <= 1e-5 and not torch.equal(real_single[0], real_single[1])
+    print(json.dumps(dict(event='s1_reference_cpu_fp32_batch_delta', max_abs=real_delta)))
+    # Real H3Adapter.predict_batch and H3RuntimeBinding.predict_batch on the tiny loaded adapter.
+    from tests.test_h3_mvp_cpu_adapter import _adapter as s1_adapter, _cpu_materialize_and_bind, _input as s1_input
+    from visual_rl.models.lifecycle.components import ComponentManager
+    from visual_rl.models.h3_interface import H3PromptInput, H3Generators
+    from visual_rl.models.interface import ModelPortError
+    from visual_rl.algorithms.dynamics.h3_cps import H3CPSDynamics
+    from visual_rl.runtime import h3_binding as s1_binding_module
+    with monkeypatch.context() as patch:
+        (tmp_path / 's1-adapter').mkdir()
+        from visual_rl.models.implementations import h3_loading as s1_loading
+        patch.setattr(s1_loading, '_admit_host_memory', lambda budget: None)  # 24 GiB host reserve is a GPU-host leaf
+        adapter, _, _ = s1_adapter(tmp_path / 's1-adapter', patch)
+        manager = ComponentManager(adapter, execution_device='cpu'); components = manager.load()
+        _cpu_materialize_and_bind(adapter, components)
+        condition = adapter.encode(H3PromptInput('cat'))
+        spec = adapter.latent_spec_for_batch(H3PromptInput('cat'), device='cpu', dtype=torch.float16)
+        latents = [adapter.prepare_latents(spec, generator=H3Generators(torch.Generator().manual_seed(2*i+1),
+                   torch.Generator().manual_seed(2*i+2))) for i in range(4)]
+        inputs = tuple(s1_input(adapter, condition, x=x) for x in latents)
+        with torch.no_grad():
+            port_single = [adapter.predict(item).value for item in inputs]
+            port_batched = adapter.predict_batch(inputs)
+        assert len(port_batched) == 4 and all(p.shape == item.latents.shape for p, item in zip(port_batched, inputs))
+        assert all(torch.allclose(a, b, rtol=0, atol=1e-5) for a, b in zip(port_batched, port_single))
+        with pytest.raises(ModelPortError, match='no-grad'): adapter.predict_batch(inputs)
+        with torch.no_grad():
+            with pytest.raises(TypeError, match='at least two'): adapter.predict_batch(inputs[:1])
+            with pytest.raises(ModelPortError, match='shared condition'):
+                adapter.predict_batch((inputs[0], dc_replace(inputs[1], timestep=torch.tensor(.7))))
+            other = adapter.encode(H3PromptInput(' cat'))
+            with pytest.raises(ModelPortError, match='shared condition'):
+                adapter.predict_batch((inputs[0], s1_input(adapter, other, x=latents[1])))
+        bind = object.__new__(s1_binding_module.H3RuntimeBinding)
+        bind.prepared = object(); bind.dynamics = H3CPSDynamics(layout, H3ScheduleSnapshot.build(10))
+        bind.adapter = adapter; bind.facts = SimpleNamespace(cache_identity=condition.cache_identity)
+        bind.source = SimpleNamespace(conditioning_for=lambda sid: condition)
+        bind.scope = lambda mode: contextlib.nullcontext()
+        ids = tuple(f'p{i}' for i in range(4)); conds = tuple(condition.embeddings for _ in ids)
+        with torch.no_grad():
+            via_binding = bind.predict_batch(bind.prepared, sample_ids=ids, x=torch.cat(latents), index=2,
+                                             conditions=conds, dynamics=bind.dynamics)
+            via_single = [bind.predict(bind.prepared, sample_id=sid, x=x, index=2, condition=c, dynamics=bind.dynamics)
+                          for sid, x, c in zip(ids, latents, conds)]
+            assert all(torch.allclose(a, b, rtol=0, atol=1e-5) for a, b in zip(via_binding, via_single))
+            for bad in (dict(sample_ids=ids[:3]), dict(sample_ids=('p0',)*4), dict(conditions=conds[:3]),
+                        dict(conditions=(torch.zeros_like(conds[0]),) + conds[1:])):
+                with pytest.raises(ValueError):
+                    bind.predict_batch(bind.prepared, **(dict(sample_ids=ids, x=torch.cat(latents), index=2,
+                                       conditions=conds, dynamics=bind.dynamics) | bad))
+        with pytest.raises(ValueError, match='no-grad'):
+            bind.predict_batch(bind.prepared, sample_ids=ids, x=torch.cat(latents), index=2, conditions=conds, dynamics=bind.dynamics)
+        adapter.close(); manager.close()
+    # (4) collect: identical records/terminals/choices with 10 instead of 40
+    # model calls; per-sample generators, selection and row order unchanged.
+    dual = H3DualFlowSDE(H3JointLayout(1, 2, 1, 3), H3ScheduleSnapshot.build(10))
+    ids = tuple(f'sample-{i}' for i in range(4))
+    initial = {sid: torch.randn(1, 5, generator=torch.Generator().manual_seed(40+i)).half() for i, sid in enumerate(ids)}
+    def generators():
+        return {sid: (torch.Generator().manual_seed(2*i), torch.Generator().manual_seed(2*i+1)) for i, sid in enumerate(ids)}
+    def invariant(x, index):  # elementwise/roll only: exactly batch-invariant on CPU fp32
+        return torch.sin(x.float()*1.7 + .1*index) * .5 + x.float().roll(1, dims=1) * .25
+    def run(batch, *, admit=None, groups=None):
+        calls, gates = [], []
+        def predict(sid, x, index):
+            assert not torch.is_grad_enabled() and x.shape[0] == 1; calls.append(('b1', sid, index)); return invariant(x, index)
+        def predict_batch(sids, x, index):
+            assert not torch.is_grad_enabled() and x.shape == (4, 5) and sids == ids
+            calls.append(('b4', sids, index)); out = invariant(x, index); return tuple(out[i:i+1] for i in range(4))
+        options = {} if batch == 1 else dict(rollout_batch=4, predict_batch=predict_batch,
+            admit=admit or (lambda index: s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout)))
+        result = s1_rollout.collect(dynamics=dual, samples=tuple(zip(ids, groups or ('g',)*4)), initial_states=initial,
+            generators=generators(), mode='flash', seed=42, optimizer_step=3, device='cpu', predict=predict,
+            read_behavior_id=lambda: 'behavior', behavior_id='behavior',
+            gate=lambda event, **kw: gates.append((event, kw.get('local_error'))), **options)
+        return result, calls, gates
+    (r1, t1, c1), calls1, gates1 = run(1)
+    (r4, t4, c4), calls4, gates4 = run(4)
+    assert [c[0] for c in calls1] == ['b1']*40 and [c[0] for c in calls4] == ['b4']*10
+    assert [c[2] for c in calls4] == list(range(10))
+    assert c1 == c4 and len(set(c4.values())) == 1 and list(t1) == list(t4) == list(ids)
+    assert all(torch.equal(t1[s], t4[s]) for s in ids)
+    assert [(r.sample_id, r.index) for r in r1] == [(r.sample_id, r.index) for r in r4] and len(r4) == 4
+    assert all(torch.equal(a.x, b.x) and torch.equal(a.action, b.action) and torch.equal(a.old_joint, b.old_joint)
+               for a, b in zip(r1, r4))
+    assert [g for g in gates1 if 'prepare' in g[0]] == [g for g in gates4 if g[0].endswith('/prepare') and 'batch' not in g[0]]
+    assert sorted(g for g in gates1 if g[0].endswith('/result')) == sorted(g for g in gates4 if g[0].endswith('/result'))
+    assert [g for g in gates4 if g[0].startswith('rollout/batch/0/')] == [
+        ('rollout/batch/0/admission', False), ('rollout/batch/0/forward', None), ('rollout/batch/0/split', False)]
+    # Admission fails closed BEFORE the first batched forward (no B=1 fallback).
+    def refuse(index):
+        return s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32), free_bytes=15*1024**3)
+    with pytest.raises(RuntimeError, match='memory admission failed'):
+        run(4, admit=refuse)
+    receipt = s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32), free_bytes=17*1024**3)
+    assert receipt['checked'] and receipt['required_bytes'] == 16*1024**3 and 'warning' not in receipt
+    assert (receipt['driver_free_bytes'], receipt['reserved_unallocated_bytes']) == (17*1024**3, 0)
+    cached = s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32),
+                                                free_bytes=40*1024**3, driver_free_bytes=10*1024**3)
+    assert cached['reserved_unallocated_bytes'] == 30*1024**3 and 'driver-free below' in cached['warning']
+    with pytest.raises(ValueError, match='driver-free <= allocatable'):
+        s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32),
+                                           free_bytes=1, driver_free_bytes=2)
+    with pytest.raises(ValueError, match='no declared'):
+        s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout, free_bytes=10**12)
+    assert s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout)['checked'] is False
+    refused_calls = []
+    with pytest.raises(RuntimeError, match='memory admission failed'):
+        s1_rollout.collect(dynamics=dual, samples=tuple(zip(ids, ('g',)*4)), initial_states=initial, generators=generators(),
+            mode='flash', seed=42, optimizer_step=3, device='cpu', predict=lambda *a: pytest.fail('B=1 fallback'),
+            read_behavior_id=lambda: 'behavior', behavior_id='behavior', gate=lambda event, **kw: refused_calls.append((event, kw.get('local_error'))),
+            rollout_batch=4, predict_batch=lambda *a: pytest.fail('batched forward after refused admission'), admit=refuse)
+    assert refused_calls[-1] == ('rollout/batch/0/admission', True)
+    with pytest.raises(ValueError, match='one prompt group'):
+        run(4, groups=('g', 'g', 'g', 'h'))
+    # Mandatory startup row self-check: rows must map to their own B=1 sample;
+    # a swapped batch output fails closed at a rank-consistent result gate.
+    def selfcheck(order, *, admit=lambda index: {'checked': False}):
+        events, forwards = [], []
+        def batch(sids, x, index):
+            forwards.append('b4'); out = invariant(x, index); return tuple(out[i:i+1] for i in order)
+        def single(sid, x, index):
+            assert not torch.is_grad_enabled(); forwards.append('b1'); return invariant(x, index)
+        result = s1_rollout.rollout_batch_selfcheck(samples=tuple(zip(ids, ('g',)*4)), initial_states=initial,
+            device='cpu', predict=single, predict_batch=batch, admit=admit,
+            gate=lambda event, **kw: events.append((event, kw.get('local_error'))))
+        return result, events, forwards
+    good, good_events, good_forwards = selfcheck((0, 1, 2, 3))
+    assert good['max_abs_delta'] == [0.]*4 and min(good['nearest_other_sample_delta']) > 0
+    assert good['extra_nograd_forwards'] == 5 and good_forwards == ['b4'] + ['b1']*4
+    assert good_events == [('rollout/batch/selfcheck/admission', False), ('rollout/batch/selfcheck/forward', None),
+                           ('rollout/batch/selfcheck/result', False)]
+    swapped_events = []
+    with pytest.raises(ValueError, match='permuted'):
+        s1_rollout.rollout_batch_selfcheck(samples=tuple(zip(ids, ('g',)*4)), initial_states=initial, device='cpu',
+            predict=lambda sid, x, index: invariant(x, index), admit=lambda index: {},
+            predict_batch=lambda sids, x, index: tuple(invariant(x, index)[i:i+1] for i in (1, 0, 2, 3)),
+            gate=lambda event, **kw: swapped_events.append((event, kw.get('local_error'))))
+    assert swapped_events[-1] == ('rollout/batch/selfcheck/result', True)
+    with pytest.raises(RuntimeError, match='memory admission failed'):
+        selfcheck((0, 1, 2, 3), admit=refuse)
+    for bad in (dict(rollout_batch=2), dict(rollout_batch=4, mode='flow'), dict(rollout_batch=4, predict_batch=None)):
+        with pytest.raises(ValueError):
+            s1_rollout.collect(**(dict(dynamics=dual, samples=tuple(zip(ids, ('g',)*4)), initial_states=initial,
+                generators=generators(), mode='flash', seed=42, optimizer_step=3, device='cpu', predict=lambda *a: None,
+                read_behavior_id=lambda: 'behavior', behavior_id='behavior', gate=lambda *a, **kw: None,
+                predict_batch=lambda *a: None, admit=lambda i: {}) | bad))
+    # (5) Real dual stages: rollout + optimize. B=4 keeps the B=1 anchor
+    # forward (old score with current-forward numerics) and checks the
+    # rollout-vs-anchor delta against the DECLARED tolerance.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.distributed, 'all_reduce', lambda value, **kwargs: value)
+        identity = IterationIdentity(1, 'source', 'train', ids, ('g',)*4, (0, 1, 2, 3))
+        def stage_run(batch, tolerance=1e-4, perturb=0.):
+            lora = torch.nn.Parameter(torch.zeros(5)); optimizer = torch.optim.AdamW([lora], lr=1e-2)
+            calls, gates, out = [], [], io.StringIO()
+            def predict(prepared, *, sample_id, x, index, **kwargs):
+                calls.append(('b1', torch.is_grad_enabled())); return invariant(x, index) + lora
+            def predict_batch(prepared, *, sample_ids, x, index, conditions, dynamics):
+                assert len(conditions) == 4 and dynamics is dual
+                calls.append(('b4', torch.is_grad_enabled())); value = invariant(x, index) + lora
+                return tuple(value[i:i+1] for i in range(4))
+            extra = {} if batch == 1 else dict(rollout_batch=4, predict_batch=predict_batch, rollout_batch_replay_tolerance=tolerance)
+            stage = H3DualIterationStages(mode='dual_flash', seed=42, predict=predict,
+                data=SimpleNamespace(reserve=lambda s: None, commit=lambda r: None, abort=lambda r: None),
+                prepared=SimpleNamespace(optimizer=optimizer, prepared_root=torch.nn.Identity(), reducer_divisor=8, scheduler=None),
+                decode=lambda t: None, score_one=lambda **kw: 1., coordination_factory=lambda plan: None,
+                process_group=None, rank=0, device='cpu', read_behavior_id=lambda: 'behavior', **extra)
+            request = SimpleNamespace(identity=identity, samples=tuple((s, 'g', m) for m, s in enumerate(ids)),
+                initial_states=initial, generators=generators(), behavior_id='behavior',
+                conditions={s: torch.zeros(1, 1, 1) for s in ids}, dynamics=dual, max_cells=40,
+                collection_id='c', next_behavior_id='n')
+            ctx = SimpleNamespace(request=request, dual=dual, plan=SimpleNamespace(samples=request.samples),
+                advantages={s: torch.tensor(v) for s, v in zip(ids, (.5, -.5, .25, -.25))},
+                coordinator=SimpleNamespace(gate=lambda event, **kw: gates.append((event, kw.get('local_error', False))),
+                                            clip_grad_norm=lambda prepared, max_norm: float(lora.grad.norm())))
+            stage._active = ctx
+            with contextlib.redirect_stdout(out):
+                stage.rollout(StageValue(identity, ctx))
+                if perturb:
+                    ctx.dual_records = (dc_replace(ctx.dual_records[0], old_joint=ctx.dual_records[0].old_joint + perturb),
+                                        *ctx.dual_records[1:])
+                result = stage.optimize(StageValue(identity, ctx))
+            return calls, gates, out.getvalue(), result.payload, lora.detach().clone(), ctx.dual_records
+        off, on = stage_run(1), stage_run(4)
+        nograd = lambda calls: [kind for kind, grad in calls if not grad]
+        # 14 per update, plus the once-per-run row self-check (1 batched + 4 B=1) before the first rollout.
+        assert nograd(off[0]) == ['b1']*44 and nograd(on[0]) == ['b4'] + ['b1']*4 + ['b4']*10 + ['b1']*4
+        assert [c for c in off[0] if c[1]] == [c for c in on[0] if c[1]] == [('b1', True)]*4
+        assert ('dual/rollout-batch/4/0.0001', False) in on[1] and not any('rollout-batch' in g for g, _ in off[1])
+        assert ('dual/anchor/reuse/0', False) in on[1]
+        assert off[2].count('h3_initial_policy_ratio') == on[2].count('h3_initial_policy_ratio') == 4
+        events = [json.loads(line) for line in on[2].splitlines() if line.startswith('{')]
+        replay = [e for e in events if e.get('event') == 'h3_rollout_replay_score_check']
+        assert len(replay) == 4 and all(e['rollout_batch'] == 4 and e['declared_tolerance'] == 1e-4
+                                        and e['old_score_source'] == 'b1_anchor_forward' and e['within_tolerance'] for e in replay)
+        assert [e['transition_index'] for e in events if e.get('event') == 'h3_rollout_batch_admission'] == [0] + list(range(10))
+        checks = [e for e in events if e.get('event') == 'h3_rollout_batch_selfcheck']
+        assert len(checks) == 1 and checks[0]['max_abs_delta'] == [0.]*4 and checks[0]['sample_ids'] == list(ids)
+        assert 'h3_rollout_batch_selfcheck' not in off[2]
+        assert all('declared_tolerance' not in json.loads(line) for line in off[2].splitlines()
+                   if 'h3_rollout_replay_score_check' in line)
+        assert all(torch.equal(a.old_joint, b.old_joint) for a, b in zip(off[5], on[5]))
+        assert off[3].scaled_loss == on[3].scaled_loss and off[3].grad_norm == on[3].grad_norm and torch.equal(off[4], on[4])
+        with pytest.raises(ValueError, match='beyond the declared batched-rollout tolerance'):
+            stage_run(4, perturb=5e-4)
+        loosened = stage_run(4, tolerance=1e-3, perturb=5e-4)
+        assert ('dual/rollout-batch/4/0.001', False) in loosened[1]
+        assert torch.equal(loosened[4], on[4])  # ratio uses the B=1 anchor score, not the perturbed rollout score
+        with pytest.raises(ValueError, match='sampled/replayed old score mismatch'):
+            stage_run(1, perturb=5e-4)
+    with pytest.raises(ValueError, match='anchor reuse is rejected'):
+        H3DualReplayAnchor(dynamics=dual, behavior_id='b', expected_keys=(('s', 0),), max_records=1,
+                           reuse_rollout=True, batched_rollout_tolerance=1e-4)
+    with pytest.raises(ValueError, match='tolerance'):
+        H3DualReplayAnchor(dynamics=dual, behavior_id='b', expected_keys=(('s', 0),), max_records=1, batched_rollout_tolerance=1)

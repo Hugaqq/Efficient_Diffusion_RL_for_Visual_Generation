@@ -196,6 +196,42 @@ class H3Adapter(ModelAdapter):
         result.validate_against(model_input)
         return result
 
+    def predict_batch(self, model_inputs) -> tuple:
+        """Opt-in S1: ONE no-grad forward for B=1 inputs sharing condition and sigmas.
+
+        Every item is first validated exactly as a B=1 ``predict`` input; the
+        returned per-item predictions are validated against their own input.
+        Not bitwise equal to B=1 forwards (batched GEMMs); callers must declare it.
+        """
+        import torch
+        self._require_loaded()
+        if (type(model_inputs) is not tuple or len(model_inputs) < 2
+                or any(not isinstance(item, H3ModelInput) for item in model_inputs)):
+            raise TypeError("H3 predict_batch requires a tuple of at least two H3ModelInput")
+        if torch.is_grad_enabled():
+            raise ModelPortError("H3 batched prediction is no-grad rollout only")
+        first = model_inputs[0]
+        for item in model_inputs:
+            self._validate_spec(item.latent_spec)
+            if item.conditioning.cache_identity != self._aux.cache.identity_sha256:
+                raise ModelPortError("H3 conditioning cache identity differs from bound cache")
+            if (item.condition_identity != first.condition_identity or item.conditioning.prompt != first.conditioning.prompt
+                    or item.guidance_identity != first.guidance_identity or item.latents.device != first.latents.device
+                    or not torch.equal(item.conditioning.embeddings, first.conditioning.embeddings)
+                    or not torch.equal(item.timestep, first.timestep) or not torch.equal(item.audio_sigma, first.audio_sigma)):
+                raise ModelPortError("H3 batched prediction requires one shared condition, sigmas and device")
+        self.prepared_components  # fail before any model call if not prepared
+        from visual_rl.models.implementations.h3_forward import h3_t2va_forward
+        value = h3_t2va_forward(self._prepared_forward, x=torch.cat([item.latents for item in model_inputs]),
+            geometry=self.geometry, text_embeddings=first.conditioning.embeddings.to(first.latents.device),
+            video_sigma=first.timestep, audio_sigma=first.audio_sigma, batch_size=len(model_inputs))
+        out = []
+        for row, item in enumerate(model_inputs):
+            result = ModelPrediction(value[row:row+1], PredictionType.FLOW, item.condition_identity, item.guidance_identity)
+            result.validate_against(item)
+            out.append(result.value)
+        return tuple(out)
+
     def decode(self, latents, latent_spec: ModelLatentSpec) -> AbstractContextManager[H3AVMedia]:
         self._require_loaded()
         self._validate_spec(latent_spec)

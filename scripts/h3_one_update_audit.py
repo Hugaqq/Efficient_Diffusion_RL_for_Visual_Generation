@@ -36,6 +36,13 @@ class PredictAudit:
             self.grad_forward_indices.append(index);self.last_prediction=weakref.ref(value)
         else:self.nograd_forwards+=1
         return value
+    def batched(self,original):
+        """S1: one batched rollout call is ONE no-grad transformer forward."""
+        def call(*args,**kwargs):
+            if torch.is_grad_enabled():raise RuntimeError('batched prediction must be no-grad rollout')
+            value=original(*args,**kwargs);self.nograd_forwards+=1
+            return value
+        return call
     def payload(self):
         return dict(grad_forward_indices=self.grad_forward_indices,nograd_forwards=self.nograd_forwards,
                     final_prediction_released=self.last_prediction is None or self.last_prediction() is None)
