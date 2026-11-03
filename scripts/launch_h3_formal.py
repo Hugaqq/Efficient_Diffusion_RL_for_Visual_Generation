@@ -378,7 +378,7 @@ class FormalBackend(TwoUpdateBackend):
     def update_failed(self, step):
         if self.retention is not None:
             ctx = self.stages._active
-            if ctx is not None and ctx.coordinator.aux_worker_alive:
+            if ctx is not None and getattr(ctx.coordinator, 'aux_worker_alive', True):  # unknown => keep staging
                 # A bounded join may time out. The worker (including its P1
                 # consumer) still owns this rank's files; never race its encode.
                 print(json.dumps(dict(event='h3_formal_staging_preserved', step=step + 1, rank=self.rank,

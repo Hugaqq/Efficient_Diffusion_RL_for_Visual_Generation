@@ -386,7 +386,9 @@ class H3Coordination:
             if launch[0]:
                 if cancel is not None:
                     cancel.set()  # no new decode, HPS request or retention encode
-                worker.join(abort_join_s)  # also on transport failure; local only, exactly one bounded join
+                if isinstance(exc, Exception):
+                    worker.join(abort_join_s)  # also on transport failure; local only, exactly one bounded join
+                # KeyboardInterrupt/SystemExit: cancel only, do not delay the interrupt by a bounded join.
                 log(event='h3_aux_parallel_abort', rank=self._rank, verdict=str(exc),
                     worker_alive=self.aux_worker_alive)
             raise
