@@ -57,6 +57,35 @@ torchrun --standalone --nnodes=1 --nproc-per-node=8 --module visual_rl.train /ab
 最新完整 `checkpoints/step-N`。这不是任意步骤/弹性拓扑恢复。终态checkpoint已保存但SUCCESS尚未写出时，
 可恢复并完成终态发布，不重复更新；已有SUCCESS的运行拒绝再次训练。
 
+## S1 batched rollout replay diagnostics
+
+The opt-in `--rollout-batch 4` in `scripts/launch_h3_resolution_memory.py` and
+`scripts/launch_h3_formal.py` keeps the B=1 anchor forward as PPO's old score;
+`--reuse-rollout-anchor` is rejected with S1. Batched bf16 forwards are not
+bitwise equal to B=1. The replay abort tolerance still defaults to **1e-4**.
+For an approved S1 run with the wider abort limit, explicitly pass
+`--rollout-batch 4 --rollout-batch-replay-tolerance 1e-3`; the declared tolerance
+already belongs to the run/resume identity. No identity fields are added.
+
+Each S1 delta above the fixed **1e-4** warning threshold and at or below the
+abort limit emits a flushed `h3_rollout_replay_score_warning` JSON event before
+the row result gate. Existing `h3_rollout_replay_score_check` events remain;
+a delta above the declared limit still fails the gate (no warning-only bypass).
+The warning threshold is observation-only, not a new identity field. B=1
+behavior, events, identity payload and strict 1e-4 replay check are unchanged.
+
+The lifecycle's terminal metrics enforce an exact schema, so diagnostics do
+**not** add fields to `h3-last-metrics.json` or `metrics.jsonl`. Instead, each
+successful update emits one flushed rank-0 `h3_rollout_replay_score_summary`
+event in `train.log` (`scope="world"`, `world_size=8`). Watchdogs can read its
+zero-based `optimizer_step`, summed `n_checks`/`n_warn`, global `max_abs_delta`,
+`warn_threshold` and `declared_tolerance`. Local successful-capture counters
+travel in the existing lifecycle loss exchange, with validation/logging inside
+the existing metrics error gate; no additional collective is introduced.
+There are no rank-local summary events. Failed captures/updates do not emit a
+world summary; row checks remain available for diagnosing an abort. This
+summary is diagnostic, not proof of a durable checkpoint or fixed-eval reward.
+
 ## 输出与验证边界
 
 `SUCCESS` 使用明确的 `visual_rl_h3_run_success` kind；结果还包含真实checkpoint、

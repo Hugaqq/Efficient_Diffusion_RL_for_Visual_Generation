@@ -274,8 +274,10 @@ class H3DualIterationStages(H3IterationStages):
         anchor=_checked(c,'dual/anchor/prepare',lambda:H3DualReplayAnchor(dynamics=ctx.dual,
             behavior_id=r.behavior_id,expected_keys=keys,max_records=r.max_cells,reuse_rollout=self.reuse_rollout_anchor,**replay))
         _checked(c,'dual/anchor/records',lambda:anchor.validate_records(records))
-        anchor.capture(records,device=self.device,predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
+        replay_summary=anchor.capture(records,device=self.device,predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
             read_behavior_id=lambda:self._version(ctx,'dual/anchor/version'),gate=lambda event,**kw:c.gate('dual/'+event,**kw))
+        if self.rollout_batch!=1:
+            self.rollout_replay_score_summary=dict(optimizer_step=r.identity.optimizer_step,**replay_summary)
         c.gate('dual/anchor/complete')
         means=None
         if self.mode=='dual_flash':

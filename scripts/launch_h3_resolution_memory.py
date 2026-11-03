@@ -212,7 +212,9 @@ def add_common_arguments(p):
                    help='opt-in S1: 4 = one batched no-grad rollout forward for the four local samples '
                         '(different run identity; batched bf16 is not bitwise B1); requires approved experiment')
     p.add_argument('--rollout-batch-replay-tolerance',type=float,default=1e-4,
-                   help='declared max |rollout - B1 anchor| old-score delta under --rollout-batch 4 (run identity)')
+                   help='declared max |rollout - B1 anchor| old-score delta under --rollout-batch 4 (run identity); '
+                        'default stays 1e-4; pass --rollout-batch-replay-tolerance 1e-3 explicitly for the wider abort limit. '
+                        'S1 warns above 1e-4 up to the declared limit; B1 remains strict at 1e-4')
     p.add_argument('--checkpoint-threads',type=int,default=1,
                    help='opt-in DCP writer and rank0 state-tree hashing threads (1 = unchanged serial path); requires approved experiment')
     return p

@@ -6,6 +6,11 @@ from visual_rl.algorithms.dynamics.h3_dual_flow_sde import H3DualFlowSDE
 from visual_rl.algorithms.trainer.h3_dual_rollout import H3DualRecord
 
 
+# Observation-only S1 threshold: the unchanged B=1 bit-replay limit. This is
+# deliberately not a run-identity field or a replacement for the declared gate.
+ROLLOUT_REPLAY_WARN_THRESHOLD = 1e-4
+
+
 class H3DualReplayAnchor:
     def __init__(self, *, dynamics, behavior_id, expected_keys, max_records, reuse_rollout=False,
                  batched_rollout_tolerance=None):
@@ -49,6 +54,9 @@ class H3DualReplayAnchor:
         if not all(callable(f) for f in (predict,read_behavior_id,gate)):
             raise TypeError('predict/version/gate are required')
         pending={};device=torch.device(device)
+        summary=(None if self.batched_rollout_tolerance is None else dict(
+            n_checks=0,n_warn=0,max_abs_delta=0.,warn_threshold=ROLLOUT_REPLAY_WARN_THRESHOLD,
+            declared_tolerance=self.batched_rollout_tolerance))
         with torch.no_grad():
             if read_behavior_id()!=self.behavior_id: raise ValueError('behavior changed before capture')
             for ordinal,record in enumerate(records):
@@ -96,6 +104,13 @@ class H3DualReplayAnchor:
                                                   within_tolerance=delta<=batched)),flush=True)
                             if delta>batched:
                                 raise ValueError('sampled/replayed old score mismatch beyond the declared batched-rollout tolerance')
+                            summary['n_checks']+=1
+                            summary['max_abs_delta']=max(summary['max_abs_delta'],delta)
+                            if delta>ROLLOUT_REPLAY_WARN_THRESHOLD:
+                                summary['n_warn']+=1
+                                print(json.dumps(dict(event='h3_rollout_replay_score_warning',sample_id=record.sample_id,
+                                    index=record.index,max_abs_delta=delta,warn_threshold=ROLLOUT_REPLAY_WARN_THRESHOLD,
+                                    declared_tolerance=batched)),flush=True)
                     pending[(record.sample_id,record.index)]=(joint.detach().cpu().clone(),tuple(v.detach().cpu().clone() for v in coeff))
                 except Exception:
                     gate(f'anchor/{ordinal}/result', local_error=True)
@@ -104,6 +119,9 @@ class H3DualReplayAnchor:
                 del prediction, joint, coeff, x, action
             if read_behavior_id()!=self.behavior_id: raise ValueError('behavior changed during capture')
         self._scores=pending
+        # Successful captures only; the lifecycle folds these local diagnostics
+        # into its existing loss exchange, not a new model-stage collective.
+        return summary
 
     def get(self,sample_id,index):
         if self._scores is None: raise RuntimeError('anchor capture incomplete')

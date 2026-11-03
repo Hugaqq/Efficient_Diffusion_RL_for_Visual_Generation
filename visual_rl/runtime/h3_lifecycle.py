@@ -83,6 +83,26 @@ def _write_json(path, payload):
     atomic_write(Path(path), canonical_line(payload))
 
 
+def _rollout_replay_totals(rows, *, step, tolerance):
+    """Small S1 diagnostics only; called inside the existing metrics error gate."""
+    from visual_rl.algorithms.optimization.h3_dual_anchor import ROLLOUT_REPLAY_WARN_THRESHOLD
+    from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
+    if len(rows) != WORLD_SIZE:
+        raise ValueError('replay summary requires every rank')
+    for row in rows:
+        if (type(row) is not dict or row.get('optimizer_step') != step
+                or row.get('warn_threshold') != ROLLOUT_REPLAY_WARN_THRESHOLD
+                or row.get('declared_tolerance') != tolerance):
+            raise ValueError('replay summary step/threshold/tolerance mismatch')
+        checks, warns, delta = row['n_checks'], row['n_warn'], row['max_abs_delta']
+        if (type(checks) is not int or type(warns) is not int or not 0 <= warns <= checks
+                or type(delta) is not float or not math.isfinite(delta) or not 0 <= delta <= tolerance):
+            raise ValueError('invalid replay summary counters/delta')
+    return dict(optimizer_step=step,n_checks=sum(row['n_checks'] for row in rows),
+        n_warn=sum(row['n_warn'] for row in rows),max_abs_delta=max(row['max_abs_delta'] for row in rows),
+        warn_threshold=ROLLOUT_REPLAY_WARN_THRESHOLD,declared_tolerance=tolerance)
+
+
 def _hps(profile, session):
     from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
     from visual_rl.algorithms.rewards.resource_descriptor import RewardResourceDescriptor, RewardRuntimePolicy
@@ -428,13 +448,29 @@ class H3LifecycleBackend:
             result = bound.trainer.run_iteration(step)
             update = result.value.payload
             from visual_rl.algorithms.optimization.h3_world import _exchange
+            local_loss = float(update.scaled_loss)
+            if self.rollout_batch != 1:
+                # Piggyback on the existing exchange; B=1 still sends the same float.
+                local_loss = dict(loss=local_loss,replay=getattr(bound.stages,'rollout_replay_score_summary',None))
             losses = _exchange('lifecycle/loss', bound.graph.session.rank,
-                               bound.graph.session.process_group, float(update.scaled_loss), True)
+                               bound.graph.session.process_group, local_loss, True)
+            replay_rows = None
+            if self.rollout_batch != 1:
+                replay_rows = losses
+                losses = [row['loss'] for row in replay_rows]
             metrics = dict(step=step, sample_count=bound.graph.profile.training.global_samples,
                 active_transition_count=8 * update.local_cells,
                 loss=sum(losses) / 8, gradient_norm=float(update.grad_norm))
             # Persist diagnostics before publishing the checkpoint that can depend on them.
             def record_metrics():
+                if replay_rows is not None:
+                    summary = _rollout_replay_totals([row['replay'] for row in replay_rows],
+                        step=step,tolerance=self.rollout_batch_replay_tolerance)
+                    if bound.graph.session.rank == 0:
+                        # Terminal metrics have an exact checked schema. Keep it
+                        # unchanged; watchdogs use this world-total train.log event.
+                        print(json.dumps(dict(event='h3_rollout_replay_score_summary',rank=0,
+                            scope='world',world_size=len(replay_rows),**summary)),flush=True)
                 if bound.graph.session.rank == 0:
                     _write_json(launch.output_dir / "h3-last-metrics.json", metrics)
             _phase(bound.graph.session, "metrics", record_metrics)
