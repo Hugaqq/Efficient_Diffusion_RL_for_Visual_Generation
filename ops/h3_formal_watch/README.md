@@ -177,12 +177,17 @@ operator first; a failed rearming gate returns to NEEDS_HUMAN with a new token.
 
 VPS observer is independent, read-only on the GPU, and cannot control training.
 Optional pi diagnosis has no tools/MCP/extensions/context, no persistent session,
-and no authority in the deterministic watchdog. Sending logs to a model/Feishu
-requires separately approved recipient, sender identity and disclosure.
+and no authority in the deterministic watchdog. Sending logs to a model requires
+separately approved disclosure. Feishu receives **alerts only**, as a direct message
+from the app bot to **one configured human user**. No group or chat-ID target is
+supported, including multi-human chats. Full pi diagnoses and daily summaries are
+local-only; they are never sent to Feishu.
 
 ```json
 {
   "state_dir": "/ABS/observer/state",
+  "report_dir": "/ABS/observer/reports",
+  "progress_log_path": "/ABS/progress/10.22-progress.md",
   "ssh_host": "ubtroot@APPROVED_ALIAS",
   "ssh_identity_file": "/ABS/read-only-key",
   "remote_python": "/usr/bin/python3",
@@ -197,7 +202,7 @@ requires separately approved recipient, sender identity and disclosure.
   "notify_retry_seconds": 300, "alert_repeat_seconds": 3600,
   "analysis_timeout_seconds": 180, "max_analyses_per_tick": 4,
   "pi_binary": "/ABS/pi",
-  "notifier": {"binary":"/ABS/lark-cli","chat_id":"oc_APPROVED_CHAT","identity":"bot","timeout_seconds":30}
+  "notifier": {"binary":"/ABS/lark-cli","alert_user_open_id":"ou_REPLACE","identity":"bot","timeout_seconds":30}
 }
 ```
 
@@ -212,7 +217,41 @@ status. Cached DONE cannot suppress the independent 30-minute SSH-unreachable
 rule. Observer cooldown/unreachability durations use its own boot-bound monotonic
 clock. Daily calendar scheduling alone intentionally uses wall time.
 
-Notification text/attempts form a durable outbox. Undelivered messages drain even
+`notifier.alert_user_open_id` must be a single `ou_` user open_id, not a list,
+chat ID, email, whitespace/comma-separated targets or CLI syntax. `identity` must
+be `bot`. The notifier accepts only the four documented keys; **any** extra key
+(including `chat_id`, `group_id`, `user_id`, or target lists) is rejected, even if
+empty. Legacy top-level chat/group keys are also rejected. Every observer start
+validates before any fetch/analysis/send and records refusals locally in
+`state_dir/notifier-errors.jsonl`; delivery rechecks the policy. The only send argv
+is `lark-cli im +messages-send --as bot --user-id <open_id> --text ...
+--idempotency-key ...` (flags checked against local CLI help). No chat lookup,
+group fallback, or sender-identity fallback exists.
+
+`report_dir` and `progress_log_path` are required absolute local paths, private
+and non-symlink, with trusted writers only. Keep the progress file distinct from
+observer state and report files. Each day's summary and optional pi diagnosis go
+to `report_dir/DAILY.md`, one dated section per day; each section is capped at
+8,000 Unicode characters. A short dated line pointing to DAILY.md is appended to
+the progress log. Non-daily pi diagnoses go to `report_dir/INCIDENTS.md` with the
+same section cap. Alert DMs contain only a bounded event/status summary and the
+local INCIDENTS.md path; the initial alert may precede its diagnosis file write.
+The follow-up DM announces the saved diagnosis, without copying model output.
+Reports use whole-file temp+fsync+rename, locks and durable markers to avoid
+partial publication or duplicate sections/progress lines after a crash. History
+is retained without rotation; monitor local disk usage. Dry-run also writes these
+local artifacts, so use separate dry-run state, reports and progress paths.
+
+Daily summaries and their diagnoses never enter the alert outbox; legacy queued
+daily messages are retained but suppressed, never sent. Legacy incident-diagnosis
+outbox text is replaced by a short local-file pointer before retry. Report-write
+failures are recorded and retried without repeating pi or blocking unrelated alert
+outbox draining. Existing configurations
+with `chat_id` must be explicitly reconciled with the new user-only configuration
+and config-bound state before deployment; do not delete evidence or reset pending
+alerts to bypass the identity check.
+
+Alert text/attempts form a durable outbox. Undelivered messages drain even
 when the triggering condition has resolved; failed sends exit nonzero, with a
 5-minute service retry/cooldown and stable idempotency key. Non-object CLI replies
 are failures. Text starting with `@`/`-` is prefixed to prevent file/option parsing;

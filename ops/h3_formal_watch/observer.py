@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo
 
 from .common import Store, digest, read_json
 from .commands import run_command
-from .notifier import FeishuNotifier
+from .notifier import FeishuNotifier, validate_target
+from .reports import Reports
 from .process import boot_id
 
 STATES = {'ARMING', 'WATCHING', 'STOPPING', 'RECOVERING', 'LAUNCHING', 'NEEDS_HUMAN', 'DONE'}
@@ -131,7 +132,7 @@ class Observer:
     def __init__(self, config, *, dry_run=False, clock=time.time, monotonic=time.monotonic, fetcher=fetch,
                  runner=run_command, notifier=None):
         self.config, self.clock, self.fetcher, self.runner, self.dry_run = config, clock, fetcher, runner, dry_run
-        self.monotonic, self.boot = monotonic, boot_id()
+        self.monotonic = monotonic
         for name, default, maximum in (('ssh_timeout_seconds', 30, 120), ('analysis_timeout_seconds', 180, 600),
                                       ('alert_repeat_seconds', 3600, 86400), ('notify_retry_seconds', 300, 86400),
                                       ('heartbeat_max_age_seconds', 600, 86400), ('unreachable_seconds', 1800, 86400)):
@@ -141,7 +142,10 @@ class Observer:
         if type(config.get('max_analyses_per_tick', 4)) is not int or not 1 <= config.get('max_analyses_per_tick', 4) <= 4:
             raise ValueError('max_analyses_per_tick must be 1..4')
         self.store = Store(config['state_dir'])
+        self.check_notification_policy()  # each run, before fetch, analysis or any send
+        self.boot = boot_id()
         self.notifier = notifier or FeishuNotifier(config['notifier'], dry_run=dry_run, runner=runner)
+        self.reports = Reports(config['report_dir'], config['progress_log_path'])
         identity = digest(config)
         self.s = self.store.load('observer-state.json') or dict(config_id=identity, dry_run=dry_run,
                  unreachable_since=None, last_state=None, jobs={}, notices={}, fetch_error=None)
@@ -152,6 +156,16 @@ class Observer:
             for notice in self.s['notices'].values():
                 notice.pop('attempted_mono', None)  # old/rebooted retry windows are not comparable
         daily_key(clock(), config.get('timezone', 'Asia/Shanghai'), config.get('daily_time', '09:00'))
+
+    def check_notification_policy(self):
+        try:
+            # Reject legacy top-level targets as well as all notifier alternatives.
+            if any('chat' in key or 'group' in key for key in self.config):
+                raise ValueError('chat/group targets are forbidden')
+            validate_target(self.config.get('notifier'))
+        except ValueError as exc:
+            self.store.append('notifier-errors.jsonl', dict(at=self.clock(), error=str(exc)))
+            raise
 
     def persist(self):
         self.s['checked_at'] = self.clock()
@@ -170,15 +184,25 @@ class Observer:
         self.deliver(key, entry, repeat=repeat)
 
     def deliver(self, key, entry, *, repeat=False):
+        if key.removeprefix('analysis:').startswith('daily:'):
+            # Also quarantine legacy queued daily diagnoses; never drain them to DM.
+            entry['suppressed'] = 'daily summaries are local-only'
+            self.persist()
+            return
         if entry.get('sent') and not repeat:
             return
         interval = self.config.get('alert_repeat_seconds', 3600) if entry.get('sent') else self.config.get('notify_retry_seconds', 300)
         if entry.get('attempted_mono') is not None and self.monotonic() - entry['attempted_mono'] < interval:
             return
+        if key.startswith('analysis:'):
+            # Never replay a legacy outbox payload containing the full model response.
+            label = self.s['jobs'].get(key.removeprefix('analysis:'), {}).get('label', '事件诊断')
+            entry['text'] = '[H3 只读建议] ' + label[:200] + '\n本地记录：' + str(self.reports.path())
         # Durable outbox and attempt BEFORE send; draining never depends on active conditions.
         entry.update(attempted_at=self.clock(), attempted_mono=self.monotonic(), sent=False)
         self.persist()
         try:
+            self.check_notification_policy()
             self.notifier.send(entry['text'], digest(dict(config=self.s['config_id'], key=key))[:48])
             entry['sent'] = True
             entry.pop('error', None)
@@ -188,12 +212,12 @@ class Observer:
 
     def drain_notices(self):
         for key, entry in self.s['notices'].items():
-            if not entry.get('sent'):
+            if not entry.get('sent') and not entry.get('suppressed'):
                 if 'text' not in entry:
                     entry['text'] = '[H3 观察器] 旧版未投递告警，需人工核查：' + key
                 self.deliver(key, entry)
         self.persist()
-        if any(not entry.get('sent') for entry in self.s['notices'].values()):
+        if any(not entry.get('sent') and not entry.get('suppressed') for entry in self.s['notices'].values()):
             raise RuntimeError('undelivered notifications remain; systemd/timer must retry')
 
     def brief(self, key, job, snapshot):
@@ -312,17 +336,36 @@ class Observer:
                 optimizer_step=status.get('optimizer_step') if status else None,
                 heartbeat_at=status.get('heartbeat_at') if status else None,
                 fetch_error=self.s['fetch_error']), ensure_ascii=False)
-            if job['alert']:
-                self.notify(key, headline, repeat=job['repeat'])
+            daily = key.startswith('daily:')
+            headline = headline[:800]
+            job.setdefault('report_summary', headline)
+            if job['alert'] and not daily:
+                self.notify(key, headline + '\n本地记录：' + str(self.reports.path()), repeat=job['repeat'])
             if job['analyze']:
                 if job['analysis_status'] == 'pending' and budget <= 0:
                     continue
                 if job['analysis_status'] == 'pending':
                     budget -= 1
                 self.analyze(key, job, snapshot)
-                if job.get('diagnosis'):
-                    self.notify('analysis:' + key, '[H3 只读建议] ' + job['label'] + '\n' + job['diagnosis'])
+            if (daily or job.get('diagnosis')) and not job.get('report_written'):
+                date = key.removeprefix('daily:') if daily else dt.datetime.fromtimestamp(
+                    job['created_at'], ZoneInfo(self.config.get('timezone', 'Asia/Shanghai'))).isoformat()
+                try:
+                    self.reports.record(key if daily else self.s['config_id'] + ':' + key, date,
+                                        job['report_summary'], job.get('diagnosis', ''), daily=daily)
+                except (OSError, ValueError) as exc:
+                    job['report_error'] = repr(exc)
+                    self.persist()
+                    continue  # local-report failure must not block unrelated alert retries
+                job['report_written'] = True
+                job.pop('report_error', None)
+                self.persist()
+            if not daily and job.get('diagnosis'):
+                self.notify('analysis:' + key, '[H3 只读建议已保存] ' + job['label'][:200]
+                            + '\n本地记录：' + str(self.reports.path()))
         self.drain_notices()
+        if any(job.get('report_error') for job in self.s['jobs'].values()):
+            raise RuntimeError('local report writes pending; systemd/timer must retry')
         return self.s
 
 

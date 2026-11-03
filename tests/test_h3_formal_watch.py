@@ -587,7 +587,8 @@ def observer_config(root):
     return dict(state_dir=str(root / 'observer'), ssh_host='ubtroot@gpu-alias',
                 remote_status='/fake/state/status.json', remote_events='/fake/state/events.jsonl',
                 remote_logs=['/fake/train.log'], timezone='Asia/Shanghai', daily_time='09:00',
-                notifier=dict(chat_id='oc_fake', identity='bot'))
+                report_dir=str(root / 'reports'), progress_log_path=str(root / 'progress.md'),
+                notifier=dict(alert_user_open_id='ou_fake', identity='bot'))
 
 
 def remote(now=0, state='WATCHING', **fields):
@@ -616,19 +617,20 @@ def test_notifier_chinese_and_special_characters_real_argv():
         received = json.loads(reply['stdout'])
         assert received[received.index('--text') + 1] == text
         return dict(stdout='{"ok":true}', stderr='')
-    notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='user'), runner=runner)
+    notifier = FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'), runner=runner)
     notifier.send(text, 'safe-id')
-    assert calls[0][calls[0].index('--as') + 1] == 'user'
-    assert calls[0][calls[0].index('--chat-id') + 1] == 'oc_fake'
+    assert calls[0][calls[0].index('--as') + 1] == 'bot'
+    assert calls[0][calls[0].index('--user-id') + 1] == 'ou_fake'
+    assert '--chat-id' not in calls[0]
     assert calls[0][calls[0].index('--text') + 1] == text
     with pytest.raises(ValueError): FeishuNotifier(dict(chat_id='oc_fake', identity='default'))
     with pytest.raises(RuntimeError):
-        FeishuNotifier(dict(chat_id='oc_fake', identity='bot'), runner=lambda *a, **k: dict(stdout='{"ok":false}')).send(text, 'k')
+        FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'), runner=lambda *a, **k: dict(stdout='{"ok":false}')).send(text, 'k')
 
 
 def test_notifier_dry_run_no_execution(capsys):
     with patch('subprocess.Popen') as spawn:
-        notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='bot'), dry_run=True)
+        notifier = FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'), dry_run=True)
         notifier.send('中文，特殊 $() " \\', 'key')
         spawn.assert_not_called()
     printed = json.loads(capsys.readouterr().out)
@@ -717,6 +719,9 @@ def test_observer_once_per_event_fresh_pi_and_persistence(tmp_path):
     assert len(runs) == 1 and len(notify.calls) == 2
     assert (Path(config['state_dir']) / 'remote-status.json').exists()
     assert list(Path(config['state_dir']).glob('analysis-*.jsonl'))
+    report = Path(config['report_dir']) / 'INCIDENTS.md'
+    assert report.read_text().count('训练尚无新进展') == 1
+    assert all(str(report) in text and '训练尚无新进展' not in text for text, _ in notify.calls)
 
 
 def test_observer_terminal_state_resume_and_daily_analysis(tmp_path):
@@ -739,6 +744,13 @@ def test_observer_terminal_state_resume_and_daily_analysis(tmp_path):
     now[0] += 86400
     obs.tick(remote(now[0], 'DONE'))
     assert len(runs) == 5
+    daily = (Path(config['report_dir']) / 'DAILY.md').read_text()
+    assert daily.count('## 2026-11-03\n') == daily.count('## 2026-11-04\n') == 1
+    assert daily.count('训练尚无新进展') == 2
+    assert len(Path(config['progress_log_path']).read_text().splitlines()) == 2
+    assert len(notify.calls) == 6  # alerts + short report pointers for resume/NEEDS_HUMAN/DONE only
+    assert all('每日' not in text and '训练尚无新进展' not in text for text, _ in notify.calls)
+    assert (Path(config['report_dir']) / 'INCIDENTS.md').read_text().count('只读诊断') == 3
 
 
 def test_observer_unreachable_and_rate_limit_recovery(tmp_path):
@@ -1010,14 +1022,14 @@ def test_undelivered_resolved_alert_drains_after_restart(tmp_path):
 
 @pytest.mark.parametrize('reply', ['[]', 'null', 'true', '"unexpected"', '123'])
 def test_notifier_non_object_reply_fails_cleanly(reply):
-    notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='bot'), runner=lambda *a, **kw: dict(stdout=reply))
+    notifier = FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'), runner=lambda *a, **kw: dict(stdout=reply))
     with pytest.raises(RuntimeError, match='acknowledge'):
         notifier.send('test', 'key')
 
 
 @pytest.mark.parametrize('text', ['@/private/file', '--option', '  @file', '\n-option'])
 def test_notifier_leading_file_or_option_syntax_is_inert(text):
-    notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='bot'))
+    notifier = FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'))
     argv = notifier.argv(text, 'key')
     assert argv[argv.index('--text') + 1] == '[H3] ' + text
 
@@ -1032,6 +1044,132 @@ def test_observer_busy_lock_returns_zero_without_work(tmp_path, capsys):
         assert main() == 0
         construct.assert_not_called()
     assert 'lock busy' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('change', [
+    {'chat_id': 'oc_group'}, {'chat_id': None}, {'group_id': 'group'},
+    {'user_id': 'ou_other'}, {'targets': ['ou_one', 'ou_two']},
+    {'identity': 'user'}, {'identity': None}, {'alert_user_open_id': None},
+    {'alert_user_open_id': ['ou_one']}, {'alert_user_open_id': ''},
+    {'alert_user_open_id': 'oc_group'}, {'alert_user_open_id': 'ou_one,ou_two'},
+    {'alert_user_open_id': 'ou_one ou_two'}, {'alert_user_open_id': 'ou_one\n'},
+    {'alert_user_open_id': '@file'}, {'alert_user_open_id': '--option'},
+])
+def test_notification_policy_rejects_targets_before_any_work(tmp_path, change):
+    config = observer_config(tmp_path)
+    config['notifier'].update(change)
+    notify = FakeNotifier()
+    with patch('subprocess.Popen') as spawn:
+        with pytest.raises(ValueError, match='alerts require'):
+            FeishuNotifier(config['notifier'])
+        with pytest.raises(ValueError, match='alerts require'):
+            Observer(config, notifier=notify)
+        spawn.assert_not_called()
+    assert not notify.calls
+    assert 'alerts require' in (Path(config['state_dir']) / 'notifier-errors.jsonl').read_text()
+
+
+def test_observer_rejects_top_level_chat_and_rechecks_before_send(tmp_path):
+    config = observer_config(tmp_path)
+    with pytest.raises(ValueError, match='chat/group'):
+        Observer(dict(config, chat_id='oc_group'), notifier=FakeNotifier())
+    notify = FakeNotifier()
+    obs = Observer(config, clock=lambda: 0, notifier=notify)
+    config['notifier']['chat_id'] = 'oc_later'
+    obs.notify('incident:mutated', 'must not send')
+    assert not notify.calls
+    assert 'alerts require' in obs.s['notices']['incident:mutated']['error']
+    assert len((Path(config['state_dir']) / 'notifier-errors.jsonl').read_text().splitlines()) == 2
+    notifier = FeishuNotifier(dict(alert_user_open_id='ou_fake', identity='bot'))
+    notifier.config['identity'] = 'user'
+    with pytest.raises(ValueError):
+        notifier.send('must not send', 'key')
+
+
+def test_daily_only_is_local_even_in_dry_run_and_legacy_outbox(tmp_path):
+    import datetime as dt
+    now = dt.datetime(2026, 11, 3, 1, tzinfo=dt.timezone.utc).timestamp()
+    config = observer_config(tmp_path)
+    notify = FakeNotifier()
+    obs = Observer(config, dry_run=True, clock=lambda: now, notifier=notify,
+                   runner=lambda *a, **kw: pytest.fail('dry run must not execute'))
+    obs.s['notices']['analysis:daily:2026-11-02'] = dict(sent=False, text='old daily diagnosis')
+    obs.s['notices']['daily:2026-11-02'] = dict(sent=False, text='old daily summary')
+    obs.tick(remote(now))
+    assert not notify.calls
+    assert all(entry['suppressed'] for entry in obs.s['notices'].values())
+    daily = Path(config['report_dir']) / 'DAILY.md'
+    before = daily.read_text()
+    assert '每日训练摘要' in before and 'Dry-run' in before and 'WATCHING' in before
+    restored = Observer(config, dry_run=True, clock=lambda: now, notifier=notify)
+    restored.tick(remote(now))
+    assert daily.read_text() == before and not notify.calls
+    assert len(Path(config['progress_log_path']).read_text().splitlines()) == 1
+    assert not (Path(config['report_dir']) / 'INCIDENTS.md').exists()
+
+
+def test_local_report_failure_does_not_block_alert_outbox(tmp_path):
+    config = observer_config(tmp_path)
+    notify, runs = FakeNotifier(), []
+    def runner(*args, **kwargs):
+        runs.append(args)
+        return pi_result('private incident diagnosis')
+    obs = Observer(config, clock=lambda: 0, notifier=notify, runner=runner)
+    obs.s['notices']['deadman:resolved'] = dict(sent=False, text='resolved alert retry')
+    snap = remote(incidents=[dict(id='i1', cause='process_died')])
+    with patch.object(obs.reports, 'record', side_effect=OSError('report disk unavailable')):
+        with pytest.raises(RuntimeError, match='local report writes pending'):
+            obs.tick(snap)
+    assert len(notify.calls) == 2 and len(runs) == 1
+    assert obs.s['notices']['deadman:resolved']['sent']
+    assert 'analysis:incident:i1' not in obs.s['notices']
+    obs.tick(snap)
+    assert len(notify.calls) == 3 and len(runs) == 1
+    assert 'private incident diagnosis' in obs.reports.path().read_text()
+    assert all('private incident diagnosis' not in text for text, _ in notify.calls)
+
+
+def test_legacy_incident_diagnosis_outbox_is_redacted(tmp_path):
+    notify = FakeNotifier()
+    obs = Observer(observer_config(tmp_path), clock=lambda: 0, notifier=notify)
+    obs.s['notices']['analysis:incident:old'] = dict(sent=False, text='full PRIVATE model response')
+    obs.drain_notices()
+    assert len(notify.calls) == 1
+    assert 'PRIVATE' not in notify.calls[0][0]
+    assert str(obs.reports.path()) in notify.calls[0][0]
+
+
+def test_report_atomic_append_bounded_sections_and_crash_replay(tmp_path):
+    from ops.h3_formal_watch.reports import Reports, SECTION_LIMIT
+    reports = Reports(tmp_path / 'reports', tmp_path / 'progress.md')
+    reports.record('daily:2026-11-03', '2026-11-03', 'first summary', '中文诊断', daily=True)
+    daily = reports.path(True)
+    before = daily.read_text()
+    real_replace = os.replace
+    replacements = []
+    def replace(source, dest):
+        replacements.append((Path(source), Path(dest)))
+        assert Path(source).parent == Path(dest).parent and Path(source).name.startswith('.write-')
+        real_replace(source, dest)
+    with patch('ops.h3_formal_watch.common.os.replace', side_effect=OSError('disk error')):
+        with pytest.raises(OSError):
+            reports.record('daily:2026-11-04', '2026-11-04', 'next', daily=True)
+    assert daily.read_text() == before
+    with patch.object(reports.progress, 'text', side_effect=OSError('progress write failed')):
+        with pytest.raises(OSError):
+            reports.record('daily:2026-11-04', '2026-11-04', 'summary', '长' * 20000, daily=True)
+    after = daily.read_text()
+    assert len(after) - len(before) <= SECTION_LIMIT
+    with patch('ops.h3_formal_watch.common.os.replace', side_effect=replace):
+        reports.record('daily:2026-11-04', '2026-11-04', 'summary', '长' * 20000, daily=True)
+        reports.record('incident:i1', '2026-11-04', 'incident', 'private diagnosis')
+        reports.record('incident:i1', '2026-11-04', 'incident', 'private diagnosis')
+        reports.record('incident:i2', '2026-11-04', 'second incident', 'second diagnosis')
+    assert daily.read_text() == after
+    assert len((tmp_path / 'progress.md').read_text().splitlines()) == 2
+    assert reports.path().read_text().count('private diagnosis') == 1
+    assert reports.path().read_text().count('second diagnosis') == 1
+    assert replacements
 
 
 def test_user_unit_contract():
