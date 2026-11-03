@@ -30,16 +30,23 @@ ROLLOUT_BATCH = 4
 # segment begin, 12.96 GiB peak, i.e. a 3.75 GiB per-forward transient that
 # already includes one block's all-gathered parameters. B=4 is charged a full
 # 4 GiB per sample, so the non-scaling parameter part is over-counted.
-ROLLOUT_BATCH_ESTIMATE = dict(layout=(5550, 96, 414, 32), transient_bytes_per_sample=4 * 1024**3,
-                              basis='attempt003 rank0 B1 rollout_forward peak 12.96 GiB - begin 9.21 GiB')
+ROLLOUT_BATCH_ESTIMATES = {
+    (5550, 96, 414, 32): dict(transient_bytes_per_sample=4 * 1024**3,
+        basis='attempt003 rank0 B1 rollout_forward peak 12.96 GiB - begin 9.21 GiB'),
+    # Formal 384x256x124 has fewer video tokens (3552 vs 5550) and the same
+    # audio/channels. Reusing the larger 480x320 estimate is conservative:
+    # still charge 4 GiB per sample (16 GiB for B=4), not a measured B=4 peak.
+    (3552, 96, 414, 32): dict(transient_bytes_per_sample=4 * 1024**3,
+        basis='conservative reuse of 480x320 attempt003 B1 estimate for 384x256 (3552 vs 5550 video tokens)'),
+}
 
 
 def rollout_batch_admission(device, *, batch, layout, free_bytes=None, driver_free_bytes=None):
     """Fail closed BEFORE a batched forward whose declared transient may not fit.
 
     Allocatable = driver-free + reserved-but-unallocated bytes of this device.
-    Only the measured geometry has a declared estimate; CUDA work for another
-    geometry is rejected rather than guessed. There is no B=1 fallback: a run
+    Only explicitly listed geometries have a declared estimate; CUDA work for
+    any other geometry is rejected rather than guessed. There is no B=1 fallback: a run
     never changes its rollout numerics mid-run. CPU without an injected free
     byte count has no device memory to admit and is recorded as unchecked.
     """
@@ -49,9 +56,10 @@ def rollout_batch_admission(device, *, batch, layout, free_bytes=None, driver_fr
     if device.type != 'cuda' and free_bytes is None:
         return dict(checked=False, device=str(device), batch=batch, reason='no CUDA device memory')
     shape = (layout.video_rows, layout.video_channels, layout.audio_rows, layout.audio_channels)
-    if shape != ROLLOUT_BATCH_ESTIMATE['layout']:
+    estimate = ROLLOUT_BATCH_ESTIMATES.get(shape)
+    if estimate is None:
         raise ValueError('no declared batched-rollout memory estimate for this geometry')
-    required = batch * ROLLOUT_BATCH_ESTIMATE['transient_bytes_per_sample']
+    required = batch * estimate['transient_bytes_per_sample']
     if free_bytes is None:
         driver_free_bytes, _ = torch.cuda.mem_get_info(device)
         free_bytes = driver_free_bytes + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
@@ -61,7 +69,8 @@ def rollout_batch_admission(device, *, batch, layout, free_bytes=None, driver_fr
         raise ValueError('free byte counts must be nonnegative integers with driver-free <= allocatable')
     receipt = dict(checked=True, device=str(device), batch=batch, free_bytes=free_bytes,
                    driver_free_bytes=driver_free_bytes, reserved_unallocated_bytes=free_bytes - driver_free_bytes,
-                   required_bytes=required, basis=ROLLOUT_BATCH_ESTIMATE['basis'])
+                   layout=shape, transient_bytes_per_sample=estimate['transient_bytes_per_sample'],
+                   required_bytes=required, basis=estimate['basis'])
     if driver_free_bytes < required:
         # Admission still counts the allocator's reserved-but-unallocated cache,
         # which may be fragmented; record the weaker margin explicitly.

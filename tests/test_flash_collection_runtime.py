@@ -5103,6 +5103,33 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='no declared'):
         s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout, free_bytes=10**12)
     assert s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout)['checked'] is False
+    # Exercise the real CUDA admission branch without initializing CUDA: derive
+    # the formal layout, and inject only the three device memory queries.
+    from visual_rl.models.implementations.h3_geometry import H3T2VAGeometry
+    width, height, frames, fps, _, _ = formal.FORMAL_GEOMETRY
+    formal_layout = H3T2VAGeometry(height, width, frames, fps).joint_layout
+    assert formal_layout == H3JointLayout(3552, 96, 414, 32)
+    with monkeypatch.context() as patch:
+        queried = []
+        available = [16 * 1024**3]
+        def cuda_free(device):
+            queried.append(device)
+            return available[0], 64 * 1024**3
+        patch.setattr(torch.cuda, 'mem_get_info', cuda_free)
+        patch.setattr(torch.cuda, 'memory_reserved', lambda device: 0)
+        patch.setattr(torch.cuda, 'memory_allocated', lambda device: 0)
+        formal_receipt = s1_rollout.rollout_batch_admission('cuda:0', batch=4, layout=formal_layout)
+        assert formal_receipt['checked'] and formal_receipt['device'] == 'cuda:0'
+        assert formal_receipt['layout'] == (3552, 96, 414, 32)
+        assert formal_receipt['transient_bytes_per_sample'] == 4 * 1024**3
+        assert formal_receipt['required_bytes'] == formal_receipt['free_bytes'] == 16 * 1024**3
+        assert 'conservative reuse' in formal_receipt['basis'] and 'warning' not in formal_receipt
+        available[0] -= 1
+        with pytest.raises(RuntimeError, match='memory admission failed'):
+            s1_rollout.rollout_batch_admission('cuda:0', batch=4, layout=formal_layout)
+        with pytest.raises(ValueError, match='no declared'):
+            s1_rollout.rollout_batch_admission('cuda:0', batch=4, layout=dual.layout)
+        assert queried == [torch.device('cuda:0')] * 2
     refused_calls = []
     with pytest.raises(RuntimeError, match='memory admission failed'):
         s1_rollout.collect(dynamics=dual, samples=tuple(zip(ids, ('g',)*4)), initial_states=initial, generators=generators(),
