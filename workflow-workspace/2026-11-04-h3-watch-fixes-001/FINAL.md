@@ -1,6 +1,6 @@
 # H3 formal watch review fixes — 2026-11-04
 
-All 17 items fixed; none rejected. Regression tests reproduced defects before fixes. Six atomic implementation commits; no push, network, SSH, GPU or systemd operations. README synchronized.
+The previous claim that all 17 items were fixed was too strong: independent re-review of `100c3ea` confirmed 16 fixed and **original item 3 partial**. This round fixes the classification regression and two additional defects, with failing regressions observed before each implementation. Legacy STOPPING behavior is documented, not changed. No push, network, SSH, GPU or systemd operations; only offline tests and fake local processes.
 
 Tests below are in `tests/test_h3_formal_watch.py`.
 
@@ -8,7 +8,7 @@ Tests below are in `tests/test_h3_formal_watch.py`.
 |---|---|---|
 | 1 | Fixed `d2710e0` | `test_human_alerts_follow_token_not_polled_state` |
 | 2 | Fixed `9fa5a67` | `test_new_launch_adoption_clears_stale_pause_ownership`, `test_pause_ownership_requires_launch_and_token` |
-| 3 | Fixed `e355f4a`, `8c17c60` | `test_failure_records_veto_transient_retry`, `test_launcher_identity_json_does_not_veto_nccl`, `test_unrecognized_error_cannot_borrow_same_line_nccl_signature` |
+| 3 | Previously partial; fixed in this round by `5eca896` after `e355f4a`, `8c17c60` | `test_failure_records_veto_transient_retry`, `test_launcher_identity_json_does_not_veto_nccl`, `test_unrecognized_error_cannot_borrow_same_line_nccl_signature` |
 | 4 | Fixed `9fa5a67` | `test_cancelled_operator_pause_latches_human` |
 | 5 | Fixed `9fa5a67` | `test_acknowledge_dead_process_cannot_resume` |
 | 6 | Fixed `9fa5a67` | `test_unknown_launch_reconcile_adopt_or_abandon`, `test_unknown_launch_abandon_prevents_delayed_submission`, `test_unknown_launch_reconcile_rejects_foreign_unit` |
@@ -24,17 +24,30 @@ Tests below are in `tests/test_h3_formal_watch.py`.
 | 16 | Fixed `b402b93` | `test_progress_log_uses_append_preserves_concurrent_edits_and_mode`, `test_failed_atomic_report_write_leaves_no_temp` |
 | 17 | Fixed `196104a` | `test_observer_unit_covers_bounded_command_budget` |
 
+## Re-review corrections
+
+| Defect | Commit / resolution | Red → green evidence |
+|---|---|---|
+| 1: real torch timeout/TERM veto | `5eca896`; per-exception application veto retained | 9 failing cases before fix; 22 new cases pass, including reviewed torch 2.x lines, sanitized NCCL/torchrun tails, receipt gates and sampled/replayed-score ValueError veto |
+| 2: acknowledged completion re-latches | `78b52a2`; SUCCESS validation precedes dead-process veto | 4 failing cases before fix; 10 cases pass, covering restart, delayed receipt and mismatched evidence; no launch/signal |
+| 3: failed-before-execute abandonment | `45b017a`; stable inactive/failed empty unit without ownership receipts can be abandoned | 12 failing cases before fix; 26 cases pass, including negative ownership/read/race cases and delayed-submission prevention |
+| 4: legacy STOPPING | `08862de`; README note, fail-closed behavior unchanged | 2 guard cases pass for missing launch ID/token; existing request preserved |
+
+Fixtures under `tests/fixtures/h3_formal_watch/` use sanitized log text from the re-review probes, not a newly collected GPU run. Unit reconciliation tests mock manager/cgroup observations; they are not systemd acceptance.
+
 ## Validation
 
-- Watch tests: **147 passed** (baseline 114; 33 additional cases).
+- Watch tests: **207 passed in 11.52s** (previous round: 147; 60 additional cases).
 - Standalone offline drill: **9/9 scenarios passed**; local fake sleep processes only.
+- All six original rev2 scripts ran unchanged: `probe_cls`, `probe_term`, `probe_done`, `probe_ledger`, `probe`, `probeA`. Torch transients now classify correctly; application veto remains permanent; acknowledged completion reaches DONE. Ledger retains 32 rows/968 dedup records; dead-man recovery and distinct human-latch alerts remain intact. Dead-process acknowledgement still performs zero resumes.
 - `git diff --check`: passed.
 - Interpreter: `../../framecode/.venv/bin/python`.
-- Producer canonicalization checked against `../../framecode/visual_rl/core/protocols/flash_hpsv3.py`.
+- Additional original seven-test Mac gate: **6 passed, 1 failed**, the known Linux `/proc` CPU-RSS dependency. Initial missing author-data configuration produced 4/7; supplying the existing dataset restored expected 6/7 before each implementation commit. No Linux gate was run; no training source/tests changed.
+- Previous-round producer canonicalization check remains historical evidence, not rerun this round.
 
 ## Safety choices and remaining risks
 
-Cancelled operator pauses latch NEEDS_HUMAN: explicit rearming is safer than guessing intent. Reconciliation never submits/signals training; adoption requires durable matching receipts, abandonment requires proven absence/death and blocks delayed submission. Legacy unknown units without proof still need manual investigation.
+Cancelled operator pauses latch NEEDS_HUMAN: explicit rearming is safer than guessing intent. Reconciliation never submits/signals training; adoption requires durable matching receipts, abandonment requires proven absence/death and blocks delayed submission. Legacy unknown units without proof still need manual investigation unless the strict failed-before-execute absence/death gate succeeds. Legacy STOPPING without launch ID/token cannot establish pause ownership and remains fail-closed.
 
 SQLite keeps pending deliveries and permanent dedup keys outside bounded JSON; these necessarily consume disk proportional to backlog/unique work. Diagnostic retention is eight segments plus active; export longer history separately. Human observations record meaningful changes only. Observer helper budget is capped at 3825 seconds under a 90-minute unit timeout.
 
