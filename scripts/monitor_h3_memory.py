@@ -113,11 +113,29 @@ def failure_limit(value):
     return int(value)
 
 
+def positive_number(value):
+    try:
+        number=float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a positive finite number') from None
+    if not 0<number<float('inf'):
+        raise argparse.ArgumentTypeError('expected a positive finite number')
+    return number
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory',type=Path);parser.add_argument('--journal-dir',type=Path,required=True)
     parser.add_argument('--max-consecutive-failures',type=failure_limit,default=3)
-    args=parser.parse_args();run(args.directory,args.journal_dir,max_consecutive_failures=args.max_consecutive_failures)
+    # Defaults keep the short-acceptance budgets; a multi-day run must raise them explicitly.
+    parser.add_argument('--interval',type=positive_number,default=1.,help='seconds between samples (default 1)')
+    parser.add_argument('--max-seconds',type=positive_number,default=24*3600.,
+                        help='monitor lifetime before it exits unhealthy (default 86400)')
+    parser.add_argument('--max-bytes',type=failure_limit,default=512*1024**2,
+                        help='card-process.jsonl byte budget (default 512 MiB)')
+    args=parser.parse_args()
+    run(args.directory,args.journal_dir,interval=args.interval,max_bytes=args.max_bytes,
+        max_seconds=args.max_seconds,max_consecutive_failures=args.max_consecutive_failures)
 
 
 if __name__=='__main__':main()

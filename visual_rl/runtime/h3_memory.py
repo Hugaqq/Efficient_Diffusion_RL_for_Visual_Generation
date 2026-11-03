@@ -204,12 +204,25 @@ _instance=None
 
 def enabled():return bool(os.environ.get('H3_MEMORY_DIR'))
 
+DEFAULT_MAX_BYTES=64*1024**2
+
+
+def max_bytes_from_environment():
+    """Per-process journal byte budget; H3_MEMORY_MAX_BYTES (decimal) overrides 64 MiB."""
+    raw=os.environ.get('H3_MEMORY_MAX_BYTES')
+    if raw is None:return DEFAULT_MAX_BYTES
+    if not raw.isascii() or not raw.isdigit() or not 1<=int(raw)<=2**40:
+        raise ValueError('H3_MEMORY_MAX_BYTES must be a decimal integer in [1, 2**40]')
+    return int(raw)
+
+
 def journal():
     global _instance
     if _instance is None and enabled():
         rank=int(os.environ.get('RANK','-1'));role=os.environ.get('H3_MEMORY_ROLE','train')
         device=int(os.environ.get('LOCAL_RANK','0'))
-        _instance=Journal(os.environ['H3_MEMORY_DIR'],rank=rank,role=role,device=device)
+        _instance=Journal(os.environ['H3_MEMORY_DIR'],rank=rank,role=role,device=device,
+                          max_bytes=max_bytes_from_environment())
     return _instance
 
 

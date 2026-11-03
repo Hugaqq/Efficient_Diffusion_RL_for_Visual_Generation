@@ -3682,3 +3682,28 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             lifecycle_events.clear(); close_failure = False; idle_failure = True
             with pytest.raises(RuntimeError, match='main idle failed'): service.main()
             assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
+
+    # Formal 200-update run: long-run observation budgets are explicit opt-ins;
+    # unset environment / default CLI keep the short-acceptance limits.
+    from visual_rl.runtime import h3_memory as budget_memory
+    from scripts import monitor_h3_memory as budget_monitor
+    import sys
+    with monkeypatch.context() as patch:
+        patch.delenv('H3_MEMORY_MAX_BYTES', raising=False)
+        assert budget_memory.max_bytes_from_environment() == 64 * 1024**2
+        patch.setenv('H3_MEMORY_MAX_BYTES', str(512 * 1024**2))
+        assert budget_memory.max_bytes_from_environment() == 512 * 1024**2
+        for bad in ('0', '-1', '1e9', ' 5', str(2**40 + 1)):
+            patch.setenv('H3_MEMORY_MAX_BYTES', bad)
+            with pytest.raises(ValueError, match='H3_MEMORY_MAX_BYTES'): budget_memory.max_bytes_from_environment()
+        runs = []
+        patch.setattr(budget_monitor, 'run', lambda *a, **kw: runs.append(kw))
+        base = ['monitor_h3_memory', str(tmp_path / 'm'), '--journal-dir', str(tmp_path / 'j')]
+        patch.setattr(sys, 'argv', base); budget_monitor.main()
+        patch.setattr(sys, 'argv', base + ['--interval', '5', '--max-seconds', '1728000', '--max-bytes', str(8 * 1024**3)])
+        budget_monitor.main()
+        assert runs == [dict(interval=1., max_bytes=512 * 1024**2, max_seconds=86400., max_consecutive_failures=3),
+                        dict(interval=5., max_bytes=8 * 1024**3, max_seconds=1728000., max_consecutive_failures=3)]
+        for bad in (['--interval', '0'], ['--max-seconds', 'inf'], ['--max-bytes', '0'], ['--interval', 'nan']):
+            patch.setattr(sys, 'argv', base + bad)
+            with pytest.raises(SystemExit): budget_monitor.main()
