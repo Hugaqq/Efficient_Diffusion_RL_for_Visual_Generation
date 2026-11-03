@@ -4,6 +4,7 @@
 
 | 工作区 | 用途 |
 |---|---|
+| [2026-11-04-h3-history-pins-001](2026-11-04-h3-history-pins-001/REPORT.md) | 历史重写后的 Git pin / 已记录身份分离；本地修复与验证，未推送 |
 | [2026-10-27-h3-8gpu-mvp-dev-001](2026-10-27-h3-8gpu-mvp-dev-001/README.md) | 原多Agent开发；在入口集成缺口处failed，保留历史记录 |
 | [2026-10-28-h3-mvp-manual-finish-001](2026-10-28-h3-mvp-manual-finish-001/final.md) | 主会话接管：初始化错误门、正式入口和CPU端到端收尾；GPU待验收 |
 | [2026-10-28-h3-experiment-cycle-001](2026-10-28-h3-experiment-cycle-001/README.md) | Experimenter↔Coder真实GPU反馈闭环；Flow/Flash各5更新后执行确认的正式实验 |

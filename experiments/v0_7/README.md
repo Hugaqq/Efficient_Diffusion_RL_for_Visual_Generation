@@ -32,7 +32,7 @@ These commands require the documented GPU/model/reward environment. Bounded
 engineering runs using the same public API and fixed role configurations have
 completed Flow, TempFlow, Flash and World-R1 C20
 continuous/interrupted-resume parity. They are documented separately in
-[the archived operational evidence](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/blob/00cee786df783f36cb254a9a666a48a5952dc0a3/docs/V0_7_OPERATIONAL_EVIDENCE.md) because a dirty engineering candidate
+[the archived operational evidence](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/blob/2f995fda636e0b5c8c0b7d50c37ba62f5bbc4e82/docs/V0_7_OPERATIONAL_EVIDENCE.md) because a dirty engineering candidate
 cannot populate the clean-candidate final evidence envelope. There is no CLI
 option, YAML overlay, experiment Runner, checkpoint loader, or plugin path.
 
@@ -49,5 +49,5 @@ all-role environment attempts, Q100 digest, and the current clean Git HEAD.
 
 The old user guide, operational evidence and acceptance matrix were removed
 from current docs. Read them in the
-[fixed historical snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/00cee786df783f36cb254a9a666a48a5952dc0a3/docs),
+[fixed historical snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/2f995fda636e0b5c8c0b7d50c37ba62f5bbc4e82/docs),
 not as instructions or support claims for the current framework.

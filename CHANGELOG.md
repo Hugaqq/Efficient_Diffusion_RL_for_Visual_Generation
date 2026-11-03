@@ -94,4 +94,4 @@ claims remain outside this release evidence.
 
 The v0.7 experiment files under `experiments/v0_7/` remain historical records,
 not v0.8 usage or support contracts. The removed `docs/V0_7_*` guides remain
-available in the [pre-cleanup Git snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/00cee786df783f36cb254a9a666a48a5952dc0a3/docs).
+available in the [pre-cleanup Git snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/2f995fda636e0b5c8c0b7d50c37ba62f5bbc4e82/docs).

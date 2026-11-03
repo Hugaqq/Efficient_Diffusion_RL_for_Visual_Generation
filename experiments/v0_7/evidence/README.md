@@ -15,5 +15,5 @@ operational C20 runs are recorded in the removed v0.7 operational guide; they
 must not be copied into this directory or represented as final release
 evidence. The operational guide and acceptance document defining generated
 filenames remain in the
-[fixed historical snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/00cee786df783f36cb254a9a666a48a5952dc0a3/docs).
+[fixed historical snapshot](https://github.com/Hugaqq/Efficient_Diffusion_RL_for_Visual_Generation/tree/2f995fda636e0b5c8c0b7d50c37ba62f5bbc4e82/docs).
 Generated evidence stays ignored until an authorized, clean-commit run produces it.
