@@ -14,7 +14,13 @@ import subprocess
 import tempfile
 import wave
 
-BASE_SHA = 'e835fe39f6d208272a28afb3555f408854e14ca2'
+if __package__:
+    from .rewritten_history import H3_RECORDED_SHA, git_revision
+else:  # Preserve direct `python scripts/launch_h3_media.py` invocation.
+    from rewritten_history import H3_RECORDED_SHA, git_revision
+
+BASE_SHA = H3_RECORDED_SHA  # recorded artifact / CLI identity
+BASE_GIT_SHA = git_revision(BASE_SHA)
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG_TIMEOUT_S = 180
 FFPROBE_TIMEOUT_S = 60
@@ -163,15 +169,15 @@ def prove_observation_only():
     if git('status','--porcelain'):
         raise ValueError('dirty source checkout')
     head=git('rev-parse','HEAD')
-    if git('merge-base',BASE_SHA,head) != BASE_SHA:
+    if git('merge-base',BASE_GIT_SHA,head) != BASE_GIT_SHA:
         raise ValueError('media launcher requires audited base ancestry')
     allowed={'scripts/launch_h3_media.py','tests/test_flash_collection_runtime.py'}
-    changed=set(git('diff','--name-only',BASE_SHA,head).splitlines())
+    changed=set(git('diff','--name-only',BASE_GIT_SHA,head).splitlines())
     if not changed <= allowed:
         raise ValueError('upgrade changes files outside observation-only allowlist')
     trees={}
     for path in ('visual_rl','data','experiments'):
-        old,new=(git('rev-parse',f'{sha}:{path}') for sha in (BASE_SHA,head))
+        old,new=(git('rev-parse',f'{sha}:{path}') for sha in (BASE_GIT_SHA,head))
         if old!=new:raise ValueError('training/model/data/config code changed')
         trees[path]=old
     return dict(base_sha=BASE_SHA,launcher_sha=head,unchanged_trees=trees,

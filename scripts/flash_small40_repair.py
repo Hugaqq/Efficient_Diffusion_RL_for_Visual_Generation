@@ -11,8 +11,10 @@ from pathlib import Path
 import subprocess
 
 from visual_rl.algorithms.rewards.clients.hpsv3 import Hpsv3VideoClient
+from scripts.rewritten_history import SMALL40_RECORDED_SHA, git_revision
 
-REPAIR_BASE = "00cee786df783f36cb254a9a666a48a5952dc0a3"
+REPAIR_BASE = SMALL40_RECORDED_SHA  # persisted owner / CLI identity
+REPAIR_GIT_BASE = git_revision(REPAIR_BASE)
 REPAIR_OUTPUT = Path("/mnt/data/user/runs/flash-small40-20261022/run-002")
 ALLOWED_CHANGES = frozenset({
     "scripts/launch_flash140.py", "scripts/flash_small40_repair.py",
@@ -98,7 +100,9 @@ class CacheHandoffRewardFactory:
 
 
 def git_read(root, *args):
-    return subprocess.check_output(["git", "-C", str(root), *args], text=True, timeout=30).strip()
+    return subprocess.check_output(
+        ["git", "-C", str(root), *(git_revision(arg) for arg in args)],
+        text=True, timeout=30).strip()
 
 
 def prove_launcher_upgrade(root, new_sha, config, *, git=None):
@@ -109,19 +113,22 @@ def prove_launcher_upgrade(root, new_sha, config, *, git=None):
     identities. Only this fixed historical base can authorize an owner change.
     """
     git = (lambda *args: git_read(root, *args)) if git is None else git
-    if git("merge-base", REPAIR_BASE, new_sha) != REPAIR_BASE:
+    new_git_sha = git_revision(new_sha)
+    # The injected Git reader may also speak recorded revisions; compare in the
+    # rewritten Git namespace, never by looking up a pre-rewrite object.
+    if git_revision(git("merge-base", REPAIR_GIT_BASE, new_git_sha)) != REPAIR_GIT_BASE:
         raise RuntimeError("launcher upgrade requires the approved base ancestry")
-    changed = git("diff", "--name-only", REPAIR_BASE, new_sha).splitlines()
+    changed = git("diff", "--name-only", REPAIR_GIT_BASE, new_git_sha).splitlines()
     if not set(changed) <= ALLOWED_CHANGES:
         raise RuntimeError("launcher upgrade changed runtime/config/source outside the allowed paths")
     trees = {}
     for path in ("visual_rl", "experiments", "data"):
-        old, new = (git("rev-parse", f"{sha}:{path}") for sha in (REPAIR_BASE, new_sha))
+        old, new = (git("rev-parse", f"{sha}:{path}") for sha in (REPAIR_GIT_BASE, new_git_sha))
         if old != new:
             raise RuntimeError(f"launcher upgrade changed {path} content")
         trees[path] = new
     relative = Path(config).relative_to(root).as_posix()
-    if git("rev-parse", f"{REPAIR_BASE}:{relative}") != git("hash-object", str(config)):
+    if git("rev-parse", f"{REPAIR_GIT_BASE}:{relative}") != git("hash-object", str(config)):
         raise RuntimeError("launcher upgrade config bytes differ")
     return dict(base_sha=REPAIR_BASE, new_sha=new_sha, changed_paths=changed,
                 unchanged_git_objects=trees,

@@ -8,7 +8,10 @@ from pathlib import Path
 import json
 import subprocess
 
-BASE_SHA='e835fe39f6d208272a28afb3555f408854e14ca2'
+from scripts.rewritten_history import H3_RECORDED_SHA, git_revision
+
+BASE_SHA=H3_RECORDED_SHA  # recorded artifact / audit identity
+BASE_GIT_SHA=git_revision(BASE_SHA)
 OLD_CODE='e0a03bfdbe367e13f5585b597485f2cd2812c3f5e844c066bd21fd10798cdd43'
 RUN_ID='671b3af57aeb4e599f48c080ec0a65d0'
 SEMANTIC='h3.semantic.v1:96ec05a8e1349b8f642cd9003fa73fe44817f7443e2b39cd61dc3fca577c4d65'
@@ -32,13 +35,13 @@ def prove(root,expected_sha):
     root=Path(root)
     if git(root,'status','--porcelain') or git(root,'rev-parse','HEAD')!=expected_sha:
         raise ValueError('upgrade requires exact clean expected Git SHA')
-    if git(root,'merge-base',BASE_SHA,expected_sha)!=BASE_SHA:
+    if git(root,'merge-base',BASE_GIT_SHA,expected_sha)!=BASE_GIT_SHA:
         raise ValueError('upgrade lacks approved base ancestry')
-    changed=set(git(root,'diff','--name-only',BASE_SHA,expected_sha).splitlines())
+    changed=set(git(root,'diff','--name-only',BASE_GIT_SHA,expected_sha).splitlines())
     if not changed<=ALLOWED:raise ValueError('upgrade outside reviewed file allowlist')
     stable={}
     for path in ('data','experiments'):
-        old,new=(git(root,'rev-parse',f'{s}:{path}') for s in (BASE_SHA,expected_sha))
+        old,new=(git(root,'rev-parse',f'{s}:{path}') for s in (BASE_GIT_SHA,expected_sha))
         if old!=new:raise ValueError('data/experiment changed during checkpoint upgrade')
         stable[path]=old
     return dict(base_sha=BASE_SHA,expected_sha=expected_sha,changed_files=sorted(changed),
@@ -49,7 +52,7 @@ class H3CodeUpgrade:
     def __init__(self,*,root,legacy_root,expected_sha):
         self.root=Path(root).resolve();self.legacy_root=Path(legacy_root).resolve()
         self.proof=prove(self.root,expected_sha)
-        if git(self.legacy_root,'rev-parse','HEAD')!=BASE_SHA or git(self.legacy_root,'status','--porcelain'):
+        if git(self.legacy_root,'rev-parse','HEAD')!=BASE_GIT_SHA or git(self.legacy_root,'status','--porcelain'):
             raise ValueError('legacy source must be the clean actual base checkout')
         from visual_rl.composition.preflight.artifacts import _hash_artifact
         self.legacy_code=_hash_artifact(self.legacy_root/'visual_rl',content_policy='python-code.v1')

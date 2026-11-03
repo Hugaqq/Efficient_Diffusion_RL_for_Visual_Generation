@@ -24,6 +24,11 @@ import sys
 import threading
 import time
 
+if __package__:
+    from .rewritten_history import SMALL40_RECORDED_SHA
+else:  # Preserve direct `python scripts/launch_flash140.py` invocation.
+    from rewritten_history import SMALL40_RECORDED_SHA
+
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "experiments/flash_wan_capacity_20261022/approved140-runtime.yaml"
 SMALL_CONFIG = CONFIG.with_name("small40-runtime.yaml")
@@ -361,7 +366,7 @@ def main(argv=None):
     parser.add_argument("--expected-sha", required=True, help="full40-character pulled Git commit")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overlay", type=Path, default=OVERLAY)
-    parser.add_argument("--upgrade-launcher-from", choices=("00cee786df783f36cb254a9a666a48a5952dc0a3",),
+    parser.add_argument("--upgrade-launcher-from", choices=(SMALL40_RECORDED_SHA,),
                         help="audited launcher-only upgrade of original run-002 step2; never rewrites checkpoint identities")
     parser.add_argument("--gpu-memory-policy", choices=("reserve", "oom"), default="reserve",
                         help="oom: log GPU memory without headroom/peak-budget aborts; real CUDA OOM still fails")
