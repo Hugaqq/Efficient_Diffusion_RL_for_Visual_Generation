@@ -452,9 +452,11 @@ class Watchdog:
         permanent = ('audit failed', 'graph/count/release', 'adam counter', 'gradient not finite',
             'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged',
             'different h3 run', 'out of memory', 'insufficient disk', 'refusing resume', 'digest mismatch')
-        nccl = (r'nccl[^\n]*watchdog[^\n]*(?:timed out|timeout)|'
-                r'watchdog[^\n]*(?:timed out|timeout)[^\n]*nccl|'
-                r'exception \(either an error or timeout\) detected by watchdog at work:[^\n]*nccl')
+        # "Either an error or timeout" / "failed or timed out" are ambiguous
+        # async-error diagnostics, not positive evidence of a collective timeout.
+        nccl = (r'nccl[^\n]*watchdog[^\n]*\btimed out\b|'
+                r'watchdog[^\n]*\btimed out\b[^\n]*nccl|'
+                r'watchdog caught collective operation timeout:[^\n]*nccl')
         monitor = r'card(?:/process)? monitor[^\n]*(?:unhealthy|stale)'
         receipt = self.exit_receipt()
         stop = self.s.get('stop') or {}

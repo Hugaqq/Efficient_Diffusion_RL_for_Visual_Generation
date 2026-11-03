@@ -66,7 +66,10 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   Each explicit exception must itself be an allowlisted transient record; an
   unrelated error cannot borrow a later NCCL substring, even on the same line.
   Torch NCCL watchdog `exception:` messages and native `c10::Error::Error` stack
-  frames are supported; a bare word "error" in metrics/diagnostics is not a failure
+  frames are supported. NCCL recovery needs a collective-operation-timeout or
+  explicit watchdog "timed out" record; "either an error or timeout" and "failed
+  or timed out" diagnostics alone cannot authorize retry. A bare word "error" in
+  metrics/diagnostics is not a failure
   record. Elastic `SignalException: Process ... got signal: 15` is exempt only as
   the sole failure record, with a matching exit receipt (-15/143 or torchrun's 1)
   and the watchdog's own same-launch TERM record (`phase=term`, `last_signal=SIGTERM`,

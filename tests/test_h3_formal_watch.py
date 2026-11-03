@@ -1198,9 +1198,6 @@ WATCH_LOGS = Path(__file__).parent / 'fixtures' / 'h3_formal_watch'
 
 
 @pytest.mark.parametrize('line', [
-    '[rank3]:[E1103 16:40:01.124 ProcessGroupNCCL.cpp:1664] [PG 0 (default_pg) Rank 3] '
-    'Exception (either an error or timeout) detected by watchdog at work: 5, '
-    'last enqueued NCCL work: 5, last completed NCCL work: 4.',
     '[rank3]:[E1103 16:40:01.125 ProcessGroupNCCL.cpp:1515] [PG 0 (default_pg) Rank 3] '
     'Process group watchdog thread terminated with exception: [Rank 3] Watchdog caught '
     'collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLREDUCE) ran for '
@@ -1219,6 +1216,23 @@ WATCH_LOGS = Path(__file__).parent / 'fixtures' / 'h3_formal_watch'
 def test_torch2_timeout_records_are_transient(box, line):
     box.log(line)
     assert box.watch.death_cause() == 'nccl_watchdog_timeout'
+
+
+@pytest.mark.parametrize('support_only', [False, True])
+@pytest.mark.parametrize('timeout', ['', 'NCCL watchdog timed out\n',
+    '[Rank 3] Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLREDUCE) '
+    'ran for 600043 milliseconds before timing out.\n'])
+def test_nccl_watchdog_supporting_lines_need_timeout_evidence(box, support_only, timeout):
+    box.tick()
+    text = (WATCH_LOGS / 'torch2_nccl_async_error.log').read_text()
+    if support_only:
+        text = text.splitlines()[0] + '\n'
+    box.log(timeout + text)
+    box.die()
+    state = box.tick()
+    assert state['incidents'][-1]['cause'] == ('nccl_watchdog_timeout' if timeout else 'unknown_exit')
+    assert state['state'] == ('RECOVERING' if timeout else 'NEEDS_HUMAN')
+    assert not state['resumes']
 
 
 @pytest.mark.parametrize('failure', ['',

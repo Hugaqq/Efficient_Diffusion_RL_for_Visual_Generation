@@ -1,0 +1,3 @@
+[rank3]:[E1103 16:40:01.124 ProcessGroupNCCL.cpp:1664] [PG 0 (default_pg) Rank 3] Exception (either an error or timeout) detected by watchdog at work: 5, last enqueued NCCL work: 5, last completed NCCL work: 4.
+[rank3]:[E1103 16:40:01.125 ProcessGroupNCCL.cpp:1664] [Rank 3] Some NCCL operations have failed or timed out.
+[rank3]:[E1103 16:40:01.126 ProcessGroupNCCL.cpp:1664] [Rank 3] To avoid data inconsistency, we are taking the entire process down.
