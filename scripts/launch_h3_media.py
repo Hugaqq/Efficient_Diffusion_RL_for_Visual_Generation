@@ -26,9 +26,8 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def selection(source, sample_id, *, every=10, terminal_step=None):
-    if type(every) is not int or every<1:
-        raise ValueError('video cadence must be a positive integer')
+def reservation(source, sample_id):
+    """Reward-independent identity of one sample in the live paired_4x8 reservation."""
     request = source._pending
     if request is None:
         raise ValueError('media observation requires a live source reservation')
@@ -39,16 +38,22 @@ def selection(source, sample_id, *, every=10, terminal_step=None):
     if len(matches) != 1:
         raise ValueError('sample absent or duplicated in current reservation')
     group, member = matches[0]
-    if (step % every and step != terminal_step) or member != 0:
-        return None
     return dict(step=step, sample_id=sample_id, group_id=group, member=member,
                 prompt=request.prompts[sample_id], collection_id=request.collection_id,
                 behavior_id=request.behavior_id,
                 interpretation='rollout for upcoming optimizer update; not a post-update evaluation')
 
 
-def save_media(*, root, metadata, media, reward, ffmpeg, ffprobe, launcher_sha):
-    """Bounded CPU copy/encode, ffprobe verification, then atomic directory rename."""
+def selection(source, sample_id, *, every=10, terminal_step=None):
+    if type(every) is not int or every<1:
+        raise ValueError('video cadence must be a positive integer')
+    chosen = reservation(source, sample_id)
+    if (chosen['step'] % every and chosen['step'] != terminal_step) or chosen['member'] != 0:
+        return None
+    return chosen
+
+
+def validate_av(media):
     import torch
     video, audio, info = media.video, media.audio, media.metadata
     if (video.device.type != 'cpu' or audio.device.type != 'cpu' or
@@ -56,12 +61,65 @@ def save_media(*, root, metadata, media, reward, ffmpeg, ffprobe, launcher_sha):
             video.requires_grad or audio.requires_grad or video.ndim != 4 or video.shape[1] != 3 or
             audio.ndim != 2 or audio.shape[1] != 2 or
             video.shape[0] != info.frame_count or audio.shape[0] != info.sample_count or
-            info.fps <= 0 or info.sample_rate <= 0 or not math.isfinite(reward)):
+            info.fps <= 0 or info.sample_rate <= 0):
         raise ValueError('invalid detached CPU AV media/reward')
     if not bool(torch.isfinite(video).all()) or not bool(torch.isfinite(audio).all()):
         raise ValueError('nonfinite media')
     if video.numel()*video.element_size() + audio.numel()*audio.element_size() > 1024**3:
         raise ValueError('media exceeds one GiB export budget')
+
+
+def encode_av(staging, *, media, ffmpeg, ffprobe):
+    """Bounded frame-by-frame CPU copy into staging/video.mp4, then ffprobe verification.
+
+    The caller validated the media with validate_av. Returns the receipt facts.
+    """
+    import torch
+    video, audio, info = media.video, media.audio, media.metadata
+    staging = Path(staging)
+    raw, wav, mp4 = staging/'video.rgb', staging/'audio.wav', staging/'video.mp4'
+    with raw.open('xb') as stream:
+        for frame in video:
+            # No in-place operation: scoring/training media remains unchanged.
+            pixels = frame.detach().clamp(0, 1).mul(255).round().to(torch.uint8)
+            stream.write(pixels.permute(1,2,0).contiguous().numpy().tobytes())
+    pcm = audio.detach().clamp(-1,1).mul(32767).round().to(torch.int16).numpy().astype('<i2',copy=False)
+    with wave.open(str(wav), 'wb') as stream:
+        stream.setnchannels(2); stream.setsampwidth(2); stream.setframerate(info.sample_rate)
+        stream.writeframes(pcm.tobytes())
+    cmd = [str(ffmpeg), '-nostdin', '-hide_banner', '-loglevel', 'error', '-n',
+           '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{video.shape[3]}x{video.shape[2]}',
+           '-r', str(info.fps), '-i', str(raw), '-i', str(wav),
+           '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-threads', '1',
+           '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
+           '-movflags', '+faststart', str(mp4)]
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
+    probe = subprocess.run([str(ffprobe), '-v', 'error', '-count_frames',
+                            '-show_streams', '-of', 'json', str(mp4)], check=True,
+                           capture_output=True, text=True, timeout=60)
+    streams = json.loads(probe.stdout)['streams']
+    videos = [s for s in streams if s['codec_type']=='video']
+    audios = [s for s in streams if s['codec_type']=='audio']
+    if (len(videos)!=1 or len(audios)!=1 or
+            int(videos[0]['nb_read_frames'])!=info.frame_count or
+            videos[0]['width']!=video.shape[3] or videos[0]['height']!=video.shape[2] or
+            int(audios[0]['sample_rate'])!=info.sample_rate or audios[0]['channels']!=2):
+        raise ValueError('encoded AV geometry/frame-count mismatch')
+    numerator,denominator=map(int,videos[0]['avg_frame_rate'].split('/'))
+    if numerator != info.fps * denominator:
+        raise ValueError('encoded frame-rate mismatch')
+    raw.unlink(); wav.unlink()
+    return dict(video_sha256=sha256_file(mp4), fps=info.fps, frames=info.frame_count,
+                audio_sample_rate=info.sample_rate, audio_samples=info.sample_count,
+                encoding='h264-crf18+aac; lossy viewing copy, not original HPS input',
+                ffprobe=streams)
+
+
+def save_media(*, root, metadata, media, reward, ffmpeg, ffprobe, launcher_sha):
+    """Bounded CPU copy/encode, ffprobe verification, then atomic directory rename."""
+    if not math.isfinite(reward):
+        raise ValueError('invalid detached CPU AV media/reward')
+    validate_av(media)
     parent = Path(root) / f"step-{metadata['step']:04d}"
     parent.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(metadata['sample_id'].encode()).hexdigest()
@@ -70,45 +128,10 @@ def save_media(*, root, metadata, media, reward, ffmpeg, ffprobe, launcher_sha):
         raise FileExistsError('refusing to overwrite an existing rollout sample')
     with tempfile.TemporaryDirectory(prefix='.pending-', dir=parent) as tmp:
         staging = Path(tmp)
-        raw, wav, mp4 = staging/'video.rgb', staging/'audio.wav', staging/'video.mp4'
-        with raw.open('xb') as stream:
-            for frame in video:
-                # No in-place operation: scoring/training media remains unchanged.
-                pixels = frame.detach().clamp(0, 1).mul(255).round().to(torch.uint8)
-                stream.write(pixels.permute(1,2,0).contiguous().numpy().tobytes())
-        pcm = audio.detach().clamp(-1,1).mul(32767).round().to(torch.int16).numpy().astype('<i2',copy=False)
-        with wave.open(str(wav), 'wb') as stream:
-            stream.setnchannels(2); stream.setsampwidth(2); stream.setframerate(info.sample_rate)
-            stream.writeframes(pcm.tobytes())
-        cmd = [str(ffmpeg), '-nostdin', '-hide_banner', '-loglevel', 'error', '-n',
-               '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{video.shape[3]}x{video.shape[2]}',
-               '-r', str(info.fps), '-i', str(raw), '-i', str(wav),
-               '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-threads', '1',
-               '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
-               '-movflags', '+faststart', str(mp4)]
-        subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
-        probe = subprocess.run([str(ffprobe), '-v', 'error', '-count_frames',
-                                '-show_streams', '-of', 'json', str(mp4)], check=True,
-                               capture_output=True, text=True, timeout=60)
-        streams = json.loads(probe.stdout)['streams']
-        videos = [s for s in streams if s['codec_type']=='video']
-        audios = [s for s in streams if s['codec_type']=='audio']
-        if (len(videos)!=1 or len(audios)!=1 or
-                int(videos[0]['nb_read_frames'])!=info.frame_count or
-                videos[0]['width']!=video.shape[3] or videos[0]['height']!=video.shape[2] or
-                int(audios[0]['sample_rate'])!=info.sample_rate or audios[0]['channels']!=2):
-            raise ValueError('encoded AV geometry/frame-count mismatch')
-        numerator,denominator=map(int,videos[0]['avg_frame_rate'].split('/'))
-        if numerator != info.fps * denominator:
-            raise ValueError('encoded frame-rate mismatch')
-        receipt = dict(metadata, reward=reward, launcher_sha=launcher_sha,
-                       video_sha256=sha256_file(mp4), fps=info.fps, frames=info.frame_count,
-                       audio_sample_rate=info.sample_rate, audio_samples=info.sample_count,
-                       encoding='h264-crf18+aac; lossy viewing copy, not original HPS input',
-                       ffprobe=streams)
+        facts = encode_av(staging, media=media, ffmpeg=ffmpeg, ffprobe=ffprobe)
+        receipt = dict(metadata, reward=reward, launcher_sha=launcher_sha, **facts)
         (staging/'receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2))
-        raw.unlink(); wav.unlink()
-        for file in (mp4,staging/'receipt.json'):
+        for file in (staging/'video.mp4',staging/'receipt.json'):
             with file.open('rb') as stream: os.fsync(stream.fileno())
         os.rename(staging,target)
         fd=os.open(parent,os.O_RDONLY)

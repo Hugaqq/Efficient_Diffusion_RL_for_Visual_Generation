@@ -34,10 +34,10 @@ def validate_fresh(profile):
     return profile
 
 
-def monitor_healthy(directory, *, now_ns=None):
+def monitor_healthy(directory, *, now_ns=None, max_age=15):
     health=json.loads((Path(directory)/'health.json').read_text())
     age=((time.monotonic_ns() if now_ns is None else now_ns)-health.get('monotonic_ns',0))/1e9
-    if not health.get('healthy') or not 0<=age<15 or health.get('sample_count',0)<2:
+    if not health.get('healthy') or not 0<=age<max_age or health.get('sample_count',0)<2:
         raise RuntimeError('card/process monitor unhealthy or stale; cannot start another update')
     # Degraded = transient nvidia-smi failures below the monitor's fatal limit.
     return dict(health,degraded=health.get('degraded') is True,consecutive_failures=health.get('consecutive_failures',0))
@@ -53,6 +53,8 @@ def phase(name):
 
 
 class TwoUpdateBackend(H3LifecycleBackend):
+    """Two-update acceptance backend; subclasses override the documented hooks only."""
+    monitor_max_age=15  # seconds; health.json older than this stops the next update
     def __init__(self,*,args):
         super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae,
                          reuse_rollout_anchor=args.reuse_rollout_anchor,
@@ -64,7 +66,34 @@ class TwoUpdateBackend(H3LifecycleBackend):
         configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
         self.profile_rollout=args.profile_rollout;self.rollout_profile=None
         self.args=args;self.previous=None;self.audits=[]
-    def compile(self,source):return validate_fresh(super().compile(source))
+        self.audit_weights=True;self.first_step=None
+    def validate_profile(self,profile):return validate_fresh(profile)
+    def compile(self,source):return self.validate_profile(super().compile(source))
+    def rollout_identity(self,bound,graph,sid):
+        """Reward-independent seed/index identity of a live rollout sample."""
+        ctx=bound.stages._active;request=ctx.request
+        return dict(stochastic_index=ctx.dual_selection[sid],
+            initial_noise_sha256=hashlib.sha256(request.initial_states[sid].numpy().tobytes()).hexdigest(),
+            model_sha256=graph.profile.expected['model_sha256'])
+    def install_media(self,bound,graph,runtime):
+        """Hook: member0 export at every update of this two-update acceptance."""
+        def exporter(**kwargs):
+            sid=kwargs['metadata']['sample_id']
+            kwargs['metadata']=dict(kwargs['metadata'],**self.rollout_identity(bound,graph,sid),
+                diagnostic_save_exception=True,interpretation='pre-update rollout; not post-update evaluation')
+            with memory.span('video_save',sample_id=sid,step=kwargs['metadata']['step']):
+                return save_media(**kwargs)
+        bound.stages.score_one=observed_score(bound.stages.score_one,source=graph.source,
+            root=graph.profile.launch.output_dir/'rollout-videos',ffmpeg=self.args.ffmpeg,
+            ffprobe=self.args.ffprobe,launcher_sha=self.args.expected_sha,every=1,terminal_step=2,saver=exporter)
+    def check_start(self,step,graph,prepared):
+        """Hook: state checks before the first update executed by this process."""
+        if step!=0 or prepared.optimizer.state or self.start_step!=0 or graph.source.state_dict()['next_optimizer_step']!=0:
+            raise ValueError('optimizer/data not fresh')
+    def after_update(self,step,runtime):
+        """Hook: collective-safe work after a successful update, before its audit."""
+    def update_failed(self,step):
+        """Hook: local cleanup when an update raised; the error is re-raised."""
     @phase('runtime_initialization')
     def create_runtime(self,*args):return super().create_runtime(*args)
     @phase('graph_cache_preparation')
@@ -87,50 +116,49 @@ class TwoUpdateBackend(H3LifecycleBackend):
                 bound.stages.rollout_cell_scope=self.rollout_profile.cell
             self.predict_audit=PredictAudit(bound.stages.predict)
             bound.stages.predict=self.predict_audit
-            def exporter(**kwargs):
-                ctx=bound.stages._active;sid=kwargs['metadata']['sample_id'];request=ctx.request
-                kwargs['metadata']=dict(kwargs['metadata'],stochastic_index=ctx.dual_selection[sid],
-                    initial_noise_sha256=hashlib.sha256(request.initial_states[sid].numpy().tobytes()).hexdigest(),
-                    model_sha256=graph.profile.expected['model_sha256'],
-                    diagnostic_save_exception=True,interpretation='pre-update rollout; not post-update evaluation')
-                with memory.span('video_save',sample_id=sid,step=kwargs['metadata']['step']):
-                    return save_media(**kwargs)
-            bound.stages.score_one=observed_score(bound.stages.score_one,source=graph.source,
-                root=graph.profile.launch.output_dir/'rollout-videos',ffmpeg=self.args.ffmpeg,
-                ffprobe=self.args.ffprobe,launcher_sha=self.args.expected_sha,every=1,terminal_step=2,saver=exporter)
+            self.install_media(bound,graph,runtime)
             original=bound.trainer.run_iteration
             def iteration(step):
                 # All ranks check local telemetry and the independent monitor
                 # before either iteration; no silent blind second update.
                 def check():
-                    memory.journal().assert_healthy();monitor_healthy(self.args.monitor_dir)
-                    if step==0:
-                        if prepared.optimizer.state or self.start_step!=0 or graph.source.state_dict()['next_optimizer_step']!=0:
-                            raise ValueError('optimizer/data not fresh')
-                        self.previous=weight_fingerprints(prepared.prepared_root)
+                    memory.journal().assert_healthy();monitor_healthy(self.args.monitor_dir,max_age=self.monitor_max_age)
+                    if self.first_step is None:
+                        self.check_start(step,graph,prepared)
+                        if self.audit_weights:self.previous=weight_fingerprints(prepared.prepared_root)
+                        self.first_step=step
                     return True
                 _phase(runtime,'memory/before-iteration',check)
                 memory.set_context(step=step+1)
-                result=original(step)
+                try:
+                    result=original(step)
+                except BaseException:
+                    self.update_failed(step)
+                    raise
+                self.after_update(step,runtime)
                 def audit():
-                    after=weight_fingerprints(prepared.prepared_root);before=self.previous
+                    # PredictAudit counts forwards of THIS process: a resumed run starts at first_step.
+                    done=step+1-self.first_step
+                    after=weight_fingerprints(prepared.prepared_root) if self.audit_weights else None;before=self.previous
                     graph_audit=self.predict_audit.payload();norm=float(result.value.payload.grad_norm)
-                    if before['hashes']['frozen']!=after['hashes']['frozen']:
+                    if self.audit_weights and before['hashes']['frozen']!=after['hashes']['frozen']:
                         raise ValueError('frozen base changed')
-                    if before['hashes']['trainable']==after['hashes']['trainable']:
+                    if self.audit_weights and before['hashes']['trainable']==after['hashes']['trainable']:
                         raise ValueError('local LoRA shard unchanged')
-                    if (len(graph_audit['grad_forward_indices'])!=4*(step+1) or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*(step+1)
+                    if (len(graph_audit['grad_forward_indices'])!=4*done or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*done
                             or not graph_audit['final_prediction_released']):
                         raise ValueError('single-cell graph/count/release audit failed')
                     if not prepared.optimizer.state or any(int(s['step'].item())!=step+1 for s in prepared.optimizer.state.values()):
                         raise ValueError('Adam counter differs from actual step')
                     import math
                     if not math.isfinite(norm) or norm<=0:raise ValueError('gradient not finite nonzero')
+                    # None = not audited (--audit-weights off), never a claim of change/no change.
+                    checked=True if self.audit_weights else None
                     memory.event('update_audit',step=step+1,graph=graph_audit,gradient_norm=norm,
-                                 lora_changed=True,frozen_unchanged=True)
+                                 lora_changed=checked,frozen_unchanged=checked)
                     self.previous=after
                     return dict(rank=runtime.rank,step=step+1,before=before,after=after,graph=graph_audit,
-                                gradient_norm=norm,lora_changed=True,frozen_unchanged=True)
+                                gradient_norm=norm,lora_changed=checked,frozen_unchanged=checked)
                 with memory.span('post_update_validation',step=step+1):
                     local=_phase(runtime,'memory/update-audit',audit)
                     rows=_exchange('memory/update-audit',runtime.rank,runtime.process_group,local,True)
@@ -152,8 +180,8 @@ class TwoUpdateBackend(H3LifecycleBackend):
         return super().checkpoint(bound,result)
 
 
-def main():
-    p=argparse.ArgumentParser(description=__doc__)
+def add_common_arguments(p):
+    """Required inputs and default-off performance opt-ins shared by the H3 launchers."""
     p.add_argument('config',type=Path);p.add_argument('--expected-sha',required=True)
     p.add_argument('--ffmpeg',type=Path,required=True);p.add_argument('--ffprobe',type=Path,required=True)
     p.add_argument('--monitor-dir',type=Path,required=True)
@@ -170,6 +198,11 @@ def main():
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     p.add_argument('--checkpoint-threads',type=int,default=1,
                    help='opt-in DCP writer and rank0 state-tree hashing threads (1 = unchanged serial path); requires approved experiment')
+    return p
+
+
+def main():
+    p=add_common_arguments(argparse.ArgumentParser(description=__doc__))
     args=p.parse_args()
     def git(*argv):return subprocess.check_output(['git','-C',str(ROOT),*argv],text=True).strip()
     if git('status','--porcelain') or git('rev-parse','HEAD')!=args.expected_sha:
