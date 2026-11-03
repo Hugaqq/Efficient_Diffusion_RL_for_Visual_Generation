@@ -84,6 +84,14 @@ class Store:
             stream.flush()
             os.fsync(stream.fileno())
 
+    def append_rotated(self, name, payload, limit=1024 * 1024):
+        """Append-only segments: rotate by rename, never truncate or delete history."""
+        path = self.path(name)
+        size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()) + 1
+        if path.exists() and path.stat().st_size + size > limit:
+            path.rename(self.path(name + '.' + uuid.uuid4().hex))
+        self.append(name, payload)
+
     def lock(self, name):
         fd = os.open(self.path(name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         stream = os.fdopen(fd, 'a+')

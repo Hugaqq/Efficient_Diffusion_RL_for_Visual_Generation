@@ -1,320 +1,265 @@
-# H3 formal-run watch (stdlib only, Python >= 3.10)
+# H3 formal watch — Python ≥3.10, standard library only
 
-This installs **infrastructure**, not authorization to start/resume a real experiment.
-No deployment or real-run acceptance has been performed. Test the installed Linux
-systemd/SSH/pi/lark versions and obtain run authorization separately. Never use the
-old paused experiments as test targets. No changes to training source, flags, HPS,
-monitor budgets or scientific semantics are made here.
+Infrastructure only: **not deployed or authorized for a real experiment**. Do not
+use paused runs as test targets. No training math, flags, HPS service, monitor
+budgets or scientific semantics are changed. Linux/systemd and external CLIs still
+need separately authorized acceptance. All development tests/drills are offline.
 
-## Contract and limitations
+## Watchdog contract
 
-* GPU watchdog: one exclusive `watchdog.lock`, atomic `status.json`, fsynced
-  append-only `events.jsonl`. 60-second checks; timings/config persist over restarts.
-  `NEEDS_HUMAN` is sticky and continues heartbeating without actions; `DONE` exits.
-* Progress: `output_dir/h3-last-metrics.json.step + 1` (rank0, after optimizer
-  completion); checkpoint `complete.json.step`/`progress.next_optimizer_step` are
-  durable fallback. `metrics.jsonl` is terminal-only. Journals are diagnostics, not
-  optimizer evidence. Checkpoint cadence is 1, every 5, terminal, or requested pause.
-  A restart starts its own progress timer; old metrics cannot fake new progress.
-* Monitor age uses the **same host's monotonic clock**, `<30s`; `healthy=false`,
-  missing/invalid health and stale health stop training. `degraded=true` alone only
-  logs. Budget fields are retained, not modified; formal launcher checks capacity.
-* HPS `/healthz`: `status=ready`, exact full `service_identity`; when present,
-  identity facts are rehashed. Unavailable/unready HPS is fatal, not auto-resumable.
-  Disk floor defaults to 20 GiB and 20,000 free inodes; unknown inode count fails
-  closed. These emergency floors do NOT replace launcher's full-run disk preflight.
-* Training must be an **exclusive session/process group containing only torchrun
-  and its ranks**. Never include HPS, card monitor, watchdog or unrelated jobs.
-  Linux identity is boot ID + PID start ticks + PGID/SID, not command names. Every
-  signal rechecks identity. PID reuse/unknown members/reboot require a human.
-  Escaped/new sessions cannot be discovered by group tracking: torchrun must not
-  daemonize ranks outside this group. Mac `ps` support is for the drill only.
-* Only watchdog state files are written. To opt into lifecycle's graceful pause,
-  the **operator**, before starting the run, provisions a dangling symlink:
-  `output/PAUSE_REQUESTED -> state/pause-request`. Watchdog only creates the target.
-  Do not replace an existing request. Without this exact link it uses SIGTERM.
-  A pause waits at most 900s (default); then TERM, 60s, KILL of the verified training
-  group only; after another 60s an unkillable group needs a human. A 75–90 minute
-  update often cannot reach its safe boundary in 15 minutes: choose a larger
-  `stop_wait_seconds` if preserving the in-flight update outweighs fault exposure.
-* Auto-resume: only process death, NCCL timeout, monitor-induced stop; known
-  identity/OOM/integrity errors are permanent. All monitor/HPS/disk checks must
-  recover first (default within 30min). No fresh starts. Require latest published
-  checkpoint, consistent hashed metadata and **full shard hashes/exact tree**;
-  no silent fallback from a corrupt newest published checkpoint. Launcher still
-  performs authoritative contract/run/code/scorer checks. It alone writes training
-  artifacts. At most 2 attempted resumes / rolling 24h, and no reuse of the same
-  checkpoint without a new global progress high-water mark. Pending spawn is
-  journaled before execution; ambiguous launch after a crash is never replayed.
-  A watchdog-owned pause target is **renamed to an archive**, never deleted.
-  An operator's independent pause request prevents resume.
-* Full checkpoint verification can take minutes and temporarily delay heartbeat;
-  observer dead-man threshold must exceed measured worst-case verification time.
-  Configure clocks with NTP; VPS heartbeat age uses UTC epoch seconds. Host reboot
-  and configuration changes require explicit manual reconciliation, not a reset.
-* `SUCCESS` alone is insufficient. DONE needs matching run/checkpoint metadata,
-  all training group members exited, and a matching supervisor exit-code-0 receipt.
-  An adopted PID has no knowable exit status; missing receipt becomes NEEDS_HUMAN.
+* First tick on **every start/restart** arms read-only: validate absolute paths and
+  recipe bindings, resolved lifecycle output, existing artifacts, ready HPS with
+  expected full identity, monitor health, readable metrics and process ownership.
+  Failure goes to NEEDS_HUMAN **without any training signal**. Provision only after
+  initial metrics exist; starting too early deliberately fails arming.
+* Every elapsed deadline uses the GPU host's monotonic clock and persisted boot ID.
+  Reboot/schema changes require reconciliation; never reuse old monotonic values.
+  UTC fields (`now`, `heartbeat_at`, `last_progress_at`) are reporting only.
+  Restart does not reset update/stop/recovery budgets. Monitor time is sampled
+  **after** the atomic health.json read to avoid a negative-age publication race.
+* HPS onload/idle-unload normally returns 503/unready. Consecutive bad health ticks
+  must persist for `hps_grace_seconds=600`; a healthy tick resets this interval.
+  Unreachable/read failures share that grace. Verified identity changes after
+  arming are immediately fatal. HTTP uses `ProxyHandler({})`, never ambient proxies.
+* Monitor unhealthy/stale and low disk require `bad_ticks=3` consecutive bad ticks.
+  Read/parse failures and unavailable inode capacity are UNKNOWN, never inferred
+  no-progress or low-disk. Persistent unknown checks latch NEEDS_HUMAN without
+  signalling. `inode_floor=0` explicitly disables the inode requirement.
+* Progress is completed metrics `step+1`, not PID existence or training reward.
+  Content/step identify new metrics; filesystem/wall-clock mtime is not a timer.
+  Old failed-attempt metrics cannot masquerade as resumed progress.
+* `monitor_stop`, `disk_low`, HPS failure after grace request a safe-boundary pause.
+  Deadline = `last_progress_mono + max_update_seconds + checkpoint_allowance_seconds`
+  (defaults 3h + 30min). New metrics extend the deadline; a newly published matching
+  step checkpoint permits escalation after the TERM allowance. A stalled run
+  (`no_progress`) gets TERM **immediately**, not an unreachable boundary request.
+  TERM wait defaults 60s, then KILL, then 60s before NEEDS_HUMAN if still populated.
+* Pause requires the operator-provisioned dangling symlink below. Missing/wrong
+  link on a boundary fault means NEEDS_HUMAN, not a surprise hard stop. A request
+  that exists without a watchdog STOPPING ownership record is an **operator pause**.
+  It is never removed or auto-resumed, including when it uses the same symlink.
+* Resume allowlist: explicit NCCL watchdog timeout, actual card/process-monitor
+  unhealthy/stale exit log, or watchdog monitor/disk boundary stop with a new
+  successful checkpoint and H3SafeBoundaryPause/log or matching TERM exit receipt.
+  Generic death, unknown exits, HPS failure/identity change, graph/Adam/gradient
+  audits and integrity errors require humans. Permanent evidence wins over
+  transient patterns. Log matching is conservative and bounded to the attempt's
+  last 256 KiB; missing evidence never authorizes retry.
+* Resume requires healthy prerequisites, latest complete checkpoint metadata and
+  **full exact-tree/shard hashing**. No rollback past a corrupt publication. Hashing
+  runs in a daemon worker with no signalling/launch authority; the main loop keeps
+  reporting RECOVERING/verifying plus byte/file progress and honest heartbeats.
+  Default verification deadline 2h, prerequisite recovery window 30min.
+* At most 2 attempted auto-resumes per boot-bound rolling 24h; no same-checkpoint
+  retry without a new high-water step. Only `launch.resume_from` changes. All
+  artifacts/config paths must remain absolute and exist immediately before launch;
+  original recipe identity, argv, full env and cwd are preserved. Launcher remains
+  the authoritative semantic/runtime admission gate. Ambiguous launches are never
+  replayed. Old watchdog-owned pause targets are archived, not deleted.
+* NEEDS_HUMAN keeps doing read-only checks and archiving observations, never signals
+  or launches, and remains sticky until explicit acknowledgement. DONE additionally
+  requires matching SUCCESS/run/checkpoint data, empty ownership and exit-code-0
+  receipt. An adopted process without a receipt cannot establish DONE.
+* `status.json` retains only 32 incident summaries, bounded checks and 128 resume
+  summaries (above the maximum allowed rolling limit of 100). Full incident data
+  goes to fsynced `incidents.jsonl`; events to `events.jsonl`. At 1 MiB these files
+  rotate by rename into uniquely named immutable segments; **nothing is deleted**.
+  Monitor archive disk usage. Old observer outages may miss summaries outside this
+  window: archive review, not the small status snapshot, is the complete history.
 
-## GPU configuration and initial process identity
+## Ownership: systemd first, conservative adoption fallback
 
-Keep code, run/output and state paths absolute and separate. State is private to
-ubtroot, non-symlink, mode 0700. Never grant untrusted writers access to it. Example
-`/home/ubtroot/h3-watch/config.json` (replace ALL placeholders; full HPS hash, not
-`542df399...`). The initial `process` may be omitted when `initial-process.json`
-exists in state_dir.
+New/relaunched training always runs in a unique transient **user service**, named
+`h3-training-UNIQUE.service`, with `KillMode=control-group`, `Restart=no`,
+`RemainAfterExit=yes`. The receipt records boot ID and systemd InvocationID. Never
+reuse the unit name. HPS, monitor, watchdog and unrelated jobs must be outside it.
+Liveness means **any process in its cgroup**, including elastic ranks with their
+own sessions. TERM uses `systemctl --user kill --kill-whom=all --signal=SIGTERM`;
+KILL escalates the whole unit and requests its stop. Training survives watcher
+service restart/disable because it belongs to a different unit.
+
+For operator-started training, set `training_unit` in config or record it once:
+
+```sh
+python3 -m ops.h3_formal_watch.process adopt-unit h3-training-UNIQUE.service /ABS/watch/state
+# Only if NOT already in a suitable training unit:
+python3 -m ops.h3_formal_watch.process record TORCHRUN_PID /ABS/watch/state
+```
+
+Fallback tracks PPID descendants plus PID/starttime/boot identity, retaining known
+orphan ranks and signalling rank groups **before** the agent. Agent must have its
+own session. Unowned group peers/reused identities fail closed. This is inherently
+weaker than cgroups: a child that forks and reparents entirely between snapshots
+cannot be discovered; PID-group signalling still has a small kernel TOCTOU window.
+Do not claim equivalent containment. Prefer a new approved unit-owned launch; do
+not migrate or restart a healthy operator run merely to simplify bookkeeping.
+
+For a separately approved fresh launch, write private `state/launch-initial.json`:
+
+```json
+{"launch_id":"initial-UNIQUE","unit":"h3-training-initial-UNIQUE.service","argv":["/ABS/venv/bin/torchrun","EXACT_APPROVED_ARGUMENTS"],"cwd":"/ABS/source","env":{"EXACT_CAPTURED_ENV":"VALUE"}}
+```
+
+```sh
+python3 -m ops.h3_formal_watch.process supervise /ABS/watch/state launch-initial.json
+# It returns after systemd submission/receipt, not after training completion.
+# Copy process-initial-UNIQUE.json to initial-process.json ONCE, or adopt training_unit.
+```
+
+The in-unit waiter saves the actual exit receipt. No systemd automatic training
+restart is permitted. An uncatchable waiter KILL may lose the exit receipt; this
+is unknown, not permission to fabricate one or replay the launch claim.
+
+## GPU configuration
+
+JSON serialization of the approved original training recipe is required (JSON is
+valid YAML). Convert YAML-relative artifact paths to absolute **from the original
+recipe's directory before provisioning**, never relative to watchdog state_dir.
+All five artifact keys are required: model, text_cache, train, eval, hps_manifest.
+No YAML parser or model import exists in ops. Config/recipe/cwd/output paths must
+be absolute; output must equal its resolved path, just as lifecycle compilation.
+Keep state private (0700), non-symlink, distinct from output/run, with no untrusted
+writers. `launcher.env` is the complete environment, not overrides.
 
 ```json
 {
-  "run_dir": "/ABS/formal-run",
-  "output_dir": "/ABS/formal-run/output",
-  "state_dir": "/home/ubtroot/h3-watch/state",
-  "monitor_dir": "/ABS/formal-run/monitor",
+  "state_dir": "/ABS/watch/state",
+  "run_dir": "/ABS/run",
+  "output_dir": "/ABS/run/output",
+  "monitor_dir": "/ABS/run/monitor",
+  "training_unit": "h3-training-initial-UNIQUE.service",
+  "training_log": "/ABS/run/training.log",
   "hps_healthz_url": "http://127.0.0.1:18823/healthz",
-  "hps_identity": "REPLACE_64_HEX_CHARACTERS",
+  "hps_identity": "REPLACE_WITH_FULL_APPROVED_64_HEX_SHA256",
   "pause_via_symlink": true,
-  "training_log": "/ABS/formal-run/initial-training.log",
   "thresholds": {
-    "max_update_seconds": 10800, "max_auto_resumes": 2,
-    "stop_wait_seconds": 900, "disk_floor_bytes": 21474836480, "inode_floor": 20000
+    "interval_seconds": 60, "monitor_max_age": 30, "bad_ticks": 3,
+    "hps_grace_seconds": 600, "max_update_seconds": 10800,
+    "checkpoint_allowance_seconds": 1800, "max_auto_resumes": 2,
+    "disk_floor_bytes": 21474836480, "inode_floor": 20000
   },
   "launcher": {
-    "argv": ["/ABS/venv/bin/torchrun", "--nproc_per_node=8", "scripts/launch_h3_formal.py", "--config", "{resume_config}", "--expected-sha", "APPROVED_SHA", "--monitor-dir", "/ABS/formal-run/monitor", "REPLACE_WITH_EXACT_APPROVED_FLAGS"],
-    "env": {"REPLACE_WITH_EXACT_LAUNCH_ENV": "VALUE"},
-    "cwd": "/ABS/approved-training-checkout",
-    "recipe_json": "/ABS/approved-original-recipe.json"
+    "recipe_json": "/ABS/original-recipe.json",
+    "cwd": "/ABS/approved-source",
+    "argv": ["/ABS/venv/bin/torchrun", "--nproc_per_node=8", "/ABS/approved-source/scripts/launch_h3_formal.py", "{resume_config}", "EXACT_OTHER_APPROVED_FLAGS"],
+    "env": {"EXACT_CAPTURED_ENV": "VALUE"}
   }
 }
 ```
 
-The formal launcher has **no `--resume-from` flag**: it reads `launch.resume_from`
-from its recipe. Supply an operator-verified JSON serialization of the original
-recipe (JSON is valid YAML), with absolute artifact/output paths. The watchdog
-writes a private immutable copy changing **only `launch.resume_from`**, passes its
-path in the single `{resume_config}` argv slot, and preserves every other flag,
-env value and cwd. Do not insert shell strings or unapproved launcher-upgrade
-switches. `launcher.env` must be the **complete captured launch environment** (not
-just overrides); the supervisor does not inherit watchdog-specific Python paths
-or other settings into training. No YAML dependency is needed by ops.
+Alternatively supply `process` receipt or `initial-process.json` instead of
+`training_unit`. Other thresholds: `term_wait_seconds=60`, `kill_wait_seconds=60`,
+`recovery_wait_seconds=1800`, `launch_wait_seconds=60`, `verification_wait_seconds=7200`.
+Old `stop_wait_seconds` is rejected; migrate config/state explicitly, not in place.
+A ~41-minute resumed initialization consumes the 3h progress budget: choose the
+approved update budget with initialization/export durations in mind.
 
-For already-running training, record its isolated torchrun PGID leader once:
+Operator provisioning, never overwrite an existing PAUSE_REQUESTED:
 
 ```sh
-cd /ABS/watch-checkout
-PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.process record TORCHRUN_PID /home/ubtroot/h3-watch/state
+ln -s /ABS/watch/state/pause-request /ABS/run/output/PAUSE_REQUESTED
+python3 -m ops.h3_formal_watch.watchdog /ABS/dry-config.json --dry-run --once
 ```
 
-For new **separately approved** training, use the durable supervisor rather than
-adoption to retain exit status. Operator writes `state/launch-initial.json` with
-`{"launch_id":"initial-UNIQUE","argv":[...exact fresh argv...],"cwd":"/ABS/training-checkout","env":{...}}`,
-then runs the following in an independently managed persistent session/service:
+Dry-run must use a separate state_dir/identity and never signals or submits units.
+After investigating NEEDS_HUMAN and reconciling real processes/checkpoints/logs:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.process supervise /home/ubtroot/h3-watch/state launch-initial.json
+python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --acknowledge 'Reviewed incident; safe to rearm'
 ```
 
-It creates a new isolated session, logs stdout/stderr under state_dir and records
-`process-initial-UNIQUE.json` and `exit-initial-UNIQUE.json`. Before enabling the
-watchdog, copy the process receipt to `initial-process.json` (or put its JSON in
-config's `process`). Never fabricate an exit receipt or overwrite a launch claim.
-Auto-resumes use the same supervisor detached from the watchdog. Configure any
-external supervisor with **no automatic training retry**. Never run two controllers.
+This writes a token-bound acknowledgement consumed by the running watchdog on its
+next tick. It does not clear retry limits, remove pause requests, bypass a reboot,
+change ownership, or force a resume. Active pause requests must be resolved by the
+operator first; a failed rearming gate returns to NEEDS_HUMAN with a new token.
 
-To provision pause (operator action; not performed by watchdog):
+## Observer / notifications
 
-```sh
-# Only before the output directory is admitted/created, plan this link; once the
-# launcher has created output, install it without overwriting any existing path.
-ln -s /home/ubtroot/h3-watch/state/pause-request /ABS/formal-run/output/PAUSE_REQUESTED
-```
-
-Dry-run uses a **separate state_dir**, recorded process identity and the same checks.
-`python3 -m ops.h3_formal_watch.watchdog /ABS/dry-config.json --dry-run --once`
-prints intended actions and writes only dry state; never sends signals or launches.
-Do not reuse dry status for a live service.
-
-## VPS observer / Feishu configuration
-
-Example `/home/qvanium/h3-observer/config.json` (private state mode 0700):
+VPS observer is independent, read-only on the GPU, and cannot control training.
+Optional pi diagnosis has no tools/MCP/extensions/context, no persistent session,
+and no authority in the deterministic watchdog. Sending logs to a model/Feishu
+requires separately approved recipient, sender identity and disclosure.
 
 ```json
 {
-  "state_dir": "/home/qvanium/h3-observer/state",
-  "ssh_host": "ubtroot@APPROVED_GPU_SSH_ALIAS",
-  "ssh_identity_file": "/home/qvanium/.ssh/h3-observer-read-only",
+  "state_dir": "/ABS/observer/state",
+  "ssh_host": "ubtroot@APPROVED_ALIAS",
+  "ssh_identity_file": "/ABS/read-only-key",
   "remote_python": "/usr/bin/python3",
-  "remote_status": "/home/ubtroot/h3-watch/state/status.json",
-  "remote_events": "/home/ubtroot/h3-watch/state/events.jsonl",
-  "remote_logs": ["/ABS/formal-run/initial-training.log", "/ABS/formal-run/monitor/exit.json"],
+  "remote_status": "/ABS/watch/state/status.json",
+  "remote_events": "/ABS/watch/state/events.jsonl",
+  "remote_logs": ["/ABS/run/training.log"],
   "include_training_log": true,
-  "expected_config_id": "REPLACE_WITH_STATUS_JSON_CONFIG_ID",
-  "timezone": "Asia/Shanghai",
-  "daily_time": "09:00",
-  "heartbeat_max_age_seconds": 600,
-  "unreachable_seconds": 1800,
-  "ssh_attempts": 3,
-  "ssh_timeout_seconds": 30,
-  "alert_repeat_seconds": 3600,
-  "notify_retry_seconds": 300,
-  "analysis_timeout_seconds": 180,
-  "max_analyses_per_tick": 4,
+  "expected_config_id": "REPLACE_WITH_APPROVED_STATUS_CONFIG_ID",
+  "timezone": "Asia/Shanghai", "daily_time": "09:00",
+  "heartbeat_max_age_seconds": 600, "unreachable_seconds": 1800,
+  "ssh_attempts": 3, "ssh_timeout_seconds": 30,
+  "notify_retry_seconds": 300, "alert_repeat_seconds": 3600,
+  "analysis_timeout_seconds": 180, "max_analyses_per_tick": 4,
   "pi_binary": "/ABS/pi",
-  "notifier": {
-    "binary": "/ABS/lark-cli",
-    "chat_id": "oc_REPLACE_APPROVED_CHAT",
-    "identity": "bot",
-    "timeout_seconds": 30
-  }
+  "notifier": {"binary":"/ABS/lark-cli","chat_id":"oc_APPROVED_CHAT","identity":"bot","timeout_seconds":30}
 }
 ```
 
-* Observer's SSH command is only `python3 -c <bundled read-only snapshot reader>`.
-  No SCP, remote writes, GPU commands or training actions. Use a dedicated key,
-  preverified host key and operator-restricted account/key; ideally enforce a
-  server-side forced command with the same fixed read-only path allowlist. The
-  code requires BatchMode/StrictHostKeyChecking and makes at most three 30s
-  attempts, with 10/20s backoff. Unreachable means **unknown**, never "training dead".
-* Snapshot copies are local. Remote reads: status <=1 MiB, events last 64 KiB,
-  at most four log tails of 16 KiB. Default includes the current supervised launch
-  log derived from its validated launch ID, plus up to three explicit log paths.
-  Missing tails are reported, not silently called healthy. Status incidents and
-  resume receipts provide catch-up when the event tail has rolled past an outage.
-* Dead-man: heartbeat >10min or unreachable >=30min; duplicate alerts at most
-  hourly by default. DONE suppresses dead-man because watchdog intentionally exits.
-  New incidents, performed resumes and NEEDS_HUMAN/DONE transitions each get one
-  independent analysis. Daily summary is once per configured timezone's local
-  date, on the first successful timer tick at/after the configured time; downtime
-  does not replay old days. A file lock and systemd oneshot prevent overlap.
-* A fresh pi process uses the requested provider/model/thinking/JSON/no-session
-  options, plus **`--no-tools --no-mcp --no-skills --no-prompt-templates
-  --no-context-files`**, and `/dev/null` stdin. Thus read-only is enforced by removing
-  tools, not only requested in Chinese instructions. Briefs contain bounded
-  status/events/tails and treat logs as untrusted evidence. No session reuse, shell
-  execution of advice, or training action. Provider network access is only on VPS.
-  Validate these flags and model availability on the installed VPS pi version.
-* Each analysis is durably claimed **before** spawn, with no automatic second
-  session after timeout/crash/ambiguous outcome. Results and briefs are retained.
-  Up to four analyses/tick; extra jobs queue. Long analyses can delay the next
-  serial timer invocation. The LLM never blocks the GPU watchdog. A deterministic
-  alert goes out before analysis; the short Chinese diagnosis follows separately.
-* Pluggable notifier contract is `send(text, idempotency_key)`. Feishu uses
-  `lark-cli im +messages-send --as IDENTITY --chat-id CHAT --text TEXT
-  --idempotency-key KEY`, with **TEXT as one UTF-8 argv element**, never shell
-  interpolation. The unit test crosses a real local subprocess argv boundary with
-  Chinese, quotes, backslashes, newlines and shell metacharacters. `ok=true` is the
-  CLI success envelope, not `code=0`. Missing scope/high-risk confirmation failures
-  are saved; never auto-authorized or switched to another sender identity.
-* Notification attempts and cooldowns persist before sending. Failed delivery
-  retries after five minutes with the same idempotency key (Feishu's dedup window
-  is one hour). A crash between delivery and acknowledgment cannot guarantee
-  exactly-once beyond that upstream window. Check `observer-state.json.notices`
-  and analysis status; systemd exit 0 alone does not prove delivery or diagnosis.
-  No service can alert you if the VPS observer itself is down: retain independent
-  VPS/user-service monitoring.
+SSH uses verified host keys, BatchMode, bounded retries/backoff and only the bundled
+read-only snapshot program. Prefer an operator-enforced forced-command read-only
+key. Snapshot bounds: status 1 MiB; events 64 KiB; four 16 KiB log tails including
+the current supervised attempt. Missing logs are explicit unknowns. No cached
+snapshot is evidence of fresh reachability. Daily and incident pi sessions are
+claimed once; ambiguous model execution is not automatically replayed.
 
-Before enabling the VPS timer, the operator must confirm the recipient, identity
-and disclosure of selected training logs to pi/Feishu. Check the installed CLI
-locally on that VPS (not run during development):
+Preview without any SSH/pi/lark subprocess (use separate dry state):
 
 ```sh
-lark-cli im +messages-send --help
-# After approval, use the actual configured chat/identity for a delivery smoke test.
-# Do not send private logs to an unapproved recipient.
+python3 -m ops.h3_formal_watch.observer /ABS/dry-observer.json --dry-run
+python3 -m ops.h3_formal_watch.observer /ABS/dry-observer.json --dry-run --snapshot /ABS/offline-snapshot.json
 ```
 
-Offline preview, with no SSH/pi/lark execution (use a distinct dry state_dir):
+## Install, stop and revoke (authorized hosts only)
+
+Do not deploy from this worktree as part of the code-fix task. After Linux/CLI
+acceptance, render `systemd/*.service` placeholders `@REPO@`, `@PYTHON@`, `@CONFIG@`
+with absolute paths without whitespace or `%`, into `~/.config/systemd/user/`.
+Install only the GPU watchdog on GPU, observer service/timer on VPS. Confirm
+`loginctl show-user "$USER" -p Linger`; enabling linger may require separate admin
+permission. Never change linger for unrelated jobs.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.observer /ABS/observer-dry-config.json --dry-run
-# To preview alerts and briefs as well, provide a saved snapshot JSON:
-PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.observer /ABS/observer-dry-config.json --dry-run --snapshot /ABS/snapshot-fixture.json
-```
-
-Dry-run prints the notifier argv including `--dry-run` but does not invoke even
-that command. It creates only local state/briefs. Live/dry state cannot be mixed.
-
-## Install user units (GPU ubtroot; observer VPS qvanium)
-
-Do NOT run these commands from this development worktree against a real host.
-On each authorized host, logged in as the correct user, set the paths and render
-only its unit. The following are exact shell commands after editing the variables:
-
-```sh
-REPO=/ABS/watch-checkout
-PYTHON=/ABS/python3
-CONFIG=/ABS/watch-config.json
-UNIT=h3-formal-watchdog  # GPU; on VPS use h3-formal-observer
-loginctl show-user "$USER" -p Linger
-# If Linger=no, request/administer permission first (often needs sudo):
-sudo loginctl enable-linger "$USER"
-loginctl show-user "$USER" -p Linger  # must be yes for unattended logout/reboot
-mkdir -p "$HOME/.config/systemd/user"
-export REPO PYTHON CONFIG UNIT
-python3 - <<'PY'
-import os
-from pathlib import Path
-repo, unit = os.environ['REPO'], os.environ['UNIT']
-text = (Path(repo) / 'ops/h3_formal_watch/systemd' / (unit + '.service')).read_text()
-for key in ('REPO', 'PYTHON', 'CONFIG'):
-    text = text.replace('@' + key + '@', os.environ[key])
-# Unit path placeholders must not contain whitespace or systemd percent specifiers.
-assert not any(any(c.isspace() or c == '%' for c in os.environ[k]) for k in ('REPO', 'PYTHON', 'CONFIG'))
-(Path.home() / '.config/systemd/user' / (unit + '.service')).write_text(text)
-PY
 systemctl --user daemon-reload
-# GPU only:
+# GPU, after arming evidence and ownership are ready:
 systemctl --user enable --now h3-formal-watchdog.service
-systemctl --user status h3-formal-watchdog.service
-journalctl --user -u h3-formal-watchdog.service -n 50 --no-pager
-# VPS only, after configuring/testing observer and notifier:
-cp "$REPO/ops/h3_formal_watch/systemd/h3-formal-observer.timer" "$HOME/.config/systemd/user/"
-systemctl --user daemon-reload
+# VPS, after recipient/delivery and CLI acceptance:
 systemctl --user enable --now h3-formal-observer.timer
 systemctl --user start h3-formal-observer.service
-systemctl --user list-timers h3-formal-observer.timer
+journalctl --user -u h3-formal-watchdog.service -n 50 --no-pager
 ```
 
-Stopping/revoking (on the respective host). **Disable the watchdog before an
-intentional manual training stop**, otherwise an unexplained death is eligible for
-the configured transient auto-resume policy:
+Revoke automation before manual process intervention:
 
 ```sh
-systemctl --user disable --now h3-formal-watchdog.service   # does NOT stop training
+systemctl --user disable --now h3-formal-watchdog.service  # does NOT stop training
 systemctl --user disable --now h3-formal-observer.timer
 systemctl --user stop h3-formal-observer.service
-# Archive local unit files before masking: mask cannot replace an installed
-# regular ~/.config/systemd/user/*.service file. No evidence/config is deleted.
-# GPU: UNITS='h3-formal-watchdog.service'
-# VPS: UNITS='h3-formal-observer.service h3-formal-observer.timer'
-UNITS='h3-formal-watchdog.service'  # select the appropriate host's list above
-STAMP=$(date +%Y%m%dT%H%M%S)
-for unit in $UNITS; do
-  file="$HOME/.config/systemd/user/$unit"
-  if [ -f "$file" ] && [ ! -L "$file" ]; then
-    mv "$file" "$file.revoked-$STAMP"
-  fi
-  systemctl --user mask "$unit"
-done
-systemctl --user daemon-reload
+# Only with separate authorization to stop training:
+systemctl --user kill --kill-whom=all --signal=SIGTERM h3-training-UNIQUE.service
 ```
 
-Preserve all state/evidence. Revoke the observer's read-only SSH key and Feishu
-permissions separately using the operator's normal credential process. Do not
-`disable-linger` if other user services depend on it. Stopping a watchdog while a
-pause/stop is in progress does not undo the already issued request; reconcile
-training/checkpoints/receipts before any manual restart. Unmask/re-enable only
-following that reconciliation; never delete status to bypass retry limits.
+Preserve state, archives, recipes and receipts. A pending pause is not undone by
+stopping the watchdog. For permanent revocation, archive the installed unit files,
+then mask their names (mask cannot replace a regular installed user-unit file).
+Revoke observer SSH/Feishu permissions separately. Never delete status, reuse a
+launch claim, or reset history to bypass gates. Restart only after reconciliation.
 
-## Offline drill and tests
+## Offline acceptance
 
 ```sh
-PYTHONPATH=. python3 -m ops.h3_formal_watch.drill --parent tmp/h3-watch-drills
-PYTHONPATH=. python3 -m pytest -q tests/test_h3_formal_watch.py
+PYTHONPATH=. python -m pytest -q tests/test_h3_formal_watch.py
+python ops/h3_formal_watch/drill.py
 ```
 
-The drill creates a unique FAKE directory, synthetic markers, `/bin/sleep` groups
-and a fake Python sleep resume command. HTTP is stubbed; it cannot accept a real
-run config. It exercises monitor stale, no progress, changed HPS identity, transient
-death + one resume + repeated failure, and matching success. Every owned dummy is
-reaped/killed; evidence is retained, no real artifacts removed. Unit tests add pause
-escalation, PID reuse, limits, corruption, write confinement, and observer cases.
+Drill defaults to a unique OS temporary directory, retains artifacts, and accepts
+no real config. Nine scenarios: monitor stale, no progress, identity change, HPS
+503 burst without stop, audit error, operator pause, fake orphan-rank PPID tree,
+one transient resume then repeated-checkpoint refusal, matching success. Only
+local sleeps are launched and cleaned up; HTTP and systemd submission are mocked.
+These are infrastructure tests, not GPU learning/performance or systemd acceptance.

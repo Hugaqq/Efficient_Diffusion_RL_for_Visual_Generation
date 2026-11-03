@@ -1,4 +1,4 @@
-"""Deterministic GPU-host watchdog. No LLM, SSH, scorer restart or training edits."""
+"""Deterministic, boot-bound training watchdog. No LLM, SSH or scorer control."""
 import argparse
 import hashlib
 import json
@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,18 +18,17 @@ from .common import Store, digest, read_json, regular, tail
 from . import process
 
 DEFAULTS = dict(interval_seconds=60, monitor_max_age=30, max_update_seconds=10800,
-                disk_floor_bytes=20 * 1024**3, inode_floor=20000,
-                stop_wait_seconds=900, term_wait_seconds=60, kill_wait_seconds=60,
+                disk_floor_bytes=20 * 1024**3, inode_floor=20000, bad_ticks=3,
+                hps_grace_seconds=600, checkpoint_allowance_seconds=1800,
+                term_wait_seconds=60, kill_wait_seconds=60, verification_wait_seconds=7200,
                 recovery_wait_seconds=1800, launch_wait_seconds=60, max_auto_resumes=2)
-TRANSIENT = {'process_died', 'nccl_timeout', 'monitor_stop'}
+TRANSIENT = {'nccl_watchdog_timeout', 'card_monitor_stop', 'watchdog_checkpoint_stop'}
+BOUNDARY_CAUSES = {'monitor_stop', 'disk_low', 'hps_failure'}
+HISTORY_LIMIT = 32
 
 
-def checkpoint(path, verify_files=False):
-    """Read publication metadata; full shard hashing only on resume, never each tick.
-
-    Mirrors manager.py's complete/contract/progress/tree envelope hashes without
-    importing torch. The formal launcher remains the authoritative semantic gate.
-    """
+def checkpoint(path, verify_files=False, report=lambda **kw: None):
+    """Metadata on ticks; full shard hashes only in the recovery worker."""
     if path.resolve() != path or not re.fullmatch(r'step-[1-9][0-9]*', path.name):
         raise ValueError('invalid checkpoint path')
     blobs = {}
@@ -53,7 +53,8 @@ def checkpoint(path, verify_files=False):
         files = tree['tree']['files']
         if tree['tree']['schema_version'] != 1 or not files:
             raise ValueError('empty or unsupported state tree')
-        names = []
+        names, verified_bytes = [], 0
+        report(files_done=0, files_total=len(files), bytes_done=0)
         for row in files:
             name = row['path']
             if not name or Path(name).is_absolute() or '..' in Path(name).parts:
@@ -65,9 +66,12 @@ def checkpoint(path, verify_files=False):
             with file.open('rb') as stream:
                 while chunk := stream.read(1024 * 1024):
                     sha.update(chunk)
+                    verified_bytes += len(chunk)
+                    report(files_done=len(names), files_total=len(files), bytes_done=verified_bytes)
             if sha.hexdigest() != row['sha256']:
                 raise ValueError('shard digest mismatch')
             names.append(name)
+            report(files_done=len(names), files_total=len(files), bytes_done=verified_bytes)
         actual = []
         for file in path.rglob('*'):
             if file.is_symlink():
@@ -79,52 +83,45 @@ def checkpoint(path, verify_files=False):
     return dict(path=str(path), step=step, complete=c)
 
 
-def latest_checkpoint(output, verify_files=False):
-    # latest.json is only a hint; rename may have committed before latest.json updated.
+def latest_checkpoint(output, verify_files=False, report=lambda **kw: None):
     paths = [p for p in (output / 'checkpoints').glob('step-*')
              if re.fullmatch(r'step-[1-9][0-9]*', p.name) and not p.is_symlink()
              and (p / 'complete.json').is_file()]
-    if not paths:
-        return None
-    # A corrupt published newest marker is NEEDS_HUMAN, not silent rollback.
-    return checkpoint(max(paths, key=lambda p: int(p.name[5:])), verify_files)
+    # No silent rollback past a corrupt newest published marker.
+    return checkpoint(max(paths, key=lambda p: int(p.name[5:])), verify_files, report) if paths else None
 
 
 def progress_evidence(output):
-    evidence = []
     metrics = output / 'h3-last-metrics.json'
-    if metrics.exists():
-        row = read_json(metrics)
-        if type(row.get('step')) is not int or row['step'] < 0:
-            raise ValueError('invalid metrics step')
-        evidence.append(dict(step=row['step'] + 1, source=str(metrics), mtime=metrics.stat().st_mtime))
+    row = read_json(metrics)  # absent/unreadable is UNKNOWN, not a stalled update
+    if type(row.get('step')) is not int or row['step'] < 0:
+        raise ValueError('invalid metrics step')
     ckpt = latest_checkpoint(output)
-    if ckpt:
-        evidence.append(dict(step=ckpt['step'], source=ckpt['path'],
-                             mtime=(Path(ckpt['path']) / 'complete.json').stat().st_mtime))
-    return max(evidence, key=lambda row: row['step']) if evidence else dict(step=0, source=None, mtime=None)
+    return dict(step=row['step'] + 1, fingerprint=digest(row), checkpoint_step=ckpt['step'] if ckpt else 0)
 
 
-def monitor_check(directory, now_ns, max_age):
-    health = read_json(Path(directory) / 'health.json')
-    age = (now_ns - health.get('monotonic_ns', 0)) / 1e9
-    return dict(ok=health.get('healthy') is True and 0 <= age < max_age, age_seconds=age,
+def monitor_check(directory, monotonic_ns, max_age):
+    health = read_json(Path(directory) / 'health.json', 65536)
+    # Read first: the producer atomically replaces health.json while we sample.
+    age = (monotonic_ns() - health['monotonic_ns']) / 1e9
+    if type(health.get('healthy')) is not bool or age < 0:
+        raise ValueError('unknown monitor clock/schema')
+    return dict(ok=health['healthy'] and age < max_age, age_seconds=age,
                 degraded=health.get('degraded', False), health=health)
 
 
 def hps_check(url, expected, timeout=8):
-    # Read even 503 bodies: a mismatched identity is always fatal, not merely unready.
     try:
-        response = urllib.request.urlopen(url, timeout=timeout)
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        response = exc
+        response = exc  # unready 503 bodies still carry identity
     with response:
         raw = response.read(65537)
         if len(raw) > 65536:
             raise ValueError('oversize HPS health')
         health = json.loads(raw)
     identity = health.get('service_identity')
-    changed = identity is not None and identity != expected
+    changed = isinstance(identity, str) and bool(re.fullmatch('[0-9a-f]{64}', identity)) and identity != expected
     facts = health.get('identity_facts')
     if facts is not None and digest(dict(identity_facts=facts, video_contract=health.get('video_contract'))) != identity:
         changed = True
@@ -135,52 +132,73 @@ def hps_check(url, expected, timeout=8):
 def disk_check(output, byte_floor, inode_floor):
     stat = os.statvfs(output)
     free, inodes = stat.f_bavail * stat.f_frsize, stat.f_favail if stat.f_files else None
-    return dict(ok=free >= byte_floor and inodes is not None and inodes >= inode_floor,
-                free_bytes=free, free_inodes=inodes)
+    ok = False if free < byte_floor or (inodes is not None and inodes < inode_floor) else (
+        None if inodes is None and inode_floor else True)
+    return dict(ok=ok, free_bytes=free, free_inodes=inodes)
+
+
+def bounded(value, limit=32768):
+    raw = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    return value if len(raw.encode()) <= limit else dict(truncated=True, summary=raw[:limit // 4])
+
+
+def existing_absolute(value):
+    path = Path(value)
+    if not path.is_absolute() or not path.exists():
+        raise ValueError('require existing absolute path: ' + str(path))
+    return path
 
 
 class Watchdog:
     def __init__(self, config, *, dry_run=False, clock=time.time, monotonic_ns=time.monotonic_ns):
-        self.config = config
+        self.config, self.clock, self.monotonic_ns, self.dry_run = config, clock, monotonic_ns, dry_run
         self.store = Store(config['state_dir'])
-        self.output = Path(config['output_dir']).absolute()
-        self.run_dir = Path(config['run_dir']).absolute()
-        if self.store.root == self.output or self.store.root == self.run_dir:
-            raise ValueError('state directory must be distinct from run/output directories')
+        self.output, self.run_dir = Path(config['output_dir']), Path(config['run_dir'])
         self.thresholds = {**DEFAULTS, **config.get('thresholds', {})}
+        if set(self.thresholds) != set(DEFAULTS):
+            raise ValueError('unknown threshold; migrate old configuration explicitly')
         if any(type(v) not in (int, float) or not 0 <= v < float('inf') for v in self.thresholds.values()):
             raise ValueError('thresholds must be finite nonnegative numbers')
-        if self.thresholds['interval_seconds'] <= 0 or type(self.thresholds['max_auto_resumes']) is not int:
-            raise ValueError('invalid interval/resume count')
-        if not re.fullmatch('[0-9a-f]{64}', config['hps_identity']):
-            raise ValueError('expected full HPS SHA256')
-        self.clock, self.monotonic_ns, self.dry_run = clock, monotonic_ns, dry_run
-        identity = digest(config)
+        for key, low, high in (('bad_ticks', 1, 100), ('max_auto_resumes', 0, 100)):
+            if type(self.thresholds[key]) is not int or not low <= self.thresholds[key] <= high:
+                raise ValueError('invalid threshold: ' + key)
+        if self.thresholds['interval_seconds'] <= 0:
+            raise ValueError('invalid interval')
+        self.boot = process.boot_id()
         saved = self.store.load('status.json')
-        if saved and (saved['config_id'] != identity or saved['dry_run'] != dry_run):
-            raise ValueError('configuration/mode changed: use a separately reconciled state directory')
-        self.s = saved or dict(schema=1, config_id=identity, dry_run=dry_run, state='WATCHING',
-                               heartbeat_at=clock(), last_progress_at=clock(), optimizer_step=0,
-                               highwater_step=0, incidents=[], resumes=[], process=config.get('process'),
-                               pending_launch=None, stop=None, last_checks={})
-        if not self.s['process'] and not self.s['pending_launch']:
+        if saved and (saved['config_id'] != digest(config) or saved['dry_run'] != dry_run):
+            raise ValueError('configuration/mode changed: reconcile explicitly, never erase retry history')
+        self.s = saved or dict(schema=2, config_id=digest(config), dry_run=dry_run, state='ARMING',
+            boot_id=self.boot, last_progress_at=clock(), last_progress_mono=self.mono(),
+            optimizer_step=0, attempt_step=0, highwater_step=0, incidents=[], resumes=[],
+            process=config.get('process'), pending_launch=None, stop=None, last_checks={}, debounce={})
+        self.needs_arm = True
+        self.worker = None
+        self.worker_lock = threading.Lock()
+        self.worker_result = {}
+        if self.s.get('schema') != 2 or self.s.get('boot_id') != self.boot:
+            self.human('schema/boot changed: reconcile identities and deadlines manually')
+        if not self.s.get('process') and not self.s.get('pending_launch'):
             self.s['process'] = self.store.load('initial-process.json')
-        if not self.s['process'] and not self.s['pending_launch'] and config.get('training_unit'):
-            self.s['process'] = process.capture_unit(config['training_unit'])
-        if not self.s['process'] and not self.s['pending_launch']:
-            raise ValueError('record initial training unit or process tree first')
+
+    def mono(self):
+        return self.monotonic_ns() / 1e9
 
     def persist(self):
-        self.s['heartbeat_at'] = self.clock()
+        self.s.update(heartbeat_at=self.clock(), now=self.clock(), heartbeat_mono=self.mono())
+        self.s['incidents'] = [{k: row[k] for k in ('id', 'at', 'cause', 'transient') if k in row}
+                               for row in self.s['incidents'][-HISTORY_LIMIT:]]
+        self.s['resumes'] = self.s['resumes'][-128:]
+        self.s['last_checks'] = {k: bounded(v) for k, v in self.s['last_checks'].items()}
         self.store.save('status.json', self.s)
 
     def event(self, kind, **fields):
-        self.store.append('events.jsonl', dict(dict(id=uuid.uuid4().hex, at=self.clock(), kind=kind), **fields))
+        self.store.append_rotated('events.jsonl', dict(dict(id=uuid.uuid4().hex, at=self.clock(),
+                                  mono=self.mono(), boot_id=self.boot, kind=kind), **fields))
 
     def state(self, name):
         if self.s['state'] != name:
-            old = self.s['state']
-            self.s['state'] = name
+            old, self.s['state'] = self.s['state'], name
             self.event('state_change', old=old, state=name)
 
     def action(self, kind, **fields):
@@ -189,62 +207,131 @@ class Watchdog:
             print(json.dumps(dict(action=kind, **fields), ensure_ascii=False))
 
     def human(self, reason):
-        self.s['reason'] = reason
+        self.s['reason'] = reason[:2000]
+        if self.s['state'] != 'NEEDS_HUMAN':
+            self.s['human_token'] = uuid.uuid4().hex
         self.state('NEEDS_HUMAN')
 
     def incident(self, cause, details):
-        row = dict(id=uuid.uuid4().hex, at=self.clock(), cause=cause,
-                   transient=cause in TRANSIENT, details=details)
+        row = dict(id=uuid.uuid4().hex, at=self.clock(), cause=cause, transient=cause in TRANSIENT)
+        self.store.append_rotated('incidents.jsonl', dict(row, details=details))
         self.s['incidents'].append(row)
+        self.s['incidents'] = self.s['incidents'][-HISTORY_LIMIT:]
         self.event('incident', **row)
         return row
+
+    def recipe(self):
+        if self.store.root in (self.output, self.run_dir):
+            raise ValueError('state directory must be distinct from run/output')
+        for key in ('state_dir', 'output_dir', 'run_dir', 'monitor_dir'):
+            existing_absolute(self.config[key])
+        if self.output.resolve() != self.output:
+            raise ValueError('output_dir must match lifecycle resolved absolute path')
+        if not re.fullmatch('[0-9a-f]{64}', self.config['hps_identity']):
+            raise ValueError('expected full HPS SHA256')
+        launch = self.config['launcher']
+        for key in ('recipe_json', 'cwd'):
+            existing_absolute(launch[key])
+        if self.config.get('training_log'):
+            existing_absolute(self.config['training_log'])
+        recipe = read_json(launch['recipe_json'])
+        binding = recipe['launch']
+        if existing_absolute(binding['output_dir']).resolve() != self.output:
+            raise ValueError('recipe output differs from lifecycle resolved output')
+        artifacts = binding['artifacts']
+        if set(artifacts) != {'model', 'text_cache', 'train', 'eval', 'hps_manifest'}:
+            raise ValueError('all launch.artifacts required')
+        for path in artifacts.values():
+            existing_absolute(path)
+        if binding.get('resume_from') is not None:
+            existing_absolute(binding['resume_from'])
+        if binding['expected']['hps_service_identity'] != self.config['hps_identity']:
+            raise ValueError('resume recipe scorer identity differs')
+        argv = launch['argv']
+        if not argv or argv.count('{resume_config}') != 1:
+            raise ValueError('one standalone {resume_config} required')
+        existing_absolute(argv[0])
+        for arg in argv[1:]:
+            if arg != '{resume_config}' and Path(arg).suffix in ('.json', '.yaml', '.yml', '.py'):
+                existing_absolute(arg.split('=', 1)[-1])
+        if not isinstance(launch['env'], dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                       for k, v in launch['env'].items()):
+            raise ValueError('complete string launch environment required')
+        identity = digest(recipe)
+        if self.s.get('recipe_id', identity) != identity:
+            raise ValueError('original recipe changed after arming')
+        self.s['recipe_id'] = identity
+        return recipe
 
     def collect(self):
         checks = {}
         def check(name, work):
             try:
                 checks[name] = work()
-            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-                checks[name] = dict(ok=False, error=repr(exc))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
+                checks[name] = dict(ok=None, error=repr(exc)[:2000])
         check('process', lambda: dict(ok=True, **process.inspect(self.s['process'])))
-        if checks['process'].get('alive'):
+        if checks['process'].get('alive') and self.s['process'].get('kind') != 'cgroup':
             self.s['process']['members'] = checks['process']['members']
-        check('monitor', lambda: monitor_check(self.config['monitor_dir'], self.monotonic_ns(),
+        check('monitor', lambda: monitor_check(self.config['monitor_dir'], self.monotonic_ns,
                                               self.thresholds['monitor_max_age']))
         check('hps', lambda: hps_check(self.config['hps_healthz_url'], self.config['hps_identity']))
         check('disk', lambda: disk_check(self.output, self.thresholds['disk_floor_bytes'], self.thresholds['inode_floor']))
         check('progress', lambda: dict(ok=True, **progress_evidence(self.output)))
         p = checks['progress']
-        if p['ok']:
-            self.s['optimizer_step'] = p['step']
-            eligible = not self.s.get('progress_mtime_floor') or (p['mtime'] or 0) >= self.s['progress_mtime_floor']
+        if p['ok'] is True:
+            # Content/step, never wall-clock mtime, distinguishes old failed-attempt metrics.
+            eligible = p['fingerprint'] != self.s.get('ignored_metrics')
             if eligible and p['step'] > self.s.get('attempt_step', 0):
-                self.s['attempt_step'] = p['step']
+                self.s.update(attempt_step=p['step'], last_progress_at=self.clock(), last_progress_mono=self.mono())
                 self.s['highwater_step'] = max(p['step'], self.s['highwater_step'])
-                self.s['last_progress_at'] = self.clock()
                 self.event('progress', **p)
-            if not eligible:
-                self.s['optimizer_step'] = self.s.get('attempt_step', 0)
-            p['seconds_without_progress'] = max(0, self.clock() - self.s['last_progress_at'])
-            p['ok'] = p['seconds_without_progress'] < self.thresholds['max_update_seconds']
-        degraded = checks['monitor'].get('degraded', False)
-        if degraded != self.s['last_checks'].get('monitor', {}).get('degraded', False):
-            self.event('monitor_degraded', degraded=degraded)
+            self.s['optimizer_step'] = self.s['attempt_step']
+            p['seconds_without_progress'] = self.mono() - self.s['last_progress_mono']
+        if checks['monitor'].get('degraded', False) != self.s['last_checks'].get('monitor', {}).get('degraded', False):
+            self.event('monitor_degraded', degraded=checks['monitor'].get('degraded', False))
+        for name in ('monitor', 'disk', 'progress', 'hps'):
+            if checks[name]['ok'] is True:
+                self.s['debounce'].pop(name, None)
+            else:
+                entry = self.s['debounce'].setdefault(name, dict(count=0, since=self.mono()))
+                entry['count'] += 1
         self.s['last_checks'] = checks
         return checks
 
+    def arm(self, checks):
+        self.recipe()
+        if any(checks[k]['ok'] is not True for k in ('process', 'monitor', 'hps', 'progress')):
+            raise ValueError('arming requires identity-matched ready HPS, monitor health, readable metrics and process ownership')
+        self.needs_arm = False
+        self.s['armed_at'] = self.clock()
+        if self.s['state'] == 'ARMING':
+            self.state('WATCHING')
+
     def pause_supported(self):
-        # Lifecycle only tests exists(). Operator provisions this dangling symlink.
         link = self.output / 'PAUSE_REQUESTED'
-        return link.is_symlink() and link.resolve() == self.store.path('pause-request').absolute()
+        return link.is_symlink() and link.resolve() == self.store.path('pause-request')
+
+    def operator_pause(self):
+        return (self.output / 'PAUSE_REQUESTED').exists() and not (
+            self.s.get('stop', {}).get('pause_issued') if self.s.get('stop') else False)
 
     def request_stop(self, cause, checks):
         self.incident(cause, checks)
-        pause = self.config.get('pause_via_symlink', False) and self.pause_supported()
-        self.s['stop'] = dict(phase='pause' if pause else 'term',
-                             deadline=self.clock() + self.thresholds['stop_wait_seconds'])
+        pause = cause in BOUNDARY_CAUSES
+        if pause and (not self.config.get('pause_via_symlink') or not self.pause_supported()):
+            self.human('boundary stop requires provisioned pause symlink; no signal issued')
+            return
+        if self.operator_pause():
+            self.human('operator pause active; no watchdog intervention')
+            return
+        self.s['stop'] = dict(cause=cause, phase='pause' if pause else 'term', pause_issued=pause,
+            target_step=self.s['optimizer_step'], checkpoint_before=checks['progress'].get('checkpoint_step', 0),
+            deadline=(self.s['last_progress_mono'] + self.thresholds['max_update_seconds'] +
+                      self.thresholds['checkpoint_allowance_seconds']) if pause else
+                     self.mono() + self.thresholds['term_wait_seconds'])
         self.state('STOPPING')
-        self.persist()  # intent durable before side effects
+        self.persist()  # ownership/intent durable BEFORE writing request or signalling
         if pause:
             self.action('pause_request')
             if not self.dry_run:
@@ -256,21 +343,34 @@ class Watchdog:
         self.action('signal', owner=self.s['process'].get('unit', self.s['process'].get('pgid')), signal=sig.name)
         if not self.dry_run:
             process.signal_group(self.s['process'], sig)
+        self.s['stop']['last_signal'] = sig.name
 
-    def stopped_tick(self, alive):
-        if not alive:
-            self.s['stop'] = None
-            self.s['recovery_since'] = self.clock()
-            self.state('RECOVERING')
-            return
+    def stopped_tick(self, checks):
         stop = self.s['stop']
-        if self.clock() < stop['deadline']:
+        if checks['hps'].get('identity_changed'):
+            stop['cause'] = 'hps_identity_change'
+            if checks['process']['alive'] and stop['phase'] == 'pause':
+                stop.update(phase='term', deadline=self.mono() + self.thresholds['term_wait_seconds'])
+                self.persist()
+                self.send(signal.SIGTERM)
+        p = checks['progress']
+        if p['ok'] is True and stop['phase'] == 'pause':
+            if self.s['optimizer_step'] > stop['target_step']:
+                stop.update(target_step=self.s['optimizer_step'], deadline=self.s['last_progress_mono'] +
+                    self.thresholds['max_update_seconds'] + self.thresholds['checkpoint_allowance_seconds'])
+            if p['checkpoint_step'] >= stop['target_step'] and p['checkpoint_step'] > stop['checkpoint_before']:
+                if not stop.get('checkpoint_saved'):
+                    stop.update(checkpoint_saved=p['checkpoint_step'], deadline=self.mono() + self.thresholds['term_wait_seconds'])
+        if not checks['process']['alive']:
+            self.handle_death(checks)
+            return
+        if self.mono() < stop['deadline']:
             return
         if stop['phase'] == 'kill':
-            self.human('training group survived SIGKILL; no further action')
+            self.human('training ownership still populated after SIGKILL')
             return
         sig = signal.SIGTERM if stop['phase'] == 'pause' else signal.SIGKILL
-        stop.update(phase='term' if sig == signal.SIGTERM else 'kill', deadline=self.clock() +
+        stop.update(phase='term' if sig == signal.SIGTERM else 'kill', deadline=self.mono() +
                     self.thresholds['term_wait_seconds' if sig == signal.SIGTERM else 'kill_wait_seconds'])
         self.persist()
         self.send(sig)
@@ -285,160 +385,232 @@ class Watchdog:
 
     def complete(self):
         marker = read_json(self.output / 'SUCCESS')
-        ckpt = latest_checkpoint(self.output)
-        owner = read_json(self.output / 'h3-run.json')
-        receipt = self.exit_receipt()
+        ckpt, owner, receipt = latest_checkpoint(self.output), read_json(self.output / 'h3-run.json'), self.exit_receipt()
         return bool(receipt and type(receipt['exit_code']) is int and receipt['exit_code'] == 0 and ckpt
-                    and marker['kind'] == 'visual_rl_h3_run_success' and marker['run_id'] == owner['run_id']
-                    and marker['committed_steps'] == ckpt['step']
-                    and marker['checkpoint_relative_path'] == 'checkpoints/step-' + str(ckpt['step'])
-                    and all(marker[k] == ckpt['complete'][k] for k in
-                            ('checkpoint_contract_id', 'progress_id', 'state_tree_id')))
+            and marker['kind'] == 'visual_rl_h3_run_success' and marker['run_id'] == owner['run_id']
+            and marker['committed_steps'] == ckpt['step']
+            and marker['checkpoint_relative_path'] == 'checkpoints/step-' + str(ckpt['step'])
+            and all(marker[k] == ckpt['complete'][k] for k in ('checkpoint_contract_id', 'progress_id', 'state_tree_id')))
 
     def death_cause(self):
         owned = self.store.path('training-' + self.s['process']['launch_id'] + '.log')
-        log = owned if owned.is_file() else self.config.get('training_log', owned)
-        text = tail(log).lower() if Path(log).is_file() else ''
-        if any(word in text for word in ('identity mismatch', 'different h3 run', 'out of memory',
-                                         'insufficient disk', 'refusing resume', 'digest mismatch')):
-            return 'permanent_training_error'
-        if 'nccl' in text and ('timeout' in text or 'timed out' in text):
-            return 'nccl_timeout'
-        if 'card monitor' in text and ('unhealthy' in text or 'stale' in text):
-            return 'monitor_stop'
-        return 'process_died'
+        log = owned if owned.is_file() else Path(self.config.get('training_log', owned))
+        text = tail(log, 256 * 1024).lower() if log.is_file() else ''
+        # Correctness evidence takes precedence over EVERY transient pattern.
+        permanent = ('audit failed', 'graph/count/release', 'adam counter', 'gradient not finite',
+            'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged', 'identity',
+            'different h3 run', 'out of memory', 'insufficient disk', 'refusing resume', 'digest mismatch')
+        if any(word in text for word in permanent):
+            return 'correctness_or_permanent_error'
+        stop = self.s.get('stop') or {}
+        if stop.get('cause') == 'hps_identity_change':
+            return 'hps_identity_change'
+        if self.s.get('operator_pause_seen') or self.operator_pause():
+            return 'operator_pause'
+        if stop.get('cause') in ('hps_failure', 'no_progress'):
+            return stop['cause']
+        receipt = self.exit_receipt()
+        if (stop.get('cause') in ('monitor_stop', 'disk_low') and stop.get('checkpoint_saved')
+                and (('h3safeboundarypause' in text) or (receipt and receipt['exit_code'] in (-15, 143)
+                     and stop.get('last_signal') == 'SIGTERM'))):
+            return 'watchdog_checkpoint_stop'
+        if re.search(r'nccl.*watchdog.*(?:timed out|timeout)|watchdog.*(?:timed out|timeout).*nccl', text):
+            return 'nccl_watchdog_timeout'
+        if re.search(r'card(?:/process)? monitor.*(?:unhealthy|stale)', text):
+            return 'card_monitor_stop'
+        return 'unknown_exit'
+
+    def handle_death(self, checks):
+        cause = self.death_cause()
+        self.incident(cause, dict(exit=self.exit_receipt(), checks=checks, stop=self.s.get('stop')))
+        if cause not in TRANSIENT:
+            self.human('non-allowlisted exit: ' + cause)
+        else:
+            self.s['recovery_since'] = self.mono()
+            self.state('RECOVERING')
 
     def resume_allowed(self, ckpt):
-        now = self.clock()
         if not ckpt:
             return 'no complete checkpoint'
-        if len([r for r in self.s['resumes'] if now - r['at'] < 86400]) >= self.thresholds['max_auto_resumes']:
+        if len([r for r in self.s['resumes'] if r['boot_id'] == self.boot and self.mono() - r['mono'] < 86400]) >= self.thresholds['max_auto_resumes']:
             return '24-hour auto-resume limit'
-        if any(r['step'] == ckpt['step'] and self.s['highwater_step'] <= r['highwater_step']
-               for r in self.s['resumes']):
+        if (ckpt['step'] <= self.s.get('retry_step', 0)
+                and self.s['highwater_step'] <= self.s.get('retry_highwater', 0)):
             return 'same checkpoint without new progress'
-        if (self.output / 'PAUSE_REQUESTED').exists() and not self.pause_supported():
-            return 'operator pause request still active'
+        if self.s.get('operator_pause_seen') or self.operator_pause():
+            return 'operator pause request active/observed'
         return None
 
     def make_resume_spec(self, ckpt, launch_id):
-        launch = self.config['launcher']
-        recipe = read_json(launch['recipe_json'])  # JSON is YAML; no PyYAML in ops
-        if Path(recipe['launch']['output_dir']) != self.output:
-            raise ValueError('resume recipe output differs from watched output (use absolute paths)')
-        if recipe['launch']['expected']['hps_service_identity'] != self.config['hps_identity']:
-            raise ValueError('resume recipe scorer identity differs from watchdog')
-        # Only this launch binding changes. Original recipe/flags/env/cwd are immutable.
-        recipe['launch']['resume_from'] = ckpt['path']
+        recipe = self.recipe()  # revalidate every artifact just before submission
+        recipe['launch']['resume_from'] = str(existing_absolute(ckpt['path']))
         name = 'resume-recipe-' + launch_id + '.json'
-        argv = launch['argv']
-        if argv.count('{resume_config}') != 1:
-            raise ValueError('launcher argv must contain one standalone {resume_config}')
         self.store.save(name, recipe)
+        launch = self.config['launcher']
         return dict(launch_id=launch_id, unit='h3-training-' + launch_id + '.service',
-                    argv=[str(self.store.path(name)) if a == '{resume_config}' else a for a in argv],
+                    argv=[str(self.store.path(name)) if a == '{resume_config}' else a for a in launch['argv']],
                     env=launch['env'], cwd=launch['cwd'])
 
+    def verify_async(self):
+        if self.worker is None:
+            self.s.update(recovery_phase='verifying', verification_started=self.mono())
+            def report(**kw):
+                with self.worker_lock:
+                    self.worker_result['progress'] = kw
+            def work():
+                try:
+                    result = dict(checkpoint=latest_checkpoint(self.output, True, report))
+                except Exception as exc:
+                    result = dict(error=repr(exc))
+                with self.worker_lock:
+                    self.worker_result.update(result, done=True)
+            self.worker = threading.Thread(target=work, name='checkpoint-verifier', daemon=True)
+            self.worker.start()
+        with self.worker_lock:
+            result = dict(self.worker_result)
+        self.s['verification_progress'] = result.get('progress', {})
+        if self.mono() - self.s['verification_started'] >= self.thresholds['verification_wait_seconds']:
+            raise ValueError('checkpoint verification deadline exceeded; worker has no action authority')
+        if result.get('error'):
+            raise ValueError('checkpoint verification failed: ' + result['error'])
+        return result
+
     def resume(self, checks):
-        incident = self.s['incidents'][-1]
-        if not incident['transient']:
-            self.human('non-transient incident: ' + incident['cause'])
+        if self.s['incidents'][-1]['cause'] not in TRANSIENT:
+            self.human('non-transient incident')
             return
-        if any(not checks[k]['ok'] for k in ('monitor', 'hps', 'disk')):
-            if checks['hps'].get('identity_changed'):
-                self.human('HPS identity changed during recovery')
-            elif self.clock() - self.s['recovery_since'] >= self.thresholds['recovery_wait_seconds']:
+        if self.operator_pause() or self.s.get('operator_pause_seen'):
+            self.human('operator pause; never remove request')
+            return
+        if checks['hps'].get('identity_changed'):
+            self.human('HPS identity changed during recovery')
+            return
+        if any(checks[k]['ok'] is not True for k in ('monitor', 'hps', 'disk', 'progress')):
+            if self.mono() - self.s['recovery_since'] >= self.thresholds['recovery_wait_seconds']:
                 self.human('recovery prerequisites did not become healthy')
             return
-        ckpt = latest_checkpoint(self.output, verify_files=True)
+        result = self.verify_async()
+        if not result.get('done'):
+            return
+        ckpt = result['checkpoint']
         reason = self.resume_allowed(ckpt)
         if reason:
             self.human(reason)
             return
+        if ckpt != latest_checkpoint(self.output):
+            raise ValueError('checkpoint changed during verification')
         if self.dry_run:
             self.action('auto_resume', checkpoint=ckpt['path'])
             self.human('dry-run: resume suppressed')
             return
         launch_id = uuid.uuid4().hex
-        spec = self.make_resume_spec(ckpt, launch_id)
         spec_name = 'launch-' + launch_id + '.json'
-        self.store.save(spec_name, spec)
-        # Crash hereafter must NEVER blindly relaunch. Reconcile receipt or require human.
-        self.s['resumes'].append(dict(at=self.clock(), step=ckpt['step'],
+        self.store.save(spec_name, self.make_resume_spec(ckpt, launch_id))
+        self.s['resumes'].append(dict(at=self.clock(), mono=self.mono(), boot_id=self.boot, step=ckpt['step'],
                                      highwater_step=self.s['highwater_step'], launch_id=launch_id))
-        self.s['pending_launch'] = dict(launch_id=launch_id, at=self.clock())
+        self.s.update(retry_step=ckpt['step'], retry_highwater=self.s['highwater_step'],
+                      pending_launch=dict(launch_id=launch_id, mono=self.mono()),
+                      ignored_metrics=checks['progress']['fingerprint'])
         self.state('LAUNCHING')
-        self.persist()
-        pause = self.store.path('pause-request')
-        if pause.exists() and self.pause_supported():
-            pause.rename(self.store.path('pause-archived-' + launch_id))
+        self.persist()  # ambiguous submission is NEVER replayed
+        if (self.s.get('stop') or {}).get('pause_issued'):
+            if not self.pause_supported():
+                raise ValueError('pause link changed before resume')
+            if self.store.path('pause-request').exists():
+                self.store.path('pause-request').rename(self.store.path('pause-archived-' + launch_id))
+        self.s['stop'] = None
         self.action('resume_intent', checkpoint=ckpt['path'], launch_id=launch_id)
         self.start_supervisor(spec_name)
 
     def start_supervisor(self, spec_name):
-        # Supervisor submits an independently owned training unit, never retries.
         root = Path(__file__).resolve().parents[2]
         self.supervisor = subprocess.Popen([sys.executable, '-m', 'ops.h3_formal_watch.process',
             'supervise', str(self.store.root), spec_name], cwd=root, env={**os.environ, 'PYTHONPATH': str(root)},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
+    def acknowledge(self):
+        ack = self.store.load('acknowledge.json')
+        if not ack or ack.get('token') != self.s.get('human_token'):
+            return
+        if self.s.get('boot_id') != self.boot or (self.output / 'PAUSE_REQUESTED').exists():
+            return  # acknowledgement does not authorize bypassing identity/pause gates
+        self.event('human_acknowledged', acknowledgement=ack)
+        self.s.pop('human_token', None)
+        self.s.pop('reason', None)
+        self.s['operator_pause_seen'] = False
+        self.s['stop'] = None
+        self.s['debounce'] = {}
+        self.needs_arm = True
+        self.state('ARMING')  # no launch; a dead process remains a human decision
+
     def tick(self):
         try:
-            if self.s['state'] in ('DONE', 'NEEDS_HUMAN'):
+            if self.s['state'] == 'DONE':
                 return self.s
-            if self.s['pending_launch']:
+            if not self.s.get('process') and self.config.get('training_unit'):
+                self.s['process'] = process.capture_unit(self.config['training_unit'])
+            checks = self.collect()  # even NEEDS_HUMAN keeps read-only evidence current
+            if self.s['state'] == 'NEEDS_HUMAN':
+                self.event('human_observation', checks=bounded(checks))
+                self.acknowledge()
+                return self.s
+            if self.needs_arm:
+                self.arm(checks)  # any restart failure -> human, without signalling
+            if self.s.get('pending_launch'):
                 pending = self.s['pending_launch']
                 record = self.store.load('process-' + pending['launch_id'] + '.json')
                 if record:
-                    self.s['process'] = record
-                    self.s['pending_launch'] = None
-                    self.s['last_progress_at'] = self.clock()
-                    self.s['progress_mtime_floor'] = record['started_at']
-                    self.s['attempt_step'] = self.s['resumes'][-1]['step']
+                    self.s.update(process=record, pending_launch=None, last_progress_at=self.clock(),
+                                  last_progress_mono=self.mono(), attempt_step=self.s['resumes'][-1]['step'])
                     self.s['resumes'][-1]['performed'] = True
+                    self.worker, self.worker_result = None, {}
+                    self.s['debounce'] = {}
                     self.state('WATCHING')
                     self.event('auto_resume', launch_id=record['launch_id'])
-                elif self.clock() - pending['at'] >= self.thresholds['launch_wait_seconds']:
+                elif self.mono() - pending['mono'] >= self.thresholds['launch_wait_seconds']:
                     self.human('launch outcome unknown; no automatic replay')
                 return self.s
-            checks = self.collect()
-            if not checks['process']['ok']:
-                self.human('cannot prove training group identity; no signals/resume')
+            if checks['process']['ok'] is not True:
+                self.human('cannot prove training ownership; no signal/resume')
                 return self.s
             alive = checks['process']['alive']
-            if not alive and (self.output / 'SUCCESS').exists():
+            if self.operator_pause():
+                self.s['operator_pause_seen'] = True
+            if not alive and (self.output / 'SUCCESS').exists() and not self.s.get('operator_pause_seen'):
                 if not self.exit_receipt():
-                    since = self.s.setdefault('success_seen_at', self.clock())
-                    if self.clock() - since < self.thresholds['launch_wait_seconds']:
-                        return self.s  # allow the external supervisor to reap and publish
-                if self.complete():
-                    self.state('DONE')
-                else:
-                    self.human('SUCCESS lacks matching successful exit/checkpoint receipt')
+                    since = self.s.setdefault('success_seen_mono', self.mono())
+                    if self.mono() - since < self.thresholds['launch_wait_seconds']:
+                        return self.s
+                self.state('DONE') if self.complete() else self.human('SUCCESS lacks matching exit/checkpoint receipt')
                 return self.s
             if self.s['state'] == 'STOPPING':
-                # A second fatal condition cannot be laundered into a transient resume.
-                if checks['hps'].get('identity_changed'):
-                    self.s['incidents'][-1]['transient'] = False
-                self.stopped_tick(alive)
+                self.stopped_tick(checks)
                 return self.s
             if self.s['state'] == 'RECOVERING':
-                if alive:
-                    self.human('training reappeared during recovery; no duplicate launch')
-                else:
-                    self.resume(checks)
+                self.human('training reappeared during recovery') if alive else self.resume(checks)
                 return self.s
             if not alive:
-                self.incident(self.death_cause(), dict(exit=self.exit_receipt(), checks=checks))
-                self.s['recovery_since'] = self.clock()
-                self.state('RECOVERING')
+                self.handle_death(checks)
                 return self.s
-            fatal = next((cause for name, cause in (('hps', 'hps_failure'), ('disk', 'disk_low'),
-                         ('progress', 'no_progress'), ('monitor', 'monitor_stop')) if not checks[name]['ok']), None)
-            if fatal:
-                self.request_stop(fatal, checks)
+            if checks['hps'].get('identity_changed'):
+                self.request_stop('hps_identity_change', checks)
+                return self.s
+            if self.s.get('operator_pause_seen'):
+                return self.s  # operator owns the pending safe-boundary pause
+            if checks['progress']['ok'] is True and checks['progress']['seconds_without_progress'] >= self.thresholds['max_update_seconds']:
+                self.request_stop('no_progress', checks)
+                return self.s
+            for name in ('monitor', 'disk', 'progress'):
+                if self.s['debounce'].get(name, {}).get('count', 0) >= self.thresholds['bad_ticks']:
+                    if checks[name]['ok'] is None:
+                        self.human(name + ' unknown for consecutive ticks; no signal')
+                    else:
+                        self.request_stop({'monitor': 'monitor_stop', 'disk': 'disk_low'}[name], checks)
+                    return self.s
+            if 'hps' in self.s['debounce'] and self.mono() - self.s['debounce']['hps']['since'] >= self.thresholds['hps_grace_seconds']:
+                self.request_stop('hps_failure', checks)
             return self.s
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
             self.event('watch_error', error=repr(exc))
             self.human('watchdog safety gate: ' + repr(exc))
             return self.s
@@ -451,14 +623,23 @@ def main():
     parser.add_argument('config')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--acknowledge', metavar='REASON', help='acknowledge current NEEDS_HUMAN; rearm only, never force resume')
     args = parser.parse_args()
-    watch = Watchdog(read_json(args.config), dry_run=args.dry_run)
-    with watch.store.lock('watchdog.lock'):
+    config = read_json(existing_absolute(args.config))
+    if args.acknowledge:
+        store = Store(config['state_dir'])
+        status = store.load('status.json')
+        if status['state'] != 'NEEDS_HUMAN' or not args.acknowledge.strip():
+            parser.error('acknowledgement requires NEEDS_HUMAN and a reason')
+        store.save('acknowledge.json', dict(token=status['human_token'], reason=args.acknowledge, at=time.time()))
+        return
+    store = Store(config['state_dir'])
+    with store.lock('watchdog.lock'):
+        watch = Watchdog(config, dry_run=args.dry_run)
         while True:
             state = watch.tick()['state']
             if args.once or state == 'DONE':
                 return
-            # NEEDS_HUMAN continues heartbeating, but never performs another action.
             time.sleep(watch.thresholds['interval_seconds'])
 
 

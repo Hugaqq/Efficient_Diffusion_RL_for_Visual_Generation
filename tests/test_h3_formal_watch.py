@@ -28,7 +28,7 @@ def box(tmp_path):
 
 def test_progress_and_checkpoint_publication(box):
     out = box.root / 'output'
-    assert progress_evidence(out)['step'] == 0
+    assert progress_evidence(out)['step'] == 1
     fake_checkpoint(out, 1)
     Store(out / 'checkpoints').save('latest.json', dict(path='step-99', step=99))
     (out / 'checkpoints' / 'step-200.tmp-ignored').mkdir()
@@ -51,10 +51,14 @@ def test_progress_and_checkpoint_publication(box):
 
 @pytest.mark.parametrize('field,value', [('healthy', False), ('monotonic_ns', 0), ('monotonic_ns', 10**30)])
 def test_monitor_failure(box, field, value):
+    box.tick()
     box.monitor(**{field: value})
-    assert not monitor_check(box.root / 'monitor', box.ns, 30)['ok']
-    assert box.tick()['state'] == 'STOPPING'
-    assert box.watch.s['incidents'][0]['cause'] == 'monitor_stop'
+    assert box.tick()['state'] == 'WATCHING'
+    assert box.tick()['state'] == 'WATCHING'
+    expected = 'NEEDS_HUMAN' if value == 10**30 else 'STOPPING'
+    assert box.tick()['state'] == expected
+    if expected == 'STOPPING':
+        assert box.watch.s['incidents'][0]['cause'] == 'monitor_stop'
 
 
 def test_monitor_degraded_is_nonfatal_and_logged(box):
@@ -63,7 +67,7 @@ def test_monitor_degraded_is_nonfatal_and_logged(box):
     assert 'monitor_degraded' in (box.root / 'state' / 'events.jsonl').read_text()
     assert box.watch.s['last_checks']['monitor']['health']['max_bytes'] == 12345
     box.advance(30)
-    assert not monitor_check(box.root / 'monitor', box.ns, 30)['ok']
+    assert not monitor_check(box.root / 'monitor', lambda: box.ns, 30)['ok']
 
 
 def test_hps_protocol_and_bounds():
@@ -79,11 +83,11 @@ def test_hps_protocol_and_bounds():
                              (dict(status='ready', service_identity='b' * 64), False, True),
                              (dict(status='ready'), False, False),
                              (dict(status='ready', service_identity=identity, identity_facts={}), False, True)]:
-        with patch('urllib.request.urlopen', return_value=Response(row)) as fetch:
+        with patch('urllib.request.OpenerDirector.open', return_value=Response(row)) as fetch:
             result = hps_check('http://unused', identity)
             assert result['ok'] is ok and result['identity_changed'] is changed
             assert fetch.call_args.kwargs['timeout'] == 8
-    with patch('urllib.request.urlopen', side_effect=TimeoutError):
+    with patch('urllib.request.OpenerDirector.open', side_effect=TimeoutError):
         with pytest.raises(TimeoutError):
             hps_check('http://unused', identity)
 
@@ -94,18 +98,23 @@ def test_disk_bytes_and_inodes(box):
         assert not disk_check(box.root, 1001, 5)['ok']
         assert not disk_check(box.root, 1000, 6)['ok']
     with patch('os.statvfs', return_value=SimpleNamespace(f_bavail=100, f_frsize=10, f_favail=5, f_files=0)):
-        assert not disk_check(box.root, 0, 0)['ok']  # unknown inode capacity is not healthy
+        assert disk_check(box.root, 0, 1)['ok'] is None
+        assert disk_check(box.root, 0, 0)['ok']
+    box.tick()
     with patch('ops.h3_formal_watch.watchdog.disk_check', return_value=dict(ok=False)):
+        assert box.tick()['state'] == 'WATCHING'
+        assert box.tick()['state'] == 'WATCHING'
         assert box.tick()['state'] == 'STOPPING'
         assert box.watch.s['incidents'][-1]['cause'] == 'disk_low'
 
 
 def test_identity_failure_is_permanent(box):
     fake_checkpoint(box.root / 'output')
+    box.tick()
     box.health = dict(ok=False, identity_changed=True)
     assert box.tick()['state'] == 'STOPPING'
     box.child.wait(timeout=5)
-    assert box.tick()['state'] == 'RECOVERING'
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
     box.health = dict(ok=True)
     assert box.tick()['state'] == 'NEEDS_HUMAN'
     assert not box.watch.s['resumes']
@@ -124,14 +133,14 @@ def test_progress_timeout_and_restart_clock(box):
 
 def test_pause_then_term_then_kill_only_recorded_group(box):
     watch = box.watch
-    watch.config['pause_via_symlink'] = True
-    (box.root / 'output' / 'PAUSE_REQUESTED').symlink_to(box.root / 'state' / 'pause-request')
+    box.tick()
     box.monitor(healthy=False)
+    box.tick(); box.tick()
     with patch.object(process, 'signal_group') as send:
         assert box.tick()['state'] == 'STOPPING'
         assert (box.root / 'output' / 'PAUSE_REQUESTED').exists()
         send.assert_not_called()
-        box.advance(.2)
+        box.advance(12600)
         box.tick()
         assert send.call_args.args == (watch.s['process'], signal.SIGTERM)
         box.advance(.2)
@@ -144,10 +153,10 @@ def test_pause_then_term_then_kill_only_recorded_group(box):
         assert send.call_count == 2
 
 
-def test_no_pause_link_falls_back_and_dry_run_prints(box, capsys):
-    box.watch.config['pause_via_symlink'] = True
+def test_dry_run_no_progress_prints_without_signalling(box, capsys):
     box.watch.dry_run = True
-    box.monitor(healthy=False)
+    box.tick()
+    box.advance(10800); box.monitor()
     with patch.object(process, 'signal_group') as send:
         box.tick()
         send.assert_not_called()
@@ -176,14 +185,16 @@ def test_process_identity_and_scope(box):
 
 def test_resume_policy_limits_and_original_recipe_unchanged(box):
     watch = box.watch
+    fake_checkpoint(box.root / 'output')
     ckpt = dict(path=str(box.root / 'output' / 'checkpoints' / 'step-1'), step=1)
     assert watch.resume_allowed(None) == 'no complete checkpoint'
-    watch.s['resumes'] = [dict(at=box.now, step=1, highwater_step=5)]
+    watch.s.update(retry_step=1, retry_highwater=5)
+    watch.s['resumes'] = [dict(at=box.now, mono=watch.mono(), boot_id=watch.boot, step=1, highwater_step=5)]
     watch.s['highwater_step'] = 5
     assert 'same checkpoint' in watch.resume_allowed(ckpt)
     watch.s['highwater_step'] = 6
     assert watch.resume_allowed(ckpt) is None
-    watch.s['resumes'].append(dict(at=box.now, step=5, highwater_step=6))
+    watch.s['resumes'].append(dict(at=box.now, mono=watch.mono(), boot_id=watch.boot, step=5, highwater_step=6))
     assert '24-hour' in watch.resume_allowed(ckpt)
     box.advance(86401)
     assert watch.resume_allowed(ckpt) is None
@@ -201,6 +212,8 @@ def test_resume_policy_limits_and_original_recipe_unchanged(box):
 
 
 def test_resume_unhealthy_prerequisites_and_unknown_launch(box):
+    box.tick()
+    box.log('NCCL watchdog timed out')
     box.die()
     assert box.tick()['state'] == 'RECOVERING'
     box.monitor(healthy=False)
@@ -208,26 +221,28 @@ def test_resume_unhealthy_prerequisites_and_unknown_launch(box):
     assert box.tick()['state'] == 'NEEDS_HUMAN'
     watch = box.watch
     watch.s['state'] = 'LAUNCHING'
-    watch.s['pending_launch'] = dict(launch_id='missing', at=box.now - 61)
-    with patch('subprocess.Popen') as spawn:
-        assert box.tick()['state'] == 'NEEDS_HUMAN'
-        spawn.assert_not_called()
-
-
-def test_corrupt_checkpoint_never_resumes(box):
-    fake_checkpoint(box.root / 'output')
-    Store(box.root / 'output' / 'checkpoints' / 'step-1').text('fake-state', 'corrupt')
-    box.die()
-    box.tick()
+    watch.s['pending_launch'] = dict(launch_id='missing', mono=watch.mono() - 61)
     with patch.object(process, 'inspect', return_value=dict(alive=False, members=[])), patch('subprocess.Popen') as spawn:
         assert box.tick()['state'] == 'NEEDS_HUMAN'
         spawn.assert_not_called()
 
 
+def test_corrupt_checkpoint_never_resumes(box):
+    box.tick()
+    box.log('NCCL watchdog timed out')
+    fake_checkpoint(box.root / 'output')
+    Store(box.root / 'output' / 'checkpoints' / 'step-1').text('fake-state', 'corrupt')
+    box.die()
+    box.tick()
+    with patch.object(process, 'inspect', return_value=dict(alive=False, members=[])), patch('subprocess.Popen') as spawn:
+        assert box.until('NEEDS_HUMAN')['state'] == 'NEEDS_HUMAN'
+        spawn.assert_not_called()
+
+
 def test_no_checkpoint_and_nonzero_without_success(box):
     box.die()
-    assert box.tick()['state'] == 'RECOVERING'
-    assert box.watch.s['incidents'][-1]['cause'] == 'process_died'
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert box.watch.s['incidents'][-1]['cause'] == 'unknown_exit'
     assert box.tick()['state'] == 'NEEDS_HUMAN'
 
 
@@ -268,11 +283,10 @@ def test_watchdog_write_confinement_and_symlink_rejection(box):
 def test_replay_metrics_after_resume_do_not_mask_or_fake_progress(box):
     watch = box.watch
     Store(box.root / 'output').save('h3-last-metrics.json', dict(step=8))
-    watch.s.update(highwater_step=9, attempt_step=5, progress_mtime_floor=box.now + 100,
-                   last_progress_at=box.now)
+    watch.s.update(highwater_step=9, attempt_step=5,
+                   ignored_metrics=progress_evidence(box.root / 'output')['fingerprint'], last_progress_at=box.now)
     box.tick()
     assert watch.s['optimizer_step'] == 5  # old metric from failed attempt ignored
-    watch.s['progress_mtime_floor'] = box.now - 100
     Store(box.root / 'output').save('h3-last-metrics.json', dict(step=5))
     box.advance(60)
     box.monitor()
@@ -283,19 +297,220 @@ def test_replay_metrics_after_resume_do_not_mask_or_fake_progress(box):
 
 def test_error_classification(box):
     log = box.watch.store.path('training-' + box.config['process']['launch_id'] + '.log')
-    for text, expected in [('NCCL watchdog timed out', 'nccl_timeout'),
-                           ('card monitor stale', 'monitor_stop'),
-                           ('CUDA out of memory', 'permanent_training_error'),
-                           ('unknown crash', 'process_died')]:
+    for text, expected in [('NCCL watchdog timed out', 'nccl_watchdog_timeout'),
+                           ('card monitor stale', 'card_monitor_stop'),
+                           ('CUDA out of memory', 'correctness_or_permanent_error'),
+                           ('unknown crash', 'unknown_exit'),
+                           ('NCCL watchdog timed out; Adam counter differs from actual step', 'correctness_or_permanent_error'),
+                           ('gradient not finite nonzero', 'correctness_or_permanent_error'),
+                           ('single-cell graph/count/release audit failed', 'correctness_or_permanent_error')]:
         box.watch.store.text(log.name, text)
         assert box.watch.death_cause() == expected
 
 
 def test_offline_fire_drill(tmp_path):
     root, results = run_drill(tmp_path / 'drills')
-    assert len(results) == 5
+    assert len(results) == 9
     assert 'same checkpoint' in results['transient_then_repeated']
     assert (root / 'drill-results.json').exists()
+
+
+def test_hps_grace_consecutive_ticks_and_wall_clock_jumps(box):
+    box.tick()
+    box.health = dict(ok=False, identity_changed=False, health=dict(status='unready', code=503))
+    assert box.tick()['state'] == 'WATCHING'
+    box.now += 864000  # wall time never consumes grace
+    box.advance(599); box.monitor()
+    assert box.tick()['state'] == 'WATCHING'
+    box.health = dict(ok=True)
+    box.tick()
+    box.health = dict(ok=None, error='timeout')
+    box.tick()
+    box.advance(599); box.monitor()
+    assert box.tick()['state'] == 'WATCHING'
+    box.advance(1); box.monitor()
+    assert box.tick()['state'] == 'STOPPING'
+    assert box.watch.s['stop']['phase'] == 'pause'
+    assert box.watch.s['stop']['cause'] == 'hps_failure'
+    assert box.child.poll() is None
+
+
+def test_hps_503_and_no_environment_proxy():
+    import io
+    import urllib.error
+    import urllib.request
+    expected = 'a' * 64
+    error = urllib.error.HTTPError('http://unused', 503, 'unready', {},
+        io.BytesIO(json.dumps(dict(status='unready', service_identity=expected)).encode()))
+    with patch('urllib.request.build_opener', wraps=urllib.request.build_opener) as opener, \
+            patch('urllib.request.OpenerDirector.open', side_effect=error):
+        assert hps_check('http://unused', expected)['ok'] is False
+        assert opener.call_args.args[0].proxies == {}
+
+
+@pytest.mark.parametrize('name', ['monitor', 'disk', 'progress'])
+def test_unknown_reads_debounce_never_imply_stall_or_disk_low(box, name):
+    box.tick()
+    functions = dict(monitor='monitor_check', disk='disk_check', progress='progress_evidence')
+    with patch('ops.h3_formal_watch.watchdog.' + functions[name], side_effect=ValueError('bad JSON/read')):
+        if name == 'progress':
+            box.advance(20000)
+        box.monitor()
+        assert box.tick()['state'] == 'WATCHING'
+        assert box.tick()['state'] == 'WATCHING'
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert not box.watch.s['incidents'] and box.child.poll() is None
+
+
+@pytest.mark.parametrize('failure', ['hps', 'metrics', 'monitor', 'relative_output', 'wrong_output', 'artifact'])
+def test_arming_failure_never_signals(box, failure):
+    if failure == 'hps': box.health = dict(ok=False)
+    elif failure == 'metrics': (box.root / 'output' / 'h3-last-metrics.json').write_text('{broken')
+    elif failure == 'monitor': (box.root / 'monitor' / 'health.json').unlink()
+    elif failure == 'relative_output': box.watch.output = Path('output')
+    else:
+        recipe = read_json(box.root / 'recipe.json')
+        if failure == 'wrong_output': recipe['launch']['output_dir'] = str(box.root)
+        else: recipe['launch']['artifacts']['train'] = 'relative/input'
+        Store(box.root).save('recipe.json', recipe)
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        send.assert_not_called()
+    assert box.child.poll() is None
+
+
+def test_restart_rearms_without_deadline_reset_and_boot_mismatch(box):
+    box.tick()
+    previous = box.watch.s['last_progress_mono']
+    box.advance(10); box.monitor()
+    box.watch = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+    box.health = dict(ok=False)
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert box.watch.s['last_progress_mono'] == previous
+    with patch.object(process, 'boot_id', return_value='different-boot'):
+        watch = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+        assert watch.s['state'] == 'NEEDS_HUMAN'
+
+
+def test_monitor_sample_time_is_after_atomic_read(box):
+    called = []
+    def read(*args):
+        called.append('read')
+        return dict(healthy=True, monotonic_ns=100)
+    def now():
+        assert called == ['read']
+        return 101
+    with patch('ops.h3_formal_watch.watchdog.read_json', side_effect=read):
+        assert monitor_check(box.root, now, 30)['ok']
+
+
+def test_pause_deadline_extends_on_metrics_then_waits_for_checkpoint(box):
+    box.tick()
+    box.monitor(healthy=False)
+    box.tick(); box.tick(); box.tick()
+    watch = box.watch
+    first = watch.s['stop']['deadline']
+    box.advance(5000)
+    Store(box.root / 'output').save('h3-last-metrics.json', dict(step=1))
+    box.tick()
+    assert watch.s['stop']['deadline'] == first + 5000
+    assert watch.s['stop']['target_step'] == 2
+    fake_checkpoint(box.root / 'output', 2)
+    box.tick()
+    assert watch.s['stop']['checkpoint_saved'] == 2
+    assert watch.s['stop']['deadline'] == watch.mono() + .1
+    box.log('H3SafeBoundaryPause')
+    box.die()
+    assert box.tick()['state'] == 'RECOVERING'
+    assert watch.s['incidents'][-1]['cause'] == 'watchdog_checkpoint_stop'
+
+
+def test_no_progress_term_immediate_and_not_transient(box):
+    box.tick()
+    box.advance(10800); box.monitor()
+    assert box.tick()['state'] == 'STOPPING'
+    assert box.watch.s['stop']['phase'] == 'term'
+    assert not (box.root / 'state' / 'pause-request').exists()
+    box.child.wait(timeout=5)
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+
+
+def test_operator_pause_is_never_removed_or_resumed(box):
+    box.tick()
+    box.watch.store.text('pause-request', 'operator')  # same symlink but NO STOPPING ownership
+    box.log('NCCL watchdog timed out')
+    assert box.tick()['state'] == 'WATCHING'
+    box.die()
+    assert box.tick()['state'] == 'NEEDS_HUMAN'
+    assert box.watch.s['incidents'][-1]['cause'] == 'operator_pause'
+    assert (box.root / 'output' / 'PAUSE_REQUESTED').read_text() == 'operator'
+    assert not box.watch.s['resumes']
+
+
+def test_human_state_keeps_checks_and_acknowledgement_rearms_only(box):
+    box.tick()
+    box.watch.human('review needed')
+    box.health = dict(ok=False, identity_changed=True)
+    box.advance(60); box.monitor()
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        assert box.watch.s['last_checks']['hps']['identity_changed']
+        assert box.watch.s['heartbeat_at'] == box.now
+        send.assert_not_called()
+    box.watch.store.save('acknowledge.json', dict(token=box.watch.s['human_token'], reason='reviewed'))
+    box.health = dict(ok=True)
+    assert box.tick()['state'] == 'ARMING'
+    assert box.tick()['state'] == 'WATCHING'
+
+
+def test_checkpoint_worker_does_not_block_heartbeat(box):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    box.tick()
+    fake_checkpoint(box.root / 'output')
+    box.log('NCCL watchdog timed out'); box.die()
+    assert box.tick()['state'] == 'RECOVERING'
+    real = latest_checkpoint
+    def slow(output, verify_files=False, report=lambda **kw: None):
+        if verify_files:
+            report(files_done=0, files_total=1, bytes_done=128)
+            entered.set()
+            assert release.wait(5)
+        return real(output, verify_files, report)
+    try:
+        with patch('ops.h3_formal_watch.watchdog.latest_checkpoint', side_effect=slow):
+            assert box.tick()['state'] == 'RECOVERING'
+            assert entered.wait(2)
+            box.advance(60); box.monitor()
+            state = box.tick()
+            assert state['heartbeat_at'] == box.now and state['recovery_phase'] == 'verifying'
+            assert state['verification_progress']['bytes_done'] == 128
+            assert not state['resumes']
+    finally:
+        release.set()
+        box.watch.worker.join(5)
+
+
+def test_long_history_is_archived_but_status_and_reload_are_bounded(box):
+    for i in range(1100):
+        box.watch.incident('unknown_exit', dict(index=i, details='x' * 2048))
+    box.watch.persist()
+    status_path = box.root / 'state' / 'status.json'
+    assert status_path.stat().st_size < 128 * 1024
+    assert len(read_json(status_path)['incidents']) == 32
+    archives = list((box.root / 'state').glob('incidents.jsonl*'))
+    assert len(archives) >= 3
+    assert sum(len(p.read_text().splitlines()) for p in archives) == 1100
+    assert all(p.stat().st_size <= 1024 * 1024 for p in archives)
+    Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+
+
+def test_resume_artifacts_rechecked_and_original_paths_unchanged(box):
+    box.tick()
+    fake_checkpoint(box.root / 'output')
+    (box.root / 'FAKE-RUN-ONLY').unlink()
+    with pytest.raises(ValueError, match='existing absolute'):
+        box.watch.make_resume_spec(dict(path=str(box.root / 'output' / 'checkpoints' / 'step-1')), 'missing')
 
 
 # Observer/notifier tests are entirely offline; the only subprocesses below are
