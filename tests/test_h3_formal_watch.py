@@ -584,7 +584,7 @@ from ops.h3_formal_watch.snapshot import snapshot as remote_snapshot
 
 
 def observer_config(root):
-    return dict(state_dir=str(root / 'observer'), ssh_host='ubtroot@gpu-alias',
+    return dict(state_dir=str(root / 'observer'), ssh_host='user@gpu-alias',
                 remote_status='/fake/state/status.json', remote_events='/fake/state/events.jsonl',
                 remote_logs=['/fake/train.log'], timezone='Asia/Shanghai', daily_time='09:00',
                 report_dir=str(root / 'reports'), progress_log_path=str(root / 'progress.md'),

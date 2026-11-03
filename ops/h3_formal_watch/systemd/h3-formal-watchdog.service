@@ -1,5 +1,5 @@
 [Unit]
-Description=H3 deterministic GPU-host training watchdog (user ubtroot)
+Description=H3 deterministic GPU-host training watchdog
 
 [Service]
 Type=simple

@@ -229,7 +229,7 @@ local-only; they are never sent to Feishu.
   "state_dir": "/ABS/observer/state",
   "report_dir": "/ABS/observer/reports",
   "progress_log_path": "/ABS/progress/10.22-progress.md",
-  "ssh_host": "ubtroot@APPROVED_ALIAS",
+  "ssh_host": "USER@APPROVED_ALIAS",
   "ssh_identity_file": "/ABS/read-only-key",
   "remote_python": "/usr/bin/python3",
   "remote_status": "/ABS/watch/state/status.json",

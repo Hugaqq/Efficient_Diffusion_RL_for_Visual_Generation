@@ -1,5 +1,5 @@
 [Unit]
-Description=H3 read-only VPS observer and advisory analysis (user qvanium)
+Description=H3 read-only VPS observer and advisory analysis
 
 [Service]
 Type=oneshot
