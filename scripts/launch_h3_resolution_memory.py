@@ -57,7 +57,8 @@ class TwoUpdateBackend(H3LifecycleBackend):
         super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae,
                          reuse_rollout_anchor=args.reuse_rollout_anchor,
                          checkpoint_threads=args.checkpoint_threads,
-                         boundary_content_check=getattr(args, 'boundary_content_check', 'full'))
+                         boundary_content_check=getattr(args, 'boundary_content_check', 'full'),
+                         parallel_owners=getattr(args, 'parallel_owners', False))
         # 4 samples x 10 rollout transitions, plus 4 anchor forwards unless the rollout anchor is reused.
         self.nograd_forwards_per_update=40 if self.reuse_rollout_anchor else 44
         from visual_rl.runtime.h3_rollout_profile import configuration
@@ -166,6 +167,9 @@ def main():
     p.add_argument('--boundary-content-check', choices=('full', 'sentinel'), default='full',
                    help='frozen-base boundary verification (default: full); sentinel uses init-hash stat snapshots '
                         'only before non-terminal saves; terminal/restore still fully hash')
+    p.add_argument('--parallel-owners',action='store_true',
+                   help='opt-in: all eight reward owners decode/score concurrently behind one bounded HPS queue '
+                        '(requires --reward-pipeline and an HPS service started with --max-queue >= 8); requires approved experiment')
     p.add_argument('--profile-rollout',action='store_true',
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     p.add_argument('--checkpoint-threads',type=int,default=1,

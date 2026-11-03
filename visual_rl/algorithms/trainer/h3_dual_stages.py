@@ -39,7 +39,7 @@ from visual_rl.algorithms.trainer.interface import StageValue
 class H3DualIterationStages(H3IterationStages):
     def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
                  rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None,
-                 reuse_rollout_anchor=False, **kwargs):
+                 reuse_rollout_anchor=False, parallel_owners=False, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -57,6 +57,10 @@ class H3DualIterationStages(H3IterationStages):
         if reuse_rollout_anchor and mode!='dual_flash':
             raise ValueError('rollout anchor reuse requires dual_flash (flow records store no old score)')
         self.reuse_rollout_anchor=reuse_rollout_anchor
+        if type(parallel_owners) is not bool: raise TypeError('parallel_owners must be bool')
+        if parallel_owners and (mode!='dual_flash' or not reward_pipeline):
+            raise ValueError('parallel owners require dual_flash with the reward pipeline')
+        self.parallel_owners=parallel_owners
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -95,14 +99,35 @@ class H3DualIterationStages(H3IterationStages):
     @_timed
     def reward(self,value):
         ctx=self._context(value);r=ctx.request
+        parallel=getattr(self,'parallel_owners',False)  # opt-in P2; default serial owner turns
         def admission():
             if (self.reward_pipeline or self.reuse_video_vae) and (self.mode!='dual_flash' or r.group_layout!='paired_4x8'):
                 raise ValueError('reward pipeline/video reuse requires paired_4x8 dual_flash')
+            if parallel and (not self.reward_pipeline or not callable(getattr(ctx.coordinator,'aux_concurrent',None))):
+                raise ValueError('parallel owners require the reward pipeline and concurrent coordination')
         _checked(ctx.coordinator,'dual/reward-pipeline/ready',admission)
         from visual_rl.models.implementations.h3_decode_reuse import VIDEO_CAP, REUSE_VERSION
         ctx.coordinator.gate(f'dual/video-reuse/{int(self.reuse_video_vae)}/{REUSE_VERSION}/{VIDEO_CAP}')
+        # Default event text is unchanged; the opt-in suffix makes a rank with a
+        # different owner mode fail this gate before any auxiliary work.
+        from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
+        from visual_rl.algorithms.trainer.h3_reward_pipeline import MEDIA_PERMITS, MediaLedger
+        from visual_rl.models.lifecycle.h3_coordination import HOST_MEDIA_CAP
         ctx.coordinator.gate(f'dual/reward-pipeline/{int(self.reward_pipeline)}/queue1/total2/'
-                             f'{self.media_bytes}/{self.decode_bytes}')
+                             f'{self.media_bytes}/{self.decode_bytes}'
+                             +(f'/parallel{WORLD_SIZE}/media{HOST_MEDIA_CAP}' if parallel else ''))
+        cancel=ledger=None
+        if parallel:
+            def host_admission():
+                # All owners on the one host decode at once: admit their summed
+                # budgets once, and the structural media bound before any decode.
+                if WORLD_SIZE*MEDIA_PERMITS>HOST_MEDIA_CAP:
+                    raise ValueError('host media cap below owners x per-owner permits')
+                from visual_rl.models.implementations.h3_loading import _admit_host_memory
+                _admit_host_memory(WORLD_SIZE*(self.decode_bytes+MEDIA_PERMITS*self.media_bytes))
+            _checked(ctx.coordinator,'dual/parallel-owners/host-admission',host_admission)
+            import threading
+            cancel,ledger=threading.Event(),MediaLedger()
         def consume_work():
             import math
             from visual_rl.algorithms.trainer.h3_reward_pipeline import RewardSample, reward_pipeline
@@ -110,6 +135,8 @@ class H3DualIterationStages(H3IterationStages):
                           for i,(sid,gid,member) in enumerate(r.samples))
             @contextmanager
             def decode(sample):
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError('parallel owners aborted; no new decode')
                 sid=sample.sample_id
                 terminal=ctx.dual_terminals[sid].clone()
                 started=time.monotonic()
@@ -137,9 +164,19 @@ class H3DualIterationStages(H3IterationStages):
                 if self.read_behavior_id()!=r.behavior_id:
                     raise ValueError('reward pipeline behavior changed before work')
                 rows=reward_pipeline(samples,decode=decode,score=score,
-                                     media_bytes=self.media_bytes,decode_bytes=self.decode_bytes)
+                                     media_bytes=self.media_bytes,decode_bytes=self.decode_bytes,
+                                     **({'ledger':ledger} if ledger is not None else {}))
                 if self.read_behavior_id()!=r.behavior_id:
                     raise ValueError('reward pipeline behavior changed during work')
+                if parallel:
+                    # Reassemble by sample_id in the canonical request order on
+                    # the worker, so a mismatch is a heartbeat failure everywhere.
+                    position={sid:i for i,(sid,_,_) in enumerate(r.samples)}
+                    if len(rows)!=len(position) or set(row[0] for row in rows)!=set(position):
+                        raise ValueError('parallel owner rows differ from the canonical sample table')
+                    rows=tuple(sorted(rows,key=lambda row:position[row[0]]))
+                    if tuple(tuple(row[:3]) for row in rows)!=tuple(tuple(x) for x in r.samples):
+                        raise ValueError('parallel owner rows differ from the canonical sample table')
                 return rows
             rows=[]
             for sample in samples:
@@ -151,7 +188,11 @@ class H3DualIterationStages(H3IterationStages):
             # Entire P1 helper returns only after its consumer has joined/drained.
             with (self.video_reuse_scope() if self.reuse_video_vae else nullcontext()):
                 return consume_work()
-        ctx.rewards=ctx.coordinator.aux_turns(work)
+        if parallel:
+            ctx.rewards=ctx.coordinator.aux_concurrent(work,cancel=cancel,
+                inflight=lambda:ledger.held,media_cap=HOST_MEDIA_CAP)
+        else:
+            ctx.rewards=ctx.coordinator.aux_turns(work)
         return StageValue(value.identity,ctx)
 
     def credit(self,value):

@@ -12,6 +12,7 @@ import math
 import threading
 import time
 import faulthandler
+from contextlib import ExitStack
 from typing import TypeVar
 
 import torch
@@ -24,6 +25,12 @@ from visual_rl.models.lifecycle.h3_fsdp import H3PreparedModel, H3_REDUCER_DIVIS
 from visual_rl.models.lifecycle.prepared import validate_optimizer_parameter_subset
 
 T = TypeVar('T')
+
+# Opt-in concurrent auxiliary work (P2). Status codes per rank in a SUM-reduced
+# heartbeat; every rank derives the same verdict from the same reduced tensor.
+AUX_RUNNING, AUX_DONE, AUX_FAILED, AUX_TIMEOUT = 0, 1, 2, 3
+AUX_BUDGET_SECONDS = 3600.
+HOST_MEDIA_CAP = 16  # decoded media in flight across the single host
 
 
 class H3CoordinationError(RuntimeError):
@@ -213,6 +220,118 @@ class H3Coordination:
                     if error is not None:
                         raise exc from error
                     raise
+            return result
+        except BaseException:
+            self._poisoned = True
+            raise
+        finally:
+            self._in_aux = False  # local only; never add a finally collective
+
+    def aux_concurrent(self, work: Callable[[], T], *, cancel: threading.Event | None = None,
+                       inflight: Callable[[], int] | None = None, media_cap: int = HOST_MEDIA_CAP,
+                       budget_s: float = AUX_BUDGET_SECONDS, interval_s: float = 1.) -> T:
+        """Opt-in: every rank runs its own auxiliary work at the same time.
+
+        Collective sequence is timing-independent: begin gate, N heartbeat
+        all_reduces, then either the end gate (all ranks done) or a common
+        abort with no further collective. N is identical on all ranks because
+        each verdict is a pure function of the SAME reduced status tensor. A
+        failure, local budget expiry, malformed status or host media count
+        above media_cap on ANY rank aborts every rank at that heartbeat; the
+        local worker is cancelled cooperatively (in-flight HTTP/decode cannot be
+        killed) and the attempt is poisoned. Results stay rank-local.
+        """
+        self._require_live()
+        invalid = (not callable(work) or self._in_aux
+                   or (cancel is not None and not isinstance(cancel, threading.Event))
+                   or (inflight is not None and not callable(inflight))
+                   or type(media_cap) is not int or media_cap < 1
+                   or type(budget_s) not in (int, float) or not 0 < budget_s <= AUX_BUDGET_SECONDS
+                   or type(interval_s) not in (int, float) or not 0 < interval_s <= 1)
+        self._in_aux = True
+        result = error = None
+        try:
+            self.gate(f'aux/parallel/{WORLD_SIZE}/media{media_cap if type(media_cap) is int else None}/begin',
+                      local_error=invalid)
+            done = threading.Event()
+            started = time.monotonic()
+            cuda = self._device.type == 'cuda'  # CPU only in the in-memory world simulation
+            work_stream = None
+            if cuda:
+                producer = torch.cuda.current_stream(self._device)
+                work_stream = torch.cuda.Stream(device=self._device)
+                work_stream.wait_stream(producer)
+            grad_enabled = torch.is_grad_enabled()
+            def execute():
+                nonlocal result, error
+                try:
+                    with ExitStack() as scope:
+                        if cuda:  # thread-local CUDA selection + side stream, as in aux_turns
+                            scope.enter_context(torch.cuda.device(self._device))
+                            scope.enter_context(torch.cuda.stream(work_stream))
+                        scope.enter_context(torch.set_grad_enabled(grad_enabled))
+                        result = work()
+                        if cuda:
+                            work_stream.synchronize()
+                except BaseException as exc:
+                    error = exc
+                finally:
+                    done.set()
+            worker = threading.Thread(target=execute, name=f'h3-aux-parallel-{self._rank}', daemon=True)
+            print(json.dumps(dict(event='h3_aux_parallel_begin', rank=self._rank, timeout_seconds=budget_s,
+                                  media_cap=media_cap)), flush=True)
+            worker.start()
+            status = torch.zeros((2, WORLD_SIZE), dtype=torch.int32, device=self._device)
+            tick, verdict = 0, None
+            while verdict is None:
+                elapsed = time.monotonic() - started
+                held = 0
+                if done.is_set():
+                    code = AUX_DONE if error is None else AUX_FAILED
+                elif elapsed >= budget_s:
+                    code = AUX_TIMEOUT
+                else:
+                    code = AUX_RUNNING
+                    try:
+                        held = inflight() if inflight is not None else 0
+                        if type(held) is not int or not 0 <= held <= media_cap:
+                            raise ValueError('invalid local in-flight media count')
+                    except Exception as exc:
+                        error, code, held = exc, AUX_FAILED, 0
+                status.zero_()
+                status[0, self._rank] = code
+                status[1, self._rank] = held
+                dist.all_reduce(status, op=dist.ReduceOp.SUM, group=self._group)
+                codes, counts = status[0].tolist(), status[1].tolist()
+                host_media = sum(counts)
+                if any(c not in (AUX_RUNNING, AUX_DONE, AUX_FAILED, AUX_TIMEOUT) for c in codes) or min(counts) < 0:
+                    verdict = 'invalid auxiliary heartbeat status'
+                elif any(c in (AUX_FAILED, AUX_TIMEOUT) for c in codes):
+                    failed = [r for r, c in enumerate(codes) if c == AUX_FAILED]
+                    late = [r for r, c in enumerate(codes) if c == AUX_TIMEOUT]
+                    verdict = f'auxiliary work failed on ranks {failed}, exceeded {budget_s:g}s on ranks {late}'
+                elif host_media > media_cap:
+                    verdict = f'host in-flight media {host_media} exceeds cap {media_cap}'
+                elif all(c == AUX_DONE for c in codes):
+                    verdict = 'done'
+                if self._rank == 0 and (tick % 30 == 0 or verdict is not None):
+                    print(json.dumps(dict(event='h3_aux_parallel_wait', seconds=elapsed, codes=codes,
+                                          host_media=host_media, verdict=verdict)), flush=True)
+                if verdict is None:
+                    if tick and tick % 300 == 0 and not done.is_set():
+                        faulthandler.dump_traceback(all_threads=True)
+                    tick += 1
+                    time.sleep(interval_s)
+            if verdict != 'done':
+                if cancel is not None:
+                    cancel.set()  # cooperative: stop issuing new decodes/requests
+                raise H3CoordinationError('parallel auxiliary phase aborted on all ranks: ' + verdict) from error
+            worker.join()
+            if cuda:
+                torch.cuda.current_stream(self._device).wait_stream(work_stream)
+            print(json.dumps(dict(event='h3_aux_parallel_end', rank=self._rank,
+                                  seconds=time.monotonic() - started)), flush=True)
+            self.gate('aux/parallel/end')
             return result
         except BaseException:
             self._poisoned = True
