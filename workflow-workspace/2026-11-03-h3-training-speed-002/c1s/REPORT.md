@@ -2,7 +2,7 @@
 
 ## Verified conclusion
 
-Implemented the opt-in boundary-verification change in `1d90a2b` on `perf/h3-training-speed-20261103-002-c1s`, starting at `7d944c3`. The review follow-up restricts mode gates to configured sentinel mode, removing the unintended default-full collectives. The original seven-function Mac gate has the expected result: **1 failed, 6 passed in 19.12s**. The sole failure is the original Linux `/proc` dependency, `tests/test_flash_collection_runtime.py:292`, `KeyError: 'cpu_rss_bytes'`. This is CPU engineering evidence, not GPU acceptance or measured speedup.
+Implemented the opt-in boundary-verification change in `7241f72` (main history; cherry-picked from the `perf/h3-training-speed-20261103-002-c1s` lane, which started at `7d944c3`). The review follow-up `67e57bf` restricts mode gates to configured sentinel mode, removing the unintended default-full collectives. The original seven-function Mac gate has the expected result: **1 failed, 6 passed in 19.12s**. The sole failure is the original Linux `/proc` dependency, `tests/test_flash_collection_runtime.py:292`, `KeyError: 'cpu_rss_bytes'`. This is CPU engineering evidence, not GPU acceptance or measured speedup.
 
 ## Premise audit (line references at input commit 7d944c3)
 
@@ -52,4 +52,4 @@ A same-size, same-inode content rewrite with **both mtime and ctime restored** i
 
 The zero-byte assertion is scoped to the replaced model-content hashing pass. Existing model config/weight-header reads in `preflight_h3_profile` (`visual_rl/composition/config/h3_profile.py:294-380`) and text-cache shard checks remain active; zero total model-file I/O at a checkpoint is **not** claimed.
 
-Completed locally: initial implementation `1d90a2b`, scoped gate-compatibility follow-up, original-seven Mac gate, import/assertion-preservation checks, and diff check. Resolve the follow-up commit containing this updated report with `git log -1 --format=%H -- workflow-workspace/2026-11-03-h3-training-speed-002/c1s/REPORT.md`. No deployment or measured speedup is claimed. Controller should carry this scoped progress record into the shared progress log during integration; this unit does not edit outside its worktree.
+Completed locally: initial implementation `7241f72`, scoped gate-compatibility follow-up `67e57bf`, original-seven Mac gate, import/assertion-preservation checks, and diff check. No deployment or measured speedup is claimed. Controller should carry this scoped progress record into the shared progress log during integration; this unit does not edit outside its worktree.
