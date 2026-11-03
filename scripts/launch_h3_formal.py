@@ -156,18 +156,21 @@ def monitor_budget(directory, *, remaining_updates, seconds_per_update=MONITOR_S
 
 
 def extension_flags(args):
-    """Extension point: S1 (rollout batching) and P2 (parallel owners) live on other
-    branches and are NOT accepted here. When one is merged and separately measured,
-    register its argparse flag next to add_common_arguments() and return it here so
-    it becomes part of the resume identity and the launch manifest."""
-    return {}
+    """S1 (--rollout-batch, --rollout-batch-replay-tolerance) and P2 (--parallel-owners),
+    registered by add_common_arguments() and default off. Both enter the resume identity and
+    the launch manifest: S1 already changes the training semantic identity; P2 is recorded so
+    a resume must keep the same value. S1 with --reuse-rollout-anchor and P2 without
+    --reward-pipeline are rejected by the backend constructor before any GPU work."""
+    return dict(rollout_batch=args.rollout_batch,
+                rollout_batch_replay_tolerance=args.rollout_batch_replay_tolerance,
+                parallel_owners=args.parallel_owners)
 
 
 def formal_identity(profile, args):
     """What a resume must not change (observation-only switches excluded). The training
     core (visual_rl code hash, semantics, topology) is enforced by the lifecycle owner check;
     the launcher Git SHA is tracked separately in formal-run.json (see check_resume_identity)."""
-    return dict(schema='h3.formal-run.v2',
+    return dict(schema='h3.formal-run.v3',
                 max_optimizer_steps=profile.launch.max_optimizer_steps,
                 checkpoint_every=CHECKPOINT_EVERY, export_every=EXPORT_EVERY, export_also=list(EXPORT_ALSO),
                 retention=retention.POLICY,

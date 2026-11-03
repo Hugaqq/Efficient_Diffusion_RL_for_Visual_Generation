@@ -4511,9 +4511,39 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     out.mkdir()
     (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
     assert formal.check_resume_identity(identity_profile, args) is None
-    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8)):
+    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8), ('rollout_batch', 4),
+                        ('rollout_batch_replay_tolerance', 1e-3), ('parallel_owners', True)):
         changed = SimpleNamespace(**dict(vars(args), **{name: value}))
         with pytest.raises(ValueError, match='changed formal-run identity'): formal.check_resume_identity(identity_profile, changed)
+    # S1/P2 wiring: default off, recorded in formal-run.json; a v2 record (no S1/P2 keys) is refused.
+    s1p2_keys = ('rollout_batch', 'rollout_batch_replay_tolerance', 'parallel_owners')
+    default_flags = formal.formal_identity(identity_profile, args)['flags']
+    assert {k: default_flags[k] for k in s1p2_keys} == dict(rollout_batch=1, rollout_batch_replay_tolerance=1e-4, parallel_owners=False)
+    s1p2 = formal.build_parser().parse_args(['cfg.json', '--expected-sha', 'a' * 40, '--ffmpeg', 'f', '--ffprobe', 'p',
+        '--monitor-dir', 'm', '--rollout-batch', '4', '--rollout-batch-replay-tolerance', '1e-3', '--reward-pipeline', '--parallel-owners'])
+    s1p2_record = formal.fresh_record(identity_profile, s1p2)
+    assert {k: s1p2_record['identity']['flags'][k] for k in s1p2_keys} == dict(rollout_batch=4, rollout_batch_replay_tolerance=1e-3, parallel_owners=True)
+    old_record = formal.fresh_record(identity_profile, args)
+    old_record['identity'] = dict(old_record['identity'], schema='h3.formal-run.v2', flags={k: v for k, v in
+        old_record['identity']['flags'].items() if k not in s1p2_keys})
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(old_record))
+    with pytest.raises(ValueError, match='changed formal-run identity'): formal.check_resume_identity(identity_profile, args)
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(s1p2_record))
+    assert formal.check_resume_identity(identity_profile, s1p2) is None
+    for name, value in (('rollout_batch', 1), ('rollout_batch_replay_tolerance', 1e-4), ('parallel_owners', False)):
+        with pytest.raises(ValueError, match='changed formal-run identity'):
+            formal.check_resume_identity(identity_profile, SimpleNamespace(**dict(vars(s1p2), **{name: value})))
+    with pytest.raises(SystemExit):  # S1 accepts only B=1 or B=4
+        formal.build_parser().parse_args(['cfg.json', '--expected-sha', 'a' * 40, '--ffmpeg', 'f', '--ffprobe', 'p',
+                                          '--monitor-dir', 'm', '--rollout-batch', '2'])
+    formal_manifest = dict(launch_stamp='t', started_utc='u')
+    s1p2_backend = formal.FormalBackend(args=s1p2, manifest=formal_manifest)
+    assert (s1p2_backend.rollout_batch, s1p2_backend.parallel_owners, s1p2_backend.nograd_forwards_per_update) == (4, True, 14)
+    with pytest.raises(ValueError, match='anchor reuse'):  # S1 + O1 stays rejected through the formal launcher
+        formal.FormalBackend(args=SimpleNamespace(**dict(vars(s1p2), reuse_rollout_anchor=True)), manifest=formal_manifest)
+    with pytest.raises(ValueError, match='reward pipeline'):  # P2 requires the owner-local reward pipeline
+        formal.FormalBackend(args=SimpleNamespace(**dict(vars(s1p2), reward_pipeline=False)), manifest=formal_manifest)
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.fresh_record(identity_profile, args)))
     observed = SimpleNamespace(**dict(vars(args), audit_weights=True))  # observation-only: not identity
     assert formal.check_resume_identity(identity_profile, observed) is None
     # Launcher upgrade: a new SHA is refused by default; allowed only with flag + reason and
