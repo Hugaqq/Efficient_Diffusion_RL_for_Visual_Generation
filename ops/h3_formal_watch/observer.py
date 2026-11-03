@@ -16,8 +16,9 @@ from zoneinfo import ZoneInfo
 from .common import Store, digest, read_json
 from .commands import run_command
 from .notifier import FeishuNotifier
+from .process import boot_id
 
-STATES = {'WATCHING', 'STOPPING', 'RECOVERING', 'LAUNCHING', 'NEEDS_HUMAN', 'DONE'}
+STATES = {'ARMING', 'WATCHING', 'STOPPING', 'RECOVERING', 'LAUNCHING', 'NEEDS_HUMAN', 'DONE'}
 
 
 def ssh_argv(config):
@@ -41,9 +42,14 @@ def ssh_argv(config):
 
 
 def validate_snapshot(value, config):
+    if not isinstance(value, dict) or not isinstance(value.get('status'), dict):
+        raise ValueError('snapshot/status must be objects')
     status = value['status']
-    heartbeat = status['heartbeat_at']
-    if (status['state'] not in STATES or type(heartbeat) not in (int, float) or not math.isfinite(heartbeat)
+    times = [status['heartbeat_at'], value['remote_time']]
+    for row, key in ((status, 'heartbeat_mono'), (value, 'remote_monotonic')):
+        if key in row:
+            times.append(row[key])
+    if (status['state'] not in STATES or any(type(v) not in (int, float) or not math.isfinite(v) for v in times)
             or not isinstance(value.get('events'), list) or not isinstance(value.get('logs'), dict)):
         raise ValueError('invalid snapshot schema')
     if config.get('expected_config_id') and status.get('config_id') != config['expected_config_id']:
@@ -68,17 +74,17 @@ def fetch(config, *, runner=run_command, sleep=time.sleep):
     raise RuntimeError('read-only SSH fetch failed: ' + repr(error))
 
 
-def deadman(status, now, unreachable_since, *, stale_seconds=600, unreachable_seconds=1800):
-    if status and status.get('state') == 'DONE':
-        return []  # terminal watchdog intentionally stopped heartbeating
+def deadman(status, remote_now, *, unreachable_age=None, heartbeat_age=None,
+            stale_seconds=600, unreachable_seconds=1800):
+    """status MUST be from this fetch, never cached. Both host clocks stay local."""
     reasons = []
-    if status:
-        age = now - status['heartbeat_at']
+    if status and status.get('state') != 'DONE':
+        age = heartbeat_age if heartbeat_age is not None else remote_now - status['heartbeat_at']
         if age > stale_seconds:
             reasons.append('heartbeat_stale')
         elif age < -60:
             reasons.append('clock_skew')
-    if unreachable_since is not None and now - unreachable_since >= unreachable_seconds:
+    if unreachable_age is not None and unreachable_age >= unreachable_seconds:
         reasons.append('unreachable')
     return reasons
 
@@ -122,9 +128,10 @@ def diagnosis(raw):
 
 
 class Observer:
-    def __init__(self, config, *, dry_run=False, clock=time.time, fetcher=fetch,
+    def __init__(self, config, *, dry_run=False, clock=time.time, monotonic=time.monotonic, fetcher=fetch,
                  runner=run_command, notifier=None):
         self.config, self.clock, self.fetcher, self.runner, self.dry_run = config, clock, fetcher, runner, dry_run
+        self.monotonic, self.boot = monotonic, boot_id()
         for name, default, maximum in (('ssh_timeout_seconds', 30, 120), ('analysis_timeout_seconds', 180, 600),
                                       ('alert_repeat_seconds', 3600, 86400), ('notify_retry_seconds', 300, 86400),
                                       ('heartbeat_max_age_seconds', 600, 86400), ('unreachable_seconds', 1800, 86400)):
@@ -140,6 +147,10 @@ class Observer:
                  unreachable_since=None, last_state=None, jobs={}, notices={}, fetch_error=None)
         if self.s['config_id'] != identity or self.s['dry_run'] != dry_run:
             raise ValueError('observer config/dry-run mode changed; reconcile state before switching')
+        if self.s.get('boot_id') != self.boot:
+            self.s.update(boot_id=self.boot, unreachable_since=None)
+            for notice in self.s['notices'].values():
+                notice.pop('attempted_mono', None)  # old/rebooted retry windows are not comparable
         daily_key(clock(), config.get('timezone', 'Asia/Shanghai'), config.get('daily_time', '09:00'))
 
     def persist(self):
@@ -152,25 +163,38 @@ class Observer:
                                       created_at=self.clock(), analysis_status='pending')
 
     def notify(self, key, text, *, repeat=False):
-        now = self.clock()
-        entry = self.s['notices'].get(key)
-        if entry:
-            if entry.get('sent') and not repeat:
-                return
-            interval = self.config.get('alert_repeat_seconds', 3600) if entry.get('sent') else self.config.get('notify_retry_seconds', 300)
-            if now - entry['attempted_at'] < interval:
-                return
-        # Persist an attempt BEFORE sending: bound duplicate alerts after an observer crash.
-        entry = dict(attempted_at=now, sent=False)
-        self.s['notices'][key] = entry
+        entry = self.s['notices'].setdefault(key, dict(sent=False, text=text))
+        if entry.get('sent') and not repeat:
+            return
+        entry['text'] = text
+        self.deliver(key, entry, repeat=repeat)
+
+    def deliver(self, key, entry, *, repeat=False):
+        if entry.get('sent') and not repeat:
+            return
+        interval = self.config.get('alert_repeat_seconds', 3600) if entry.get('sent') else self.config.get('notify_retry_seconds', 300)
+        if entry.get('attempted_mono') is not None and self.monotonic() - entry['attempted_mono'] < interval:
+            return
+        # Durable outbox and attempt BEFORE send; draining never depends on active conditions.
+        entry.update(attempted_at=self.clock(), attempted_mono=self.monotonic(), sent=False)
         self.persist()
         try:
-            # Stable across retries (Feishu deduplicates this key for one hour).
-            self.notifier.send(text, digest(dict(config=self.s['config_id'], key=key))[:48])
+            self.notifier.send(entry['text'], digest(dict(config=self.s['config_id'], key=key))[:48])
             entry['sent'] = True
-        except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
+            entry.pop('error', None)
+        except (OSError, RuntimeError, ValueError, TypeError, TimeoutError) as exc:
             entry['error'] = repr(exc)
         self.persist()
+
+    def drain_notices(self):
+        for key, entry in self.s['notices'].items():
+            if not entry.get('sent'):
+                if 'text' not in entry:
+                    entry['text'] = '[H3 观察器] 旧版未投递告警，需人工核查：' + key
+                self.deliver(key, entry)
+        self.persist()
+        if any(not entry.get('sent') for entry in self.s['notices'].values()):
+            raise RuntimeError('undelivered notifications remain; systemd/timer must retry')
 
     def brief(self, key, job, snapshot):
         payload = snapshot or dict(status=None, events=[], logs={})
@@ -224,30 +248,43 @@ class Observer:
 
     def tick(self, snapshot=None):
         now = self.clock()
+        fresh = False
         try:
             if snapshot is None:
                 if self.dry_run:
                     print(json.dumps(dict(ssh_argv=ssh_argv(self.config)), ensure_ascii=False))
+                    self.drain_notices()
                     return self.s  # dry-run never contacts SSH; --snapshot supplies offline evidence
                 snapshot = self.fetcher(self.config)
             validate_snapshot(snapshot, self.config)
+            fresh = True
             self.store.save('snapshot.json', snapshot)
             self.store.save('remote-status.json', snapshot['status'])
             self.store.text('remote-events-tail.jsonl', ''.join(json.dumps(e, ensure_ascii=False) + '\n'
                                                              for e in snapshot['events']))
             self.s.update(unreachable_since=None, fetch_error=None)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, TimeoutError) as exc:
+            fresh = False
             if self.s['unreachable_since'] is None:
-                self.s['unreachable_since'] = now
+                self.s['unreachable_since'] = self.monotonic()
             self.s['fetch_error'] = repr(exc)
-            snapshot = self.store.load('snapshot.json')
+            try:
+                snapshot = self.store.load('snapshot.json')
+            except (OSError, ValueError, TypeError):
+                snapshot = None  # corrupt cache cannot block the durable notification outbox
         status = snapshot['status'] if snapshot else None
-        reasons = deadman(status, now, self.s['unreachable_since'],
+        heartbeat_age = None
+        if fresh and snapshot.get('remote_boot_id') and status.get('boot_id') == snapshot['remote_boot_id']:
+            if type(status.get('heartbeat_mono')) in (int, float) and type(snapshot.get('remote_monotonic')) in (int, float):
+                heartbeat_age = snapshot['remote_monotonic'] - status['heartbeat_mono']
+        reasons = deadman(status if fresh else None, snapshot['remote_time'] if fresh else None,
+                          heartbeat_age=heartbeat_age,
+                          unreachable_age=None if self.s['unreachable_since'] is None else self.monotonic() - self.s['unreachable_since'],
                           stale_seconds=self.config.get('heartbeat_max_age_seconds', 600),
                           unreachable_seconds=self.config.get('unreachable_seconds', 1800))
         for reason in reasons:
             self.queue('deadman:' + reason, '失联告警：' + reason + '；远端训练状态需人工核实', analyze=False, repeat=True)
-        if status:
+        if fresh and status:
             for incident in status.get('incidents', []):
                 self.queue('incident:' + incident['id'], '新事件：' + incident['cause'])
             for resume in status.get('resumes', []):
@@ -285,7 +322,7 @@ class Observer:
                 self.analyze(key, job, snapshot)
                 if job.get('diagnosis'):
                     self.notify('analysis:' + key, '[H3 只读建议] ' + job['label'] + '\n' + job['diagnosis'])
-        self.persist()
+        self.drain_notices()
         return self.s
 
 
@@ -297,10 +334,18 @@ def main():
     args = parser.parse_args()
     if args.snapshot and not args.dry_run:
         parser.error('--snapshot requires --dry-run')
-    observer = Observer(read_json(args.config), dry_run=args.dry_run)
-    with observer.store.lock('observer.lock'):
+    config = read_json(args.config)
+    store = Store(config['state_dir'])
+    try:
+        lock = store.lock('observer.lock')
+    except BlockingIOError:
+        print('observer lock busy; overlapping timer tick skipped')
+        return 0
+    with lock:
+        observer = Observer(config, dry_run=args.dry_run)
         observer.tick(read_json(args.snapshot) if args.snapshot else None)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

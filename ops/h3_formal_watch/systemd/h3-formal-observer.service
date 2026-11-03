@@ -8,5 +8,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@REPO@
 ExecStart=@PYTHON@ -m ops.h3_formal_watch.observer @CONFIG@
 TimeoutStartSec=30min
+Restart=on-failure
+RestartSec=5min
 KillMode=control-group
 UMask=0077

@@ -531,7 +531,7 @@ def observer_config(root):
 
 def remote(now=0, state='WATCHING', **fields):
     return dict(status=dict(dict(heartbeat_at=now, state=state, optimizer_step=7,
-                                 incidents=[], resumes=[]), **fields), events=[], logs={})
+                                 incidents=[], resumes=[]), **fields), events=[], logs={}, remote_time=now)
 
 
 class FakeNotifier:
@@ -580,11 +580,11 @@ def test_notifier_dry_run_no_execution(capsys):
     (dict(state='WATCHING', heartbeat_at=0), 600, None, []),
     (dict(state='WATCHING', heartbeat_at=0), 601, None, ['heartbeat_stale']),
     (dict(state='WATCHING', heartbeat_at=0), 1800, 0, ['heartbeat_stale', 'unreachable']),
-    (dict(state='DONE', heartbeat_at=0), 100000, 0, []),
+    (dict(state='DONE', heartbeat_at=0), 100000, 0, ['unreachable']),
     (dict(state='NEEDS_HUMAN', heartbeat_at=0), 601, None, ['heartbeat_stale']),
     (dict(state='WATCHING', heartbeat_at=1000), 0, None, ['clock_skew'])])
 def test_deadman_logic(status, now, since, expected):
-    assert deadman(status, now, since) == expected
+    assert deadman(status, now, unreachable_age=None if since is None else now - since) == expected
 
 
 def test_ssh_read_only_argv_and_retry_bounds(tmp_path):
@@ -685,7 +685,7 @@ def test_observer_unreachable_and_rate_limit_recovery(tmp_path):
     config = observer_config(tmp_path)
     config['daily_time'] = '23:59'
     def unreachable(*args): raise RuntimeError('SSH failure (state unknown)')
-    obs = Observer(config, clock=lambda: now[0], fetcher=unreachable, notifier=notify,
+    obs = Observer(config, clock=lambda: now[0], monotonic=lambda: now[0], fetcher=unreachable, notifier=notify,
                    runner=lambda *a, **kw: pytest.fail('no LLM for dead-man only'))
     obs.tick()
     assert not notify.calls
@@ -716,14 +716,17 @@ def test_failed_notifier_rate_limited_and_analysis_never_replayed(tmp_path):
         analyses.append(a)
         raise TimeoutError('fake analysis timeout')
     config = observer_config(tmp_path)
-    obs = Observer(config, clock=lambda: now[0], runner=broken_analysis, notifier=Broken())
+    obs = Observer(config, clock=lambda: now[0], monotonic=lambda: now[0], runner=broken_analysis, notifier=Broken())
     snap = remote(incidents=[dict(id='i1', cause='process_died')])
-    obs.tick(snap)
+    with pytest.raises(RuntimeError, match='undelivered'):
+        obs.tick(snap)
     assert len(analyses) == 1 and len(calls) == 2
-    obs.tick(snap)
+    with pytest.raises(RuntimeError, match='undelivered'):
+        obs.tick(snap)
     assert len(calls) == 2
     now[0] += 300
-    obs.tick(remote(now[0], incidents=snap['status']['incidents']))
+    with pytest.raises(RuntimeError, match='undelivered'):
+        obs.tick(remote(now[0], incidents=snap['status']['incidents']))
     assert len(calls) == 4 and len(analyses) == 1
     assert calls[0][1] == calls[2][1]
     assert obs.s['jobs']['incident:i1']['analysis_status'] == 'failed'
@@ -806,7 +809,7 @@ def test_exclusive_locks_and_config_identity(tmp_path):
 
 def test_snapshot_identity_mismatch_counts_as_unreachable(tmp_path):
     config = dict(observer_config(tmp_path), expected_config_id='approved-config')
-    obs = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    obs = Observer(config, clock=lambda: 0, monotonic=lambda: 0, notifier=FakeNotifier())
     obs.tick(remote(config_id='other-run'))
     assert obs.s['unreachable_since'] == 0
     assert 'identity changed' in obs.s['fetch_error']
@@ -860,6 +863,86 @@ def test_systemd_launch_claim_and_no_replay(tmp_path):
         assert 'execute' in argv
         with pytest.raises(FileExistsError): process.supervise(store.root, 'spec.json')
         assert command.call_count == 1
+
+
+def test_observer_fresh_remote_time_never_local_or_cached_age(tmp_path):
+    config = dict(observer_config(tmp_path), daily_time='23:59')
+    local, mono, notify = [10000000], [0], FakeNotifier()
+    def unreachable(*args): raise RuntimeError('network unavailable')
+    obs = Observer(config, clock=lambda: local[0], monotonic=lambda: mono[0],
+                   fetcher=unreachable, notifier=notify)
+    obs.tick(remote(20))  # remote clock far behind VPS: no false stale alert
+    assert not notify.calls
+    mono[0] = 600
+    obs.tick()  # cached heartbeat is NEVER aged
+    local[0] += 864000  # wall jump is irrelevant to unreachable window
+    mono[0] += 1799
+    obs.tick()
+    assert not notify.calls
+    mono[0] += 1
+    obs.tick()
+    assert len(notify.calls) == 1 and 'unreachable' in notify.calls[0][0]
+    assert 'deadman:heartbeat_stale' not in obs.s['jobs']
+
+
+def test_observer_remote_monotonic_beats_remote_wall_jump(tmp_path):
+    notify = FakeNotifier()
+    obs = Observer(observer_config(tmp_path), clock=lambda: 0, notifier=notify)
+    snap = remote(0, boot_id='gpu-boot', heartbeat_mono=100)
+    snap.update(remote_time=999999, remote_monotonic=101, remote_boot_id='gpu-boot')
+    obs.tick(snap)
+    assert not notify.calls
+    snap['remote_monotonic'] = 701
+    obs.tick(snap)
+    assert len(notify.calls) == 1 and 'heartbeat_stale' in notify.calls[0][0]
+
+
+def test_undelivered_resolved_alert_drains_after_restart(tmp_path):
+    config = dict(observer_config(tmp_path), daily_time='23:59')
+    mono, calls = [0], []
+    class OnceBroken:
+        def send(self, text, key):
+            calls.append((text, key))
+            raise RuntimeError('delivery unavailable')
+    obs = Observer(config, clock=lambda: 0, monotonic=lambda: mono[0], notifier=OnceBroken())
+    stale = remote(0)
+    stale['remote_time'] = 601
+    with pytest.raises(RuntimeError, match='undelivered'):
+        obs.tick(stale)
+    assert len(calls) == 1
+    mono[0] = 300
+    notify = FakeNotifier()
+    obs = Observer(config, clock=lambda: 0, monotonic=lambda: mono[0], notifier=notify)
+    obs.tick(remote(1000))  # condition resolved but old outbox still must deliver
+    assert len(notify.calls) == 1 and notify.calls[0] == calls[0]
+    obs.tick(remote(1000))
+    assert len(notify.calls) == 1
+
+
+@pytest.mark.parametrize('reply', ['[]', 'null', 'true', '"unexpected"', '123'])
+def test_notifier_non_object_reply_fails_cleanly(reply):
+    notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='bot'), runner=lambda *a, **kw: dict(stdout=reply))
+    with pytest.raises(RuntimeError, match='acknowledge'):
+        notifier.send('test', 'key')
+
+
+@pytest.mark.parametrize('text', ['@/private/file', '--option', '  @file', '\n-option'])
+def test_notifier_leading_file_or_option_syntax_is_inert(text):
+    notifier = FeishuNotifier(dict(chat_id='oc_fake', identity='bot'))
+    argv = notifier.argv(text, 'key')
+    assert argv[argv.index('--text') + 1] == '[H3] ' + text
+
+
+def test_observer_busy_lock_returns_zero_without_work(tmp_path, capsys):
+    from ops.h3_formal_watch.observer import main
+    config = observer_config(tmp_path)
+    Store(tmp_path).save('config.json', config)
+    store = Store(config['state_dir'])
+    with store.lock('observer.lock'), patch.object(sys, 'argv', ['observer', str(tmp_path / 'config.json')]), \
+            patch('ops.h3_formal_watch.observer.Observer') as construct:
+        assert main() == 0
+        construct.assert_not_called()
+    assert 'lock busy' in capsys.readouterr().out
 
 
 def test_user_unit_contract():

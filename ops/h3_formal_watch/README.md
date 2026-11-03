@@ -205,8 +205,23 @@ SSH uses verified host keys, BatchMode, bounded retries/backoff and only the bun
 read-only snapshot program. Prefer an operator-enforced forced-command read-only
 key. Snapshot bounds: status 1 MiB; events 64 KiB; four 16 KiB log tails including
 the current supervised attempt. Missing logs are explicit unknowns. No cached
-snapshot is evidence of fresh reachability. Daily and incident pi sessions are
-claimed once; ambiguous model execution is not automatically replayed.
+snapshot is evidence of fresh reachability. Heartbeat age is judged ONLY on a
+fresh fetch, using the GPU snapshot's remote monotonic clock when boot IDs match,
+otherwise that same remote host's wall time — never Mac/VPS time against cached
+status. Cached DONE cannot suppress the independent 30-minute SSH-unreachable
+rule. Observer cooldown/unreachability durations use its own boot-bound monotonic
+clock. Daily calendar scheduling alone intentionally uses wall time.
+
+Notification text/attempts form a durable outbox. Undelivered messages drain even
+when the triggering condition has resolved; failed sends exit nonzero, with a
+5-minute service retry/cooldown and stable idempotency key. Non-object CLI replies
+are failures. Text starting with `@`/`-` is prefixed to prevent file/option parsing;
+UTF-8 argv is never shell-interpolated. An overlapping timer's busy lock exits 0
+with an explicit log line, without constructing/running the observer. Exactly-once
+network delivery is not guaranteed beyond Feishu's upstream deduplication window.
+Daily and incident pi sessions are claimed once; ambiguous model execution is not
+automatically replayed. Independent VPS monitoring is still required: a dead VPS
+cannot report its own outage.
 
 Preview without any SSH/pi/lark subprocess (use separate dry state):
 
@@ -224,7 +239,28 @@ Install only the GPU watchdog on GPU, observer service/timer on VPS. Confirm
 `loginctl show-user "$USER" -p Linger`; enabling linger may require separate admin
 permission. Never change linger for unrelated jobs.
 
+Example rendering on the **authorized host**, after replacing the paths:
+
 ```sh
+export REPO=/ABS/watch-checkout PYTHON=/ABS/python3 CONFIG=/ABS/config.json
+export UNIT=h3-formal-watchdog  # on VPS: h3-formal-observer
+python3 - <<'PY'
+import os
+from pathlib import Path
+root = Path.home() / '.config/systemd/user'
+root.mkdir(parents=True, exist_ok=True)
+unit = os.environ['UNIT']
+assert unit in ('h3-formal-watchdog', 'h3-formal-observer')
+source = Path(os.environ['REPO']) / 'ops/h3_formal_watch/systemd'
+text = (source / (unit + '.service')).read_text()
+for key in ('REPO', 'PYTHON', 'CONFIG'):
+    value = os.environ[key]
+    assert Path(value).is_absolute() and not any(c.isspace() or c == '%' for c in value)
+    text = text.replace('@' + key + '@', value)
+(root / (unit + '.service')).write_text(text)
+if unit == 'h3-formal-observer':
+    (root / (unit + '.timer')).write_text((source / (unit + '.timer')).read_text())
+PY
 systemctl --user daemon-reload
 # GPU, after arming evidence and ownership are ready:
 systemctl --user enable --now h3-formal-watchdog.service

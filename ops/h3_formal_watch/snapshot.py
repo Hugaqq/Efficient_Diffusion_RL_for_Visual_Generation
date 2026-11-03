@@ -52,7 +52,9 @@ def snapshot(request):
             logs[path] = read_file(path, 16384, from_end=True)
         except OSError as exc:
             errors[path] = repr(exc)
-    return dict(status=status, events=events, logs=logs, errors=errors, remote_time=time.time())
+    boot = Path('/proc/sys/kernel/random/boot_id')
+    return dict(status=status, events=events, logs=logs, errors=errors, remote_time=time.time(),
+                remote_monotonic=time.monotonic(), remote_boot_id=boot.read_text().strip() if boot.exists() else None)
 
 
 if __name__ == '__main__':

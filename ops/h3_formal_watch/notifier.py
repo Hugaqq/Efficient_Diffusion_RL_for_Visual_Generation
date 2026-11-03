@@ -14,6 +14,10 @@ class FeishuNotifier:
         self.config, self.dry_run, self.runner = config, dry_run, runner
 
     def argv(self, text, key):
+        if not isinstance(text, str):
+            raise ValueError('notification text must be a string')
+        if text.lstrip().startswith(('@', '-')):
+            text = '[H3] ' + text  # never CLI @file expansion or a leading option
         argv = [self.config.get('binary', 'lark-cli'), 'im', '+messages-send',
                 '--as', self.config['identity'], '--chat-id', self.config['chat_id'],
                 '--text', text, '--idempotency-key', key]
@@ -28,6 +32,6 @@ class FeishuNotifier:
             return
         result = self.runner(argv, timeout=self.config.get('timeout_seconds', 30), max_bytes=65536)
         response = json.loads(result['stdout'])
-        if response.get('ok') is not True:
+        if not isinstance(response, dict) or response.get('ok') is not True:
             # Do not silently approve missing scopes, risk confirmations or change identity.
             raise RuntimeError('Feishu did not acknowledge ok=true')
