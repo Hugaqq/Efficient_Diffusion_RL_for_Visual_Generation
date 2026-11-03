@@ -48,6 +48,11 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   adopting any new attempt clears the previous stop record. Unpublished pause intent
   is replayed before escalation, with a fresh full boundary allowance. It is never
   assumed published merely because STOPPING was persisted.
+  **Legacy STOPPING:** a record lacking `launch_id` or `pause_token` cannot prove
+  pause ownership. An existing request is treated as an operator pause and the
+  stop/death path fails closed to NEEDS_HUMAN, not automatic recovery. Reconcile
+  the actual attempt and request manually before acknowledging; do not invent
+  ownership tokens, erase the request/history or restart training to migrate it.
   Operator pauses are never removed or auto-resumed, including via the same symlink.
   If an observed operator request disappears while training lives, latch NEEDS_HUMAN:
   cancellation intent is ambiguous, so checks require explicit rearming.
@@ -60,6 +65,10 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   normal launcher JSON (including identity metadata) is not failure evidence.
   Each explicit exception must itself be an allowlisted transient record; an
   unrelated error cannot borrow a later NCCL substring, even on the same line.
+  Torch NCCL watchdog `exception:` messages and native `c10::Error::Error` stack
+  frames are supported; a bare word "error" in metrics/diagnostics is not a failure
+  record. Elastic `SignalException: Process ... got signal: 15` requires a matching
+  SIGTERM exit receipt (-15/143) to avoid a veto, and does not itself authorize retry.
   Log matching is conservative and bounded to the attempt's
   last 256 KiB; missing evidence never authorizes retry.
 * Resume requires healthy prerequisites, latest complete checkpoint metadata and
@@ -193,8 +202,11 @@ python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --acknowledge 'Reviewed
 This writes a token-bound acknowledgement consumed by the running watchdog on its
 next tick. It does not clear retry limits, remove pause requests, bypass a reboot,
 change ownership, or force a resume. Active pause requests must be resolved by the
-operator first; a failed rearming gate or a dead process returns to NEEDS_HUMAN
-with a new token. Acknowledgement never reclassifies a dead process for auto-resume.
+operator first; a failed rearming gate or a dead **incomplete** process returns to
+NEEDS_HUMAN with a new token. Matching SUCCESS/run/checkpoint/exit evidence is
+checked before that dead-process veto, so an attempt finishing while latched can
+reach DONE after acknowledgement (including when the exit receipt arrives later).
+Acknowledgement never reclassifies a dead process for auto-resume.
 
 An unknown pending launch requires reconciliation, not repeated acknowledgements.
 Stop **only the watchdog service** first (its lock must be free; training is separate),

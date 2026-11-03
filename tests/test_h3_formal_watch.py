@@ -1380,6 +1380,24 @@ def test_pause_ownership_requires_launch_and_token(box):
     assert watch.operator_pause()
 
 
+@pytest.mark.parametrize('missing', ['launch_id', 'pause_token'])
+def test_legacy_stopping_pause_fails_closed(box, missing):
+    box.tick()
+    watch = box.watch
+    watch.s.update(state='STOPPING', stop=dict(pause_issued=True, pause_published=True,
+        phase='pause', cause='monitor_stop', launch_id=watch.s['process']['launch_id'],
+        pause_token='legacy-token', target_step=1, checkpoint_before=0, deadline=watch.mono() + 60))
+    watch.s['stop'].pop(missing)
+    watch.store.text('pause-request', 'legacy unbound pause')
+    assert watch.operator_pause()
+    box.die()
+    with patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        assert watch.store.path('pause-request').read_text() == 'legacy unbound pause'
+        assert not watch.s['resumes']
+        send.assert_not_called()
+
+
 def test_cancelled_operator_pause_latches_human(box):
     box.tick()
     box.watch.store.text('pause-request', 'operator')
