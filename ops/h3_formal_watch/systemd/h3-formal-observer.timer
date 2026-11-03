@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll H3 GPU watchdog every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+# Persistent is only effective for calendar timers; add a matching wall-clock tick.
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+AccuracySec=10s
+Unit=h3-formal-observer.service
+
+[Install]
+WantedBy=timers.target

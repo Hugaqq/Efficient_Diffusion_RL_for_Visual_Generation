@@ -1,0 +1,19 @@
+[Unit]
+Description=H3 deterministic GPU-host training watchdog (user ubtroot)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@REPO@
+ExecStart=@PYTHON@ -m ops.h3_formal_watch.watchdog @CONFIG@
+Restart=on-failure
+RestartSec=30
+# Stopping/restarting the watcher MUST NOT kill training or detached supervisors.
+KillMode=process
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

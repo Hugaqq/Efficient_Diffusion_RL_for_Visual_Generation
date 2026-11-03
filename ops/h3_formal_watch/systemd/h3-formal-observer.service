@@ -1,0 +1,12 @@
+[Unit]
+Description=H3 read-only VPS observer and advisory analysis (user qvanium)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=@REPO@
+ExecStart=@PYTHON@ -m ops.h3_formal_watch.observer @CONFIG@
+TimeoutStartSec=30min
+KillMode=control-group
+UMask=0077
