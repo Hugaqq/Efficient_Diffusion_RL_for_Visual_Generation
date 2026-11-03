@@ -12,6 +12,26 @@ from threading import Event, Lock, Semaphore, Thread
 
 from visual_rl.runtime import h3_memory as memory
 
+MEDIA_PERMITS = 2  # per owner: one being scored + one decoded/queued
+
+
+class MediaLedger:
+    """Thread-safe count of this owner's held media permits (decode..close)."""
+    def __init__(self):
+        self._lock = Lock()
+        self.held = self.peak = 0
+
+    def acquire(self):
+        with self._lock:
+            self.held += 1
+            self.peak = max(self.peak, self.held)
+
+    def release(self):
+        with self._lock:
+            if self.held <= 0:
+                raise RuntimeError('media ledger released more than acquired')
+            self.held -= 1
+
 
 @dataclass(frozen=True)
 class RewardSample:
@@ -23,15 +43,20 @@ class RewardSample:
     selected_index: int
 
 
-def reward_pipeline(samples, *, decode, score, media_bytes, decode_bytes):
-    """Consume FIFO original media storage, completely drain/join before return."""
+def reward_pipeline(samples, *, decode, score, media_bytes, decode_bytes, ledger=None):
+    """Consume FIFO original media storage, completely drain/join before return.
+
+    Optional ledger mirrors every permit acquire/release (accounting only).
+    """
     if any(type(n) is not int or n <= 0 for n in (media_bytes, decode_bytes)):
         raise ValueError('explicit positive pipeline byte budgets required')
+    if ledger is not None and not isinstance(ledger, MediaLedger):
+        raise TypeError('ledger must be a MediaLedger')
     from visual_rl.models.implementations.h3_loading import _admit_host_memory
     _admit_host_memory(decode_bytes + media_bytes)
     cpu_scope = memory.capture_cpu_scope()
     queue = Queue(maxsize=1)
-    permits = Semaphore(2)  # acquired BEFORE decode, released AFTER close
+    permits = Semaphore(MEDIA_PERMITS)  # acquired BEFORE decode, released AFTER close
     cancelled, finished = Event(), Event()
     errors, rows = [], []
     error_lock = Lock()
@@ -49,6 +74,13 @@ def reward_pipeline(samples, *, decode, score, media_bytes, decode_bytes):
             media.close()
         except BaseException as error:
             fail(error)
+        finally:
+            give()
+
+    def give():
+        try:
+            if ledger is not None:
+                ledger.release()
         finally:
             permits.release()
 
@@ -86,6 +118,8 @@ def reward_pipeline(samples, *, decode, score, media_bytes, decode_bytes):
                 raise ValueError('pipeline sample ordinal mismatch')
             while not cancelled.is_set():
                 if permits.acquire(timeout=.05):
+                    if ledger is not None:
+                        ledger.acquire()
                     break
             else:
                 break
@@ -115,7 +149,7 @@ def reward_pipeline(samples, *, decode, score, media_bytes, decode_bytes):
                     if owned is not None:
                         dispose(owned)
                     else:
-                        permits.release()
+                        give()
                 owned = media = None
     except BaseException as error:
         fail(error)

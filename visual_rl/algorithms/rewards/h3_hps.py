@@ -90,6 +90,19 @@ class H3HPSReward:
         if hashlib.sha256(self._manifest_bytes()).hexdigest() != self._manifest_sha256:
             raise ValueError("H3 HPS manifest changed since declaration")
 
+    def declared_queue_capacity(self) -> int:
+        """Admission capacity the immutable manifest declares (0: single-threaded)."""
+        self._check_manifest()
+        facts = decode_json(self._manifest_bytes(), MAX_HEALTH_BYTES)["identity_facts"]
+        policy = facts.get("request_queue_policy") if isinstance(facts, dict) else None
+        if policy is None:
+            return 0
+        if (not isinstance(policy, dict) or policy.get("version") != "hps.bounded-fifo-queue.v1"
+                or policy.get("scoring_concurrency") != 1 or type(policy.get("max_queue")) is not int
+                or policy["max_queue"] < 1):
+            raise ValueError("H3 HPS manifest declares an unknown request queue policy")
+        return policy["max_queue"]
+
     def acquire(self) -> H3HPSReward:
         if self._closed or self._attempted:
             raise RuntimeError("H3 HPS is closed or acquisition already attempted")

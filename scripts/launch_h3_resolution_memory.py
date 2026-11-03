@@ -61,7 +61,8 @@ class TwoUpdateBackend(H3LifecycleBackend):
                          checkpoint_threads=args.checkpoint_threads,
                          boundary_content_check=getattr(args, 'boundary_content_check', 'full'),
                          rollout_batch=getattr(args, 'rollout_batch', 1),
-                         rollout_batch_replay_tolerance=getattr(args, 'rollout_batch_replay_tolerance', 1e-4))
+                         rollout_batch_replay_tolerance=getattr(args, 'rollout_batch_replay_tolerance', 1e-4),
+                         parallel_owners=getattr(args, 'parallel_owners', False))
         # 10 rollout transitions x 4 samples (S1: x 1 batched forward), plus 4 B=1 anchor
         # forwards unless the rollout anchor is reused (rejected with S1): 44 / 40 / 14.
         self.nograd_forwards_per_update=(10 if self.rollout_batch==4 else 40)+(0 if self.reuse_rollout_anchor else 4)
@@ -202,6 +203,9 @@ def add_common_arguments(p):
     p.add_argument('--boundary-content-check', choices=('full', 'sentinel'), default='full',
                    help='frozen-base boundary verification (default: full); sentinel uses init-hash stat snapshots '
                         'only before non-terminal saves; terminal/restore still fully hash')
+    p.add_argument('--parallel-owners',action='store_true',
+                   help='opt-in: all eight reward owners decode/score concurrently behind one bounded HPS queue '
+                        '(requires --reward-pipeline and an HPS service started with --max-queue >= 8); requires approved experiment')
     p.add_argument('--profile-rollout',action='store_true',
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
     p.add_argument('--rollout-batch',type=int,choices=(1,4),default=1,

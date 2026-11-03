@@ -4,6 +4,9 @@
 CPU weights persist between requests. One video is scored serially (all frames,
 frame microbatch1); default GPU use offloads per request. Opt-in dedicated-UUID
 residency retains one model only with original headroom and a 60s idle lease.
+Opt-in --max-queue N admits at most N requests (one scoring, N-1 waiting) and
+still scores strictly one at a time in admission order; a full queue answers
+503 + Retry-After before any scoring. Default 0 keeps the single-threaded server.
 The artifact manifest hashes actual tensors/processor/code and declared policy.
 """
 from __future__ import annotations
@@ -11,7 +14,9 @@ import argparse
 import base64
 from dataclasses import asdict, is_dataclass
 import hashlib
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import deque
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from io import BytesIO
 import importlib.metadata
 import inspect
@@ -73,6 +78,135 @@ def residency_policy(enabled=False, expected_uuid=None):
                 expected_gpu_uuid=expected_uuid, idle_ttl_seconds=RESIDENCY_TTL)
 
 
+QUEUE_FULL_ERROR = 'hpsv3_queue_full'
+QUEUE_RETRY_AFTER_S = 1
+MAX_QUEUE = 64
+
+
+def queue_policy(max_queue=0):
+    """Declared admission policy; None (absent from identity) for the default server."""
+    if type(max_queue) is not int or not 0 <= max_queue <= MAX_QUEUE:
+        raise ValueError(f'max_queue must be an int in 0..{MAX_QUEUE}')
+    if max_queue == 0:
+        return None
+    return dict(version='hps.bounded-fifo-queue.v1', max_queue=max_queue, scoring_concurrency=1,
+                order='admission', full='503-retry-after-before-scoring')
+
+
+class QueueFull(Exception):
+    """The request was rejected BEFORE admission; nothing was scored."""
+
+
+class QueueClosed(Exception):
+    """The server is shutting down; this request was never scored."""
+
+
+class ScoreQueue:
+    """Bounded FIFO tickets: at most `capacity` admitted requests, one holds the turn.
+
+    Tickets are served strictly in admission order. Every admitted ticket is
+    released in a finally block, so a failed request never blocks later ones.
+    The idle-housekeeping ticket is counted separately and never consumes
+    request capacity. close() wakes all waiters (they abandon unscored).
+    """
+    def __init__(self, capacity):
+        if queue_policy(capacity) is None:
+            raise ValueError('a score queue needs capacity >= 1')
+        self.capacity = capacity
+        self._condition = threading.Condition()
+        self._next = self._serving = 0
+        self._idle_held = self._closed = self._turn_held = False
+        self._replying = 0  # scored responses not yet written (shutdown waits for them)
+        self.admitted_order = deque(maxlen=256)  # recent admission labels; observability only
+
+    @property
+    def outstanding(self):
+        """Admitted REQUESTS not yet released (excludes a held idle ticket)."""
+        with self._condition:
+            return self._next - self._serving - int(self._idle_held)
+
+    def _admit(self, label):
+        if self._closed:
+            raise QueueClosed('HPS request queue closed')
+        if self._next - self._serving - int(self._idle_held) >= self.capacity:
+            raise QueueFull('HPS request queue full')
+        ticket = self._next
+        self._next += 1
+        self.admitted_order.append(label)
+        return ticket
+
+    def _release(self, ticket, *, idle=False):
+        with self._condition:
+            if ticket != self._serving:
+                raise RuntimeError('HPS queue released out of order')
+            if idle:
+                self._idle_held = False
+            self._turn_held = False
+            self._serving += 1
+            self._condition.notify_all()
+
+    @contextmanager
+    def turn(self, label=None):
+        with self._condition:
+            ticket = self._admit(label)
+            self._condition.wait_for(lambda: self._serving == ticket or self._closed)
+            if self._closed or self._serving != ticket:
+                raise QueueClosed('HPS server closing; queued request abandoned unscored')
+            self._turn_held = True
+        try:
+            yield ticket
+        finally:
+            self._release(ticket)
+
+    def try_idle_turn(self):
+        """Ticket only when nothing is admitted; housekeeping then excludes scoring."""
+        with self._condition:
+            if self._closed or self._next != self._serving:
+                return None
+            ticket = self._next
+            self._next += 1
+            self._idle_held = self._turn_held = True
+            return ticket
+
+    def release_idle(self, ticket):
+        self._release(ticket, idle=True)
+
+    @property
+    def replying(self):
+        with self._condition:
+            return self._replying
+
+    def begin_reply(self):
+        """Inside the turn, after scoring: the response now counts as in flight."""
+        with self._condition:
+            self._replying += 1
+
+    def end_reply(self):
+        with self._condition:
+            if self._replying <= 0:
+                raise RuntimeError('HPS reply accounting underflow')
+            self._replying -= 1
+            self._condition.notify_all()
+
+    def close(self, timeout_s):
+        """Refuse/abandon waiters, then wait (bounded) for the active turn AND
+        every already-scored reply still being written.
+
+        Terminal: abandoned waiters never release their tickets, so the
+        ticket counters are inconsistent afterwards. A closed queue must never
+        be reopened; build a new ScoreQueue (and server) instead.
+        """
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            return self._condition.wait_for(lambda: not self._turn_held and self._replying == 0,
+                                            timeout=timeout_s)
+
+    def reopen(self):
+        raise RuntimeError('a closed ScoreQueue can never be reopened (abandoned tickets were not released); '
+                           'create a new queue')
+
+
 def _cleanup(primary, action):
     try: action()
     except BaseException as error:
@@ -83,8 +217,9 @@ def _cleanup(primary, action):
 
 class HpsBackend:
     def __init__(self, checkpoint: Path, config: Path, contract: VideoContract, min_free_gib: float,
-                 *, gpu_resident=False, resident_gpu_uuid=None):
+                 *, gpu_resident=False, resident_gpu_uuid=None, max_queue=0):
         self._initialize_residency(gpu_resident, resident_gpu_uuid)
+        request_queue = queue_policy(max_queue)
         os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
         import torch
         import hpsv3
@@ -121,6 +256,8 @@ class HpsBackend:
             'data_config': asdict(self.inferencer.data_config) if is_dataclass(self.inferencer.data_config) else vars(self.inferencer.data_config),
             'gpu_residency_policy': dict(self._policy),
         }
+        if request_queue is not None:  # absent by default: unchanged identity fact set
+            facts['request_queue_policy'] = request_queue
         self._health = {
             'status': 'ready', 'reward': 'hpsv3', 'protocol': PROTOCOL, 'protocol_version': VERSION,
             'identity_facts': facts, 'video_contract': contract.payload(),
@@ -376,15 +513,18 @@ class HpsBackend:
         return scores
 
 
-def make_handler(backend):
+def make_handler(backend, queue=None):
+    if queue is not None and not isinstance(queue, ScoreQueue):
+        raise TypeError('queue must be a ScoreQueue')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
-        def reply(self, status: int, value: dict):
+        def reply(self, status: int, value: dict, headers=()):
             body = canonical_json(value)
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
+            for name, header in headers: self.send_header(name, header)
             self.end_headers(); self.wfile.write(body)
         def do_GET(self):
             if self.path != '/healthz':
@@ -393,7 +533,10 @@ def make_handler(backend):
         def do_POST(self):
             if self.path != '/score':
                 return self.reply(404, {'error': 'not_found'})
-            if not backend.ready:
+            # Queued mode: `ready` is transiently False while the turn holder
+            # moves weights (_location 'unknown'); only terminal state rejects
+            # here, and readiness is rechecked inside the exclusive turn.
+            if (backend._closed or backend._poisoned) if queue is not None else not backend.ready:
                 return self.reply(503, {'error': 'hpsv3_unready'})
             try:
                 self.connection.settimeout(30)
@@ -426,17 +569,35 @@ def make_handler(backend):
                         images.append(image.convert('RGB'))
             except Exception:
                 return self.reply(400, {'error': 'invalid_video_request'})
+            replying = False
             try:
-                scores = backend.score(data['sample_id'], data['prompt'], images)
+                if queue is None:
+                    scores = backend.score(data['sample_id'], data['prompt'], images)
+                else:
+                    # Admission happens only after full validation; the turn is
+                    # released before the reply so a slow reader never blocks
+                    # the GPU, but the scored reply stays counted until written
+                    # so an intentional shutdown waits for it (bounded).
+                    with queue.turn(data['sample_id']):
+                        if not backend.ready:  # an earlier queued request poisoned it
+                            return self.reply(503, {'error': 'hpsv3_unready'})
+                        scores = backend.score(data['sample_id'], data['prompt'], images)
+                        queue.begin_reply(); replying = True
                 score, _indices = aggregate_frame_scores(scores, backend.contract)
                 self.reply(200, {'protocol': PROTOCOL, 'protocol_version': VERSION,
                     'service_identity': backend.health['service_identity'], 'sample_id': data['sample_id'],
                     'frame_scores': scores, 'video_score': score})
+            except QueueFull:
+                self.reply(503, {'error': QUEUE_FULL_ERROR}, (('Retry-After', str(QUEUE_RETRY_AFTER_S)),))
+            except QueueClosed:
+                self.reply(503, {'error': 'hpsv3_unready'})
             except BlockingIOError:
                 self.reply(503, {'error': 'gpu_admission_or_margin'})
             except Exception:
                 traceback.print_exc()
                 self.reply(500, {'error': 'hpsv3_scoring_failed'})
+            finally:
+                if replying: queue.end_reply()
     return Handler
 
 
@@ -445,6 +606,38 @@ class HpsHTTPServer(HTTPServer):
         # Called by serve_forever on the SAME serial HTTP thread, never a new
         # idle worker. TTL has poll/scheduling delay, not hard real-time bounds.
         self.backend.idle_housekeeping()
+
+
+class HpsQueuedHTTPServer(ThreadingHTTPServer):
+    """Opt-in: per-connection threads only parse/validate; ScoreQueue serializes GPU work."""
+    daemon_threads = True  # shutdown is bounded by ScoreQueue.close, never an unbounded join
+    shutdown_timeout_s = 120.
+
+    def __init__(self, address, handler, score_queue):
+        if not isinstance(score_queue, ScoreQueue):
+            raise TypeError('queued server requires a ScoreQueue')
+        self.score_queue = score_queue
+        self.request_queue_size = max(5, 2 * score_queue.capacity)  # listen backlog
+        super().__init__(address, handler)
+
+    def service_actions(self):
+        # Idle housekeeping takes a queue ticket, so it never overlaps a score.
+        ticket = self.score_queue.try_idle_turn()
+        if ticket is None:
+            return
+        try:
+            self.backend.idle_housekeeping()
+        finally:
+            self.score_queue.release_idle(ticket)
+
+    def server_close(self):
+        # Waiters abandon unscored (503); the active score gets a bounded
+        # drain so backend.close never offloads underneath it. If it does not
+        # finish, backend.close refuses (active request) and the process exits.
+        drained = self.score_queue.close(self.shutdown_timeout_s)
+        super().server_close()
+        if not drained:
+            raise RuntimeError('active HPS score did not finish within the shutdown bound')
 
 
 def main():
@@ -459,9 +652,14 @@ def main():
     p.add_argument('--min-free-gib', type=float, default=40)
     p.add_argument('--gpu-resident', action='store_true', help='opt-in dedicated UUID idle residency; requires new deployment approval')
     p.add_argument('--resident-gpu-uuid')
+    p.add_argument('--max-queue', type=int, default=0,
+                   help='opt-in bounded FIFO admission of N requests (0 = single-threaded default); '
+                        'changes the service identity; requires new deployment approval')
     a = p.parse_args()
     try: residency_policy(a.gpu_resident, a.resident_gpu_uuid)
     except (ValueError, TypeError, RuntimeError) as error: p.error(str(error))
+    try: queue_policy(a.max_queue)
+    except ValueError as error: p.error(str(error))
     if not 1 <= a.port <= 65535 or not 40 <= a.min_free_gib <= 80:
         p.error('invalid private port or safety admission budget')
     from visual_rl.runtime import h3_memory as memory
@@ -471,10 +669,15 @@ def main():
     primary = None
     try:
         with memory.span('hps_initialization'):
+            options = dict(gpu_resident=a.gpu_resident, resident_gpu_uuid=a.resident_gpu_uuid)
+            if a.max_queue: options['max_queue'] = a.max_queue
             backend = HpsBackend(a.checkpoint.resolve(strict=True), a.config.resolve(strict=True),
-                VideoContract(a.frames, a.height, a.width), a.min_free_gib,
-                gpu_resident=a.gpu_resident, resident_gpu_uuid=a.resident_gpu_uuid)
-        server = HpsHTTPServer(('127.0.0.1', a.port), make_handler(backend))
+                VideoContract(a.frames, a.height, a.width), a.min_free_gib, **options)
+        if a.max_queue:
+            score_queue = ScoreQueue(a.max_queue)
+            server = HpsQueuedHTTPServer(('127.0.0.1', a.port), make_handler(backend, score_queue), score_queue)
+        else:
+            server = HpsHTTPServer(('127.0.0.1', a.port), make_handler(backend))
         server.backend = backend
         artifact = canonical_json(backend.health)
         a.artifact_output.parent.mkdir(parents=True, exist_ok=True)

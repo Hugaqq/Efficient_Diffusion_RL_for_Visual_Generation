@@ -133,14 +133,22 @@ class _Graph:
         self.resources.close()
 
 
+PARALLEL_HPS_REQUEST_BOUND_S = 90.  # conservative per-request HPS time (non-resident incl. transfers)
+PARALLEL_ABORT_JOIN_MARGIN_S = 60.  # abort join = hps_timeout_s + margin (an owner may be in one request)
+
+
 class H3LifecycleBackend:
     def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False,
                  reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check='full',
-                 rollout_batch=1, rollout_batch_replay_tolerance=1e-4):
+                 rollout_batch=1, rollout_batch_replay_tolerance=1e-4, parallel_owners=False):
         if type(reward_pipeline) is not bool:
             raise TypeError('reward_pipeline must be bool')
         if type(reuse_video_vae) is not bool: raise TypeError('reuse_video_vae must be bool')
         if type(reuse_rollout_anchor) is not bool: raise TypeError('reuse_rollout_anchor must be bool')
+        if type(parallel_owners) is not bool: raise TypeError('parallel_owners must be bool')
+        if parallel_owners and not reward_pipeline:
+            raise ValueError('parallel owners require the reward pipeline')
+        self.parallel_owners=parallel_owners
         from visual_rl.artifacts.checkpoint.manager import _checkpoint_threads
         self.checkpoint_threads=_checkpoint_threads(checkpoint_threads)  # strict int; 1 keeps serial publish
         from visual_rl.runtime.h3_content_sentinel import boundary_content_check_mode
@@ -194,6 +202,16 @@ class H3LifecycleBackend:
         if self.reward_pipeline and (profile.training.algorithm!='dual_flash'
                                      or profile.training.group_layout!='paired_4x8'):
             raise ValueError('reward pipeline requires paired_4x8 dual_flash')
+        if self.parallel_owners:
+            if (not self.reward_pipeline or profile.training.algorithm!='dual_flash'
+                    or profile.training.group_layout!='paired_4x8'):
+                raise ValueError('parallel owners require --reward-pipeline with paired_4x8 dual_flash')
+            from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
+            # One request in flight per owner: the last of WORLD_SIZE queued
+            # requests waits for the others; every read must fit the HPS timeout.
+            if profile.launch.hps_timeout_s < WORLD_SIZE*PARALLEL_HPS_REQUEST_BOUND_S:
+                raise ValueError(f'parallel owners need an HPS timeout >= {WORLD_SIZE}x'
+                                 f'{PARALLEL_HPS_REQUEST_BOUND_S:g}s worst-case queue wait')
 
     def preflight(self, profile):
         from visual_rl.composition.preflight.artifacts import _hash_artifact
@@ -338,6 +356,11 @@ class H3LifecycleBackend:
                 predict=binding.predict, decode=binding.decode, score_one=binding.score_one,
                 coordination_factory=binding.coordination_factory, process_group=runtime.process_group,
                 rank=runtime.rank, device=_execution_device(runtime), read_behavior_id=graph.source.read_behavior_id)
+            if self.parallel_owners:
+                from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
+                capacity = binding.scorer.declared_queue_capacity()
+                if capacity < WORLD_SIZE:
+                    raise ValueError(f'parallel owners need an HPS manifest declaring a request queue >= {WORLD_SIZE}, got {capacity}')
             if graph.profile.training.algorithm == 'cps':
                 stages = H3IterationStages(**options)
             else:
@@ -349,6 +372,9 @@ class H3LifecycleBackend:
                     reuse_video_vae=self.reuse_video_vae,
                     video_reuse_scope=binding.video_reuse_scope if self.reuse_video_vae else None,
                     reuse_rollout_anchor=self.reuse_rollout_anchor,
+                    parallel_owners=self.parallel_owners,
+                    parallel_abort_join_s=(min(graph.profile.launch.hps_timeout_s+PARALLEL_ABORT_JOIN_MARGIN_S, 3600.)
+                                           if self.parallel_owners else None),
                     **(dict(rollout_batch=self.rollout_batch, predict_batch=binding.predict_batch,
                             rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance)
                        if self.rollout_batch != 1 else {}),**options)

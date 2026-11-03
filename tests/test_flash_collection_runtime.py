@@ -2731,6 +2731,262 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
         trainer.close(); scorer.close()
 
+    # P2: opt-in concurrent owners. Real H3Coordination gates/heartbeat, real
+    # dual reward stage + P1 pipeline and real gather_h3_credit on an
+    # in-memory eight-thread world; only collectives/CUDA streams/sleep and the
+    # decode/HPS leaves are replaced. Ranks get different decode/score timings.
+    from visual_rl.models.lifecycle import h3_coordination as p2coord
+    from visual_rl.algorithms.trainer import h3_reward_pipeline as p2pipe
+    import random as p2random
+    class P2World:
+        def __init__(self, patch):
+            self.group, self.tls, self.cv = object(), threading.local(), threading.Condition()
+            self.rounds, self.calls = {}, {r: [] for r in range(8)}
+            dist = torch.distributed
+            patch.setattr(dist, 'group', SimpleNamespace(WORLD=self.group), raising=False)
+            for name, value in (('is_available', lambda: True), ('is_initialized', lambda: True),
+                                ('get_backend', lambda group: 'nccl'), ('get_world_size', lambda group: 8),
+                                ('get_rank', lambda group: self.tls.rank), ('all_gather_object', self.gather),
+                                ('all_reduce', self.reduce), ('broadcast', self.broadcast)):
+                patch.setattr(dist, name, value)
+            patch.setattr(p2coord, '_cuda_device', lambda device: torch.device('cpu'))
+            class StreamLeaf:
+                def wait_stream(self, other): pass
+                def synchronize(self): pass
+            patch.setattr(torch.cuda, 'current_stream', lambda device=None: StreamLeaf())
+            patch.setattr(torch.cuda, 'Stream', lambda device=None: StreamLeaf())
+            patch.setattr(torch.cuda, 'device', lambda device: nullcontext())
+            patch.setattr(torch.cuda, 'stream', lambda stream: nullcontext())
+            real_sleep = time.sleep
+            patch.setattr(p2coord, 'time', SimpleNamespace(monotonic=time.monotonic, sleep=lambda s: real_sleep(.002)))
+        def _round(self, label, value, combine):
+            rank, index = self.tls.rank, self.tls.index
+            self.tls.index += 1; self.calls[rank].append(label)
+            with self.cv:
+                slot = self.rounds.setdefault(index, dict(label=label[0], values={}, done=False))
+                if slot['label'] != label[0]:
+                    slot['error'] = AssertionError(f'mismatched collectives {slot["label"]} vs {label[0]}')
+                slot['values'][rank] = value
+                if len(slot['values']) == 8 or 'error' in slot:
+                    if 'error' not in slot: slot['result'] = combine([slot['values'][r] for r in range(8)])
+                    slot['done'] = True; self.cv.notify_all()
+                if not self.cv.wait_for(lambda: slot['done'], timeout=20):
+                    raise TimeoutError(f'rank {rank} left waiting in collective {index}')
+                if 'error' in slot: raise slot['error']
+                return slot['result']
+        def gather(self, outputs, obj, *, group):
+            entry = json.loads(obj)
+            event = entry[4][2] if entry[1] == 'coordination' and entry[4] else entry[1]
+            outputs[:] = self._round(('all_gather_object', event), obj, list)
+        def reduce(self, tensor, *, op, group):
+            assert op == torch.distributed.ReduceOp.SUM and tensor.dtype == torch.int32
+            tensor.copy_(self._round(('all_reduce', tuple(tensor.shape)), tensor.clone(), lambda v: torch.stack(v).sum(0)))
+        def broadcast(self, tensor, *, src, group):
+            tensor.copy_(self._round(('broadcast', src), tensor.clone(), lambda v: v[src]))
+        def run(self, function):
+            self.rounds, self.calls = {}, {r: [] for r in range(8)}
+            out = [None]*8
+            def call(rank):
+                self.tls.rank, self.tls.index = rank, 0
+                try: out[rank] = function(rank)
+                except BaseException as exc: out[rank] = exc
+            threads = [Thread(target=call, args=(r,), name=f'p2-rank-{r}') for r in range(8)]
+            for t in threads: t.start()
+            for t in threads: t.join(60); assert not t.is_alive(), 'simulated rank hung'
+            return out
+    def p2_score(sid):
+        return float(int(hashlib.sha256(sid.encode()).hexdigest()[:6], 16) % 997) / 7.
+    with monkeypatch.context() as patch:
+        world = P2World(patch)
+        budgets = []
+        patch.setattr(h3_loading, '_admit_host_memory', budgets.append)
+        running, peak, live = [0], [0], threading.Lock()
+        holds, gates_seen, posted = {}, [], []
+        def make_stage(rank, *, parallel, fail_rank=None, block=None):
+            stage = object.__new__(H3DualIterationStages)
+            stage.rank, stage.mode, stage.media_bytes, stage.decode_bytes = rank, 'dual_flash', 10**7, 2*10**7
+            stage.reuse_video_vae, stage.video_reuse_scope, stage.reward_pipeline = False, None, True
+            stage.parallel_owners = parallel; stage.read_behavior_id = lambda: 'b'
+            delays = p2random.Random(1000 + rank)
+            @contextmanager
+            def decode(terminal):
+                with live: running[0] += 1; peak[0] = max(peak[0], running[0])
+                try:
+                    time.sleep(delays.uniform(0, .02))  # rank-specific timing
+                    if block is not None and rank != fail_rank: assert block[rank].wait(20)
+                    media = H3AVMedia(torch.full((2, 3, 2, 2), float(terminal[0, 0])), torch.zeros(4, 2), 24, 32000)
+                finally:
+                    with live: running[0] -= 1
+                try: yield media
+                finally: media._release()
+            def score_one(*, sample_id, prompt, media):
+                posted.append(rank)
+                time.sleep(delays.uniform(0, .02))
+                if rank == fail_rank: raise RuntimeError('owner 5 HPS failure')
+                return p2_score(sample_id)
+            stage.decode, stage.score_one = decode, score_one
+            return stage
+        def rank_context(rank):
+            samples = plan.samples_by_rank[rank]
+            identity = IterationIdentity(0, 'source', 'train', tuple(s[0] for s in samples),
+                                         tuple(s[1] for s in samples), tuple(s[2] for s in samples))
+            request = SimpleNamespace(identity=identity, group_layout='paired_4x8', samples=samples,
+                prompts={s[0]: 'p' for s in samples}, collection_id='c', behavior_id='b')
+            return SimpleNamespace(request=request,
+                dual_terminals={s[0]: torch.full((1, 2), float(i), dtype=torch.float16) for i, s in enumerate(samples)},
+                dual_selection={s[0]: i for i, s in enumerate(samples)})
+        def p2_iteration(parallel, *, fail_rank=None, block=None):
+            budgets.clear(); peak[0] = 0
+            stages = [make_stage(r, parallel=parallel, fail_rank=fail_rank, block=block) for r in range(8)]
+            def rank_work(rank):
+                ctx = rank_context(rank)
+                ctx.coordinator = p2coord.H3Coordination(plan, process_group=world.group, device=f'cuda:{rank}')
+                stages[rank]._active = ctx
+                try:
+                    stages[rank].reward(StageValue(ctx.request.identity, ctx))
+                finally:
+                    holds[rank] = ctx.coordinator._poisoned
+                credit = h3_world.gather_h3_credit(plan, process_group=world.group, collection_id='c',
+                                                   behavior_id='b', rewards=ctx.rewards)
+                return ctx.rewards, {k: v.item() for k, v in credit.items()}
+            return world.run(rank_work)
+        serial = p2_iteration(False)
+        serial_calls = dict(world.calls)
+        assert all(type(r) is tuple for r in serial), serial
+        assert peak == [1] and all(calls == serial_calls[0] for calls in serial_calls.values())
+        assert not any('parallel' in str(label) for label in serial_calls[0])
+        assert sum(1 for label in serial_calls[0] if label[0] == 'all_reduce') == 0  # default: broadcasts only
+        concurrent = p2_iteration(True)
+        assert all(type(r) is tuple for r in concurrent), concurrent
+        # Identical canonical rows and identical global advantages on every rank.
+        assert concurrent == serial
+        assert all(r[0] == tuple((s[0], s[1], s[2], p2_score(s[0]), True) for s in plan.samples_by_rank[i])
+                   for i, r in enumerate(concurrent))
+        assert peak[0] > 1  # owners really overlapped
+        # Same collective sequence on all ranks regardless of rank timing.
+        calls = world.calls
+        assert all(c == calls[0] for c in calls.values())
+        events = [label[1] for label in calls[0] if label[0] == 'all_gather_object']
+        assert 'dual/reward-pipeline/1/queue1/total2/10000000/20000000/parallel8/media16' in events
+        assert events.index('dual/parallel-owners/host-admission') < events.index('aux/parallel/8/media16/begin') \
+            < events.index('aux/parallel/end') < events.index('credit')
+        assert not any(e.startswith('aux/0/') for e in events)
+        # Every rank admits the summed host budget (8 owners x (decode + 2 media))
+        # before the begin gate, so before any owner's own P1 admission.
+        assert budgets == [8*(2*10**7 + 2*10**7)]*8 + [3*10**7]*8
+        assert {label for label in calls[0] if label[0] == 'all_reduce'} == {('all_reduce', (2, 8))}
+        # One owner failing poisons ALL ranks at the next heartbeat while the
+        # other owners are still blocked in their first decode (released only by
+        # their own abort cancel); no end/credit collective. After the abort the
+        # released decode yields media, but the consumer sends NO new POST, and
+        # every rank joins its worker before raising (nothing left running).
+        cancel_of, real_concurrent = {}, p2coord.H3Coordination.aux_concurrent
+        def capture_cancel(self, work, **kwargs):
+            cancel_of[self._rank] = kwargs['cancel']
+            return real_concurrent(self, work, **kwargs)
+        posted.clear()
+        with patch.context() as capture:
+            capture.setattr(p2coord.H3Coordination, 'aux_concurrent', capture_cancel)
+            failed = p2_iteration(True, fail_rank=5, block=cancel_of)
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'failed on ranks [5]' in str(e) for e in failed), failed
+        assert isinstance(failed[5].__cause__, RuntimeError) and 'owner 5 HPS failure' in str(failed[5].__cause__)
+        assert all(holds[r] for r in range(8)) and all(cancel_of[r].is_set() for r in range(8))
+        assert set(posted) == {5}  # blocked owners never POSTed, even after their decode returned
+        assert all(c == world.calls[0] for c in world.calls.values())
+        failed_events = [label[1] for label in world.calls[0] if label[0] == 'all_gather_object']
+        assert 'aux/parallel/end' not in failed_events and 'credit' not in failed_events
+        assert not any(t.name.startswith('h3-aux-parallel-') or t.name == 'h3-reward-consumer' for t in threading.enumerate())
+        # Abort landing after the LAST decode but before its score: the consumer
+        # must not POST it (deterministic: earlier scores have already begun).
+        cancel_box = []
+        class CancelMidway:
+            def gate(self, event, **kwargs):
+                if kwargs.get('local_error'): raise ValueError('local error')
+            def aux_concurrent(self, work, *, cancel, inflight, media_cap, **kwargs):
+                cancel_box.append(cancel); joins.append(kwargs.get('abort_join_s')); return work()
+        joins = []
+        midway = make_stage(0, parallel=True); posted.clear()
+        midway.parallel_abort_join_s = 1860.  # profile hps_timeout_s 1800 + 60
+        inner_decode = midway.decode
+        @contextmanager
+        def decode_then_abort(terminal):
+            with inner_decode(terminal) as media:
+                if float(terminal[0, 0]) == 3.:
+                    for _ in range(500):
+                        if len(posted) == 3: break
+                        Event().wait(.01)
+                    cancel_box[0].set()
+                yield media
+        midway.decode = decode_then_abort
+        midway_ctx = rank_context(0); midway_ctx.coordinator = CancelMidway(); midway._active = midway_ctx
+        with pytest.raises(RuntimeError, match='no new HPS request'):
+            midway.reward(StageValue(midway_ctx.request.identity, midway_ctx))
+        assert posted == [0, 0, 0] and not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+        assert joins == [1860.]  # stage threads the profile-derived abort join
+        # Coordination-level bounds: local budget expiry, host media cap and a
+        # rank in the serial mode all abort every rank in lock step.
+        def coord_case(function):
+            def rank_work(rank):
+                coordinator = p2coord.H3Coordination(plan, process_group=world.group, device=f'cuda:{rank}')
+                try: return function(rank, coordinator)
+                finally: holds[rank] = coordinator._poisoned
+            return world.run(rank_work)
+        stop = Event()
+        expired = coord_case(lambda r, c: c.aux_concurrent(lambda: stop.wait(20) if r == 2 else r, budget_s=.05,
+                                                           abort_join_s=.05))
+        stop.set()
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'on ranks [2]' in str(e) and 'exceeded' in str(e) for e in expired)
+        assert all(c == world.calls[0] for c in world.calls.values()) and all(holds.values())
+        stop = Event()
+        cancels = [Event() for _ in range(8)]
+        over = coord_case(lambda r, c: c.aux_concurrent(lambda: cancels[r].wait(20), cancel=cancels[r], inflight=lambda: 3))
+        assert not any(t.name.startswith('h3-aux-parallel-') for t in threading.enumerate())  # cancelled + joined
+        stop.set()
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'exceeds cap 16' in str(e) for e in over)
+        assert all(e.is_set() for e in cancels)
+        mixed = coord_case(lambda r, c: c.aux_turns(lambda: r) if r == 3 else c.aux_concurrent(lambda: r))
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'gate failed' in str(e) for e in mixed)
+        assert all(len(c) == 2 for c in world.calls.values())  # init gate + one mismatched begin gate
+        # Review fix: local failures between/around gates never strand peers.
+        # (a) setup failure before the begin gate -> one gate, work never runs;
+        ran, real_zeros = [], torch.zeros
+        def zeros_failing_on_rank4(*args, **kwargs):
+            if threading.current_thread().name == 'p2-rank-4' and args and args[0] == (2, 8):
+                raise RuntimeError('injected status allocation failure')
+            return real_zeros(*args, **kwargs)
+        with patch.context() as inject:
+            inject.setattr(torch, 'zeros', zeros_failing_on_rank4)
+            setup = coord_case(lambda r, c: c.aux_concurrent(lambda: ran.append(r)))
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'gate failed' in str(e) for e in setup)
+        assert 'injected status allocation' in str(setup[4].__cause__) and ran == []
+        assert all(len(c) == 2 for c in world.calls.values()) and all(holds.values())
+        assert not any(t.name.startswith('h3-aux-parallel-') for t in threading.enumerate())
+        # (b) a local status failure (inflight probe) is a common FAILED verdict;
+        flaky = coord_case(lambda r, c: c.aux_concurrent(lambda: Event().wait(.2),
+            inflight=(lambda: 1 // 0) if r == 1 else (lambda: 0)))
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'failed on ranks [1]' in str(e) for e in flaky)
+        assert isinstance(flaky[1].__cause__, ZeroDivisionError) and all(c == world.calls[0] for c in world.calls.values())
+        # (c) broken stdout/logging on every rank cannot break or desync the phase.
+        def broken_print(*args, **kwargs): raise OSError('stdout closed')
+        with patch.context() as inject:
+            inject.setattr(p2coord, 'print', broken_print, raising=False)
+            logged = coord_case(lambda r, c: c.aux_concurrent(lambda: ('local', r)))
+        assert logged == [('local', r) for r in range(8)]
+        ok = coord_case(lambda r, c: c.aux_concurrent(lambda: ('local', r)))
+        assert ok == [('local', r) for r in range(8)] and not any(holds.values())
+    # P2 flag: strict bool, default off, dual_flash + paired_4x8 + reward pipeline only.
+    assert H3DualIterationStages.__init__.__kwdefaults__['parallel_owners'] is False
+    for bad in (1, 'yes', None):
+        with pytest.raises(TypeError, match='bool'):
+            H3DualIterationStages(mode='dual_flash', seed=42, parallel_owners=bad)
+    with pytest.raises(ValueError, match='reward pipeline'):
+        H3DualIterationStages(mode='dual_flash', seed=42, parallel_owners=True)
+    with pytest.raises(ValueError, match='reward pipeline'):
+        H3DualIterationStages(mode='dual_flow', seed=42, parallel_owners=True)
+    for bad in (0, -1., 3601., '60', True):
+        with pytest.raises(ValueError, match='abort join'):
+            H3DualIterationStages(mode='dual_flash', seed=42, parallel_abort_join_s=bad)
+
     # Concurrent observation: CPU score encloses GPU decode in wall time but
     # must NOT enclose it in the GPU stack or reset/synchronize its counters.
     class Counters:
@@ -2993,6 +3249,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         reuse_backend.binding = backend.binding; reuse_backend.transaction = backend.transaction
         reuse_bound = reuse_backend.bind(None, runtime, graph, object(), None)
         assert reuse_bound.stages.reuse_rollout_anchor is True and reuse_bound.stages.reward_pipeline is True
+        assert reuse_bound.stages.parallel_owners is False and reuse_bound.stages.parallel_abort_join_s is None  # default
         reuse_bound.close()
         # S1 bind threading: B=4 stages get the binding's batch predict and the
         # declared tolerance; the default bind passes neither (unchanged B1 stages).
@@ -3009,9 +3266,47 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert s1_bound.stages.predict_batch is batch_leaf and s1_bound.stages.reuse_rollout_anchor is False
         s1_bound.close()
         assert (bound.stages.rollout_batch, bound.stages.predict_batch) == (1, None)
+        # P2 lifecycle: reward pipeline + paired_4x8 dual_flash, an HPS timeout
+        # covering eight queued requests, and a manifest-declared queue >= 8.
+        assert H3LifecycleBackend().parallel_owners is False
+        for bad in (1, 'yes', None):
+            with pytest.raises(TypeError, match='bool'): H3LifecycleBackend(reward_pipeline=True, parallel_owners=bad)
+        with pytest.raises(ValueError, match='reward pipeline'): H3LifecycleBackend(parallel_owners=True)
+        parallel_backend = H3LifecycleBackend(reward_pipeline=True, parallel_owners=True)
+        def p2_profile(layout='paired_4x8', timeout=900.):
+            return SimpleNamespace(training=SimpleNamespace(algorithm='dual_flash', group_layout=layout),
+                launch=SimpleNamespace(hps_timeout_s=timeout, seed=42, budgets=SimpleNamespace(media_bytes=1024, decode_bytes=2048)))
+        parallel_backend._check_reward_pipeline(p2_profile())
+        parallel_backend._check_reward_pipeline(p2_profile(timeout=720.))
+        with pytest.raises(ValueError, match='paired_4x8'): parallel_backend._check_reward_pipeline(p2_profile('rank_local'))
+        with pytest.raises(ValueError, match='HPS timeout'): parallel_backend._check_reward_pipeline(p2_profile(timeout=719.))
+        parallel_backend.transaction = object()
+        for capacity in (8, 7, 0):
+            parallel_backend.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf,
+                scorer=SimpleNamespace(declared_queue_capacity=lambda capacity=capacity: capacity))
+            p2_graph = SimpleNamespace(source=source, profile=p2_profile())
+            if capacity < 8:
+                with pytest.raises(ValueError, match='request queue >= 8'):
+                    parallel_backend.bind(None, runtime, p2_graph, object(), None)
+            else:
+                p2_bound = parallel_backend.bind(None, runtime, p2_graph, object(), None)
+                assert p2_bound.stages.parallel_owners is True and p2_bound.stages.reward_pipeline is True
+                assert p2_bound.stages.parallel_abort_join_s == 960.  # hps_timeout_s 900 + 60
+                p2_bound.close()
+                long_bound = parallel_backend.bind(None, runtime, SimpleNamespace(source=source,
+                    profile=p2_profile(timeout=1800.)), object(), None)
+                assert long_bound.stages.parallel_abort_join_s == 1860.  # production profile timeout_s 1800
+                long_bound.close()
+        p2_args = dict(launcher_args, reward_pipeline=True, parallel_owners=True)
+        assert two_update.TwoUpdateBackend(args=SimpleNamespace(**p2_args)).parallel_owners is True
+        assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).parallel_owners is False
+        with pytest.raises(TypeError, match='bool'):
+            two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(p2_args, parallel_owners='yes')))
+        with pytest.raises(ValueError, match='reward pipeline'):
+            two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(p2_args, reward_pipeline=False)))
         # Real CLI parser, help exits before any Git/preflight/GPU side effect.
         import sys
-        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--help'])
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--parallel-owners', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
         import io
@@ -3038,11 +3333,13 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         required = ['launch_h3_resolution_memory', 'profile.yaml', '--expected-sha', 'x',
                     '--ffmpeg', 'f', '--ffprobe', 'p', '--monitor-dir', 'm']
         for argv in (required, required + ['--checkpoint-threads', '4'],
-                     required + ['--rollout-batch', '4', '--rollout-batch-replay-tolerance', '1e-3']):
+                     required + ['--rollout-batch', '4', '--rollout-batch-replay-tolerance', '1e-3'],
+                     required + ['--reward-pipeline', '--parallel-owners']):
             patch.setattr(sys, 'argv', argv)
             with pytest.raises(SystemExit): two_update.main()
-        assert [row.checkpoint_threads for row in parsed] == [1, 4, 1]
-        assert [(row.rollout_batch, row.rollout_batch_replay_tolerance) for row in parsed] == [(1, 1e-4), (1, 1e-4), (4, 1e-3)]
+        assert [row.checkpoint_threads for row in parsed] == [1, 4, 1, 1]
+        assert [(row.rollout_batch, row.rollout_batch_replay_tolerance) for row in parsed] == [(1, 1e-4), (1, 1e-4), (4, 1e-3), (1, 1e-4)]
+        assert [row.parallel_owners for row in parsed] == [False, False, False, True]
     with monkeypatch.context() as patch:
         def no_memory(n): raise BlockingIOError('host pipeline budget insufficient')
         patch.setattr(h3_loading, '_admit_host_memory', no_memory)
@@ -3741,6 +4038,280 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             lifecycle_events.clear(); close_failure = False; idle_failure = True
             with pytest.raises(RuntimeError, match='main idle failed'): service.main()
             assert lifecycle_events == ['construct', 'socket-leaf', 'idle', 'server-close', 'backend-close']
+
+        # P2 HPS: opt-in bounded FIFO admission. Real Handler/ScoreQueue/backend
+        # on handler threads (no socket); default make_handler(backend) above is
+        # unchanged and never threads. Queue-full is answered before scoring.
+        assert service.queue_policy(0) is None
+        for bad in (-1, 65, True, 1.0, '2', None):
+            with pytest.raises(ValueError, match='max_queue'): service.queue_policy(bad)
+        with pytest.raises(ValueError, match='capacity'): service.ScoreQueue(0)
+        def queued_backend(capacity):
+            clock[0] = 0.
+            backend = service.HpsBackend(checkpoint, config, contract, 40., gpu_resident=True,
+                                         resident_gpu_uuid=uuid, max_queue=capacity)
+            backend.cuda = CudaLeaf(backend); backend.inferencer.model.controller = backend.cuda
+            active[0] = backend
+            return backend
+        def frames_for(k):
+            frames = []
+            for i in range(124):
+                stream = BytesIO(); Image.new('RGB', (32, 32), ((7*k+i) % 97, 10+k, 20)).save(stream, format='JPEG')
+                frames.append(base64.b64encode(stream.getvalue()).decode())
+            return frames
+        def qpost(backend, queue, sample_id, out):
+            k = ord(sample_id[-1]) - ord('A')
+            raw = canonical_json(dict(protocol=service.PROTOCOL, protocol_version=service.VERSION,
+                service_identity=backend.health['service_identity'], sample_id=sample_id,
+                prompt=f'prompt {sample_id}', jpeg_frames=frames_for(k)))
+            handler = object.__new__(service.make_handler(backend, queue))
+            handler.path = '/score'; handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(raw))}
+            handler.rfile = BytesIO(raw); handler.wfile = BytesIO()
+            handler.connection = SimpleNamespace(settimeout=lambda seconds: None)
+            statuses, headers = [], []
+            handler.send_response = statuses.append; handler.send_header = lambda *a: headers.append(a)
+            handler.end_headers = lambda: None
+            handler.do_POST()
+            out[sample_id] = (statuses[0], dict(headers), json.loads(handler.wfile.getvalue()))
+        queued = queued_backend(3)
+        facts = queued.health['identity_facts']
+        assert facts['request_queue_policy'] == dict(version='hps.bounded-fifo-queue.v1', max_queue=3,
+            scoring_concurrency=1, order='admission', full='503-retry-after-before-scoring')
+        assert {k: v for k, v in facts.items() if k != 'request_queue_policy'} == warm._health['identity_facts']
+        assert 'request_queue_policy' not in warm._health['identity_facts']
+        assert queued.health['service_identity'] != warm._health['service_identity']
+        validate_health(queued.health, queued.health['service_identity'], contract)
+        score_queue = service.ScoreQueue(3)
+        real_reward = queued.inferencer.reward
+        release_first, first_entered = Event(), Event()
+        running, overlap = [0], [0]
+        running_lock = threading.Lock()
+        def gated_reward(*, prompts, image_paths):
+            with running_lock:
+                running[0] += 1; overlap[0] = max(overlap[0], running[0])
+            try:
+                first_entered.set()
+                assert release_first.wait(5), 'test never released the first score'
+                return real_reward(prompts=prompts, image_paths=image_paths)
+            finally:
+                with running_lock: running[0] -= 1
+        queued.inferencer.reward = gated_reward
+        responses, threads = {}, []
+        def wait_for(predicate):
+            for _ in range(500):  # time.monotonic is the fake HPS clock here
+                if predicate(): return
+                Event().wait(.01)
+            pytest.fail('queue state not reached')
+        for sid, expected_outstanding in (('q-A', 1), ('q-B', 2), ('q-C', 3)):
+            worker = Thread(target=qpost, args=(queued, score_queue, sid, responses), name='hps-handler-' + sid)
+            worker.start(); threads.append(worker)
+            wait_for(lambda: score_queue.outstanding == expected_outstanding)
+            if sid == 'q-A': assert first_entered.wait(5)
+        qpost(queued, score_queue, 'q-D', responses)  # full: rejected before any scoring
+        status, headers, body = responses['q-D']
+        assert (status, body, headers['Retry-After']) == (503, {'error': 'hpsv3_queue_full'}, '1')
+        assert len(queued.inferencer.calls) == 0 and score_queue.outstanding == 3
+        release_first.set()
+        for worker in threads: worker.join(10); assert not worker.is_alive()
+        assert overlap == [1] and score_queue.outstanding == 0
+        assert list(score_queue.admitted_order) == ['q-A', 'q-B', 'q-C']
+        assert [p for p, _ in queued.inferencer.calls[::124]] == ['prompt q-A', 'prompt q-B', 'prompt q-C']
+        assert len(queued.inferencer.calls) == 3*124  # rejected q-D never scored, nothing scored twice
+        serial_backend = new_backend(True); serial = {}
+        for sid in ('q-A', 'q-B', 'q-C'):
+            qpost(serial_backend, None, sid, serial)
+        active[0] = queued
+        for sid in ('q-A', 'q-B', 'q-C'):
+            assert responses[sid][0] == serial[sid][0] == 200
+            got, want = responses[sid][2], serial[sid][2]
+            assert got['service_identity'] == queued.health['service_identity']
+            assert {k: v for k, v in got.items() if k != 'service_identity'} == {k: v for k, v in want.items() if k != 'service_identity'}
+            assert validate_score(got, sample_id=sid, identity=queued.health['service_identity'], contract=contract)
+        serial_backend.close()
+        # Idle housekeeping takes a ticket: skipped while any request is admitted.
+        housekeeping = []
+        queued.idle_housekeeping = lambda: housekeeping.append(score_queue.outstanding)
+        queued_server = object.__new__(service.HpsQueuedHTTPServer)
+        queued_server.backend, queued_server.score_queue = queued, score_queue
+        with score_queue.turn('busy'):
+            queued_server.service_actions(); assert housekeeping == []
+        queued_server.service_actions(); assert housekeeping == [0] and score_queue.outstanding == 0
+        # Review fix: a request arriving while the turn holder moves weights
+        # (ready transiently False, _location 'unknown') is admitted and scored,
+        # not rejected 503-unready; on onload (resident cold) and offload (per request).
+        for resident, direction in ((True, 'cuda'), (False, 'cpu')):
+            clock[0] = 0.
+            racer = service.HpsBackend(checkpoint, config, contract, 40., gpu_resident=resident,
+                                       resident_gpu_uuid=uuid if resident else None, max_queue=3)
+            racer.cuda = CudaLeaf(racer); racer.inferencer.model.controller = racer.cuda; active[0] = racer
+            race_queue, in_move, let_move = service.ScoreQueue(3), Event(), Event()
+            real_to = racer.inferencer.model.to
+            def blocking_to(device, real_to=real_to, direction=direction):
+                if device == direction and not let_move.is_set():
+                    in_move.set(); assert let_move.wait(5)
+                return real_to(device)
+            racer.inferencer.model.to = blocking_to
+            race = {}
+            first = Thread(target=qpost, args=(racer, race_queue, 'q-A', race)); first.start()
+            assert in_move.wait(5) and not racer.ready and racer._location == 'unknown'
+            second = Thread(target=qpost, args=(racer, race_queue, 'q-B', race)); second.start()
+            wait_for(lambda: race_queue.outstanding == 2)
+            let_move.set(); first.join(10); second.join(10)
+            assert race['q-A'][0] == race['q-B'][0] == 200 and racer.ready
+            assert list(race_queue.admitted_order) == ['q-A', 'q-B'] and len(racer.inferencer.calls) == 2*124
+            # Review fix: a held idle ticket does not consume request capacity.
+            idle_ticket = race_queue.try_idle_turn(); assert race_queue.outstanding == 0
+            waiting = [Thread(target=qpost, args=(racer, race_queue, sid, race)) for sid in ('q-C', 'q-D', 'q-E')]
+            for worker in waiting: worker.start()
+            wait_for(lambda: race_queue.outstanding == 3)
+            qpost(racer, race_queue, 'q-F', race); assert race['q-F'][0] == 503 and race['q-F'][2]['error'] == 'hpsv3_queue_full'
+            race_queue.release_idle(idle_ticket)
+            for worker in waiting: worker.join(10)
+            assert all(race[sid][0] == 200 for sid in ('q-C', 'q-D', 'q-E')) and len(racer.inferencer.calls) == 5*124
+            racer.close()
+        # Review fix: bounded shutdown. Waiters abandon unscored (503 unready);
+        # close waits only for the active turn, with a timeout.
+        closing, hold, holding, outcomes = service.ScoreQueue(2), Event(), Event(), []
+        def holder():
+            with closing.turn('active'): holding.set(); assert hold.wait(5)
+            outcomes.append('active-done')
+        def waiter():
+            try:
+                with closing.turn('waiting'): outcomes.append('waiter-scored')
+            except service.QueueClosed: outcomes.append('waiter-abandoned')
+        holder_thread = Thread(target=holder); holder_thread.start(); assert holding.wait(5)
+        waiter_thread = Thread(target=waiter); waiter_thread.start(); wait_for(lambda: closing.outstanding == 2)
+        assert closing.close(.05) is False
+        waiter_thread.join(5); assert outcomes == ['waiter-abandoned']
+        hold.set(); holder_thread.join(5)
+        assert outcomes == ['waiter-abandoned', 'active-done'] and closing.close(.05) is True
+        assert closing.try_idle_turn() is None
+        with pytest.raises(RuntimeError, match='never be reopened'): closing.reopen()
+        # Review fix: a SCORED reply still being written keeps shutdown waiting
+        # (bounded) even though the GPU turn was already released.
+        replies_queue, write_gate, writing = service.ScoreQueue(2), Event(), Event()
+        def slow_writer_post(out):
+            raw = canonical_json(dict(protocol=service.PROTOCOL, protocol_version=service.VERSION,
+                service_identity=queued.health['service_identity'], sample_id='q-R',
+                prompt='prompt q-R', jpeg_frames=frames_for(17)))
+            handler = object.__new__(service.make_handler(queued, replies_queue))
+            handler.path = '/score'; handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(raw))}
+            handler.rfile = BytesIO(raw); handler.wfile = BytesIO()
+            handler.connection = SimpleNamespace(settimeout=lambda seconds: None)
+            statuses = []
+            handler.send_response = statuses.append; handler.send_header = lambda *a: None
+            def end_headers(): writing.set(); assert write_gate.wait(5)
+            handler.end_headers = end_headers
+            handler.do_POST(); out.append((statuses[0], json.loads(handler.wfile.getvalue())))
+        replied = []
+        reply_thread = Thread(target=slow_writer_post, args=(replied,)); reply_thread.start()
+        assert writing.wait(5)
+        assert replies_queue.outstanding == 0 and replies_queue.replying == 1  # turn released, reply in flight
+        assert replies_queue.close(.05) is False  # shutdown waits for the scored reply
+        write_gate.set(); reply_thread.join(5)
+        assert replied[0][0] == 200 and replied[0][1]['sample_id'] == 'q-R'
+        assert replies_queue.replying == 0 and replies_queue.close(.05) is True
+        with pytest.raises(service.QueueClosed):
+            with closing.turn('late'): pytest.fail('closed queue admitted a request')
+        closed_out = {}
+        qpost(queued, closing, 'q-G', closed_out)
+        assert closed_out['q-G'][0] == 503 and closed_out['q-G'][2] == {'error': 'hpsv3_unready'}
+        socket_closed = []
+        stuck = object.__new__(service.HpsQueuedHTTPServer); stuck.shutdown_timeout_s = .05
+        stuck.socket = SimpleNamespace(close=lambda: socket_closed.append(True))
+        stuck.score_queue = service.ScoreQueue(1); busy_ticket = stuck.score_queue.try_idle_turn()
+        with pytest.raises(RuntimeError, match='shutdown bound'): stuck.server_close()
+        assert socket_closed == [True]
+        stuck.score_queue.release_idle(busy_ticket)
+        # A failed queued request releases its ticket; a later queued request
+        # sees the poisoned backend as 503 unready, never a second inference.
+        queued.inferencer.reward = real_reward; queued.inferencer.failure = 'reward'
+        failed = {}
+        qpost(queued, score_queue, 'q-E', failed); assert failed['q-E'][0] == 500
+        qpost(queued, score_queue, 'q-F', failed)
+        assert failed['q-F'][:1] == (503,) and failed['q-F'][2] == {'error': 'hpsv3_unready'}
+        assert score_queue.outstanding == 0 and len(queued.inferencer.calls) == 4*124 + 1  # q-A..C, q-R, failed q-E
+        queued.close()
+        # Client: retries ONLY the explicit pre-admission queue-full 503, inside
+        # the one timeout budget; other 503s / exhaustion never resend a POST.
+        from tests.test_h3_mvp_cpu_hps import _Response, _media
+        from visual_rl.algorithms.rewards.clients import hpsv3 as hps_client
+        from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
+        for scenario in ('one-full', 'exhausted', 'gpu-503', 'no-retry-after', 'late-retry'):
+            scorer, inner, _ = _scorer(tmp_path / f'queue-client-{scenario}', hp, contract)
+            sent, sleeps, now = [], [], [100.]
+            class QueueFullTransport:
+                full = {'one-full': 1, 'exhausted': 9, 'gpu-503': 1, 'no-retry-after': 1, 'late-retry': 1}[scenario]
+                def request(self, method, url, **kwargs):
+                    sent.append((method, kwargs['timeout']))
+                    if method == 'POST' and self.full:
+                        self.full -= 1
+                        body = {'error': 'gpu_admission_or_margin' if scenario == 'gpu-503' else 'hpsv3_queue_full'}
+                        response = _Response(body, status=503)
+                        if scenario != 'no-retry-after': response.headers['Retry-After'] = '1'
+                        return response
+                    if method == 'POST' and scenario == 'late-retry': now[0] += 5.  # retried read trickles past budget
+                    return inner.request(method, url, **dict(kwargs, timeout=2.5))
+                def close(self): inner.close()
+            hp.setattr(hps_client, 'requests_session', lambda: QueueFullTransport())
+            hp.setattr(hps_client, 'time', SimpleNamespace(monotonic=lambda: now[0],
+                sleep=lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s))))
+            scorer.acquire()
+            media = _media(contract)
+            if scenario == 'one-full':
+                value = scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert sent == [('GET', 2.5), ('POST', 2.5), ('POST', 1.5)] and sleeps == [1.]
+                assert len(inner.frame_scores) == 1  # exactly one accepted request was scored
+                assert value == service.aggregate_frame_scores(inner.frame_scores[0], contract)[0]
+            elif scenario == 'late-retry':
+                with pytest.raises(RuntimeError, match='wall-clock'):
+                    scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert [m for m, _ in sent].count('POST') == 2 and sleeps == [1.]  # no third send
+            else:
+                with pytest.raises(RuntimeError, match='never admitted' if scenario == 'exhausted' else 'no automatic POST retry'):
+                    scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert inner.frame_scores == []
+                assert [m for m, _ in sent].count('POST') == (2 if scenario == 'exhausted' else 1)
+                assert sleeps == ([1.] if scenario == 'exhausted' else [])
+            media._release(); scorer.close()
+        stub = object.__new__(H3HPSReward); stub._check_manifest = lambda: None
+        for health, expected in ((warm._health, 0), (queued._health, 3)):
+            stub._manifest_bytes = lambda health=health: canonical_json(health)
+            assert stub.declared_queue_capacity() == expected
+        bad_policy = dict(queued._health, identity_facts=dict(queued._health['identity_facts'],
+                          request_queue_policy=dict(version='other', max_queue=3)))
+        stub._manifest_bytes = lambda: canonical_json(bad_policy)
+        with pytest.raises(ValueError, match='queue policy'): stub.declared_queue_capacity()
+        # CLI: strict --max-queue bound before loading; N>0 selects the queued
+        # server and declares the policy, 0 keeps HpsHTTPServer (asserted above).
+        with hp.context() as cli:
+            cli.setattr(service, 'HpsBackend', lambda *a, **kw: pytest.fail('invalid queue CLI loaded model'))
+            for bad in ('65', '-1', 'x'):
+                cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                    '--artifact-output', str(hps_root/'unused'), '--max-queue', bad])
+                with pytest.raises(SystemExit): service.main()
+        queue_events, queued_idle = [], service.HpsQueuedHTTPServer.service_actions
+        class QueuedBackendLeaf:
+            def __init__(self, *args, **kwargs):
+                assert kwargs == dict(gpu_resident=False, resident_gpu_uuid=None, max_queue=8)
+                self.health = queued._health; queue_events.append('construct')
+            def idle_housekeeping(self): queue_events.append('idle')
+            def close(self): queue_events.append('backend-close')
+        class QueuedServerLeaf:
+            def __init__(self, address, handler, score_queue):
+                assert address == ('127.0.0.1', 18820) and score_queue.capacity == 8
+                self.score_queue = score_queue; queue_events.append('queued-socket-leaf')
+            def serve_forever(self, *, poll_interval):
+                queued_idle(self); raise KeyboardInterrupt('fake loop exit')
+            def server_close(self): queue_events.append('server-close')
+        with hp.context() as cli:
+            cli.setattr(service, 'HpsBackend', QueuedBackendLeaf)
+            cli.setattr(service, 'HpsQueuedHTTPServer', QueuedServerLeaf)
+            cli.setattr(service, 'HpsHTTPServer', lambda *a: pytest.fail('queued CLI built the serial server'))
+            cli.setattr(sys, 'argv', ['serve_hpsv3_video', '--checkpoint', str(checkpoint), '--config', str(config),
+                '--artifact-output', str(hps_root / 'queued-manifest.json'), '--max-queue', '8'])
+            with pytest.raises(KeyboardInterrupt, match='fake loop exit'): service.main()
+        assert queue_events == ['construct', 'queued-socket-leaf', 'idle', 'server-close', 'backend-close']
 
     # Formal 200-update run: long-run observation budgets are explicit opt-ins;
     # unset environment / default CLI keep the short-acceptance limits.
