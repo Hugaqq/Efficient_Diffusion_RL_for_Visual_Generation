@@ -1,96 +1,90 @@
-# Round 006 — H1：默认关闭、专卡UUID约束的有界HPS权重驻留
+# Round 007 — V1v：只在一个aux owner内复用视频VAE，默认关闭
 
-## 恢复/决策
+## 上轮独立验收与本轮选择
 
-主会话已明确恢复并直接提供M0；M0成本输入已足以选择本轮，**不再等待同一M0，也不申请先跑GPU才写代码**。本轮唯一单元H1：对原HPS服务代码增加opt-in单模型复用，带原显存准入、低余量offload回退、闲置60s卸载和退出清理。返回implement。
+已读H1实际累计diff、完整最新serve_hpsv3_video.py及原测试完整H1区间，确认原子commit `3f02fdb`（父0190004）。当前HEAD `2f4cce22e8b53c2c21919c42905377163d29649d`为工作流快照；Simplifier无代码commit。Planner重新执行原七项：**7 passed, 3 warnings in 51.96s**。H1默认off、身份/free/state/monitor/idle/close与原逐帧数学保持，未发现应先修复的已知缺口；真实GPU/服务效果仍未验证。
 
-只写代码/CPU验证，不启动/请求/替换/重启现有服务、不SSH/训练/推理/部署；M1与任何GPU执行仍未授权，Euler-B仍paused。
+本轮唯一单元 **V1v：有界owner-local视频VAE对象复用**。不复用audio VAE，不做跨owner/跨update缓存或HPS/FSDP修改。返回implement。M0已满足收益选择，不再请求同一数据或执行GPU。
 
-## 已有结果复核，不重复已发生操作
+## 真实收益与边界
 
-HEAD `e5cfeb446bb20d1222a1e8df09516f4682572eee`实际log/HEAD stat确认：相对上一已审`0eb2a5b`只是Planner四份报告快照，无新源码commit，初始status仅原.pi/。G0/I1/P1/F0代码/commit审查和Planner上轮实际原七项 **7 passed, 3 warnings in 44.91s**有效，本步骤不重复跑该门禁/恢复补丁。Coder本轮提交前仍必须对自己新代码实跑7/7。
+M0视频load32条232.2621479s，其中每rank第一个load合计63.7945410s；若每owner四样本只加载一次，可去24次视频load **168.467607s≈2.808min/轮**（仅decode子段，不含优化/保存，未扣资格/失效/资源管理成本）。audio额外可省不足0.5min，暂不承担第二个缓存模型/weight-norm状态复杂度。
 
-## 真实成本/排序/收益边界
+M0反事实P1+H1后D预计成为临界路径，复用视频更可能转为墙钟收益；保持旧调度假设、不叠I1，含优化/完整校验/保存、不含初始化的约104.25min条件分母，上界约104.25→101.44min、增量约1.028×。不是实测/承诺，也不能简单加所有VAE load4.50min；若资源/RNG资格导致fallback，可能没有收益。原8次cold保留，不加预热/额外decode。
 
-选用32行原值存于M0-ROWS.csv，完整归因/来源指纹与原摘录交叉核对见M0-ANALYSIS.md。原归档路径只作索引，未读取工作区外；没有伪称独立重hash整个480条归档。
+headers当前NA不阻碍写保守策略：首次仍按原loader加载，读取**实际模块字节与实际free**才决定是否可保留；不从19.71GiB allocated峰推断pair驻留安全。
 
-实测每样本：D=45.613s，score_full=50.405s；服务hps_score=49.112s，其中onload12.081s+offload12.631s=24.712s，**占服务父段约50.3%**。32条搬运共790.792s=13.180min；剩余服务24.400s不是纯GPU kernel，不能父子相加。VAE两load共270.054s=4.501min；owner内保留一次后可去24次reload的旧serial上界约197.290s=3.288min。
+## 一个独立单元的允许范围
 
-现读真实 `scripts/serve_hpsv3_video.py`：CPU模型已初始化一次，**每POST却完整model.to(cuda)→124次原reward→model.to(cpu)**。因此单模型有界GPU复用是直接可实施、显著冗余消除，不依赖缺失的VAE headers/完整拓扑/CUDA trace。
+1. `visual_rl/models/implementations/h3_decode.py`：视频复用scope/借用释放、资源/RNG/状态/失效门、正常/异常退出。可选新增窄helper `visual_rl/models/implementations/h3_decode_reuse.py`，避免把decoder数学复制两份；不是通用缓存框架。
+2. `visual_rl/models/implementations/h3.py`：懒scope/关闭owned decoder的桥接；不改predict/encoding/latent数学。
+3. `visual_rl/runtime/h3_binding.py`：由真实完整哈希取得私有视频文件凭据并传给scope；decode普通API保持。
+4. `visual_rl/composition/preflight/artifacts.py`：**仅增加可选只读file observer/receipt输出能力**，从现有完整哈希的同一遍读取产生凭据；现有返回identity/schema/hash编码及所有强检查不变，无额外大文件扫描。这是缓存安全必需接线，不是另一个完整性优化。
+5. `visual_rl/runtime/h3_lifecycle.py`、`visual_rl/algorithms/trainer/h3_dual_stages.py`、`scripts/launch_h3_resolution_memory.py`：默认False的strict-bool `--reuse-video-vae`（或同等明确命名）、真实binding/scope接线、同位置rank配置门；仅dual_flash/paired_4x8开启。
+6. `tests/test_flash_collection_runtime.py`：原七函数内部必要回归，保留所有原断言/函数数量，不改其它测试文件。
+7. Coder自己的round-007/commit材料。
 
-不能把13.18min全叠到P1：以M0各owner顺序和旧D/H不变的反事实理想调度，P1主体约33.069min；warm H'=H-on-off后decode转为瓶颈，主体约27.730min，**H1相对P1约省5.339min/轮**。旧完整保存轮127.73min分母（含优化/完整校验/保存，不含初始化等），仅此模型推算P1后约109.59→104.25min，增量约1.05×。这是条件估算，未实现/未实测；不叠I1、不能承诺2倍。首个cold load、最终offload/TTL、实际争用/回退/监控开销须实测。
+不改H1/HPS、P1容量/评分协议、F0窗口、FSDP/精度/geometry/科学profile/依赖/transaction/checkpoint语义或授权文件。不合入audio缓存/跨owner流水。若范围必须扩大先报告。
 
-## 严格修改边界与原子单元
+## A. 缓存范围与所有权
 
-代码只允许：
-1. `scripts/serve_hpsv3_video.py`：可选驻留状态机、CPU健康身份策略、原请求路径复用/回退、同线程idle housekeeping/close及main资源finally。可在文件内用小helper组织，不造通用服务框架/新调度器。
-2. `tests/test_flash_collection_runtime.py`：原七函数内部必要回归，所有既有断言/函数数量保留；不得新增测试函数、skip/替换/参数化套件或编辑其它测试文件。
-3. Coder自己的round-006/commit材料。
+- off与原单样本load/use/drop路径一致，不探GPU/新预算、不创建新文件/线程。普通decode_one与lease/handoff不放宽。
+- on在**现有aux_turns的owner工作内部**建立scope，覆盖该owner四条sample的串行或P1工作；至多保留**一个video VAE model**，audio每条仍原loader/drop。不常驻8个owner的缓存，不跨collection/optimizer/policy/geometry。
+- CUDA加载/使用/丢弃保持原producer工作线程/stream，consumer只处理原CPU媒体；P1先join/drain，scope再销毁模型，最后才owner-end/下一owner/credit/forward。不要通过callback从CPU consumer清缓存。
+- 新scope进入/退出、decoder.close/adapter.close有明确防重入/并发/queued-after-close合同。close幂等；活跃decoder/lease/producer不能从foreign thread强行销毁。正常成功退出后cache不持model/weight/媒体引用；失败只保证清除自己引用、poison并禁止后续owner/model，异常traceback可能暂持张量，不能假称物理内存已释放。
+- 不改变VAE tiling、未patchify/denorm、24/32通道、audio stereo、clamp、FP32、blocking D2H、finite/shape/statistics/rate/hop检查。不要复制计算实现、预解码/缓存媒体或减少decode次数。
 
-不改原HPS客户端/wire/aggregation/processor/model/权重/精度/帧batch、P1/F0/训练算法/FSDP、依赖、科研配置/旧manifest、TASK/AGENTS/其它角色报告。若必须扩大代码范围，先报告具体原因，不混做VAE缓存或HPS批处理。
+## B. 借用既有完整哈希的真实凭据，禁止重复大扫描
 
-建议commit：`perf(hps): reuse dedicated GPU weights with guarded idle residency`。必要功能/回归同原子commit，先7/7/diff检查；Simplifier必要等价简化另commit并先7/7，无必要不造commit。
+当前 `_hash_artifact` 已为每个文件算content_digest后合入整个model digest，但丢弃per-file结果。不要在每个owner scope/hit再次stream数GiB权重抵消收益。
 
-## 不变量
+- 可选observer只接收**本次hasher已完成原身份/文件稳定性检查**的relative path、streamed SHA256、size和独立stat快照(dev/inode/size/mtime_ns/ctime_ns等)。在同一文件读取中收集vae/子树，无caller verified=True、无跳过哈希接口。observer失败仍失败关闭；默认None保持所有老调用/返回identity字节不变。
+- Binding仅在本次完整 `verify_h3_content` 成功且原资源/model/source/numerics门都成功后保存私有、独立的video文件凭据，绑定已核model SHA/root；validate_live每个原边界仍完整重验并更新凭据。不要把路径/mtime/observer凭据加进semantic/checkpoint identity或改变原合同。
+- scope从实际binding借到凭据，不能由stage/CLI声明一个hash冒充已验证。scope拷贝只读凭据，核root/文件清单/config/class/路径、symlink/index安全及每个文件stat；每次decode/hit和scope退出廉价复核。包括ctime，检测内容被改后人为恢复mtime；metadata只是**失效哨兵**，content SHA和原全内容校验仍是身份权威。
+- `_configs()`和原所有path/config/statistics检查每次decode保留；任何文件清单/配置/路径/设备/对象/状态漂移失败关闭，不能静默接受新weights或用旧媒体得分继续更新。无文件系统锁/恶意并发写盘的原子快照保证，不做过度声明。
+- 普通构造/restore/关闭cache模式不需要凭据；请求on但没有真实凭据必须明确拒绝，而非无凭据复用。不得减少原checkpoint/init全模型/code/cache核验，也不能用mtime缓存替换这些扫描。
 
-- 原124帧全部逐帧、frame microbatch1、原inferencer.reward/processor/prompts/images顺序、原dtype/autocast/inference_mode、scalar_fp32和top37/排序/HTTP字段/输入校验不变。不假设模型所有权重都FP32，**不新增dtype cast/量化/compile/改batch**。
-- 构造仍CPU加载/eval/requires_grad(False)，原loaded_tensor_sha及processor/package/config/weight身份检查不跳过；不开启时原每POST上卡/下卡/40GiB准入/16GiB监测/unused-cache cleanup行为保持。
-- 只保留同一个冻结model对象，最多一份GPU模型，无复制CPU+GPU双模型、无跨设备转移/CPU推理fallback；不保存images/媒体/请求队列。HPS HTTP仍单线程串行，不并发访问同一inferencer。
-- 当前这是服务**代码**优化，不是服务操作。任何实际启用须未来独立批准专有GPU4、新实例/端口/manifest/身份/日志归属；现有服务/原3db2a05 run及旧证据不动。
+## C. RNG与模型资格（科学语义优先于命中）
 
-## 建议策略与状态合同
+- 第一次视频loader调用前后读取Python/NumPy/Torch CPU与**已初始化的当前目标CUDA**随机状态（可复用RankRNGSnapshot或窄helper）。这是只读观察，不能为了检查新初始化其它GPU/RNG，不能save/restore来改变baseline消费。首次仍执行原load。
+- 若加载消耗任何所检查全局RNG，**本owner禁用视频复用，走原每sample load/drop，保留实际已消费状态**。不重放load、restore RNG或伪造generator offset；不因不符合缓存资格而停止合法baseline训练。若不能无副作用观测CUDA RNG则不启用复用，不探未授权设备。
+- 只有首load RNG-neutral且同一已加载、eval/frozen、目标device/FP32、相同class/config/geometry、无不受控持久tensor状态时才能借用。首次按原顺序load视频再load audio；不新增warmup/预加载。
+- 每次借用前/解码后核参数/buffer对象/shape/dtype/device/grad/eval与版本等只读状态，必要的轻量buffer检查可保留。检查失败或模型decode显式改变注册状态时invalidate/drop；不允许后续sample用变过的状态。不要为检查把所有GPU权重D2H重hash（会抵消7s/样本收益）。视频参考实现无audio weight-norm钩子，audio维持原drop；任何不能建立安全资格的状态只disable reuse或失败关闭，不盲缓存任意插件。
+- 不让cached model暴露给score/consumer；支持的固定stateless视频decode资格需写清，不宣称可自动证明任意Python模型没有隐藏副作用。CPU测试应故意注入加载RNG消费和注册buffer漂移，证明不会改变原序列/后续复用错误状态。
 
-### A. 明确opt-in、设备与健康身份
+## D. 内存准入与fallback
 
-- CLI默认off，例如`--gpu-resident`；on必须配`--resident-gpu-uuid`完整规范UUID，off时额外UUID参数应拒绝，非bool/非法UUID/不完整声明先拒绝。idle TTL本轮固定60s，别引入任意schedule或调参框架。
-- on要求显式CUDA_VISIBLE_DEVICES恰为该单一完整UUID；**只读验证，不改环境/LOCAL_RANK**。在每次warm reuse/cold onload及idle/close相关GPU生命周期操作前核实际logical0/current device/完整observed UUID与声明一致；不按名称/物理序号记忆猜。可复用已有严格UUID规范化方法，支持PyTorch已知_CUuuid，不能接受任意stringable替代。
-- M0里GPU4 UUID为`GPU-0e1cd165-126d-e889-2b87-240d8faddddb`，只能作保存证据；代码不能把此历史值当实时独占/可用内存证明，仍需future实验核准。不要自动占GPU5/训练卡。
-- 保留原health top-level schema；在identity_facts加入**声明为运行策略**的版本/启用/expected UUID/TTL字段并纳入原canonical digest，不能称其为未发生的实际GPU观察。模型hash/processor等事实照常实际生成，source SHA自动随代码改变；实际观察只记遥测。
-- health/manifest identity一旦就绪保持稳定，不随命中/TTL/state计数改变；源码/策略变更自然形成**新身份**，不得硬编码旧identity/改旧manifest/放松健康比对掩盖差异。新artifact由未来获准实例按原真实代码生成，只用于新run。
-- 模型卸载/UUID观察/监测失败造成状态不明时要fail closed并报告unready/拒绝后续POST；不能健康端点仍宣称可安全复用。不要吞异常后自动重试同一次POST。
+- 固定缓存逻辑上限建议16GiB、最多1个video模型。这是上限不是驻留承诺：读取首load实际参数/buffer字节；检查不受控/unregistered tensor状态，GPU实际allocated增量也需计入可能的persistent workspace，不能只用checkpoint文件大小冒充全部占用。资格/容量不够则不保留。
+- **原每次decode的40GiB实际card-free准入与16GiB全decode监控保持**。warm入口若保留模型导致free<40，先在无in-flight decode处drop自己的缓存/unused-cache释放，再读真实free，够才原cold path，不够仍拒绝。禁止free+weight虚构准入、下调阈值/FP16/CPU decode fallback。
+- 因视频模型会在audio加载时仍在GPU，audio cold load前也要有不弱于原40GiB的真实free条件；不够则先drop idle video缓存、禁用本owner复用，再按原路径load audio。audio从不复用，不允许两个VAE并行forward。
+- drop必须真清owned模型引用，不只是empty_cache；unused-cache仍原操作，只在新的scope结束/drop需要时增加有原因的释放，不作显存曲线美容。日志坏了也不能阻止必要清引用，主错误优先、cleanup附note。
+- 模型是GPU复用，不保留额外一份CPU权重；如果实现发现额外CPU持久张量须纳入上限/host reserve或拒绝资格。保持P1原host预算/媒体上界和CPU引用生命周期。不要把16GiB逻辑cap或当前allocated当整个设备/RSS硬界。
+- 成功scope退出必须在下一FSDP/model阶段前清空模型；释放/monitor异常就poison/中止attempt，不能带缓存继续训练。正常monitor stop/join/日志失败清理如需补齐属于本生命周期必要修复；不能谎称驱动永久阻塞已释放。
 
-### B. 每请求原准入与可解释的fallback
+## E. 接线/遥测
 
-可用CPU / GPU-idle / scoring / poisoned-closed小状态，标明模型实际位置，只有确认成功转移后才更新状态。
+- backend strict bool默认False，仅paired Flash可启；将真实binding scope工厂传给dual reward，在work中context包住现有串行/P1整体。所有rank同位置协商开关/容量版本，mode不一致先于aux失败；worker无PG。
+- TwoUpdateBackend/CLI支持新flag但不运行main；P1/H1/F0可独立开关，原所有fresh两步/监控/图/参数/媒体/保存审计保持。对既有CPU wrapper只补必要默认字段，不放松断言。
+- 只真实load记h3_vae_load_begin/end，hit/miss/invalidate/RNG-ineligible/resource-fallback/scope-release独立事件；记录cached bytes/free/资格原因。原h3_vae_decode_begin/exit每sample照旧；新cache scope不要新增peak-reset span来改曲线。
+- warm `incremental_peak` 的baseline含cached weights，须明确该口径/记录cached bytes和总allocated，不能拿增量变小宣称总显存下降。原lossless allocator事件与HPS/P1 CPU日志隔离不改。
 
-1. cold：原实际free>=min_free_gib（原CLI40..80边界不改）才model.to(cuda)，dtype不变；按原路径评分。
-2. warm：先核UUID、实际位置、TTL与**实际card free>=原min_free_gib**。不得以free+cached_weight构造“虚拟free”绕过40GiB门，原16GiB全请求采样余量保持。
-3. warm余量不足/TTL过期：先对**自己的**model安全.to(cpu)+原unused-cache释放，重新观测真实free；足够则本次走原cold路径，不足按原503/异常结束。只回退模型驻留策略，**不重试POST/不重做已开始的124前向/不降CPU计算**。
-4. 成功评分后同步/原余量检查照旧；仅on且实际free仍满足原min_free、状态明确时保留GPU权重。否则原offload cleanup；任何评分/monitor/margin/identity异常都不留warm可复用状态，可靠offload后传播；cleanup失败附note/poison，不能盖住首个业务错误。
-5. 复用本轮不删原unused-cache释放；warm时它只释放unused，不能谎称已return-to-CPU。fallback/TTL真正offload所需cleanup明确原因/计数，不为曲线新增无谓empty_cache。
+## 必要CPU回归（仅原七项内部）
 
-### C. 有界idle与退出：不新增服务线程
+1. 原hasher真实小文件：observer on/off返回identity完全相同、原每文件只读/哈希一次，捕获SHA/stat/ctime正确；原symlink/修改/observer抛错拒绝。旧init/checkpoint完整验证仍调用，私有凭据不入contract/semantic/RNG。scope不做额外权重payload read（可设置读取spy），mtime恢复但ctime变化的实际文件改动仍拒绝。
+2. 真实tiny视频/audio decoder计算：off四条各load4次；on有资格视频只load1、audio仍4。四条video/audio原张量值/布局/shape/FP32/metadata/terminal/global及sample RNG完全一致，原正常单lease与handoff不变；成功/消费异常后cache引用清空，下一scope重新load，不能跨update复用。
+3. loader故意消费Python/NumPy/Torch CPU（以及CUDA观察叶子）RNG：on自动不缓存但不restore/replay，四条结果/调用数/最终RNG等于off；故意注册buffer变化/foreign model/config/device/dtype/grad/eval漂移，不得热复用错误状态。不能只用无随机fake模型宣称解决RNG。
+4. 真实free/实际字节上限CUDA叶子：warm<40先清cache后cold再验，仍不足拒绝；audio前不足先evict，无虚拟free；16GiB监测/非法telemetry/monitor/日志/load/decode/cleanup故障无后续owner或update、不留可复用模型。显式允许外部刻意alias/异常traceback限制，不谎称可撤销任意引用。
+5. 真实dual reward→复用scope→P1/serial：确保scope在owner worker，P1 consumer已join后才释放、owner-end之前无cache，Queue1/总许可2/原score_once/124-JPEG字节/有限标量一致；任一错误不进credit/update/下一owner，scope exit仍复核文件。实际backend/CLI off/on、rank配置不一致与close生命周期接线需执行，不仅源码字符串断言。
+6. 不GPU测试；只替不可用重模型/CUDA/transport/host观察叶子。可构造真正tiny safetensors/header文件，不需真实VAE大权重，不改外部fixtures或依赖。已有G0/I1/P1/F0/H1全部回归和七函数保留。
 
-- 利用同一HTTPServer主线程的service_actions/serve_forever poll（如0.5s）做idle housekeeping，或等价明确的单线程周期hook。默认off的idle不探CUDA；on仅已驻留且无active request时检查真实UUID/free和monotonic idle age。
-- 满60s idle或free低于原min_free即主动卸载自己的模型；下一POST入口再检查expiry，避免漏tick后继续无限复用。active scoring期间绝不TTL卸载，不并发close inferencer。
-- TTL是正常服务loop中的检查期限＋poll/调度延迟，**不是能强杀卡死HTTP/kernel的硬实时保证**；不得为这条保证开启无界后台线程。意外阻塞/卸载失败记录失败/poison，不能伪称完成释放。
-- 新close幂等；shutdown/KeyboardInterrupt/server异常通过main try/finally关闭server并释放owned resident模型。初始化仍不提前上卡；不影响其它服务/进程。close与idle都不发评分请求。
-- 原请求monitor stop/join必须在所有业务/转移异常下执行。若需为本状态机修复“offload异常导致原monitor未停”的局部路径，可同单元处理，但不扩为其它优化；monitor异常不能静默丢失。多错误保留原business异常＋cleanup notes，无法确认卸载就不再ready。
+## 原子commit与权限
 
-### D. 遥测/安全证据
-
-在原journal/JSON机制记录hit/miss/cold/fallback/TTL/offload/retain及reason/声明与observed UUID/free、实际onload/offload次数；只对真实.to动作记原onload/offload span，warm跳过应有明确hit事件，不能把虚构零秒搬运当实测。idle offload是独立idle阶段，不错绑成某个sample的评分时长。原日志失败仍fail closed，source/manifest/health完整门不删。
-
-## 必要原七项CPU回归（不能发真实服务请求）
-
-- 使用真实HpsBackend `_score`/handler/策略路径，只有HPS重模型/inferencer与CUDA/显存/UUID/clock/HTTPServer socket为CPU叶子；`object.__new__`配tiny模型也可，但不能把整个评分或驻留逻辑mock掉。
-- 同一CPU tiny冻结模型/原torch scalars，连续至少两请求：default仍每次cuda→cpu；on cold一次上卡、warm无第二次上/下卡，124调用/请求、参数/输入顺序/模型dtype/RNG不变。比较全部逐帧FP32数组/原aggregate与top37 indices **bitwise相同**，含ties；用原wire validator/真实Handler离线BytesIO输入的JSON/JPEG，不能只断言计数。预留真实GPU配对未验证，不拿CPU结果代替。
-- cold不足40拒绝且零forward；warm不足40先卸载/empty-cache，真实free复核够时只执行一次cold评分，不够时503/零forward；运行中余量<16/无效telemetry/monitor异常/错误UUID/错误CVD均失败关闭。覆盖状态不明不复用，health/POST不虚报ready。
-- fake monotonic＋实际server idle hook：59s不卸，60s后卸，低headroom先卸，active不卸，off不探CUDA；过期在next POST重验、shutdown/重复close无重复卸载，无idle线程残留。
-- 原业务reward失败、onload/offload/idle/close失败、多重业务+cleanup失败、journal失败：传播主错误、monitor确实stop/join，不返回partial scores、不自动POST重试；后续不能用poisoned GPU状态。不要构造无法teardown的永久阻塞线程。
-- manifest/health：真实CPU loaded_tensor_sha与原digest/validate_health保留；策略改变形成新identity，未匹配artifact被原客户端拒绝；状态/hit计数不改变ready时identity，不覆盖旧manifest。不得修改protocol validator实现来让测试通过。
-- 实际CLI --help/非法组合在heavy模型/GPU/socket之前退出；main用fake server/backend叶子验证finally close/idle hook接线，绝不监听真实端口。G0/I1/P1/F0原回归与当前worktree导入证明全部保留。
-
-## 提交门禁与风险/后续
-
-Coder新代码每个commit前实跑原七项：
+Coder提交前实际执行原七项和git diff --check：
 
 ```text
 bash workflow-workspace/2026-11-03-h3-training-speed-001/inputs/run-cpu-gate.sh
 ```
 
-必须7/7＋git diff --check；功能及必要回归一起提交，只显式stage所属文件，不处理原.pi/，不amend/rebase/squash。记录真实SHA、测试和未测收益。Simplifier随后独立审核状态/身份/生命周期/科学等价；Planner再复审。
+必须7/7，功能与必要回归同commit，建议 `perf(h3): reuse verified video VAE within bounded owner turns`；不amend/rebase/squash/换分支。Simplifier另审，必要简化独立commit并先7/7，不造空commit。保留原未跟踪.pi/，只stage所属文件，不改其它角色报告/授权/ignore。
 
-GPU风险仍是实际显存/host/CUPTI/服务数值、残留缓存、TTL/争用收益；本轮不运行M1。之前MEASUREMENT-CARD的M1无服务变更授权，**不能拿它开启H1**；后续如需H1实验必须另批新专有服务/manifest/endpoint及资源，不自动替换健康旧HPS或改旧run。原生同输入GPU逐帧/排序先要求完全一致，任何非零差异先调查，不自动放宽容差/换reward。代码/CPU通过不称已达speedup。
-
-M0已解除同一成本等待；VAE复用在H1后重新成为高优先下一候选，P2/FSDP等仍开放，本轮只H1，不写FINAL/不判耗尽。
+本轮不操作GPU/服务/SSH/真实HPS/训练/推理/部署；Euler-B保持暂停。GPU缓存容量/模型数值/实际命中/收益、H1新服务与最终两更新验收仍待另批实验卡。M0已可用，不重索同一输入，不写FINAL或宣告2倍/硬件最优。更细FSDP/P2机会仍保留，不夹带。
