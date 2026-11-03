@@ -7,7 +7,9 @@ WorkingDirectory=@REPO@
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=@REPO@
 ExecStart=@PYTHON@ -m ops.h3_formal_watch.observer @CONFIG@
-TimeoutStartSec=30min
+# Max helper budget: 3*(120+5)+30 + 4*(600+5) + 8*(120+5) = 3825s.
+# Remaining margin covers bounded local IO and scheduling; pending sends defer.
+TimeoutStartSec=90min
 Restart=on-failure
 RestartSec=5min
 KillMode=control-group

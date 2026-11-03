@@ -1426,6 +1426,89 @@ def test_repeat_alert_window_key_stable_across_failed_retry(tmp_path):
     assert notify.calls[-1][1] == second
 
 
+def test_observer_history_bounded_pending_and_dedup_preserved(tmp_path):
+    config = observer_config(tmp_path)
+    obs = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    for i in range(220):
+        key = 'incident:' + str(i)
+        obs.s['jobs'][key] = dict(label=key, analyze=True, alert=True, repeat=False,
+            created_at=0, analysis_status='complete', diagnosis='中' * 4000,
+            report_written=True, finished=True)
+        obs.s['notices'][key] = dict(sent=True, text='old alert')
+    for i in range(100):
+        obs.queue('pending:' + str(i), 'pending', analyze=False)
+        obs.s['notices']['pending:' + str(i)] = dict(sent=False, text='must deliver')
+    obs.persist()
+    # Even before compaction, pending/diagnosis payloads cannot enlarge the JSON header.
+    assert obs.store.path('observer-state.json').stat().st_size < 65536
+    obs.compact()
+    restored = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    assert len(restored.s['jobs']) <= 132
+    assert len(restored.s['notices']) <= 164
+    restored.queue('incident:0', 'must not replay analysis')
+    assert 'incident:0' not in restored.s['jobs']  # durable indexed dedup survives archive eviction
+    assert sum(not n['sent'] for n in restored.s['notices'].values()) == 100
+    assert list(restored.store.root.glob('observer-history.jsonl*'))
+
+
+def test_legacy_observer_migration_cannot_replay_newer_claims(tmp_path):
+    from ops.h3_formal_watch.common import digest
+    config = observer_config(tmp_path)
+    store = Store(config['state_dir'])
+    legacy = dict(config_id=digest(config), dry_run=False, boot_id=process.boot_id(),
+                  unreachable_since=None, last_state=None, fetch_error=None,
+                  jobs={'incident:i': dict(label='incident', analyze=True, alert=True,
+                        repeat=False, created_at=0, analysis_status='pending')},
+                  notices={'incident:i': dict(sent=False, text='original')})
+    store.save('observer-state.json', legacy)
+    obs = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    obs.s['jobs']['incident:i']['analysis_status'] = 'claimed'
+    obs.s['notices']['incident:i'].update(sent=True, repeat_window=7)
+    obs.ledger.flush()  # simulate crash before legacy JSON header was replaced
+    restored = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    assert restored.s['jobs']['incident:i']['analysis_status'] == 'claimed'
+    assert restored.s['notices']['incident:i']['sent']
+    assert restored.s['notices']['incident:i']['repeat_window'] == 7
+
+
+def test_human_observations_only_on_health_change(box):
+    box.tick()
+    box.watch.human('review')
+    box.tick()
+    for _ in range(5):
+        box.advance(60); box.monitor(); box.tick()
+    events = [json.loads(line) for line in box.watch.store.path('events.jsonl').read_text().splitlines()]
+    assert sum(e['kind'] == 'human_observation' for e in events) == 1
+    box.health = dict(ok=False, identity_changed=True)
+    box.tick()
+    events = [json.loads(line) for line in box.watch.store.path('events.jsonl').read_text().splitlines()]
+    assert sum(e['kind'] == 'human_observation' for e in events) == 2
+
+
+def test_rotated_segments_have_retention_cap(tmp_path):
+    store = Store(tmp_path)
+    for i in range(30):
+        store.append_rotated('events.jsonl', dict(i=i, payload='x' * 60), limit=100)
+    assert len(list(tmp_path.glob('events.jsonl*'))) <= 9  # active plus eight archives
+    assert json.loads(store.path('events.jsonl').read_text())['i'] == 29
+
+
+def test_observer_unit_covers_bounded_command_budget(tmp_path):
+    from ops.h3_formal_watch import observer
+    text = Path('ops/h3_formal_watch/systemd/h3-formal-observer.service').read_text()
+    minutes = int(next(line.split('=')[1][:-3] for line in text.splitlines() if line.startswith('TimeoutStartSec=')))
+    # Max configured SSH/analysis timeouts alone already exceed the old 30min.
+    assert minutes * 60 > 3 * 125 + 30 + 4 * 605
+    assert minutes * 60 > 3 * 125 + 30 + 4 * 605 + observer.MAX_NOTIFICATIONS_PER_TICK * 125
+    notify = FakeNotifier()
+    obs = Observer(observer_config(tmp_path), clock=lambda: 0, notifier=notify)
+    for i in range(100):
+        obs.s['notices'][str(i)] = dict(sent=False, text='queued')
+    with pytest.raises(RuntimeError, match='undelivered'):
+        obs.drain_notices()
+    assert len(notify.calls) == observer.MAX_NOTIFICATIONS_PER_TICK
+
+
 def test_user_unit_contract():
     units = Path(__file__).resolve().parents[1] / 'ops/h3_formal_watch/systemd'
     watchdog = (units / 'h3-formal-watchdog.service').read_text()

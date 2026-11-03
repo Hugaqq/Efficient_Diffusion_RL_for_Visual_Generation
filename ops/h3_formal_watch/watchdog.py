@@ -670,13 +670,23 @@ class Watchdog:
         self.needs_arm = True
         self.state('ARMING')  # no launch; a dead process remains a human decision
 
+    def observe_human(self, checks):
+        # Health transitions, not ticking ages/free-byte counters/producer timestamps.
+        fields = ('ok', 'alive', 'error', 'degraded', 'identity_changed', 'step',
+                  'checkpoint_step', 'fingerprint')
+        summary = {name: {k: row[k] for k in fields if k in row} for name, row in checks.items()}
+        identity = digest(dict(token=self.s.get('human_token'), checks=summary))
+        if identity != self.s.get('human_observation_id'):
+            self.event('human_observation', checks=bounded(checks))
+            self.s['human_observation_id'] = identity
+
     def tick(self):
         try:
             if self.s['state'] == 'DONE':
                 return self.s
             checks = self.collect()  # even NEEDS_HUMAN keeps read-only evidence current
             if self.s['state'] == 'NEEDS_HUMAN':
-                self.event('human_observation', checks=bounded(checks))
+                self.observe_human(checks)
                 self.acknowledge()
                 return self.s
             if self.needs_arm:

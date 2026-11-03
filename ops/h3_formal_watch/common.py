@@ -39,8 +39,8 @@ def digest(value):
 class Store:
     """All writes are direct children of an operator-owned, non-symlink state dir.
 
-    Do not put untrusted writers in this directory. Retain all receipts; never unlink.
-    Atomic replacement of our own status files is the only overwrite operation.
+    Do not put untrusted writers in this directory. Retain ownership/launch receipts.
+    Bounded diagnostic segments may expire; pending work and dedup never rely on them.
     """
     def __init__(self, root):
         self.root = Path(os.path.abspath(root))
@@ -84,13 +84,19 @@ class Store:
             stream.flush()
             os.fsync(stream.fileno())
 
-    def append_rotated(self, name, payload, limit=1024 * 1024):
-        """Append-only segments: rotate by rename, never truncate or delete history."""
+    def append_rotated(self, name, payload, limit=1024 * 1024, keep=8):
+        """Bounded diagnostic history: active segment plus at most keep archives."""
         path = self.path(name)
         size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()) + 1
         if path.exists() and path.stat().st_size + size > limit:
             path.rename(self.path(name + '.' + uuid.uuid4().hex))
         self.append(name, payload)
+        segments = sorted((p for p in self.root.glob(name + '.*')
+                           if len(p.name.removeprefix(name + '.')) == 32 and
+                           all(c in '0123456789abcdef' for c in p.name.removeprefix(name + '.'))),
+                          key=lambda p: (p.stat().st_mtime_ns, p.name))
+        for old in segments[:max(0, len(segments) - keep)]:
+            self.path(old.name).unlink()
 
     def lock(self, name):
         fd = os.open(self.path(name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)

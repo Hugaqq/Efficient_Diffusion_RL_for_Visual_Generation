@@ -17,9 +17,12 @@ from .common import Store, digest, read_json
 from .commands import run_command
 from .notifier import FeishuNotifier, validate_target
 from .reports import Reports
+from .ledger import Ledger
 from .process import boot_id
 
 STATES = {'ARMING', 'WATCHING', 'STOPPING', 'RECOVERING', 'LAUNCHING', 'NEEDS_HUMAN', 'DONE'}
+MAX_NOTIFICATIONS_PER_TICK = 8
+MAX_JOBS_PER_TICK = 64
 
 
 def ssh_argv(config):
@@ -147,10 +150,18 @@ class Observer:
         self.notifier = notifier or FeishuNotifier(config['notifier'], dry_run=dry_run, runner=runner)
         self.reports = Reports(config['report_dir'], config['progress_log_path'])
         identity = digest(config)
-        self.s = self.store.load('observer-state.json') or dict(config_id=identity, dry_run=dry_run,
-                 unreachable_since=None, last_state=None, jobs={}, notices={}, fetch_error=None)
+        state_path = self.store.path('observer-state.json')
+        # One-time migration also handles old inline histories already over 2 MiB.
+        self.s = (read_json(state_path, 64 * 1024 * 1024) if state_path.exists() else None) or dict(
+                 config_id=identity, dry_run=dry_run, unreachable_since=None, last_state=None,
+                 jobs={}, notices={}, fetch_error=None)
         if self.s['config_id'] != identity or self.s['dry_run'] != dry_run:
             raise ValueError('observer config/dry-run mode changed; reconcile state before switching')
+        self.ledger = Ledger(self.store, digest(dict(config=identity, dry_run=dry_run)))
+        for kind in ('jobs', 'notices'):
+            self.ledger.migrate(kind, self.s.get(kind, {}))
+            self.s[kind] = self.ledger.maps[kind]
+        self.notification_attempts = 0
         if self.s.get('boot_id') != self.boot:
             self.s.update(boot_id=self.boot, unreachable_since=None)
             for notice in self.s['notices'].values():
@@ -164,19 +175,22 @@ class Observer:
                 raise ValueError('chat/group targets are forbidden')
             validate_target(self.config.get('notifier'))
         except ValueError as exc:
-            self.store.append('notifier-errors.jsonl', dict(at=self.clock(), error=str(exc)))
+            self.store.append_rotated('notifier-errors.jsonl', dict(at=self.clock(), error=str(exc)))
             raise
 
     def persist(self):
         self.s['checked_at'] = self.clock()
-        self.store.save('observer-state.json', self.s)
+        self.ledger.flush()
+        self.store.save('observer-state.json', {k: v for k, v in self.s.items() if k not in ('jobs', 'notices')})
 
     def queue(self, key, label, *, analyze=True, alert=True, repeat=False):
-        if key not in self.s['jobs']:
+        if not self.s['jobs'].seen(key):
             self.s['jobs'][key] = dict(label=label, analyze=analyze, alert=alert, repeat=repeat,
                                       created_at=self.clock(), analysis_status='pending')
 
     def notify(self, key, text, *, repeat=False):
+        if not repeat and self.s['notices'].seen(key) and key not in self.s['notices']:
+            return  # delivered and compacted; never resurrect its payload
         entry = self.s['notices'].setdefault(key, dict(sent=False, text=text))
         if entry.get('sent') and not repeat:
             return
@@ -198,6 +212,9 @@ class Observer:
             # Never replay a legacy outbox payload containing the full model response.
             label = self.s['jobs'].get(key.removeprefix('analysis:'), {}).get('label', '事件诊断')
             entry['text'] = '[H3 只读建议] ' + label[:200] + '\n本地记录：' + str(self.reports.path())
+        if self.notification_attempts >= MAX_NOTIFICATIONS_PER_TICK:
+            return  # durable pending row drains on another timer tick
+        self.notification_attempts += 1
         # Advance only for a NEW repeat, never for retrying an ambiguous attempt.
         window = int(self.monotonic() // self.config.get('alert_repeat_seconds', 3600))
         if entry.get('sent') and repeat:
@@ -276,7 +293,28 @@ class Observer:
                            analysis_error=repr(exc))
         self.persist()
 
+    def delivered(self, key):
+        entry = self.s['notices'].get(key)
+        return bool(entry and (entry.get('sent') or entry.get('suppressed'))) or (
+            entry is None and self.s['notices'].seen(key))
+
+    def compact(self):
+        def finished(key, job):
+            return (not job.get('repeat') and
+                (not job.get('analyze') or job.get('analysis_status') not in ('pending', 'claimed')) and
+                (not (key.startswith('daily:') or job.get('diagnosis')) or job.get('report_written')) and
+                (not job.get('alert') or key.startswith('daily:') or self.delivered(key)) and
+                (not job.get('diagnosis') or key.startswith('daily:') or self.delivered('analysis:' + key)))
+        for key, job in self.s['jobs'].items():
+            if finished(key, job):
+                job['finished'] = True
+        self.s['jobs'].compact(32, lambda key, row: row.get('finished'))
+        self.s['notices'].compact(64, lambda key, row: not key.startswith('deadman:') and
+                                 (row.get('sent') or row.get('suppressed')))
+        self.persist()
+
     def tick(self, snapshot=None):
+        self.notification_attempts = 0
         now = self.clock()
         fresh = False
         try:
@@ -338,9 +376,10 @@ class Observer:
             self.queue(key, '每日训练摘要', alert=False)
         self.persist()  # pending jobs survive timer/service restart
         budget = self.config.get('max_analyses_per_tick', 4)
-        for key, job in self.s['jobs'].items():
+        for key, job in self.s['jobs'].batch(self.s.get('job_cursor', ''), MAX_JOBS_PER_TICK):
+            self.s['job_cursor'] = key
             resolved = key.startswith('deadman:') and key.removeprefix('deadman:') not in reasons
-            if resolved and key in self.s['notices']:
+            if resolved and self.s['notices'].seen(key):
                 continue  # initial outbox exists; drain it, but don't create more repeats
             headline = '[H3 观察器] ' + job['label'] + '\n' + json.dumps(dict(
                 state=status.get('state') if status else 'UNKNOWN',
@@ -374,7 +413,10 @@ class Observer:
             if not daily and job.get('diagnosis'):
                 self.notify('analysis:' + key, '[H3 只读建议已保存] ' + job['label'][:200]
                             + '\n本地记录：' + str(self.reports.path()))
-        self.drain_notices()
+        try:
+            self.drain_notices()
+        finally:
+            self.compact()
         if any(job.get('report_error') for job in self.s['jobs'].values()):
             raise RuntimeError('local report writes pending; systemd/timer must retry')
         return self.s

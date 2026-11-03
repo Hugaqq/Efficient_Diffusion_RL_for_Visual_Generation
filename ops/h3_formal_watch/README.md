@@ -4,6 +4,10 @@ Infrastructure only: **not deployed or authorized for a real experiment**. Do no
 use paused runs as test targets. No training math, flags, HPS service, monitor
 budgets or scientific semantics are changed. Linux/systemd and external CLIs still
 need separately authorized acceptance. All development tests/drills are offline.
+The observer unit allows 90 minutes: worst configured helper sum is 3825 seconds
+(3×125s SSH + 30s backoff + 4×605s analysis + 8×125s sends, including 5s cleanup
+per helper), with margin for local IO/scheduling. It cannot make unbounded sends
+in one invocation; deferred/failed deliveries remain durable for subsequent ticks.
 
 ## Watchdog contract
 
@@ -70,16 +74,18 @@ need separately authorized acceptance. All development tests/drills are offline.
   original recipe identity, argv, full env and cwd are preserved. Launcher remains
   the authoritative semantic/runtime admission gate. Ambiguous launches are never
   replayed. Old watchdog-owned pause targets are archived, not deleted.
-* NEEDS_HUMAN keeps doing read-only checks and archiving observations, never signals
+* NEEDS_HUMAN keeps doing read-only checks; observations are recorded only on
+  health/progress/token changes, not every age/free-byte/timestamp tick. It never signals
   or launches, and remains sticky until explicit acknowledgement. DONE additionally
   requires matching SUCCESS/run/checkpoint data, empty ownership and exit-code-0
   receipt. An adopted process without a receipt cannot establish DONE.
 * `status.json` retains only 32 incident summaries, bounded checks and 128 resume
   summaries (above the maximum allowed rolling limit of 100). Full incident data
   goes to fsynced `incidents.jsonl`; events to `events.jsonl`. At 1 MiB these files
-  rotate by rename into uniquely named immutable segments; **nothing is deleted**.
-  Monitor archive disk usage. Old observer outages may miss summaries outside this
-  window: archive review, not the small status snapshot, is the complete history.
+  rotate by rename, retaining at most **eight archived segments plus the active file**
+  per stream; older diagnostics are deleted. Ownership, launch and exit receipts are
+  not rotated. Export diagnostics separately if longer history is required. Outages
+  beyond retained status/event windows can miss evidence; no complete-history claim.
 
 ## Ownership: systemd first, conservative adoption fallback
 
@@ -287,6 +293,22 @@ alerts to bypass the identity check.
 NEEDS_HUMAN alerts are keyed by the durable human token, including a new latch
 between two polls that both observe NEEDS_HUMAN. Persisted dead-man jobs finish
 publishing their initial outbox entry even if the next snapshot is healthy.
+Jobs and outbox rows live in `observer-work.sqlite3` (standard-library SQLite,
+FULL synchronous commits), not the small `observer-state.json` header. Legacy inline
+state up to 64 MiB migrates before any work; repeated migration cannot overwrite
+newer claims/delivery results. Pending rows are never evicted and are streamed from
+disk. Each tick visits at most 64 unfinished jobs round-robin, runs at most four
+analyses and attempts at most eight notifications. Remaining work drains later.
+
+Completed jobs/diagnoses/notices compact to `observer-history.jsonl` (1 MiB segments,
+eight archives plus active), retaining only 32 completed jobs and 64 delivered
+notices in the active database. Completed briefs/raw model responses expire with
+compaction; readable local reports retain diagnoses. Compact indexed dedup tombstones
+remain in SQLite independently of archive retention. Back up the database with the
+header, never delete it to reset retries. Pending backlog and dedup keys necessarily
+use disk proportional to undelivered/unique work, but no longer inflate JSON or
+require loading all payloads into memory; monitor disk capacity.
+
 Alert text/attempts form a durable outbox. Undelivered messages drain even
 when the triggering condition has resolved; failed sends exit nonzero, with a
 5-minute service retry/cooldown. A new repeat window gets a new idempotency key;
