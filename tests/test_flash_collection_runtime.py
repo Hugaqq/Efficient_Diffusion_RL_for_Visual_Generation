@@ -1786,10 +1786,21 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert sorted(r.relative for r in evidence.records) == ['vae/config.json', 'vae/diffusion_pytorch_model.safetensors']
         assert all(r.sha256 == hashlib.sha256((root / r.relative).read_bytes()).hexdigest() for r in evidence.records)
         events, loads, decodes, finalized = [], [], [], []
-        knobs = dict(rng=False, drift=None, probe=False)
+        knobs = dict(rng=False, drift=None, probe=False, processor=None)
         patch.setattr(memory, 'event', lambda kind, **fields: events.append((kind, fields)))
         for module, name in ((torch, 'set_rng_state'), (random, 'setstate'), (np.random, 'set_state')):
             patch.setattr(module, name, lambda *a, **k: pytest.fail('video reuse must observe RNG read-only'))
+        class Processor:  # mirrors MiniMaxH3VideoAttnProcessor: plain callable object without tensor state
+            _attention_backend = None
+            _parallel_config = None
+            def __call__(self, module, hidden_states): return hidden_states
+        class Attention(torch.nn.Module):  # mirrors AttentionModuleMixin.set_processor: object kept in vars(module)
+            def __init__(self):
+                super().__init__()
+                self.to_q = torch.nn.Parameter(torch.ones(1))  # deterministic: the loader must not consume RNG
+                self.processor = Processor()
+                if knobs['processor'] == 'tensor': self.processor.cache = torch.zeros(1)
+                if knobs['processor'] == 'cycle': self.processor.owner = self.processor
         def resolve(component):
             class Leaf(torch.nn.Module):
                 def __init__(self, config):
@@ -1797,6 +1808,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                     self.weight = torch.nn.Parameter(torch.tensor(1.))
                     self.register_buffer('filter', torch.tensor([.5]))
                     self.config = config; self.hop_length = 800
+                    if component == 'vae': self.attn = Attention()
                     if knobs['probe'] and component == 'vae': self.flags = {None, 'mixed'}  # probe sorted() TypeError
                 @classmethod
                 def from_pretrained(cls, path, *, subfolder, torch_dtype, local_files_only):
@@ -1813,6 +1825,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                         return (latents[:, :1].repeat_interleave(800, dim=2) * self.weight,)
                     if knobs['drift'] == 'buffer': self.filter.add_(1.)  # registered state changed in place
                     if knobs['drift'] == 'attribute': self.scratch = torch.ones(1)  # unregistered tensor state
+                    if knobs['drift'] == 'processor': self.attn.processor.calls = 1  # nested plain state changed
                     t = torch.arange(geometry.num_frames) % latents.shape[2]
                     h = torch.arange(geometry.height) % latents.shape[3]
                     w = torch.arange(geometry.width) % latents.shape[4]
@@ -1852,7 +1865,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert on[0] == off[0] and on[1] == off[1] == ['vae', 'audio_vae'] * 2 and not decoder._poisoned
         assert [f['reason'][:9] for k, f in events if k == 'video_reuse_ineligible'] == ['TypeError']
         knobs['probe'] = False
-        for drift in ('buffer', 'attribute'):  # decode changed registered/unregistered state: media kept, cache dropped
+        for drift in ('buffer', 'attribute', 'processor'):  # decode changed registered/unregistered/nested state: media kept, cache dropped
             knobs['drift'] = drift
             off, on = run(decoder, False), run(decoder, True)
             assert on[0] == off[0] and on[1] == off[1] == ['vae', 'audio_vae'] * 2 and not decoder._poisoned
@@ -1860,6 +1873,21 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             assert reasons[0].startswith('decode-state-drift') and reasons[-1] == 'owner-scope-release'
             assert 'video_reuse_hit' not in [k for k, _ in events]
         knobs['drift'] = None
+        for hidden, reason in (('tensor', 'ValueError: unregistered tensor state'), ('cycle', 'ValueError: cyclic module state')):
+            knobs['processor'] = hidden  # processor object hiding tensor/cyclic state: ineligible, off path
+            off, on = run(decoder, False), run(decoder, True)
+            assert on[0] == off[0] and on[1] == off[1] == ['vae', 'audio_vae'] * 2 and not decoder._poisoned
+            assert [f['reason'] for k, f in events if k == 'video_reuse_ineligible'] == [reason]
+        knobs['processor'] = None
+        class Plain: pass
+        nested = Plain(); nested.inner = Plain(); nested.inner.flag = 'x'
+        name = Plain.__module__ + '.' + Plain.__qualname__
+        assert reuse._plain(nested) == ['object', name, {'inner': ['object', name, {'flag': 'x'}]}]
+        deep = []
+        for _ in range(reuse._NEST_LIMIT + 1): deep = [deep]
+        for bad, message in ((deep, 'nested too deeply'), (lambda: None, 'callable'), (Plain, 'callable'),
+                             (torch.nn.Linear(1, 1), 'module state'), (object(), 'uncontrolled Python')):
+            with pytest.raises(ValueError, match=message): reuse._plain(bad)
         # Credential is an invalidation sentinel over the hashed file set/stat.
         shard = root / 'vae/diffusion_pytorch_model.safetensors'
         original, stamp = shard.read_bytes(), shard.stat()

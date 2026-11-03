@@ -6,6 +6,9 @@ an atomic filesystem lock. File SHA authority comes from binding's full hash.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass
+import enum
+import functools
+import inspect
 import json
 from pathlib import Path
 import random
@@ -72,14 +75,37 @@ def _supported_class(model):
             and type(model).__name__ == 'AutoencoderKLMiniMaxH3')
 
 
-def _plain(value):
+_NEST_LIMIT = 8
+
+
+def _plain(value, depth=0, active=()):
+    """JSON-safe structural signature of non-registered module state.
+
+    Plain instances (e.g. an attention processor object stored in
+    vars(module)) are described by class identity plus their own vars under
+    the same rules; any tensor/module/routine/class inside rejects. Bounded
+    depth and a path cycle guard keep the walk finite.
+    """
     if isinstance(value, torch.Tensor): raise ValueError('unregistered tensor state')
+    if isinstance(value, torch.nn.Module): raise ValueError('unregistered module state')
     if value is None or type(value) in (str, bool, int, float): return value
     if isinstance(value, (torch.dtype, torch.device)): return str(value)
-    if isinstance(value, dict): return {str(k): _plain(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)): return [_plain(v) for v in value]
-    if isinstance(value, (set, frozenset)): return sorted(_plain(v) for v in value)
-    raise ValueError('uncontrolled Python module state')
+    if isinstance(value, enum.Enum): return ['enum', _qualified(type(value)), value.name]
+    if inspect.isroutine(value) or inspect.isclass(value) or isinstance(value, functools.partial):
+        raise ValueError('uncontrolled callable state')
+    if depth >= _NEST_LIMIT: raise ValueError('module state nested too deeply')
+    if id(value) in active: raise ValueError('cyclic module state')
+    active = active + (id(value),)
+    if isinstance(value, dict): return {str(k): _plain(v, depth + 1, active) for k, v in value.items()}
+    if isinstance(value, (list, tuple)): return [_plain(v, depth + 1, active) for v in value]
+    if isinstance(value, (set, frozenset)): return sorted(_plain(v, depth + 1, active) for v in value)
+    fields = getattr(value, '__dict__', None)
+    if type(fields) is not dict: raise ValueError('uncontrolled Python module state')
+    return ['object', _qualified(type(value)), {str(k): _plain(v, depth + 1, active) for k, v in fields.items()}]
+
+
+def _qualified(cls):
+    return cls.__module__ + '.' + cls.__qualname__
 
 
 def _state(model, device):
