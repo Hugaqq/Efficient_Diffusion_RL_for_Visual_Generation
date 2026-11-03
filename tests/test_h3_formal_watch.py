@@ -1155,7 +1155,7 @@ def test_report_atomic_append_bounded_sections_and_crash_replay(tmp_path):
         with pytest.raises(OSError):
             reports.record('daily:2026-11-04', '2026-11-04', 'next', daily=True)
     assert daily.read_text() == before
-    with patch.object(reports.progress, 'text', side_effect=OSError('progress write failed')):
+    with patch('ops.h3_formal_watch.reports.append_progress', side_effect=OSError('progress write failed')):
         with pytest.raises(OSError):
             reports.record('daily:2026-11-04', '2026-11-04', 'summary', '长' * 20000, daily=True)
     after = daily.read_text()
@@ -1507,6 +1507,44 @@ def test_observer_unit_covers_bounded_command_budget(tmp_path):
     with pytest.raises(RuntimeError, match='undelivered'):
         obs.drain_notices()
     assert len(notify.calls) == observer.MAX_NOTIFICATIONS_PER_TICK
+
+
+def test_progress_log_uses_append_preserves_concurrent_edits_and_mode(tmp_path):
+    from ops.h3_formal_watch.reports import Reports
+    progress = tmp_path / 'progress.md'
+    progress.write_text('operator history\n')
+    progress.chmod(0o640)
+    inode = progress.stat().st_ino
+    reports = Reports(tmp_path / 'reports', progress)
+    real_open, real_write = os.open, os.write
+    append_fds, injected = set(), []
+    def opening(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path) == progress and flags & os.O_APPEND:
+            append_fds.add(fd)
+        return fd
+    def writing(fd, raw):
+        if fd in append_fds and not injected:
+            injected.append(True)
+            with progress.open('a') as stream:
+                stream.write('concurrent operator edit\n')
+        return real_write(fd, raw)
+    with patch('os.open', side_effect=opening), patch('os.write', side_effect=writing):
+        reports.record('daily:date', 'date', 'summary', daily=True)
+    assert append_fds and injected
+    assert progress.stat().st_ino == inode and progress.stat().st_mode & 0o777 == 0o640
+    assert 'concurrent operator edit' in progress.read_text()
+    reports.record('daily:date', 'date', 'summary', daily=True)
+    assert progress.read_text().count('H3 daily summary') == 1
+    assert not list(tmp_path.glob('.h3-progress*')) and not list(tmp_path.glob('.write-*'))
+
+
+def test_failed_atomic_report_write_leaves_no_temp(tmp_path):
+    store = Store(tmp_path)
+    with patch('os.replace', side_effect=OSError('failed replace')):
+        with pytest.raises(OSError):
+            store.text('report.md', 'new section')
+    assert not list(tmp_path.glob('.write-*'))
 
 
 def test_user_unit_contract():

@@ -1,4 +1,6 @@
 """Local-only Markdown reports, bounded sections and crash-safe append-once writes."""
+import fcntl
+import os
 from pathlib import Path
 
 from .common import Store, digest
@@ -12,6 +14,38 @@ def append_once(store, name, marker, text):
     previous = path.read_text(encoding='utf-8') if path.exists() else ''
     if marker not in previous.splitlines():
         store.text(name, previous + ('\n' if previous and not previous.endswith('\n') else '') + text)
+
+
+def append_progress(store, name, line):
+    """Lock the actual inode, then append one marker-bearing line with O_APPEND.
+
+    Other appenders need not share our lock: their bytes are never replaced. A
+    writer that replaces/truncates the entire file must still coordinate externally.
+    """
+    path = store.path(name)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'r', encoding='utf-8') as stream:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        last = ''
+        for previous in stream:
+            if previous.rstrip('\n') == line:
+                os.fsync(fd)  # replay after an earlier append succeeded but fsync failed
+                return
+            last = previous
+        raw = (('\n' if last and not last.endswith('\n') else '') + line + '\n').encode('utf-8')
+        # Regular-file appends are normally one write. Handle a short write without
+        # replacing existing bytes; a failed partial line is not a complete marker.
+        while raw:
+            written = os.write(fd, raw)
+            if not written:
+                raise OSError('zero-byte progress append')
+            raw = raw[written:]
+        os.fsync(fd)
+    directory = os.open(store.root, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 class Reports:
@@ -42,6 +76,5 @@ class Reports:
                 # A separate marker-bearing single line makes a crash between the
                 # report, progress and observer-state writes safe to replay.
                 line = '- ' + date + ' H3 daily summary saved: ' + str(self.path(True)) + ' ' + marker
-                with self.progress.lock('.h3-progress.lock'):
-                    append_once(self.progress, self.progress_name, line, line + '\n')
+                append_progress(self.progress, self.progress_name, line)
         return self.path(daily)

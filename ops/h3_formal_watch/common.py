@@ -59,11 +59,14 @@ class Store:
     def text(self, name, text):
         dest = self.path(name)
         temporary = self.path('.write-' + uuid.uuid4().hex)
-        with temporary.open('x', encoding='utf-8') as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, dest)
+        try:
+            with temporary.open('x', encoding='utf-8') as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, dest)
+        finally:
+            temporary.unlink(missing_ok=True)
         fd = os.open(self.root, os.O_RDONLY)
         try:
             os.fsync(fd)

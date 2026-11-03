@@ -276,9 +276,14 @@ the progress log. Non-daily pi diagnoses go to `report_dir/INCIDENTS.md` with th
 same section cap. Alert DMs contain only a bounded event/status summary and the
 local INCIDENTS.md path; the initial alert may precede its diagnosis file write.
 The follow-up DM announces the saved diagnosis, without copying model output.
-Reports use whole-file temp+fsync+rename, locks and durable markers to avoid
-partial publication or duplicate sections/progress lines after a crash. History
-is retained without rotation; monitor local disk usage. Dry-run also writes these
+Report files use whole-file temp+fsync+rename and durable markers under reports.lock;
+failed writes clean up their temporary file. Progress lines instead use O_APPEND,
+fsync and an inode lock, preserving existing mode/inode and concurrent appends;
+no progress lock or temporary sidecar is created. Markers avoid duplicate completed
+lines on retry. Uncoordinated whole-file replacements/truncations by other writers
+are outside this append contract; an interrupted short write can leave a partial line.
+Readable report/progress history is retained without rotation; monitor local disk
+usage. Dry-run also writes these
 local artifacts, so use separate dry-run state, reports and progress paths.
 
 Daily summaries and their diagnoses never enter the alert outbox; legacy queued
