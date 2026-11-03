@@ -148,6 +148,9 @@ class H3DualIterationStages(H3IterationStages):
                                           seconds=time.monotonic()-started)),flush=True)
                     yield media
             def score(sample,media):
+                # Called by the P1 consumer thread just before each POST.
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError('parallel owners aborted; no new HPS request')
                 sid=sample.sample_id
                 started=time.monotonic()
                 print(json.dumps(dict(event='h3_reward_score_begin',sample_id=sid)),flush=True)

@@ -2785,7 +2785,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         budgets = []
         patch.setattr(h3_loading, '_admit_host_memory', budgets.append)
         running, peak, live = [0], [0], threading.Lock()
-        holds, gates_seen = {}, []
+        holds, gates_seen, posted = {}, [], []
         def make_stage(rank, *, parallel, fail_rank=None, block=None):
             stage = object.__new__(H3DualIterationStages)
             stage.rank, stage.mode, stage.media_bytes, stage.decode_bytes = rank, 'dual_flash', 10**7, 2*10**7
@@ -2797,13 +2797,14 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 with live: running[0] += 1; peak[0] = max(peak[0], running[0])
                 try:
                     time.sleep(delays.uniform(0, .02))  # rank-specific timing
-                    if block is not None and rank != fail_rank: assert block.wait(20)
+                    if block is not None and rank != fail_rank: assert block[rank].wait(20)
                     media = H3AVMedia(torch.full((2, 3, 2, 2), float(terminal[0, 0])), torch.zeros(4, 2), 24, 32000)
                 finally:
                     with live: running[0] -= 1
                 try: yield media
                 finally: media._release()
             def score_one(*, sample_id, prompt, media):
+                posted.append(rank)
                 time.sleep(delays.uniform(0, .02))
                 if rank == fail_rank: raise RuntimeError('owner 5 HPS failure')
                 return p2_score(sample_id)
@@ -2859,22 +2860,50 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         assert budgets == [8*(2*10**7 + 2*10**7)]*8 + [3*10**7]*8
         assert {label for label in calls[0] if label[0] == 'all_reduce'} == {('all_reduce', (2, 8))}
         # One owner failing poisons ALL ranks at the next heartbeat while the
-        # other owners are still blocked in decode; no end/credit collective.
-        block = Event()
-        started = time.monotonic()
-        failed = p2_iteration(True, fail_rank=5, block=block)
-        elapsed = time.monotonic() - started
-        block.set()
+        # other owners are still blocked in their first decode (released only by
+        # their own abort cancel); no end/credit collective. After the abort the
+        # released decode yields media, but the consumer sends NO new POST, and
+        # every rank joins its worker before raising (nothing left running).
+        cancel_of, real_concurrent = {}, p2coord.H3Coordination.aux_concurrent
+        def capture_cancel(self, work, **kwargs):
+            cancel_of[self._rank] = kwargs['cancel']
+            return real_concurrent(self, work, **kwargs)
+        posted.clear()
+        with patch.context() as capture:
+            capture.setattr(p2coord.H3Coordination, 'aux_concurrent', capture_cancel)
+            failed = p2_iteration(True, fail_rank=5, block=cancel_of)
         assert all(isinstance(e, p2coord.H3CoordinationError) and 'failed on ranks [5]' in str(e) for e in failed), failed
         assert isinstance(failed[5].__cause__, RuntimeError) and 'owner 5 HPS failure' in str(failed[5].__cause__)
-        assert elapsed < 15 and all(holds[r] for r in range(8))
+        assert all(holds[r] for r in range(8)) and all(cancel_of[r].is_set() for r in range(8))
+        assert set(posted) == {5}  # blocked owners never POSTed, even after their decode returned
         assert all(c == world.calls[0] for c in world.calls.values())
         failed_events = [label[1] for label in world.calls[0] if label[0] == 'all_gather_object']
         assert 'aux/parallel/end' not in failed_events and 'credit' not in failed_events
-        for _ in range(500):
-            if not any(t.name.startswith('h3-aux-parallel-') or t.name == 'h3-reward-consumer' for t in threading.enumerate()): break
-            Event().wait(.01)
-        assert not any(t.name.startswith('h3-aux-parallel-') for t in threading.enumerate())
+        assert not any(t.name.startswith('h3-aux-parallel-') or t.name == 'h3-reward-consumer' for t in threading.enumerate())
+        # Abort landing after the LAST decode but before its score: the consumer
+        # must not POST it (deterministic: earlier scores have already begun).
+        cancel_box = []
+        class CancelMidway:
+            def gate(self, event, **kwargs):
+                if kwargs.get('local_error'): raise ValueError('local error')
+            def aux_concurrent(self, work, *, cancel, inflight, media_cap):
+                cancel_box.append(cancel); return work()
+        midway = make_stage(0, parallel=True); posted.clear()
+        inner_decode = midway.decode
+        @contextmanager
+        def decode_then_abort(terminal):
+            with inner_decode(terminal) as media:
+                if float(terminal[0, 0]) == 3.:
+                    for _ in range(500):
+                        if len(posted) == 3: break
+                        Event().wait(.01)
+                    cancel_box[0].set()
+                yield media
+        midway.decode = decode_then_abort
+        midway_ctx = rank_context(0); midway_ctx.coordinator = CancelMidway(); midway._active = midway_ctx
+        with pytest.raises(RuntimeError, match='no new HPS request'):
+            midway.reward(StageValue(midway_ctx.request.identity, midway_ctx))
+        assert posted == [0, 0, 0] and not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
         # Coordination-level bounds: local budget expiry, host media cap and a
         # rank in the serial mode all abort every rank in lock step.
         def coord_case(function):
@@ -2884,19 +2913,46 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 finally: holds[rank] = coordinator._poisoned
             return world.run(rank_work)
         stop = Event()
-        expired = coord_case(lambda r, c: c.aux_concurrent(lambda: stop.wait(20) if r == 2 else r, budget_s=.05))
+        expired = coord_case(lambda r, c: c.aux_concurrent(lambda: stop.wait(20) if r == 2 else r, budget_s=.05,
+                                                           abort_join_s=.05))
         stop.set()
         assert all(isinstance(e, p2coord.H3CoordinationError) and 'on ranks [2]' in str(e) and 'exceeded' in str(e) for e in expired)
         assert all(c == world.calls[0] for c in world.calls.values()) and all(holds.values())
         stop = Event()
         cancels = [Event() for _ in range(8)]
-        over = coord_case(lambda r, c: c.aux_concurrent(lambda: stop.wait(20), cancel=cancels[r], inflight=lambda: 3))
+        over = coord_case(lambda r, c: c.aux_concurrent(lambda: cancels[r].wait(20), cancel=cancels[r], inflight=lambda: 3))
+        assert not any(t.name.startswith('h3-aux-parallel-') for t in threading.enumerate())  # cancelled + joined
         stop.set()
         assert all(isinstance(e, p2coord.H3CoordinationError) and 'exceeds cap 16' in str(e) for e in over)
         assert all(e.is_set() for e in cancels)
         mixed = coord_case(lambda r, c: c.aux_turns(lambda: r) if r == 3 else c.aux_concurrent(lambda: r))
         assert all(isinstance(e, p2coord.H3CoordinationError) and 'gate failed' in str(e) for e in mixed)
         assert all(len(c) == 2 for c in world.calls.values())  # init gate + one mismatched begin gate
+        # Review fix: local failures between/around gates never strand peers.
+        # (a) setup failure before the begin gate -> one gate, work never runs;
+        ran, real_zeros = [], torch.zeros
+        def zeros_failing_on_rank4(*args, **kwargs):
+            if threading.current_thread().name == 'p2-rank-4' and args and args[0] == (2, 8):
+                raise RuntimeError('injected status allocation failure')
+            return real_zeros(*args, **kwargs)
+        with patch.context() as inject:
+            inject.setattr(torch, 'zeros', zeros_failing_on_rank4)
+            setup = coord_case(lambda r, c: c.aux_concurrent(lambda: ran.append(r)))
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'gate failed' in str(e) for e in setup)
+        assert 'injected status allocation' in str(setup[4].__cause__) and ran == []
+        assert all(len(c) == 2 for c in world.calls.values()) and all(holds.values())
+        assert not any(t.name.startswith('h3-aux-parallel-') for t in threading.enumerate())
+        # (b) a local status failure (inflight probe) is a common FAILED verdict;
+        flaky = coord_case(lambda r, c: c.aux_concurrent(lambda: Event().wait(.2),
+            inflight=(lambda: 1 // 0) if r == 1 else (lambda: 0)))
+        assert all(isinstance(e, p2coord.H3CoordinationError) and 'failed on ranks [1]' in str(e) for e in flaky)
+        assert isinstance(flaky[1].__cause__, ZeroDivisionError) and all(c == world.calls[0] for c in world.calls.values())
+        # (c) broken stdout/logging on every rank cannot break or desync the phase.
+        def broken_print(*args, **kwargs): raise OSError('stdout closed')
+        with patch.context() as inject:
+            inject.setattr(p2coord, 'print', broken_print, raising=False)
+            logged = coord_case(lambda r, c: c.aux_concurrent(lambda: ('local', r)))
+        assert logged == [('local', r) for r in range(8)]
         ok = coord_case(lambda r, c: c.aux_concurrent(lambda: ('local', r)))
         assert ok == [('local', r) for r in range(8)] and not any(holds.values())
     # P2 flag: strict bool, default off, dual_flash + paired_4x8 + reward pipeline only.
