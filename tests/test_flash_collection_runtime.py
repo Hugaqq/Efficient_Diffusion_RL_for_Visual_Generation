@@ -483,6 +483,43 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         assert row['gpus'][0]['physical_index']==0 and row['gpus'][0]['used_bytes']==12*1024**2
         assert row['gpu_processes'][0]['pid']==os.getpid() and row['processes'][0]['cpu_rss_bytes']>0
         assert row['schema']=='h3.card-sample.v1'
+    # Transient nvidia-smi timeouts degrade the monitor; only N consecutive are fatal.
+    import subprocess
+    def scripted_monitor(directory, script, captured):
+        calls=iter(script)
+        def query(fields, kind):
+            if kind!='gpu': return [['GPU-test',str(os.getpid()),'10','python']]
+            step=next(calls,'stop')
+            if step=='stop':
+                (directory/'STOP').touch();return [['0','GPU-test','12','52','64','9']]
+            if step=='health':
+                health=json.loads((directory/'health.json').read_text())
+                captured.append((health,monitor_healthy(directory,now_ns=health['monotonic_ns']+1)))
+            if step=='fail': raise subprocess.TimeoutExpired(['nvidia-smi'],8)
+            return [['0','GPU-test','12','52','64','9']]
+        return query
+    with monkeypatch.context() as mp:
+        captured=[];degraded=tmp_path/'monitor-degraded'
+        mp.setattr(card_monitor,'query',scripted_monitor(degraded,['ok','ok','fail','fail','health','ok'],captured))
+        card_monitor.run(degraded,tmp_path/'memory-events',interval=0.)
+        rows=[json.loads(line) for line in (degraded/'card-process.jsonl').read_text().splitlines()]
+        assert [r.get('consecutive_failures') for r in rows if r.get('degraded')]==[1,2]
+        assert all(r['schema']=='h3.card-sample.v1' and 'TimeoutExpired' in r['error'] for r in rows if r.get('degraded'))
+        mid,seen=captured[0]
+        assert mid['healthy'] is True and mid['degraded'] is True and mid['consecutive_failures']==2 and 'TimeoutExpired' in mid['last_error']
+        assert seen['degraded'] is True and seen['consecutive_failures']==2
+        final=json.loads((degraded/'health.json').read_text())
+        assert final['healthy'] is True and final['degraded'] is False and final['consecutive_failures']==0
+        assert monitor_healthy(degraded,now_ns=final['monotonic_ns']+1)['degraded'] is False
+        assert json.loads((degraded/'exit.json').read_text())['exit_code']==0
+        fatal=tmp_path/'monitor-fatal'
+        mp.setattr(card_monitor,'query',scripted_monitor(fatal,['ok','ok','fail','fail','fail','ok'],[]))
+        with pytest.raises(subprocess.TimeoutExpired):card_monitor.run(fatal,tmp_path/'memory-events',interval=0.)
+        assert json.loads((fatal/'health.json').read_text())['healthy'] is False
+        assert json.loads((fatal/'exit.json').read_text())['exit_code']==1
+        with pytest.raises(RuntimeError,match='unhealthy'):monitor_healthy(fatal)
+        for bad in (0,True,1.5):
+            with pytest.raises(ValueError):card_monitor.run(tmp_path/'monitor-bad',tmp_path/'memory-events',max_consecutive_failures=bad)
     # Exercise the real new bind/iteration/audit wrapper twice with tiny CPU
     # model/optimizer/world leaves. No fabricated real-GPU memory evidence.
     from scripts import launch_h3_resolution_memory as resolution_entry

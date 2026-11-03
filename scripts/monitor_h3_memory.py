@@ -65,20 +65,39 @@ def atomic(path, payload):
     temp.replace(path)
 
 
-def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_seconds=24*3600):
+def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_seconds=24*3600,
+        max_consecutive_failures=3):
+    """A failed nvidia-smi sample is degraded, not fatal, until N in a row fail."""
+    if type(max_consecutive_failures) is not int or max_consecutive_failures<1:
+        raise ValueError('max_consecutive_failures must be an int >= 1')
     directory.mkdir(parents=True, exist_ok=True)
-    started=time.monotonic();size=0;count=0
+    started=time.monotonic();size=0;count=0;failures=0
     try:
         with (directory/'card-process.jsonl').open('x',buffering=1) as stream:
+            def write(row):
+                nonlocal size
+                raw=json.dumps(row,allow_nan=False)+'\n'
+                size+=len(raw.encode())
+                if size>max_bytes:raise RuntimeError('monitor disk byte budget exhausted')
+                stream.write(raw);stream.flush()
             while not (directory/'STOP').exists():
                 tick=time.monotonic()
                 if tick-started>max_seconds:raise RuntimeError('monitor duration budget exhausted')
-                row=sample(journal_dir);raw=json.dumps(row,allow_nan=False)+'\n'
-                size+=len(raw.encode())
-                if size>max_bytes:raise RuntimeError('monitor disk byte budget exhausted')
-                stream.write(raw);stream.flush();count+=1
-                atomic(directory/'health.json',dict(healthy=True,pid=os.getpid(),sample_count=count,
-                       monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size))
+                try:
+                    row=sample(journal_dir)
+                except Exception as exc:
+                    failures+=1
+                    if failures>=max_consecutive_failures:raise
+                    now=time.monotonic_ns();utc=datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    write(dict(schema='h3.card-sample.v1',utc=utc,monotonic_ns=now,monitor_pid=os.getpid(),
+                               degraded=True,error=repr(exc),consecutive_failures=failures))
+                    atomic(directory/'health.json',dict(healthy=True,degraded=True,pid=os.getpid(),sample_count=count,
+                           consecutive_failures=failures,last_error=repr(exc),monotonic_ns=now,utc=utc,bytes=size))
+                else:
+                    failures=0
+                    write(row);count+=1
+                    atomic(directory/'health.json',dict(healthy=True,degraded=False,pid=os.getpid(),sample_count=count,
+                           consecutive_failures=0,monotonic_ns=row['monotonic_ns'],utc=row['utc'],bytes=size))
                 time.sleep(max(0.,interval-(time.monotonic()-tick)))
             os.fsync(stream.fileno())
         atomic(directory/'exit.json',dict(exit_code=0,sample_count=count,bytes=size))
@@ -88,10 +107,17 @@ def run(directory, journal_dir, *, interval=1., max_bytes=512*1024**2, max_secon
         raise
 
 
+def failure_limit(value):
+    if not isinstance(value,str) or not value.isascii() or not value.isdigit() or int(value)<1:
+        raise argparse.ArgumentTypeError('expected an integer >= 1')
+    return int(value)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory',type=Path);parser.add_argument('--journal-dir',type=Path,required=True)
-    args=parser.parse_args();run(args.directory,args.journal_dir)
+    parser.add_argument('--max-consecutive-failures',type=failure_limit,default=3)
+    args=parser.parse_args();run(args.directory,args.journal_dir,max_consecutive_failures=args.max_consecutive_failures)
 
 
 if __name__=='__main__':main()

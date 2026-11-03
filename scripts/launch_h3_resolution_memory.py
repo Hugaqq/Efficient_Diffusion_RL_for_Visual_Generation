@@ -39,7 +39,8 @@ def monitor_healthy(directory, *, now_ns=None):
     age=((time.monotonic_ns() if now_ns is None else now_ns)-health.get('monotonic_ns',0))/1e9
     if not health.get('healthy') or not 0<=age<15 or health.get('sample_count',0)<2:
         raise RuntimeError('card/process monitor unhealthy or stale; cannot start another update')
-    return health
+    # Degraded = transient nvidia-smi failures below the monitor's fatal limit.
+    return dict(health,degraded=health.get('degraded') is True,consecutive_failures=health.get('consecutive_failures',0))
 
 
 def phase(name):
