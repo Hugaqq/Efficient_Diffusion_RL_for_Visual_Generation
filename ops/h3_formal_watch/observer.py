@@ -198,12 +198,18 @@ class Observer:
             # Never replay a legacy outbox payload containing the full model response.
             label = self.s['jobs'].get(key.removeprefix('analysis:'), {}).get('label', '事件诊断')
             entry['text'] = '[H3 只读建议] ' + label[:200] + '\n本地记录：' + str(self.reports.path())
+        # Advance only for a NEW repeat, never for retrying an ambiguous attempt.
+        window = int(self.monotonic() // self.config.get('alert_repeat_seconds', 3600))
+        if entry.get('sent') and repeat:
+            entry['repeat_window'] = max(entry.get('repeat_window', -1) + 1, window)
+        entry.setdefault('repeat_window', window)
         # Durable outbox and attempt BEFORE send; draining never depends on active conditions.
         entry.update(attempted_at=self.clock(), attempted_mono=self.monotonic(), sent=False)
         self.persist()
         try:
             self.check_notification_policy()
-            self.notifier.send(entry['text'], digest(dict(config=self.s['config_id'], key=key))[:48])
+            self.notifier.send(entry['text'], digest(dict(config=self.s['config_id'], key=key,
+                                                       repeat_window=entry['repeat_window']))[:48])
             entry['sent'] = True
             entry.pop('error', None)
         except (OSError, RuntimeError, ValueError, TypeError, TimeoutError) as exc:
@@ -318,19 +324,24 @@ class Observer:
             for event in snapshot.get('events', []):
                 if event.get('kind') == 'auto_resume':
                     self.queue('resume:' + event['launch_id'], '已自动恢复：' + event['launch_id'])
-            if status['state'] != self.s['last_state']:
-                self.s['last_state'] = status['state']
-                if status['state'] in ('NEEDS_HUMAN', 'DONE'):
-                    identity = (status.get('incidents') or [{}])[-1].get('id', 'terminal')
-                    self.queue('state:' + status['state'] + ':' + identity, '训练状态：' + status['state'])
+            if status['state'] == 'NEEDS_HUMAN':
+                # A latch+ack+latch can happen entirely between polls. The durable
+                # latch token, not an observed state transition or incident, is its identity.
+                token = status.get('human_token') or 'legacy-missing-token'
+                self.queue('state:NEEDS_HUMAN:' + token, '训练状态：NEEDS_HUMAN')
+            elif status['state'] == 'DONE' and status['state'] != self.s['last_state']:
+                identity = (status.get('incidents') or [{}])[-1].get('id', 'terminal')
+                self.queue('state:DONE:' + identity, '训练状态：DONE')
+            self.s['last_state'] = status['state']
         key = daily_key(now, self.config.get('timezone', 'Asia/Shanghai'), self.config.get('daily_time', '09:00'))
         if key:
             self.queue(key, '每日训练摘要', alert=False)
         self.persist()  # pending jobs survive timer/service restart
         budget = self.config.get('max_analyses_per_tick', 4)
         for key, job in self.s['jobs'].items():
-            if key.startswith('deadman:') and key.removeprefix('deadman:') not in reasons:
-                continue  # recovered: do not keep repeating a resolved dead-man alert
+            resolved = key.startswith('deadman:') and key.removeprefix('deadman:') not in reasons
+            if resolved and key in self.s['notices']:
+                continue  # initial outbox exists; drain it, but don't create more repeats
             headline = '[H3 观察器] ' + job['label'] + '\n' + json.dumps(dict(
                 state=status.get('state') if status else 'UNKNOWN',
                 optimizer_step=status.get('optimizer_step') if status else None,
@@ -340,7 +351,7 @@ class Observer:
             headline = headline[:800]
             job.setdefault('report_summary', headline)
             if job['alert'] and not daily:
-                self.notify(key, headline + '\n本地记录：' + str(self.reports.path()), repeat=job['repeat'])
+                self.notify(key, headline + '\n本地记录：' + str(self.reports.path()), repeat=job['repeat'] and not resolved)
             if job['analyze']:
                 if job['analysis_status'] == 'pending' and budget <= 0:
                     continue

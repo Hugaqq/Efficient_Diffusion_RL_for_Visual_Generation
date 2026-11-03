@@ -1378,6 +1378,54 @@ def test_unknown_launch_reconcile_rejects_foreign_unit(box):
     assert watch.s['pending_launch']
 
 
+@pytest.mark.parametrize('observe_ack', [False, True])
+def test_human_alerts_follow_token_not_polled_state(tmp_path, observe_ack):
+    notify = FakeNotifier()
+    obs = Observer(observer_config(tmp_path), clock=lambda: 0, notifier=notify,
+                   runner=lambda *a, **kw: pi_result())
+    obs.tick(remote(state='NEEDS_HUMAN', human_token='first'))
+    if observe_ack:
+        obs.tick(remote(state='WATCHING'))
+    obs.tick(remote(state='NEEDS_HUMAN', human_token='second'))
+    obs.tick(remote(state='NEEDS_HUMAN', human_token='second'))
+    assert len(notify.calls) == 4  # alert + local diagnosis pointer for EACH token
+    assert len({key for _, key in notify.calls}) == 4
+
+
+def test_persisted_deadman_job_gets_outbox_after_recovery(tmp_path):
+    config = dict(observer_config(tmp_path), daily_time='23:59')
+    obs = Observer(config, clock=lambda: 0, notifier=FakeNotifier())
+    obs.queue('deadman:heartbeat_stale', 'detected before crash', analyze=False, repeat=True)
+    obs.persist()  # crash before notify/outbox publication
+    notify = FakeNotifier()
+    restored = Observer(config, clock=lambda: 0, notifier=notify)
+    restored.tick(remote())
+    assert len(notify.calls) == 1 and 'detected before crash' in notify.calls[0][0]
+    restored.tick(remote())
+    assert len(notify.calls) == 1
+
+
+def test_repeat_alert_window_key_stable_across_failed_retry(tmp_path):
+    config = dict(observer_config(tmp_path), alert_repeat_seconds=10, notify_retry_seconds=1)
+    now, notify = [0], FakeNotifier()
+    obs = Observer(config, clock=lambda: now[0], monotonic=lambda: now[0], notifier=notify)
+    obs.notify('deadman:stale', 'alert', repeat=True)
+    first = notify.calls[-1][1]
+    now[0] = 10
+    class Broken:
+        def send(self, text, key):
+            notify.calls.append((text, key))
+            raise RuntimeError('ambiguous delivery')
+    obs.notifier = Broken()
+    obs.notify('deadman:stale', 'alert', repeat=True)
+    second = notify.calls[-1][1]
+    assert second != first
+    now[0] = 100  # retries keep the original repeat attempt's key, even in another window
+    obs = Observer(config, clock=lambda: now[0], monotonic=lambda: now[0], notifier=notify)
+    obs.drain_notices()
+    assert notify.calls[-1][1] == second
+
+
 def test_user_unit_contract():
     units = Path(__file__).resolve().parents[1] / 'ops/h3_formal_watch/systemd'
     watchdog = (units / 'h3-formal-watchdog.service').read_text()

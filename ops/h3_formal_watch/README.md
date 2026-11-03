@@ -284,9 +284,13 @@ with `chat_id` must be explicitly reconciled with the new user-only configuratio
 and config-bound state before deployment; do not delete evidence or reset pending
 alerts to bypass the identity check.
 
+NEEDS_HUMAN alerts are keyed by the durable human token, including a new latch
+between two polls that both observe NEEDS_HUMAN. Persisted dead-man jobs finish
+publishing their initial outbox entry even if the next snapshot is healthy.
 Alert text/attempts form a durable outbox. Undelivered messages drain even
 when the triggering condition has resolved; failed sends exit nonzero, with a
-5-minute service retry/cooldown and stable idempotency key. Non-object CLI replies
+5-minute service retry/cooldown. A new repeat window gets a new idempotency key;
+retries of that attempt retain the saved window/key across restarts. Non-object CLI replies
 are failures. Text starting with `@`/`-` is prefixed to prevent file/option parsing;
 UTF-8 argv is never shell-interpolated. An overlapping timer's busy lock exits 0
 with an explicit log line, without constructing/running the observer. Exactly-once
