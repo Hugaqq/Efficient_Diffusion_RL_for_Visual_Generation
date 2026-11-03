@@ -1506,6 +1506,68 @@ def test_unknown_launch_abandon_prevents_delayed_submission(box):
         command.assert_not_called()
 
 
+@pytest.mark.parametrize('active', ['inactive', 'failed'])
+@pytest.mark.parametrize('group', ['empty', 'pruned', 'none'])
+@pytest.mark.parametrize('claimed', [False, True])
+def test_abandon_unit_failed_before_execute(box, active, group, claimed):
+    watch, spec = pending_unknown(box)
+    box.die()
+    if not claimed:
+        watch.store.path('claimed-unknown.json').unlink()
+    resumes = list(watch.s['resumes'])
+    info = dict(LoadState='loaded', InvocationID='never-executed', ActiveState=active,
+                SubState='failed' if active == 'failed' else 'dead',
+                ControlGroup='' if group == 'none' else '/fake', KillMode='control-group', Restart='no')
+    with patch.object(process, 'unit_info', return_value=info), \
+            patch.object(process, 'cgroup_members', return_value=[],
+                         side_effect=FileNotFoundError if group == 'pruned' else None), \
+            patch.object(process, 'run_command') as command, patch.object(process, 'signal_group') as send:
+        watch.reconcile_launch('abandon', 'verified failure before execute')
+        assert watch.s['pending_launch'] is None and watch.s['state'] == 'NEEDS_HUMAN'
+        assert watch.store.path('abandoned-unknown.json').exists()
+        assert watch.store.path('claimed-unknown.json').exists() == claimed
+        assert watch.s['resumes'] == resumes
+        with pytest.raises(ValueError, match='abandoned'):
+            process.supervise(watch.store.root, 'launch-unknown.json')
+        command.assert_not_called()
+        send.assert_not_called()
+
+
+@pytest.mark.parametrize('case', ['active', 'activating', 'deactivating', 'unknown-load', 'unknown-state',
+                                  'populated', 'unreadable', 'changed', 'restart', 'kill-mode', 'unknown-group',
+                                  'execution-receipt', 'process-receipt', 'exit-receipt'])
+def test_abandon_unproven_unit_fails_closed(box, case):
+    watch, spec = pending_unknown(box)
+    box.die()
+    info = dict(LoadState='loaded', InvocationID='never-executed', ActiveState='failed',
+                SubState='failed', ControlGroup='/fake', KillMode='control-group', Restart='no')
+    if case in ('active', 'activating', 'deactivating'):
+        info['ActiveState'] = case
+    if case == 'unknown-load':
+        info.pop('LoadState')
+    if case == 'unknown-state':
+        info.pop('ActiveState')
+    if case == 'unknown-group':
+        info.pop('ControlGroup')
+    if case == 'restart':
+        info['Restart'] = 'always'
+    if case == 'kill-mode':
+        info['KillMode'] = 'process'
+    if case.endswith('-receipt'):
+        watch.store.save(case.split('-')[0] + '-unknown.json', {'launch_id': 'foreign'})
+    with patch.object(process, 'unit_info', side_effect=[info, dict(info, InvocationID='changed')]
+                      if case == 'changed' else None, return_value=info), \
+            patch.object(process, 'cgroup_members', return_value=[123] if case == 'populated' else [],
+                         side_effect=PermissionError if case == 'unreadable' else None), \
+            patch.object(process, 'run_command') as command, patch.object(process, 'signal_group') as send:
+        with pytest.raises((ValueError, PermissionError)):
+            watch.reconcile_launch('abandon', 'not proven safe')
+        assert watch.s['pending_launch']
+        assert not watch.store.path('abandoned-unknown.json').exists()
+        command.assert_not_called()
+        send.assert_not_called()
+
+
 def test_unknown_launch_reconcile_rejects_foreign_unit(box):
     watch, spec = pending_unknown(box)
     with patch.object(process, 'unit_info', return_value=dict(InvocationID='foreign', ControlGroup='/fake',

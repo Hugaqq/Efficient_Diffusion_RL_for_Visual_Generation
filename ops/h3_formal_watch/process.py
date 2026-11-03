@@ -187,6 +187,39 @@ def reconcile_unit(store, spec):
     return record
 
 
+def require_abandonable_unit(store, spec):
+    """Read-only absence/death proof; caller must hold supervisor.lock.
+
+    A failed-before-execute unit has no ownership receipt to adopt. Abandoning
+    its unused identity is safe only with stable inactive/failed, empty ownership.
+    This never adopts, resets, stops or deletes the unit or its launch claim.
+    """
+    info = unit_info(spec['unit'])
+    if info.get('LoadState') == 'not-found':
+        return
+    launch_id = spec['launch_id']
+    if any(store.path(kind + '-' + launch_id + '.json').exists() for kind in ('process', 'execution', 'exit')):
+        # Existing ownership evidence must be reconciled, never bypassed through
+        # the no-receipt exception (even if the receipt is invalid/conflicting).
+        record = reconcile_unit(store, spec)
+        if inspect(record)['alive']:
+            raise ValueError('pending training still alive; cannot abandon')
+        return
+    if (info.get('LoadState') != 'loaded' or info.get('ActiveState') not in ('inactive', 'failed') or
+            not isinstance(info.get('ControlGroup'), str) or
+            info.get('KillMode') != 'control-group' or info.get('Restart') != 'no'):
+        raise ValueError('unproven unit must be inactive/failed with exclusive no-restart policy')
+    group = info.get('ControlGroup')
+    try:
+        members = cgroup_members(group) if group else []
+    except FileNotFoundError:
+        members = []  # pruned group: accept only after stable manager confirmation below
+    if unit_info(spec['unit']) != info:
+        raise ValueError('unit changed while proving empty failed-before-execute ownership')
+    if members:
+        raise ValueError('pending training still alive; cannot abandon')
+
+
 def execute(state_dir, spec_name):
     """Inside the training unit: capture the exact training exit, never restart."""
     store = Store(state_dir)

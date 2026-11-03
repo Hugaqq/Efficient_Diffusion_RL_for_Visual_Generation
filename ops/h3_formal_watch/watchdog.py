@@ -663,11 +663,7 @@ class Watchdog:
             elif action == 'abandon':
                 if process.inspect(self.s['process'])['alive']:
                     raise ValueError('old training still alive; cannot abandon')
-                info = process.unit_info(spec['unit'])
-                if info.get('LoadState') != 'not-found':
-                    record = process.reconcile_unit(self.store, spec)
-                    if process.inspect(record)['alive']:
-                        raise ValueError('pending training still alive; cannot abandon')
+                process.require_abandonable_unit(self.store, spec)
                 self.store.save('abandoned-' + launch_id + '.json', dict(reason=reason, at=self.clock()))
                 self.s.update(pending_launch=None, stop=None)
             else:

@@ -208,8 +208,14 @@ python3 -m ops.h3_formal_watch.watchdog /ABS/config.json --reconcile-launch aban
 Adoption requires a matching process receipt, or the in-unit execution receipt
 (binding spec digest, launch ID, boot and InvocationID) plus current unit ownership.
 A unit without proof is refused, never guessed from its name. Abandonment requires
-empty old ownership and an absent unit or a proven owned empty unit; an abandonment
-receipt prevents delayed supervisor submission. Both operations serialize against
+empty old ownership and an absent unit or a proven owned empty unit. A unit that
+failed **before execute** may also be abandoned without `reset-failed`: there must
+be no process/execution/exit receipt claiming ownership, and two matching manager
+snapshots must show loaded, inactive/failed, `KillMode=control-group`, `Restart=no`
+and an empty/pruned cgroup (or an explicitly empty cgroup path). Unknown/unreadable,
+populated, restarting/changing units and conflicting receipts remain refused.
+The consumed submission claim is retained; it is not an execution/ownership receipt.
+An abandonment receipt prevents delayed supervisor submission. Both operations serialize against
 supervision, retain claims/retry counts, stay NEEDS_HUMAN and never submit or signal.
 Then acknowledge separately and restart the watchdog. Legacy ambiguous units without
 receipts require manual identity investigation; acknowledgement cannot bypass this.
