@@ -97,11 +97,17 @@ class QueueFull(Exception):
     """The request was rejected BEFORE admission; nothing was scored."""
 
 
+class QueueClosed(Exception):
+    """The server is shutting down; this request was never scored."""
+
+
 class ScoreQueue:
-    """Bounded FIFO tickets: at most `capacity` admitted, exactly one holds the turn.
+    """Bounded FIFO tickets: at most `capacity` admitted requests, one holds the turn.
 
     Tickets are served strictly in admission order. Every admitted ticket is
     released in a finally block, so a failed request never blocks later ones.
+    The idle-housekeeping ticket is counted separately and never consumes
+    request capacity. close() wakes all waiters (they abandon unscored).
     """
     def __init__(self, capacity):
         if queue_policy(capacity) is None:
@@ -109,25 +115,32 @@ class ScoreQueue:
         self.capacity = capacity
         self._condition = threading.Condition()
         self._next = self._serving = 0
+        self._idle_held = self._closed = self._turn_held = False
         self.admitted_order = deque(maxlen=256)  # recent admission labels; observability only
 
     @property
     def outstanding(self):
+        """Admitted REQUESTS not yet released (excludes a held idle ticket)."""
         with self._condition:
-            return self._next - self._serving
+            return self._next - self._serving - int(self._idle_held)
 
     def _admit(self, label):
-        if self._next - self._serving >= self.capacity:
+        if self._closed:
+            raise QueueClosed('HPS request queue closed')
+        if self._next - self._serving - int(self._idle_held) >= self.capacity:
             raise QueueFull('HPS request queue full')
         ticket = self._next
         self._next += 1
         self.admitted_order.append(label)
         return ticket
 
-    def _release(self, ticket):
+    def _release(self, ticket, *, idle=False):
         with self._condition:
             if ticket != self._serving:
                 raise RuntimeError('HPS queue released out of order')
+            if idle:
+                self._idle_held = False
+            self._turn_held = False
             self._serving += 1
             self._condition.notify_all()
 
@@ -135,7 +148,10 @@ class ScoreQueue:
     def turn(self, label=None):
         with self._condition:
             ticket = self._admit(label)
-            self._condition.wait_for(lambda: self._serving == ticket)
+            self._condition.wait_for(lambda: self._serving == ticket or self._closed)
+            if self._closed or self._serving != ticket:
+                raise QueueClosed('HPS server closing; queued request abandoned unscored')
+            self._turn_held = True
         try:
             yield ticket
         finally:
@@ -144,9 +160,22 @@ class ScoreQueue:
     def try_idle_turn(self):
         """Ticket only when nothing is admitted; housekeeping then excludes scoring."""
         with self._condition:
-            if self._next != self._serving:
+            if self._closed or self._next != self._serving:
                 return None
-            return self._admit('idle-housekeeping')
+            ticket = self._next
+            self._next += 1
+            self._idle_held = self._turn_held = True
+            return ticket
+
+    def release_idle(self, ticket):
+        self._release(ticket, idle=True)
+
+    def close(self, timeout_s):
+        """Refuse/abandon waiters, then wait (bounded) for the active turn only."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            return self._condition.wait_for(lambda: not self._turn_held, timeout=timeout_s)
 
 
 def _cleanup(primary, action):
@@ -475,7 +504,10 @@ def make_handler(backend, queue=None):
         def do_POST(self):
             if self.path != '/score':
                 return self.reply(404, {'error': 'not_found'})
-            if not backend.ready:
+            # Queued mode: `ready` is transiently False while the turn holder
+            # moves weights (_location 'unknown'); only terminal state rejects
+            # here, and readiness is rechecked inside the exclusive turn.
+            if (backend._closed or backend._poisoned) if queue is not None else not backend.ready:
                 return self.reply(503, {'error': 'hpsv3_unready'})
             try:
                 self.connection.settimeout(30)
@@ -524,6 +556,8 @@ def make_handler(backend, queue=None):
                     'frame_scores': scores, 'video_score': score})
             except QueueFull:
                 self.reply(503, {'error': QUEUE_FULL_ERROR}, (('Retry-After', str(QUEUE_RETRY_AFTER_S)),))
+            except QueueClosed:
+                self.reply(503, {'error': 'hpsv3_unready'})
             except BlockingIOError:
                 self.reply(503, {'error': 'gpu_admission_or_margin'})
             except Exception:
@@ -541,7 +575,8 @@ class HpsHTTPServer(HTTPServer):
 
 class HpsQueuedHTTPServer(ThreadingHTTPServer):
     """Opt-in: per-connection threads only parse/validate; ScoreQueue serializes GPU work."""
-    daemon_threads = False  # server_close joins handlers before backend.close
+    daemon_threads = True  # shutdown is bounded by ScoreQueue.close, never an unbounded join
+    shutdown_timeout_s = 120.
 
     def __init__(self, address, handler, score_queue):
         if not isinstance(score_queue, ScoreQueue):
@@ -558,7 +593,16 @@ class HpsQueuedHTTPServer(ThreadingHTTPServer):
         try:
             self.backend.idle_housekeeping()
         finally:
-            self.score_queue._release(ticket)
+            self.score_queue.release_idle(ticket)
+
+    def server_close(self):
+        # Waiters abandon unscored (503); the active score gets a bounded
+        # drain so backend.close never offloads underneath it. If it does not
+        # finish, backend.close refuses (active request) and the process exits.
+        drained = self.score_queue.close(self.shutdown_timeout_s)
+        super().server_close()
+        if not drained:
+            raise RuntimeError('active HPS score did not finish within the shutdown bound')
 
 
 def main():

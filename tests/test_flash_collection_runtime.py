@@ -4008,7 +4008,69 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         queued_server.backend, queued_server.score_queue = queued, score_queue
         with score_queue.turn('busy'):
             queued_server.service_actions(); assert housekeeping == []
-        queued_server.service_actions(); assert housekeeping == [1] and score_queue.outstanding == 0
+        queued_server.service_actions(); assert housekeeping == [0] and score_queue.outstanding == 0
+        # Review fix: a request arriving while the turn holder moves weights
+        # (ready transiently False, _location 'unknown') is admitted and scored,
+        # not rejected 503-unready; on onload (resident cold) and offload (per request).
+        for resident, direction in ((True, 'cuda'), (False, 'cpu')):
+            clock[0] = 0.
+            racer = service.HpsBackend(checkpoint, config, contract, 40., gpu_resident=resident,
+                                       resident_gpu_uuid=uuid if resident else None, max_queue=3)
+            racer.cuda = CudaLeaf(racer); racer.inferencer.model.controller = racer.cuda; active[0] = racer
+            race_queue, in_move, let_move = service.ScoreQueue(3), Event(), Event()
+            real_to = racer.inferencer.model.to
+            def blocking_to(device, real_to=real_to, direction=direction):
+                if device == direction and not let_move.is_set():
+                    in_move.set(); assert let_move.wait(5)
+                return real_to(device)
+            racer.inferencer.model.to = blocking_to
+            race = {}
+            first = Thread(target=qpost, args=(racer, race_queue, 'q-A', race)); first.start()
+            assert in_move.wait(5) and not racer.ready and racer._location == 'unknown'
+            second = Thread(target=qpost, args=(racer, race_queue, 'q-B', race)); second.start()
+            wait_for(lambda: race_queue.outstanding == 2)
+            let_move.set(); first.join(10); second.join(10)
+            assert race['q-A'][0] == race['q-B'][0] == 200 and racer.ready
+            assert list(race_queue.admitted_order) == ['q-A', 'q-B'] and len(racer.inferencer.calls) == 2*124
+            # Review fix: a held idle ticket does not consume request capacity.
+            idle_ticket = race_queue.try_idle_turn(); assert race_queue.outstanding == 0
+            waiting = [Thread(target=qpost, args=(racer, race_queue, sid, race)) for sid in ('q-C', 'q-D', 'q-E')]
+            for worker in waiting: worker.start()
+            wait_for(lambda: race_queue.outstanding == 3)
+            qpost(racer, race_queue, 'q-F', race); assert race['q-F'][0] == 503 and race['q-F'][2]['error'] == 'hpsv3_queue_full'
+            race_queue.release_idle(idle_ticket)
+            for worker in waiting: worker.join(10)
+            assert all(race[sid][0] == 200 for sid in ('q-C', 'q-D', 'q-E')) and len(racer.inferencer.calls) == 5*124
+            racer.close()
+        # Review fix: bounded shutdown. Waiters abandon unscored (503 unready);
+        # close waits only for the active turn, with a timeout.
+        closing, hold, holding, outcomes = service.ScoreQueue(2), Event(), Event(), []
+        def holder():
+            with closing.turn('active'): holding.set(); assert hold.wait(5)
+            outcomes.append('active-done')
+        def waiter():
+            try:
+                with closing.turn('waiting'): outcomes.append('waiter-scored')
+            except service.QueueClosed: outcomes.append('waiter-abandoned')
+        holder_thread = Thread(target=holder); holder_thread.start(); assert holding.wait(5)
+        waiter_thread = Thread(target=waiter); waiter_thread.start(); wait_for(lambda: closing.outstanding == 2)
+        assert closing.close(.05) is False
+        waiter_thread.join(5); assert outcomes == ['waiter-abandoned']
+        hold.set(); holder_thread.join(5)
+        assert outcomes == ['waiter-abandoned', 'active-done'] and closing.close(.05) is True
+        assert closing.try_idle_turn() is None
+        with pytest.raises(service.QueueClosed):
+            with closing.turn('late'): pytest.fail('closed queue admitted a request')
+        closed_out = {}
+        qpost(queued, closing, 'q-G', closed_out)
+        assert closed_out['q-G'][0] == 503 and closed_out['q-G'][2] == {'error': 'hpsv3_unready'}
+        socket_closed = []
+        stuck = object.__new__(service.HpsQueuedHTTPServer); stuck.shutdown_timeout_s = .05
+        stuck.socket = SimpleNamespace(close=lambda: socket_closed.append(True))
+        stuck.score_queue = service.ScoreQueue(1); busy_ticket = stuck.score_queue.try_idle_turn()
+        with pytest.raises(RuntimeError, match='shutdown bound'): stuck.server_close()
+        assert socket_closed == [True]
+        stuck.score_queue.release_idle(busy_ticket)
         # A failed queued request releases its ticket; a later queued request
         # sees the poisoned backend as 503 unready, never a second inference.
         queued.inferencer.reward = real_reward; queued.inferencer.failure = 'reward'
@@ -4023,11 +4085,11 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         from tests.test_h3_mvp_cpu_hps import _Response, _media
         from visual_rl.algorithms.rewards.clients import hpsv3 as hps_client
         from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
-        for scenario in ('one-full', 'exhausted', 'gpu-503', 'no-retry-after'):
+        for scenario in ('one-full', 'exhausted', 'gpu-503', 'no-retry-after', 'late-retry'):
             scorer, inner, _ = _scorer(tmp_path / f'queue-client-{scenario}', hp, contract)
             sent, sleeps, now = [], [], [100.]
             class QueueFullTransport:
-                full = {'one-full': 1, 'exhausted': 9, 'gpu-503': 1, 'no-retry-after': 1}[scenario]
+                full = {'one-full': 1, 'exhausted': 9, 'gpu-503': 1, 'no-retry-after': 1, 'late-retry': 1}[scenario]
                 def request(self, method, url, **kwargs):
                     sent.append((method, kwargs['timeout']))
                     if method == 'POST' and self.full:
@@ -4036,6 +4098,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                         response = _Response(body, status=503)
                         if scenario != 'no-retry-after': response.headers['Retry-After'] = '1'
                         return response
+                    if method == 'POST' and scenario == 'late-retry': now[0] += 5.  # retried read trickles past budget
                     return inner.request(method, url, **dict(kwargs, timeout=2.5))
                 def close(self): inner.close()
             hp.setattr(hps_client, 'requests_session', lambda: QueueFullTransport())
@@ -4048,6 +4111,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 assert sent == [('GET', 2.5), ('POST', 2.5), ('POST', 1.5)] and sleeps == [1.]
                 assert len(inner.frame_scores) == 1  # exactly one accepted request was scored
                 assert value == service.aggregate_frame_scores(inner.frame_scores[0], contract)[0]
+            elif scenario == 'late-retry':
+                with pytest.raises(RuntimeError, match='wall-clock'):
+                    scorer.score_one(sample_id='s0', prompt='p', media=media)
+                assert [m for m, _ in sent].count('POST') == 2 and sleeps == [1.]  # no third send
             else:
                 with pytest.raises(RuntimeError, match='never admitted' if scenario == 'exhausted' else 'no automatic POST retry'):
                     scorer.score_one(sample_id='s0', prompt='p', media=media)

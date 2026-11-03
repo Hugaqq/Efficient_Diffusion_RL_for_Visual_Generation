@@ -104,8 +104,14 @@ class Hpsv3VideoClient:
         # The whole call, including queue-full backoff, stays inside timeout_s.
         # Only an explicit pre-admission queue-full 503 is retried; any other
         # status, transport error or timeout may follow acceptance and is final.
+        # The first attempt keeps the original per-socket timeout_s semantics;
+        # a retried attempt is also checked against the wall-clock deadline
+        # (its per-socket timeout alone would not cap a slow trickle).
         deadline = time.monotonic() + self.timeout_s
         timeout, attempt = self.timeout_s, 0
+        def over_deadline():
+            if attempt and time.monotonic() > deadline:
+                raise RuntimeError('HPSv3 retried request exceeded the wall-clock timeout budget; not retried')
         while True:
             response = self.transport.request(
                 method, self.origin + route, data=raw,
@@ -113,6 +119,7 @@ class Hpsv3VideoClient:
                 timeout=timeout, allow_redirects=False, stream=True,
             )
             try:
+                over_deadline()
                 if response.status_code != 200:
                     delay = self._queue_full_delay(response, method, route, attempt)
                     if delay is None:
@@ -121,6 +128,7 @@ class Hpsv3VideoClient:
                     if response.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/json':
                         raise ValueError('HPSv3 response must be JSON')
                     body = read_bounded_http_response(response, max_response_bytes=self.max_response_bytes)
+                    over_deadline()
                     return decode_json(body, self.max_response_bytes)
             finally:
                 close_http_response(response)
