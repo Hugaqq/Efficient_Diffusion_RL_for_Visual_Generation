@@ -68,12 +68,12 @@ in one invocation; deferred/failed deliveries remain durable for subsequent tick
   Torch NCCL watchdog `exception:` messages and native `c10::Error::Error` stack
   frames are supported. NCCL recovery needs a collective-operation-timeout or
   explicit watchdog "timed out" record; "either an error or timeout" and "failed
-  or timed out" diagnostics alone cannot authorize retry. A bare word "error" in
-  metrics/diagnostics is not a failure
-  record. Uppercase `ERROR`/`CRITICAL`/`FATAL` level tokens are recognized even
-  after timestamps/rank/logger prefixes; existing conservative error-record vetoes
-  remain intact. Elastic `SignalException: Process ... got signal: 15` is exempt only as
-  the sole failure record, with a matching exit receipt (-15/143 or torchrun's 1)
+  or timed out" diagnostics alone cannot authorize retry. A lowercase metric word
+  such as "max abs error" is not a log level. Uppercase `ERROR`/`CRITICAL`/`FATAL`
+  level tokens are recognized even after timestamps/rank/logger prefixes; existing
+  conservative error-record vetoes remain intact.
+  Elastic `SignalException: Process ... got signal: 15` is exempt only as the sole
+  failure record, with a matching exit receipt (-15/143 or torchrun's 1)
   and the watchdog's own same-launch TERM record (`phase=term`, `last_signal=SIGTERM`,
   saved checkpoint, monitor/disk stop). Code 1 without that exception never proves
   TERM; stale/missing stop ownership, other errors and other signals still veto retry.
