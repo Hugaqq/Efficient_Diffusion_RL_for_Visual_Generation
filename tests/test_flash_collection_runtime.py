@@ -3799,3 +3799,195 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     (video_root / 'step-0010').mkdir()
     assert keeper.supersede(first_step=5, label='attempt-x') == ['step-0010']
     assert (video_root / 'step-0005').is_dir() and (video_root / 'superseded' / 'attempt-x' / 'step-0010').is_dir()
+
+    # Formal 200-update launcher: validation, resume identity, disk preflight,
+    # 30 s monitor staleness with degraded non-fatal, and the real backend
+    # hooks around tiny CPU iterations (no GPU, no controller.run).
+    from scripts import launch_h3_formal as formal
+    from scripts import launch_h3_resolution_memory as two_entry
+    from scripts.launch_h3_one_update import TRAIN_SHA as FORMAL_TRAIN, TEST_SHA as FORMAL_TEST
+    from tests.test_h3_mvp_cpu_profile import _fixture as formal_fixture, _save as formal_save
+    from visual_rl.composition.config.h3_profile import compile_h3_profile as formal_compile
+    from visual_rl.runtime import h3_lifecycle as formal_lifecycle
+    from visual_rl.runtime import h3_memory as formal_memory
+    import io, math, threading, time
+    from contextlib import contextmanager, redirect_stdout
+    profile_path, raw = formal_fixture(tmp_path / 'formal-profile')
+    raw['overrides']['training'] = dict(group_size=8, num_steps=10, algorithm='dual_flash', group_layout='paired_4x8')
+    raw['overrides']['model'] = dict(params=dict(width=384, height=256, frames=124, fps=24, lora_rank=32, lora_alpha=64))
+    raw['launch'].update(max_optimizer_steps=200, checkpoint_every_optimizer_steps=5)
+    raw['launch']['expected'].update(train_sha256=FORMAL_TRAIN, eval_sha256=FORMAL_TEST)
+    def compiled(**changes):
+        data = json.loads(json.dumps(raw))
+        for key, value in changes.items():
+            if key in ('width', 'height'): data['overrides']['model']['params'][key] = value
+            else: data['launch'][key] = value
+        return formal_compile(formal_save(profile_path.parent, data))
+    accepted = compiled()
+    assert formal.validate_formal(accepted) is accepted
+    for changes in (dict(width=480, height=320), dict(width=384, height=320), dict(max_optimizer_steps=2),
+                    dict(max_optimizer_steps=199), dict(max_optimizer_steps=205),
+                    dict(checkpoint_every_optimizer_steps=10), dict(checkpoint_every_optimizer_steps=1)):
+        with pytest.raises(ValueError, match='formal run requires'): formal.validate_formal(compiled(**changes))
+    for bad in (199, 2, '200', 200.0, True):
+        with pytest.raises(ValueError, match='accepts max_optimizer_steps'):
+            formal.validate_formal(accepted, max_optimizer_steps=bad)
+    with pytest.raises(ValueError, match='max2'): two_entry.validate_fresh(accepted)  # old launcher unchanged
+    # Resume target: only this run's checkpoints/step-N with 0 < N < 200.
+    out = tmp_path / 'formal-out'
+    def at(path):
+        return SimpleNamespace(launch=SimpleNamespace(resume_from=path, output_dir=out, max_optimizer_steps=200))
+    assert formal.resume_step(at(None)) is None and formal.resume_step(at(out / 'checkpoints' / 'step-20')) == 20
+    for bad in (out / 'checkpoints' / 'step-200', out / 'checkpoints' / 'latest', tmp_path / 'other' / 'checkpoints' / 'step-5',
+                out / 'checkpoints' / 'step-0'):
+        with pytest.raises(ValueError, match='resume_from'): formal.resume_step(at(bad))
+    args = formal.build_parser().parse_args(['cfg.json', '--expected-sha', 'a' * 40, '--ffmpeg', 'f',
+                                             '--ffprobe', 'p', '--monitor-dir', 'm'])
+    assert (args.max_optimizer_steps, args.audit_weights, args.reward_pipeline, args.reuse_video_vae,
+            args.reuse_rollout_anchor, args.profile_rollout, args.checkpoint_threads,
+            args.boundary_content_check, args.journal_max_mib) == (200, False, False, False, False, False, 1, 'full', 512)
+    identity_profile = SimpleNamespace(launch=SimpleNamespace(output_dir=out, max_optimizer_steps=200))
+    with pytest.raises(ValueError, match='formal-run.json'): formal.check_resume_identity(identity_profile, args)
+    out.mkdir()
+    (out / formal.IDENTITY_FILE).write_text(json.dumps(formal.formal_identity(identity_profile, args)))
+    assert formal.check_resume_identity(identity_profile, args)['flags']['checkpoint_threads'] == 1
+    for name, value in (('reuse_video_vae', True), ('checkpoint_threads', 8), ('expected_sha', 'b' * 40)):
+        changed = SimpleNamespace(**dict(vars(args), **{name: value}))
+        with pytest.raises(ValueError, match='changed formal-run identity'): formal.check_resume_identity(identity_profile, changed)
+    observed = SimpleNamespace(**dict(vars(args), audit_weights=True))  # observation-only: not identity
+    formal.check_resume_identity(identity_profile, observed)
+    # Disk: 41 checkpoints (step1, every 5, terminal) and 40 video exports for a fresh run.
+    assert formal.checkpoint_steps(total=200)[:3] == [1, 5, 10] and len(formal.checkpoint_steps(total=200)) == 41
+    need = formal.disk_need(total=200)
+    assert (need['checkpoints'], need['export_updates']) == (41, 40)
+    assert need['need_bytes'] == math.ceil(1.2 * (41 * formal.CHECKPOINT_BYTES + 480 * formal.VIDEO_BYTES + formal.LOG_BYTES))
+    assert formal.disk_need(total=200, after=100)['checkpoints'] == 20
+    fs = lambda free: (lambda path: SimpleNamespace(f_bavail=free // 4096, f_frsize=4096))
+    deep = SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / 'missing' / 'run', max_optimizer_steps=200))
+    report = formal.disk_preflight(deep, statvfs=fs(160 * 10**9))
+    assert report['filesystem_probe'] == str(tmp_path) and report['free_bytes'] <= 160 * 10**9
+    with pytest.raises(RuntimeError, match='insufficient disk'): formal.disk_preflight(deep, statvfs=fs(100 * 10**9))
+    assert formal.disk_preflight(deep, after=150, statvfs=fs(50 * 10**9))['checkpoints'] == 10
+    # Monitor: degraded is non-fatal; stale beyond 30 s or healthy=false stops the next update.
+    health_dir = tmp_path / 'formal-monitor'; health_dir.mkdir()
+    def health(**fields):
+        (health_dir / 'health.json').write_text(json.dumps(dict(dict(healthy=True, monotonic_ns=10**12, sample_count=9), **fields)))
+    health(degraded=True, consecutive_failures=2)
+    assert two_entry.monitor_healthy(health_dir, now_ns=10**12 + 20 * 10**9, max_age=formal.FormalBackend.monitor_max_age)['degraded'] is True
+    with pytest.raises(RuntimeError, match='stale'): two_entry.monitor_healthy(health_dir, now_ns=10**12 + 20 * 10**9)
+    with pytest.raises(RuntimeError, match='stale'):
+        two_entry.monitor_healthy(health_dir, now_ns=10**12 + 31 * 10**9, max_age=formal.FormalBackend.monitor_max_age)
+    health(healthy=False)
+    with pytest.raises(RuntimeError, match='unhealthy'): two_entry.monitor_healthy(health_dir, now_ns=10**12, max_age=30)
+    # Journal budget is explicit and must agree with any pre-set environment.
+    with monkeypatch.context() as patch:
+        patch.delenv('H3_MEMORY_MAX_BYTES', raising=False)
+        assert formal.journal_budget(512) == 512 * 1024**2 == int(os.environ['H3_MEMORY_MAX_BYTES'])
+        with pytest.raises(ValueError, match='differs'): formal.journal_budget(256)
+        for bad in (63, 16385, 512.0, True):
+            with pytest.raises(ValueError, match='journal-max-mib'): formal.journal_budget(bad)
+    # Backend hooks over tiny CPU iterations: fresh 0..4 exports at 5, then a resume at 5.
+    class FakeJournal:
+        lock = threading.RLock(); base = {}
+        def assert_healthy(self): pass
+        def event(self, *a, **kw): pass
+        @contextmanager
+        def span(self, *a, **kw): yield self
+    calls = []
+    class SpyRetention:
+        def __init__(self, **kw): self.kw = kw; calls.append(('init', kw['rank'], kw['terminal_step'], kw['every']))
+        def observe(self, original, *, source): return original
+        def is_export(self, step): return formal.retention.export_step(step, every=5, terminal_step=200)
+        def local_rows(self, step): calls.append(('rows', step)); return [['s', 'g', 0, 1.0]]
+        def publish(self, step, tables): calls.append(('publish', step, len(tables)))
+        def discard(self): calls.append(('discard',))
+        def supersede(self, *, first_step, label): calls.append(('supersede', first_step)); return []
+    def tiny_backend(start_step, audit_weights, adam_step=0):
+        model = torch.nn.Module()
+        model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
+        model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
+        optimizer = torch.optim.AdamW([model.lora], lr=1e-4)
+        if adam_step:
+            model.lora.grad = torch.ones(2)
+            for _ in range(adam_step): optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
+        stages = SimpleNamespace(predict=lambda **kw: model.lora * 2, score_one=lambda **kw: 1.)
+        def tiny_iteration(step):
+            if step == 7: raise RuntimeError('injected update failure')
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(44):
+                with torch.no_grad(): stages.predict(index=2)
+            for _ in range(4):
+                value = stages.predict(index=2); value.sum().backward(); del value
+            norm = float(model.lora.grad.norm()); optimizer.step(); optimizer.zero_grad(set_to_none=True)
+            return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
+        bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
+        graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=start_step)),
+            profile=SimpleNamespace(launch=SimpleNamespace(output_dir=tmp_path / f'formal-wrapper-{start_step}',
+                max_optimizer_steps=200, seed=42), expected={'model_sha256': 'm'}))
+        graph.profile.launch.output_dir.mkdir(exist_ok=True)
+        options = dict(vars(args), monitor_dir=health_dir, audit_weights=audit_weights)
+        backend = formal.FormalBackend(args=SimpleNamespace(**options), manifest=dict(launch_stamp='t'))
+        backend.start_step = start_step
+        bound_holder[0] = bound
+        backend.bind(None, SimpleNamespace(rank=0, process_group=None), graph, prepared, None)
+        return backend, bound, graph
+    with monkeypatch.context() as patch:
+        patch.setattr(formal_memory, 'journal', lambda: FakeJournal())
+        bound_holder = [None]
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'bind', lambda self, *a: bound_holder[0])
+        for module in (formal, two_entry):
+            patch.setattr(module, '_phase', lambda session, label, work: work())
+            patch.setattr(module, '_exchange', lambda *a: [a[3]] * 8)
+        patch.setattr(formal.retention, 'RolloutRetention', SpyRetention)
+        health(degraded=True, consecutive_failures=2, monotonic_ns=time.monotonic_ns())  # degraded, fresh (<30 s)
+        fresh_backend, fresh_bound, fresh_graph = tiny_backend(0, False)
+        assert calls[0] == ('init', 0, 200, 5) and fresh_backend.audit_weights is False
+        for step in range(5): fresh_bound.trainer.run_iteration(step)
+        # Start: stale staging deleted and later step dirs set aside; export only after update 5.
+        assert calls[1:3] == [('discard',), ('supersede', 0)]
+        assert [c for c in calls if c[0] in ('rows', 'publish')] == [('rows', 5), ('publish', 5, 8)]
+        assert calls[-1] == ('discard',) and len(fresh_backend.audits) == 5
+        assert fresh_backend.audits[-1]['lora_changed'] is None and fresh_backend.audits[-1]['after'] is None
+        assert json.loads((fresh_graph.profile.launch.output_dir / 'update-5-audit.json').read_text())['optimizer_updates'] == 5
+        # Resume at 5 with weight audit on: counts restart for this process; Adam counter must match.
+        calls.clear()
+        resumed, resumed_bound, _ = tiny_backend(5, True, adam_step=5)
+        resumed_bound.trainer.run_iteration(5); resumed_bound.trainer.run_iteration(6)
+        assert resumed.audits[-1]['graph']['nograd_forwards'] == 88 and resumed.audits[-1]['lora_changed'] is True
+        assert ('supersede', 5) in calls and not any(c[0] == 'publish' for c in calls)
+        calls.clear()
+        with pytest.raises(RuntimeError, match='injected'): resumed_bound.trainer.run_iteration(7)
+        assert calls == [('discard',)]  # failed update: staging removed, error re-raised
+        mismatch, mismatch_bound, _ = tiny_backend(10, False, adam_step=9)
+        with pytest.raises(ValueError, match='resume checkpoint'): mismatch_bound.trainer.run_iteration(10)
+        fresh_wrong, fresh_wrong_bound, _ = tiny_backend(0, False, adam_step=1)
+        with pytest.raises(ValueError, match='not fresh'): fresh_wrong_bound.trainer.run_iteration(0)
+        health(healthy=False)
+        stopped, stopped_bound, _ = tiny_backend(0, False)
+        with pytest.raises(RuntimeError, match='unhealthy'): stopped_bound.trainer.run_iteration(0)
+        # Construct: identity + per-launch manifest after admission; disk logged around each save.
+        graph_out = tmp_path / 'formal-graph'; graph_out.mkdir()
+        closed = []
+        fake_graph = SimpleNamespace(run_id='r', close=lambda: closed.append(1), profile=SimpleNamespace(
+            launch=SimpleNamespace(output_dir=graph_out, resume_from=None, max_optimizer_steps=200)))
+        patch.setattr(formal_lifecycle.H3LifecycleBackend, 'construct_graph', lambda self, *a: fake_graph)
+        maker = formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
+                                     manifest=dict(launch_stamp='20261103T000000Z', started_utc='x'))
+        maker.transaction = SimpleNamespace(checkpoint=lambda *a, **kw: SimpleNamespace(step=5))
+        preflight = SimpleNamespace(facts=SimpleNamespace(semantic_id='sem', binding_id='bind'), code_hash='code')
+        assert maker.construct_graph(preflight, SimpleNamespace(rank=0)) is fake_graph
+        assert json.loads((graph_out / formal.IDENTITY_FILE).read_text())['max_optimizer_steps'] == 200
+        launches = list((graph_out / 'formal-launches').iterdir())
+        assert len(launches) == 1 and json.loads(launches[0].read_text())['semantic_id'] == 'sem'
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            assert maker.transaction.checkpoint(progress=SimpleNamespace(next_optimizer_step=5)).step == 5
+        disk_rows = [json.loads(line) for line in printed.getvalue().splitlines()]
+        assert [r['when'] for r in disk_rows] == ['before_save', 'after_save'] and disk_rows[1]['free_bytes'] > 0
+        assert disk_rows[1]['remaining_need_bytes'] == formal.disk_need(total=200, after=5, log_bytes=0)['need_bytes']
+        with pytest.raises(FileExistsError, match='identity'):
+            formal.FormalBackend(args=SimpleNamespace(**dict(vars(args), monitor_dir=health_dir)),
+                                 manifest=dict(launch_stamp='later', started_utc='y')).construct_graph(preflight, SimpleNamespace(rank=0))
+        assert closed == [1]
