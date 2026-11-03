@@ -63,6 +63,8 @@ class TwoUpdateBackend(H3LifecycleBackend):
         # 10 rollout transitions x 4 samples (S1: x 1 batched forward), plus 4 B=1 anchor
         # forwards unless the rollout anchor is reused (rejected with S1): 44 / 40 / 14.
         self.nograd_forwards_per_update=(10 if self.rollout_batch==4 else 40)+(0 if self.reuse_rollout_anchor else 4)
+        # S1 startup row-mapping self-check: 1 batched + 4 B=1 no-grad forwards, once per run.
+        self.nograd_forwards_once=5 if self.rollout_batch==4 else 0
         from visual_rl.runtime.h3_rollout_profile import configuration
         configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
         self.profile_rollout=args.profile_rollout;self.rollout_profile=None
@@ -124,7 +126,7 @@ class TwoUpdateBackend(H3LifecycleBackend):
                         raise ValueError('frozen base changed')
                     if before['hashes']['trainable']==after['hashes']['trainable']:
                         raise ValueError('local LoRA shard unchanged')
-                    if (len(graph_audit['grad_forward_indices'])!=4*(step+1) or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*(step+1)
+                    if (len(graph_audit['grad_forward_indices'])!=4*(step+1) or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*(step+1)+self.nograd_forwards_once
                             or not graph_audit['final_prediction_released']):
                         raise ValueError('single-cell graph/count/release audit failed')
                     if not prepared.optimizer.state or any(int(s['step'].item())!=step+1 for s in prepared.optimizer.state.values()):

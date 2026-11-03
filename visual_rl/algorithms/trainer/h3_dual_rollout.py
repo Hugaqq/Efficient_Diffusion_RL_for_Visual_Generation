@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import nullcontext
 import hashlib
+import math
 
 import torch
 from visual_rl.runtime import h3_memory as memory
@@ -33,7 +34,7 @@ ROLLOUT_BATCH_ESTIMATE = dict(layout=(5550, 96, 414, 32), transient_bytes_per_sa
                               basis='attempt003 rank0 B1 rollout_forward peak 12.96 GiB - begin 9.21 GiB')
 
 
-def rollout_batch_admission(device, *, batch, layout, free_bytes=None):
+def rollout_batch_admission(device, *, batch, layout, free_bytes=None, driver_free_bytes=None):
     """Fail closed BEFORE a batched forward whose declared transient may not fit.
 
     Allocatable = driver-free + reserved-but-unallocated bytes of this device.
@@ -52,12 +53,19 @@ def rollout_batch_admission(device, *, batch, layout, free_bytes=None):
         raise ValueError('no declared batched-rollout memory estimate for this geometry')
     required = batch * ROLLOUT_BATCH_ESTIMATE['transient_bytes_per_sample']
     if free_bytes is None:
-        driver_free, _ = torch.cuda.mem_get_info(device)
-        free_bytes = driver_free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-    if type(free_bytes) is not int or free_bytes < 0:
-        raise ValueError('free byte count must be a nonnegative integer')
+        driver_free_bytes, _ = torch.cuda.mem_get_info(device)
+        free_bytes = driver_free_bytes + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    elif driver_free_bytes is None:
+        driver_free_bytes = free_bytes
+    if any(type(v) is not int or v < 0 for v in (free_bytes, driver_free_bytes)) or driver_free_bytes > free_bytes:
+        raise ValueError('free byte counts must be nonnegative integers with driver-free <= allocatable')
     receipt = dict(checked=True, device=str(device), batch=batch, free_bytes=free_bytes,
+                   driver_free_bytes=driver_free_bytes, reserved_unallocated_bytes=free_bytes - driver_free_bytes,
                    required_bytes=required, basis=ROLLOUT_BATCH_ESTIMATE['basis'])
+    if driver_free_bytes < required:
+        # Admission still counts the allocator's reserved-but-unallocated cache,
+        # which may be fragmented; record the weaker margin explicitly.
+        receipt['warning'] = 'driver-free below declared requirement; admitted only via reserved-unallocated cache'
     if free_bytes < required:
         raise RuntimeError(f'batched rollout memory admission failed: {free_bytes} free < {required} declared bytes')
     return receipt
@@ -199,6 +207,50 @@ def collect(*, dynamics: H3DualFlowSDE, samples, initial_states, generators,
     return tuple(records),terminals,choices
 
 
+def rollout_batch_selfcheck(*, samples, initial_states, device, predict, predict_batch, admit, gate, index=0):
+    """S1 startup guard, once per run before the first batched rollout: ONE
+    batched forward vs four B=1 forwards on the same first-step inputs.
+
+    ``validate_against`` cannot tell rows apart (they share one condition
+    identity), so row i must match B=1 sample i strictly better than any other
+    sample; a permutation fails closed through a rank-consistent gate. Pure
+    no-grad predictions: no generator, record or model state is touched.
+    Cost: one batched + four B=1 no-grad forwards, once.
+    """
+    ids = tuple(s for s,_ in samples)
+    if len(ids) < 2 or not all(callable(f) for f in (predict, predict_batch, admit, gate)):
+        raise ValueError('batched self-check requires samples, predictors, admission and gates')
+    device = torch.device(device)
+    with torch.no_grad():
+        try:
+            states = [initial_states[sid].to(device) for sid in ids]
+            receipt = admit(index)
+        except Exception:
+            gate('rollout/batch/selfcheck/admission', local_error=True)
+            raise
+        gate('rollout/batch/selfcheck/admission', local_error=False)
+        gate('rollout/batch/selfcheck/forward')
+        batched = predict_batch(ids, torch.cat(states), index)
+        singles = [predict(sid, x, index) for sid, x in zip(ids, states)]
+        try:
+            if type(batched) is not tuple or len(batched) != len(ids) or any(
+                    not isinstance(b, torch.Tensor) or b.shape != s.shape for b, s in zip(batched, singles)):
+                raise ValueError('batched self-check returned the wrong per-sample shapes')
+            matrix = [[float((b.float() - s.float()).abs().max()) for s in singles] for b in batched]
+            if not all(math.isfinite(v) for row in matrix for v in row):
+                raise ValueError('batched self-check produced nonfinite deltas')
+            deltas = [matrix[i][i] for i in range(len(ids))]
+            nearest = [min(v for j, v in enumerate(row) if j != i) for i, row in enumerate(matrix)]
+            if any(deltas[i] >= nearest[i] for i in range(len(ids))):
+                raise ValueError('batched rollout rows are permuted or ambiguous against B=1 samples')
+        except Exception:
+            gate('rollout/batch/selfcheck/result', local_error=True)
+            raise
+        gate('rollout/batch/selfcheck/result', local_error=False)
+    return dict(transition_index=index, sample_ids=list(ids), max_abs_delta=deltas,
+                nearest_other_sample_delta=nearest, admission=receipt, extra_nograd_forwards=1 + len(ids))
+
+
 def _collect_batched(*, dynamics, samples, initial_states, generators, seed, optimizer_step, device,
                      predict_batch, admit, read_behavior_id, behavior_id, gate, window_size, cell_scope):
     """S1: B=1 rollout semantics with one batched model forward per transition.
@@ -247,7 +299,7 @@ def _collect_batched(*, dynamics, samples, initial_states, generators, seed, opt
             # target traces exactly that batched cell.
             scope=(nullcontext() if cell_scope is None else cell_scope(
                 optimizer_step=optimizer_step,row=1,index=index,sample_id=ids[1],
-                selected_index=choice,gate=gate))
+                selected_index=choice,gate=gate,batch_sample_ids=ids))
             with scope:
                 try:
                     receipt=admit(index)

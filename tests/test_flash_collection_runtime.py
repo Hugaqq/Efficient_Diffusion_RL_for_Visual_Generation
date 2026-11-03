@@ -2902,7 +2902,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     # on. Exactly 40 no-grad predicts per update pass for two updates (40, 80);
     # 44 with the flag on, or 40 with it off, is rejected by the same audit.
     import time
-    def audited_nograd_counts(*, reuse, nograd, batched=0, rollout_batch=1):
+    def audited_nograd_counts(*, reuse, nograd, batched=0, rollout_batch=1, selfcheck=False):
         model = torch.nn.Module()
         model.register_parameter('lora', torch.nn.Parameter(torch.ones(2)))
         model.register_parameter('frozen', torch.nn.Parameter(torch.ones(2), requires_grad=False))
@@ -2912,8 +2912,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         if batched: stages.predict_batch = lambda **kw: (model.lora*2,)*4  # S1 batched rollout leaf
         def tiny_iteration(step):
             optimizer.zero_grad(set_to_none=True)
-            for _ in range(batched):
+            for _ in range(batched + (1 if step == 0 and selfcheck else 0)):
                 with torch.no_grad(): stages.predict_batch(index=2)
+            for _ in range(4 if step == 0 and selfcheck else 0):  # S1 startup self-check B=1 forwards
+                with torch.no_grad(): stages.predict(index=0)
             for _ in range(nograd):
                 with torch.no_grad(): stages.predict(index=2)
             for _ in range(4):
@@ -2921,7 +2923,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             norm = float(model.lora.grad.norm()); optimizer.step(); optimizer.zero_grad(set_to_none=True)
             return SimpleNamespace(value=SimpleNamespace(payload=SimpleNamespace(grad_norm=norm)))
         bound = SimpleNamespace(stages=stages, trainer=SimpleNamespace(run_iteration=tiny_iteration))
-        root = tmp_path / f'o1-audit-{int(reuse)}-{nograd}-{batched}-{rollout_batch}'; monitor = root / 'monitor'; monitor.mkdir(parents=True)
+        root = tmp_path / f'o1-audit-{int(reuse)}-{nograd}-{batched}-{rollout_batch}-{int(selfcheck)}'; monitor = root / 'monitor'; monitor.mkdir(parents=True)
         (monitor / 'health.json').write_text(json.dumps(dict(healthy=True, monotonic_ns=time.monotonic_ns(), sample_count=2)))
         graph = SimpleNamespace(source=SimpleNamespace(state_dict=lambda: dict(next_optimizer_step=0)),
                                 profile=SimpleNamespace(launch=SimpleNamespace(output_dir=root)))
@@ -2952,10 +2954,12 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             audited_nograd_counts(reuse=reuse, nograd=nograd)
     # S1: 10 batched rollout forwards + 4 B=1 anchor forwards = 14 per update
     # through the same real audit wrapper; B1 constants reject 14, B4 rejects 44.
-    assert audited_nograd_counts(reuse=False, nograd=4, batched=10, rollout_batch=4) == [14, 28]
-    for nograd, batched, rollout_batch in ((44, 0, 4), (40, 4, 4), (4, 10, 1)):
+    # Plus the mandatory once-per-run S1 row self-check (1 batched + 4 B=1): [19, 33].
+    assert audited_nograd_counts(reuse=False, nograd=4, batched=10, rollout_batch=4, selfcheck=True) == [19, 33]
+    for nograd, batched, rollout_batch, selfcheck in ((44, 0, 4, False), (40, 4, 4, False), (4, 10, 1, False),
+                                                      (4, 10, 4, False), (4, 10, 1, True)):
         with pytest.raises(ValueError, match='graph/count/release audit'):
-            audited_nograd_counts(reuse=False, nograd=nograd, batched=batched, rollout_batch=rollout_batch)
+            audited_nograd_counts(reuse=False, nograd=nograd, batched=batched, rollout_batch=rollout_batch, selfcheck=selfcheck)
     launcher_args = dict(reward_pipeline=True, profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1)
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).reward_pipeline is True
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(launcher_args, reward_pipeline=False))).reward_pipeline is False
@@ -3223,8 +3227,19 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             bounded.setattr(Path, 'read_bytes', lambda path: pytest.fail('unbounded profile read_bytes'))
             with rec.cell(**target): pass
             rec.assert_complete()
+        assert {'rollout_batch', 'sample_ids'}.isdisjoint(json.loads(rec.receipt.read_text())['actual'])
         rec.receipt.write_text('{}')
         with pytest.raises(ValueError, match='integrity'): rec.assert_complete()
+        # S1: a batched target cell names its batch and every traced sample.
+        rec = recorder('profile-batched-cell')
+        batch_ids = ('s0', target['sample_id'], 's2', 's3')
+        with rec.cell(**target, batch_sample_ids=batch_ids): pass
+        rec.assert_complete()
+        actual = json.loads(rec.receipt.read_text())['actual']
+        assert (actual['rollout_batch'], actual['sample_ids'], actual['row']) == (4, list(batch_ids), target['row'])
+        rec = recorder('profile-batched-bad')
+        with pytest.raises(ValueError, match='batched sample identities'):
+            with rec.cell(**target, batch_sample_ids=('s0', 's2')): pass
         # Only the main thread may enter the target; no body execution/replay.
         rec = recorder('profile-thread')
         errors = []
@@ -3808,6 +3823,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args)).nograd_forwards_per_update == 44
     s1_backend = two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args, rollout_batch=4, rollout_batch_replay_tolerance=1e-3))
     assert (s1_backend.rollout_batch, s1_backend.rollout_batch_replay_tolerance, s1_backend.nograd_forwards_per_update) == (4, 1e-3, 14)
+    assert (s1_backend.nograd_forwards_once, two_update.TwoUpdateBackend(args=SimpleNamespace(**s1_args)).nograd_forwards_once) == (5, 0)
     with pytest.raises(ValueError, match='anchor reuse is rejected'):
         two_update.TwoUpdateBackend(args=SimpleNamespace(**dict(s1_args, reuse_rollout_anchor=True), rollout_batch=4))
     # (2) World admission: B4 only for paired_4x8 and only if every rank agrees.
@@ -3967,7 +3983,14 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match='memory admission failed'):
         run(4, admit=refuse)
     receipt = s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32), free_bytes=17*1024**3)
-    assert receipt['checked'] and receipt['required_bytes'] == 16*1024**3
+    assert receipt['checked'] and receipt['required_bytes'] == 16*1024**3 and 'warning' not in receipt
+    assert (receipt['driver_free_bytes'], receipt['reserved_unallocated_bytes']) == (17*1024**3, 0)
+    cached = s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32),
+                                                free_bytes=40*1024**3, driver_free_bytes=10*1024**3)
+    assert cached['reserved_unallocated_bytes'] == 30*1024**3 and 'driver-free below' in cached['warning']
+    with pytest.raises(ValueError, match='driver-free <= allocatable'):
+        s1_rollout.rollout_batch_admission('cpu', batch=4, layout=H3JointLayout(5550, 96, 414, 32),
+                                           free_bytes=1, driver_free_bytes=2)
     with pytest.raises(ValueError, match='no declared'):
         s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout, free_bytes=10**12)
     assert s1_rollout.rollout_batch_admission('cpu', batch=4, layout=dual.layout)['checked'] is False
@@ -3980,6 +4003,32 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     assert refused_calls[-1] == ('rollout/batch/0/admission', True)
     with pytest.raises(ValueError, match='one prompt group'):
         run(4, groups=('g', 'g', 'g', 'h'))
+    # Mandatory startup row self-check: rows must map to their own B=1 sample;
+    # a swapped batch output fails closed at a rank-consistent result gate.
+    def selfcheck(order, *, admit=lambda index: {'checked': False}):
+        events, forwards = [], []
+        def batch(sids, x, index):
+            forwards.append('b4'); out = invariant(x, index); return tuple(out[i:i+1] for i in order)
+        def single(sid, x, index):
+            assert not torch.is_grad_enabled(); forwards.append('b1'); return invariant(x, index)
+        result = s1_rollout.rollout_batch_selfcheck(samples=tuple(zip(ids, ('g',)*4)), initial_states=initial,
+            device='cpu', predict=single, predict_batch=batch, admit=admit,
+            gate=lambda event, **kw: events.append((event, kw.get('local_error'))))
+        return result, events, forwards
+    good, good_events, good_forwards = selfcheck((0, 1, 2, 3))
+    assert good['max_abs_delta'] == [0.]*4 and min(good['nearest_other_sample_delta']) > 0
+    assert good['extra_nograd_forwards'] == 5 and good_forwards == ['b4'] + ['b1']*4
+    assert good_events == [('rollout/batch/selfcheck/admission', False), ('rollout/batch/selfcheck/forward', None),
+                           ('rollout/batch/selfcheck/result', False)]
+    swapped_events = []
+    with pytest.raises(ValueError, match='permuted'):
+        s1_rollout.rollout_batch_selfcheck(samples=tuple(zip(ids, ('g',)*4)), initial_states=initial, device='cpu',
+            predict=lambda sid, x, index: invariant(x, index), admit=lambda index: {},
+            predict_batch=lambda sids, x, index: tuple(invariant(x, index)[i:i+1] for i in (1, 0, 2, 3)),
+            gate=lambda event, **kw: swapped_events.append((event, kw.get('local_error'))))
+    assert swapped_events[-1] == ('rollout/batch/selfcheck/result', True)
+    with pytest.raises(RuntimeError, match='memory admission failed'):
+        selfcheck((0, 1, 2, 3), admit=refuse)
     for bad in (dict(rollout_batch=2), dict(rollout_batch=4, mode='flow'), dict(rollout_batch=4, predict_batch=None)):
         with pytest.raises(ValueError):
             s1_rollout.collect(**(dict(dynamics=dual, samples=tuple(zip(ids, ('g',)*4)), initial_states=initial,
@@ -4025,7 +4074,8 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             return calls, gates, out.getvalue(), result.payload, lora.detach().clone(), ctx.dual_records
         off, on = stage_run(1), stage_run(4)
         nograd = lambda calls: [kind for kind, grad in calls if not grad]
-        assert nograd(off[0]) == ['b1']*44 and nograd(on[0]) == ['b4']*10 + ['b1']*4  # 14 per update
+        # 14 per update, plus the once-per-run row self-check (1 batched + 4 B=1) before the first rollout.
+        assert nograd(off[0]) == ['b1']*44 and nograd(on[0]) == ['b4'] + ['b1']*4 + ['b4']*10 + ['b1']*4
         assert [c for c in off[0] if c[1]] == [c for c in on[0] if c[1]] == [('b1', True)]*4
         assert ('dual/rollout-batch/4/0.0001', False) in on[1] and not any('rollout-batch' in g for g, _ in off[1])
         assert ('dual/anchor/reuse/0', False) in on[1]
@@ -4034,7 +4084,10 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         replay = [e for e in events if e.get('event') == 'h3_rollout_replay_score_check']
         assert len(replay) == 4 and all(e['rollout_batch'] == 4 and e['declared_tolerance'] == 1e-4
                                         and e['old_score_source'] == 'b1_anchor_forward' and e['within_tolerance'] for e in replay)
-        assert [e['transition_index'] for e in events if e.get('event') == 'h3_rollout_batch_admission'] == list(range(10))
+        assert [e['transition_index'] for e in events if e.get('event') == 'h3_rollout_batch_admission'] == [0] + list(range(10))
+        checks = [e for e in events if e.get('event') == 'h3_rollout_batch_selfcheck']
+        assert len(checks) == 1 and checks[0]['max_abs_delta'] == [0.]*4 and checks[0]['sample_ids'] == list(ids)
+        assert 'h3_rollout_batch_selfcheck' not in off[2]
         assert all('declared_tolerance' not in json.loads(line) for line in off[2].splitlines()
                    if 'h3_rollout_replay_score_check' in line)
         assert all(torch.equal(a.old_joint, b.old_joint) for a, b in zip(off[5], on[5]))

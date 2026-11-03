@@ -76,6 +76,7 @@ class H3DualIterationStages(H3IterationStages):
             raise ValueError('batch predict/replay tolerance are only declared for batched rollout')
         self.rollout_batch,self.rollout_batch_replay_tolerance=rollout_batch,rollout_batch_replay_tolerance
         self.predict_batch=predict_batch
+        self.rollout_batch_selfcheck=None  # S1: mandatory once-per-run row-mapping check receipt
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -114,6 +115,17 @@ class H3DualIterationStages(H3IterationStages):
         if self.rollout_batch!=1:
             # Admission already exchanged B4; this gate also pins the declared tolerance.
             c.gate(f'dual/rollout-batch/{self.rollout_batch}/{self.rollout_batch_replay_tolerance!r}')
+            if self.rollout_batch_selfcheck is None:
+                from visual_rl.algorithms.trainer.h3_dual_rollout import rollout_batch_selfcheck
+                receipt=rollout_batch_selfcheck(samples=tuple((sid,gid) for sid,gid,_ in r.samples),
+                    initial_states=r.initial_states,device=self.device,
+                    predict=lambda sid,x,index:self._predict(ctx,sid,x,index),
+                    predict_batch=lambda sids,x,index:self._predict_batch(ctx,sids,x,index),
+                    admit=lambda index:self._rollout_batch_admission(ctx,index),
+                    gate=lambda event,**kw:c.gate('dual/'+event,**kw))
+                print(json.dumps(dict(event='h3_rollout_batch_selfcheck',
+                    optimizer_step=r.identity.optimizer_step,**receipt)),flush=True)
+                self.rollout_batch_selfcheck=receipt
             batched=dict(rollout_batch=self.rollout_batch,
                          predict_batch=lambda sids,x,index:self._predict_batch(ctx,sids,x,index),
                          admit=lambda index:self._rollout_batch_admission(ctx,index))
