@@ -31,7 +31,7 @@ T = TypeVar('T')
 AUX_RUNNING, AUX_DONE, AUX_FAILED, AUX_TIMEOUT = 0, 1, 2, 3
 AUX_BUDGET_SECONDS = 3600.
 HOST_MEDIA_CAP = 16  # decoded media in flight across the single host
-AUX_ABORT_JOIN_SECONDS = 900.  # bounded local join of a cancelled owner (= configured HPS request timeout)
+AUX_ABORT_JOIN_SECONDS = 900.  # fallback bounded local join; the H3 stage passes hps_timeout_s + margin
 
 
 class H3CoordinationError(RuntimeError):

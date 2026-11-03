@@ -2886,9 +2886,11 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         class CancelMidway:
             def gate(self, event, **kwargs):
                 if kwargs.get('local_error'): raise ValueError('local error')
-            def aux_concurrent(self, work, *, cancel, inflight, media_cap):
-                cancel_box.append(cancel); return work()
+            def aux_concurrent(self, work, *, cancel, inflight, media_cap, **kwargs):
+                cancel_box.append(cancel); joins.append(kwargs.get('abort_join_s')); return work()
+        joins = []
         midway = make_stage(0, parallel=True); posted.clear()
+        midway.parallel_abort_join_s = 1860.  # profile hps_timeout_s 1800 + 60
         inner_decode = midway.decode
         @contextmanager
         def decode_then_abort(terminal):
@@ -2904,6 +2906,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match='no new HPS request'):
             midway.reward(StageValue(midway_ctx.request.identity, midway_ctx))
         assert posted == [0, 0, 0] and not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
+        assert joins == [1860.]  # stage threads the profile-derived abort join
         # Coordination-level bounds: local budget expiry, host media cap and a
         # rank in the serial mode all abort every rank in lock step.
         def coord_case(function):
@@ -2964,6 +2967,9 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         H3DualIterationStages(mode='dual_flash', seed=42, parallel_owners=True)
     with pytest.raises(ValueError, match='reward pipeline'):
         H3DualIterationStages(mode='dual_flow', seed=42, parallel_owners=True)
+    for bad in (0, -1., 3601., '60', True):
+        with pytest.raises(ValueError, match='abort join'):
+            H3DualIterationStages(mode='dual_flash', seed=42, parallel_abort_join_s=bad)
 
     # Concurrent observation: CPU score encloses GPU decode in wall time but
     # must NOT enclose it in the GPU stack or reset/synchronize its counters.
@@ -3212,7 +3218,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         reuse_backend.binding = backend.binding; reuse_backend.transaction = backend.transaction
         reuse_bound = reuse_backend.bind(None, runtime, graph, object(), None)
         assert reuse_bound.stages.reuse_rollout_anchor is True and reuse_bound.stages.reward_pipeline is True
-        assert reuse_bound.stages.parallel_owners is False  # default
+        assert reuse_bound.stages.parallel_owners is False and reuse_bound.stages.parallel_abort_join_s is None  # default
         reuse_bound.close()
         # P2 lifecycle: reward pipeline + paired_4x8 dual_flash, an HPS timeout
         # covering eight queued requests, and a manifest-declared queue >= 8.
@@ -3239,7 +3245,12 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             else:
                 p2_bound = parallel_backend.bind(None, runtime, p2_graph, object(), None)
                 assert p2_bound.stages.parallel_owners is True and p2_bound.stages.reward_pipeline is True
+                assert p2_bound.stages.parallel_abort_join_s == 960.  # hps_timeout_s 900 + 60
                 p2_bound.close()
+                long_bound = parallel_backend.bind(None, runtime, SimpleNamespace(source=source,
+                    profile=p2_profile(timeout=1800.)), object(), None)
+                assert long_bound.stages.parallel_abort_join_s == 1860.  # production profile timeout_s 1800
+                long_bound.close()
         p2_args = dict(launcher_args, reward_pipeline=True, parallel_owners=True)
         assert two_update.TwoUpdateBackend(args=SimpleNamespace(**p2_args)).parallel_owners is True
         assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).parallel_owners is False
@@ -4115,6 +4126,31 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         hold.set(); holder_thread.join(5)
         assert outcomes == ['waiter-abandoned', 'active-done'] and closing.close(.05) is True
         assert closing.try_idle_turn() is None
+        with pytest.raises(RuntimeError, match='never be reopened'): closing.reopen()
+        # Review fix: a SCORED reply still being written keeps shutdown waiting
+        # (bounded) even though the GPU turn was already released.
+        replies_queue, write_gate, writing = service.ScoreQueue(2), Event(), Event()
+        def slow_writer_post(out):
+            raw = canonical_json(dict(protocol=service.PROTOCOL, protocol_version=service.VERSION,
+                service_identity=queued.health['service_identity'], sample_id='q-R',
+                prompt='prompt q-R', jpeg_frames=frames_for(17)))
+            handler = object.__new__(service.make_handler(queued, replies_queue))
+            handler.path = '/score'; handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(raw))}
+            handler.rfile = BytesIO(raw); handler.wfile = BytesIO()
+            handler.connection = SimpleNamespace(settimeout=lambda seconds: None)
+            statuses = []
+            handler.send_response = statuses.append; handler.send_header = lambda *a: None
+            def end_headers(): writing.set(); assert write_gate.wait(5)
+            handler.end_headers = end_headers
+            handler.do_POST(); out.append((statuses[0], json.loads(handler.wfile.getvalue())))
+        replied = []
+        reply_thread = Thread(target=slow_writer_post, args=(replied,)); reply_thread.start()
+        assert writing.wait(5)
+        assert replies_queue.outstanding == 0 and replies_queue.replying == 1  # turn released, reply in flight
+        assert replies_queue.close(.05) is False  # shutdown waits for the scored reply
+        write_gate.set(); reply_thread.join(5)
+        assert replied[0][0] == 200 and replied[0][1]['sample_id'] == 'q-R'
+        assert replies_queue.replying == 0 and replies_queue.close(.05) is True
         with pytest.raises(service.QueueClosed):
             with closing.turn('late'): pytest.fail('closed queue admitted a request')
         closed_out = {}
@@ -4134,7 +4170,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         qpost(queued, score_queue, 'q-E', failed); assert failed['q-E'][0] == 500
         qpost(queued, score_queue, 'q-F', failed)
         assert failed['q-F'][:1] == (503,) and failed['q-F'][2] == {'error': 'hpsv3_unready'}
-        assert score_queue.outstanding == 0 and len(queued.inferencer.calls) == 3*124 + 1
+        assert score_queue.outstanding == 0 and len(queued.inferencer.calls) == 4*124 + 1  # q-A..C, q-R, failed q-E
         queued.close()
         # Client: retries ONLY the explicit pre-admission queue-full 503, inside
         # the one timeout budget; other 503s / exhaustion never resend a POST.

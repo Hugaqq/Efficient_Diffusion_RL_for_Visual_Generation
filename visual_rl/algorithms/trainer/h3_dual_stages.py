@@ -39,7 +39,7 @@ from visual_rl.algorithms.trainer.interface import StageValue
 class H3DualIterationStages(H3IterationStages):
     def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
                  rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None,
-                 reuse_rollout_anchor=False, parallel_owners=False, **kwargs):
+                 reuse_rollout_anchor=False, parallel_owners=False, parallel_abort_join_s=None, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -60,7 +60,10 @@ class H3DualIterationStages(H3IterationStages):
         if type(parallel_owners) is not bool: raise TypeError('parallel_owners must be bool')
         if parallel_owners and (mode!='dual_flash' or not reward_pipeline):
             raise ValueError('parallel owners require dual_flash with the reward pipeline')
-        self.parallel_owners=parallel_owners
+        if parallel_abort_join_s is not None and (type(parallel_abort_join_s) not in (int,float)
+                                                  or not 0<parallel_abort_join_s<=3600):
+            raise ValueError('parallel abort join must be a positive bound <= 3600 s')
+        self.parallel_owners,self.parallel_abort_join_s=parallel_owners,parallel_abort_join_s
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -192,8 +195,12 @@ class H3DualIterationStages(H3IterationStages):
             with (self.video_reuse_scope() if self.reuse_video_vae else nullcontext()):
                 return consume_work()
         if parallel:
+            # A cancelled owner may still be inside one HPS request: wait up to
+            # the request timeout (+margin, from the profile) before raising.
+            join=getattr(self,'parallel_abort_join_s',None)
             ctx.rewards=ctx.coordinator.aux_concurrent(work,cancel=cancel,
-                inflight=lambda:ledger.held,media_cap=HOST_MEDIA_CAP)
+                inflight=lambda:ledger.held,media_cap=HOST_MEDIA_CAP,
+                **({'abort_join_s':join} if join is not None else {}))
         else:
             ctx.rewards=ctx.coordinator.aux_turns(work)
         return StageValue(value.identity,ctx)

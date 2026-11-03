@@ -116,6 +116,7 @@ class ScoreQueue:
         self._condition = threading.Condition()
         self._next = self._serving = 0
         self._idle_held = self._closed = self._turn_held = False
+        self._replying = 0  # scored responses not yet written (shutdown waits for them)
         self.admitted_order = deque(maxlen=256)  # recent admission labels; observability only
 
     @property
@@ -170,12 +171,40 @@ class ScoreQueue:
     def release_idle(self, ticket):
         self._release(ticket, idle=True)
 
+    @property
+    def replying(self):
+        with self._condition:
+            return self._replying
+
+    def begin_reply(self):
+        """Inside the turn, after scoring: the response now counts as in flight."""
+        with self._condition:
+            self._replying += 1
+
+    def end_reply(self):
+        with self._condition:
+            if self._replying <= 0:
+                raise RuntimeError('HPS reply accounting underflow')
+            self._replying -= 1
+            self._condition.notify_all()
+
     def close(self, timeout_s):
-        """Refuse/abandon waiters, then wait (bounded) for the active turn only."""
+        """Refuse/abandon waiters, then wait (bounded) for the active turn AND
+        every already-scored reply still being written.
+
+        Terminal: abandoned waiters never release their tickets, so the
+        ticket counters are inconsistent afterwards. A closed queue must never
+        be reopened; build a new ScoreQueue (and server) instead.
+        """
         with self._condition:
             self._closed = True
             self._condition.notify_all()
-            return self._condition.wait_for(lambda: not self._turn_held, timeout=timeout_s)
+            return self._condition.wait_for(lambda: not self._turn_held and self._replying == 0,
+                                            timeout=timeout_s)
+
+    def reopen(self):
+        raise RuntimeError('a closed ScoreQueue can never be reopened (abandoned tickets were not released); '
+                           'create a new queue')
 
 
 def _cleanup(primary, action):
@@ -540,16 +569,20 @@ def make_handler(backend, queue=None):
                         images.append(image.convert('RGB'))
             except Exception:
                 return self.reply(400, {'error': 'invalid_video_request'})
+            replying = False
             try:
                 if queue is None:
                     scores = backend.score(data['sample_id'], data['prompt'], images)
                 else:
                     # Admission happens only after full validation; the turn is
-                    # released before the reply so a slow reader never blocks.
+                    # released before the reply so a slow reader never blocks
+                    # the GPU, but the scored reply stays counted until written
+                    # so an intentional shutdown waits for it (bounded).
                     with queue.turn(data['sample_id']):
                         if not backend.ready:  # an earlier queued request poisoned it
                             return self.reply(503, {'error': 'hpsv3_unready'})
                         scores = backend.score(data['sample_id'], data['prompt'], images)
+                        queue.begin_reply(); replying = True
                 score, _indices = aggregate_frame_scores(scores, backend.contract)
                 self.reply(200, {'protocol': PROTOCOL, 'protocol_version': VERSION,
                     'service_identity': backend.health['service_identity'], 'sample_id': data['sample_id'],
@@ -563,6 +596,8 @@ def make_handler(backend, queue=None):
             except Exception:
                 traceback.print_exc()
                 self.reply(500, {'error': 'hpsv3_scoring_failed'})
+            finally:
+                if replying: queue.end_reply()
     return Handler
 
 
