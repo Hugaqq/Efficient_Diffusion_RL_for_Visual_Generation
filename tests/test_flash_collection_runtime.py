@@ -3707,3 +3707,95 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         for bad in (['--interval', '0'], ['--max-seconds', 'inf'], ['--max-bytes', '0'], ['--interval', 'nan']):
             patch.setattr(sys, 'argv', base + bad)
             with pytest.raises(SystemExit): budget_monitor.main()
+
+    # Formal reward-ranked video retention: cadence, tie-break, real CPU encode
+    # on 8 simulated owner ranks, global selection, and temp cleanup.
+    from scripts import h3_video_retention as retention
+    from visual_rl.models.implementations.h3_decode import H3AVMedia
+    import shutil
+    assert retention.export_steps(every=5, terminal_step=200) == list(range(5, 201, 5))
+    assert retention.export_steps(every=5, terminal_step=203)[-2:] == [200, 203]
+    assert retention.export_steps(every=5, terminal_step=200, after=20)[0] == 25
+    for bad in ((0, 5, 200), (5, 0, 200), (5, 5, True), (1.0, 5, 200)):
+        with pytest.raises(ValueError): retention.export_step(bad[0], every=bad[1], terminal_step=bad[2])
+    tie_rows = [(f's{g}-{m}', f'g{g}', m, float(m % 3)) for g in range(4) for m in range(8)]
+    roles, ranks = retention.select_roles(tie_rows)
+    # Members 2 and 5 tie at the max (2.0), members 0/3/6 tie at the min (0.0): smallest sample_id wins.
+    assert roles['s0-0'] == ('member0', 'worst') and roles['s0-2'] == ('best',)
+    assert ranks['s0-2'] == 1 and ranks['s0-5'] == 2 and ranks['s0-6'] == 8
+    assert sum(len(v) for v in roles.values()) == 12
+    flat_rows = [(f's{g}-{m}', f'g{g}', m, 1.5) for g in range(4) for m in range(8)]
+    assert retention.select_roles(flat_rows)[0]['s1-0'] == ('member0', 'best', 'worst')
+    for broken in (tie_rows[:-1], tie_rows[:-1] + [tie_rows[0]], tie_rows[:-1] + [('x', 'g3', 7, float('nan'))],
+                   tie_rows[:-1] + [('x', 'g3', 7, 1)], tie_rows[:-1] + [('x', 'g3', 0, 1.0)]):
+        with pytest.raises(ValueError): retention.select_roles(broken)
+    assert retention.sample_dirname('h3-sample:ab') == 'h3-sample:ab'
+    assert retention.sample_dirname('../x') == hashlib.sha256(b'../x').hexdigest()
+    ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
+    assert ffmpeg and ffprobe, 'CPU media gate requires ffmpeg and ffprobe'
+    video_root = tmp_path / 'formal-videos'
+    reward_of = {f'h3-sample:{g}-{m}': float((m * 7 + g) % 8) / 4 for g in range(4) for m in range(8)}
+    def owner(rank, step):
+        g, half = rank // 2, rank % 2
+        local = tuple((f'h3-sample:{g}-{m}', f'h3-group:{g}', m) for m in range(4 * half, 4 * half + 4))
+        request = SimpleNamespace(identity=SimpleNamespace(optimizer_step=step - 1), group_layout='paired_4x8',
+            samples=local, prompts={sid: f'prompt {g}' for sid, _, _ in local}, collection_id='c', behavior_id='b')
+        return SimpleNamespace(_pending=request)
+    media = H3AVMedia(torch.linspace(0, 1, 3 * 3 * 16 * 16).reshape(3, 3, 16, 16), torch.zeros(8000, 2), 12, 32000)
+    scored = []
+    def original(*, sample_id, prompt, media):
+        scored.append(sample_id); return reward_of[sample_id]
+    def owners(step, ffmpeg_path=ffmpeg):
+        rows = []
+        for rank in range(8):
+            keep = retention.RolloutRetention(root=video_root, rank=rank, ffmpeg=ffmpeg_path, ffprobe=ffprobe,
+                launcher_sha='test', every=5, terminal_step=200, run_seed=42,
+                identity=lambda sid: dict(stochastic_index=3, initial_noise_sha256='n' * 64))
+            source = owner(rank, step)
+            callback = keep.observe(original, source=source)
+            for sid, _, _ in source._pending.samples:
+                assert callback(sample_id=sid, prompt=source._pending.prompts[sid], media=media) == reward_of[sid]
+            rows.append(keep)
+        return rows
+    before = media.video.clone()
+    quiet = owners(4)  # non-export update: scored, never encoded or staged
+    assert len(scored) == 32 and not video_root.exists() and all(not k.pending for k in quiet)
+    keepers = owners(5)
+    assert len(scored) == 64 and torch.equal(media.video, before)
+    tables = [k.local_rows(5) for k in keepers]
+    published = [path for k in keepers for path in k.publish(5, tables)]
+    roles, ranks = retention.select_roles([tuple(r) for t in tables for r in t])
+    assert len(published) == sum(len(v) for v in roles.values()) == 12
+    step_dir = video_root / 'step-0005'
+    assert sorted(p.name for p in step_dir.iterdir()) == ['best', 'member0', 'selection.json', 'worst']
+    for role in retention.ROLES:
+        assert len(list((step_dir / role).iterdir())) == 4
+    best = [sid for sid, value in roles.items() if 'best' in value]
+    for sid in best:
+        group = sid.split(':')[1].split('-')[0]
+        assert reward_of[sid] == max(v for s, v in reward_of.items() if s.split(':')[1].split('-')[0] == group)
+        receipt = json.loads((step_dir / 'best' / sid / 'receipt.json').read_text())
+        assert (receipt['role'], receipt['reward'], receipt['group_reward_rank'], receipt['run_seed']) == ('best', reward_of[sid], 1, 42)
+        assert receipt['prompt'].startswith('prompt ') and receipt['stochastic_index'] == 3 and receipt['frames'] == 3
+        assert receipt['video_sha256'] == hashlib.sha256((step_dir / 'best' / sid / 'video.mp4').read_bytes()).hexdigest()
+    selection_rows = json.loads((step_dir / 'selection.json').read_text())['samples']
+    assert len(selection_rows) == 32 and sum(len(r['roles']) for r in selection_rows) == 12
+    assert not (video_root / '.staging').exists() or not any((video_root / '.staging').rglob('*.mp4'))
+    with pytest.raises(FileExistsError):  # an export step is never silently overwritten
+        again = owners(5)
+        for k in again: k.publish(5, [k2.local_rows(5) for k2 in again])
+    for k in again: k.discard()
+    assert not any((video_root / '.staging').rglob('*.mp4'))
+    # Failure: a broken encoder fails the score call AFTER the original reward; no temp survives.
+    with pytest.raises(Exception):
+        owners(10, ffmpeg_path=str(tmp_path / 'missing-ffmpeg'))
+    assert not any((video_root / '.staging').rglob('.encode-*')) and not (video_root / 'step-0010').exists()
+    retention.RolloutRetention(root=video_root, rank=0, ffmpeg=ffmpeg, ffprobe=ffprobe, launcher_sha='t',
+        every=5, terminal_step=200, run_seed=42).discard()
+    assert not (video_root / '.staging' / 'rank-0').exists()
+    # Resume: step dirs after the restored boundary move aside (kept), earlier ones stay.
+    keeper = retention.RolloutRetention(root=video_root, rank=0, ffmpeg=ffmpeg, ffprobe=ffprobe, launcher_sha='t',
+        every=5, terminal_step=200, run_seed=42)
+    (video_root / 'step-0010').mkdir()
+    assert keeper.supersede(first_step=5, label='attempt-x') == ['step-0010']
+    assert (video_root / 'step-0005').is_dir() and (video_root / 'superseded' / 'attempt-x' / 'step-0010').is_dir()
