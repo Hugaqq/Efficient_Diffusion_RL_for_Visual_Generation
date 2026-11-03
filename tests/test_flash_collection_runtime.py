@@ -421,6 +421,24 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     raw['launch']['resume_from']=str(tmp_path/'old-step1')
     with pytest.raises(ValueError,match='max2'):validate_two(compile_h3_profile(save_h3_profile(profile_path.parent,raw)))
     raw['launch']['resume_from']=None
+    # Zero-update restore inspector for the two-update layout: compile gate and pure live-state comparison.
+    from scripts.inspect_h3_one_update_restore import check_restore_layout,check_restored_state
+    raw['launch']['resume_from']=str(two.launch.output_dir/'checkpoints'/'step-1')
+    resumed=compile_h3_profile(save_h3_profile(profile_path.parent,raw))
+    assert check_restore_layout(resumed,'resolution-memory',tmp_path/'restore-receipt.json') is resumed
+    with pytest.raises(ValueError,match='output tree'):check_restore_layout(resumed,'resolution-memory',resumed.launch.output_dir/'r.json')
+    with pytest.raises(ValueError,match='one-update'):check_restore_layout(resumed,'one-update',tmp_path/'r.json')
+    with pytest.raises(ValueError,match='resolution-memory'):check_restore_layout(two,'resolution-memory',tmp_path/'r.json')
+    raw['launch']['resume_from']=None
+    fp=dict(hashes=dict(trainable='a',frozen='b'),tensor_counts=dict(trainable=1,frozen=1))
+    good=dict(rank=3,start_step=1,trainer_step=1,adam_steps=[1,1],saved_row=dict(rank=3,step=1,after=fp),current=fp,
+              source_state=dict(next_optimizer_step=1,global_cursor=4),cursor=4)
+    check_restored_state(**good)
+    for change,match in ((dict(adam_steps=[1,2]),'Adam'),(dict(adam_steps=[]),'Adam'),(dict(trainer_step=2),'trainer'),
+                         (dict(current=dict(fp,hashes=dict(trainable='x',frozen='b'))),'bytes'),
+                         (dict(saved_row=dict(rank=2,step=1,after=fp)),'audit row'),
+                         (dict(source_state=dict(next_optimizer_step=1,global_cursor=0)),'cursor')):
+        with pytest.raises(ValueError,match=match):check_restored_state(**dict(good,**change))
     from visual_rl.runtime.h3_memory import Journal, TorchCounters
     # Actual PyTorch2.8 HPS telemetry exposed UUID text WITHOUT GPU-. Keep
     # strict runtime/NVML identity spelling compatible, before any update.
