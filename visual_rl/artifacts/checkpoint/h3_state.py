@@ -13,6 +13,8 @@ import json
 import math
 import os
 from pathlib import Path
+import threading
+import time
 
 import torch
 
@@ -306,7 +308,28 @@ def _disk_schema(path, template):
               for n, v in metadata.state_dict_metadata.items()}
     if expected != actual:
         raise ValueError('DCP state keys/shape/dtype do not exactly match target schema')
-    for entry in metadata.storage_data.values():
+    _storage_coverage(path, metadata)
+
+
+def _storage_coverage(path, metadata):
+    """Every state chunk needs a storage entry whose file really holds it.
+
+    DCP builds the global chunk list from the deduplicated plans, so every
+    complete save covers all chunks; a dropped item (e.g. a failed writer
+    thread) leaves a chunk without storage that the reader would KeyError on.
+    """
+    from torch.distributed.checkpoint.metadata import MetadataIndex, TensorStorageMetadata, BytesStorageMetadata
+    storage = metadata.storage_data
+    for fqn, item in metadata.state_dict_metadata.items():
+        if isinstance(item, TensorStorageMetadata):
+            keys = [MetadataIndex(fqn, chunk.offsets) for chunk in item.chunks]
+        elif isinstance(item, BytesStorageMetadata):
+            keys = [MetadataIndex(fqn)]
+        else:
+            raise ValueError('unsupported DCP metadata kind')
+        if not keys or any(key not in storage for key in keys):
+            raise ValueError(f'DCP storage entries do not cover state item {fqn}')
+    for entry in storage.values():
         relative = Path(entry.relative_path)
         if relative.is_absolute() or '..' in relative.parts:
             raise ValueError('DCP storage path escape')
@@ -316,20 +339,91 @@ def _disk_schema(path, template):
             raise ValueError('missing/truncated/escaping DCP storage file')
 
 
+_JOIN_TIMEOUT_S = 300.0
+
+
+def _writer_threads(before):
+    """Live DCP writer threads that this save started."""
+    from torch.distributed.checkpoint import filesystem
+    queue_worker = getattr(filesystem, '_write_files_from_queue', None)
+    return [thread for thread in threading.enumerate()
+            if thread not in before and thread.is_alive() and thread is not threading.current_thread()
+            and (queue_worker is None or getattr(thread, '_target', None) is queue_worker)]
+
+
+def _rank_coverage(path, items, results):
+    """This rank's final plan must be fully present in the writer results and on disk."""
+    written = {result.index: result.storage_data for result in results}
+    missing = [item.index.fqn for item in items if item.index not in written]
+    if missing or len(written) != len(items):
+        raise ValueError(f'DCP writer returned {len(written)} results for {len(items)} planned items;'
+                         f' missing {missing[:8]}')
+    for entry in written.values():
+        file = path / entry.relative_path
+        if file.is_symlink() or not file.is_file() or file.stat().st_size < entry.offset + entry.length:
+            raise ValueError(f'DCP storage file missing/truncated after write: {entry.relative_path}')
+
+
 def _save_dcp(state, path, process_group, *, thread_count=1):
     import torch.distributed.checkpoint as dcp
     # Torch 2.8's writer retains tensor_dict for every tensor in one output
     # file, even for TORCH_SAVE. One file per rank retains an entire CPU shard
     # on all eight ranks. One item per file bounds this retention to a tensor
     # while preserving the complete DCP state/metadata and synchronous fsync.
+    thread_count = _checkpoint_threads(thread_count)
+    writer = dcp.FileSystemWriter(path, overwrite=False, sync_files=True,
+                                  single_file_per_rank=False, thread_count=thread_count)
+    if thread_count == 1:
+        dcp.save(state, checkpoint_id=path, process_group=process_group, storage_writer=writer)
+        return
     # thread_count>1 is an explicit opt-in: the writer drains the same
     # one-item-per-file queue from N threads, still fsyncing every file before
     # close, so names, item bytes and metadata keys are unchanged and at most
-    # N items are in flight.
-    dcp.save(state, checkpoint_id=path, process_group=process_group,
-             storage_writer=dcp.FileSystemWriter(
-                 path, overwrite=False, sync_files=True,
-                 single_file_per_rank=False, thread_count=_checkpoint_threads(thread_count)))
+    # N items are in flight. torch 2.13 filesystem.py:716-747 only joins those
+    # raw threads and :375-477 catches only queue.Empty, so a worker OSError
+    # reaches threading.excepthook, the save returns normally and .metadata
+    # omits the item. Collect exceptions of threads started by this save,
+    # verify this rank's planned items against the writer's results, and raise
+    # INSIDE write_data so DCP exchanges the failure across ranks exactly like
+    # a serial-path write error (utils.py reduce_scatter -> CheckpointException).
+    before = set(threading.enumerate())
+    failures = []
+    lock = threading.Lock()
+    previous_hook = threading.excepthook
+    def hook(args):
+        if args.thread is not None and args.thread not in before:
+            with lock:
+                failures.append(args.exc_value)
+        previous_hook(args)
+    def first_failure():
+        with lock:
+            return failures[0] if failures else None
+    original_write_data = writer.write_data
+    def write_data(plan, planner):
+        future = original_write_data(plan, planner)
+        results = future.wait()  # torch.futures.Future, already resolved by the writer
+        failure = first_failure()
+        if failure is not None:
+            raise failure
+        _rank_coverage(path, plan.items, results)
+        return future
+    writer.write_data = write_data
+    threading.excepthook = hook
+    try:
+        dcp.save(state, checkpoint_id=path, process_group=process_group, storage_writer=writer)
+    except BaseException:
+        # A calling-thread failure propagates from torch before its workers
+        # are joined; join them (bounded) so the original error is not masked
+        # by writes landing after staging cleanup, then propagate unchanged.
+        deadline = time.monotonic() + _JOIN_TIMEOUT_S
+        for thread in _writer_threads(before):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        raise
+    finally:
+        threading.excepthook = previous_hook
+    failure = first_failure()
+    if failure is not None:
+        raise failure
 
 
 def _load_dcp(state, path, process_group):
@@ -397,6 +491,12 @@ def save_h3_state(prepared, staging, *, process_group, identity: H3StateIdentity
     error = None
     try:
         if rank == 0:
+            # The coordinator wrote .metadata and sees every rank's files on
+            # the shared staging: refuse metadata whose storage entries do not
+            # cover all state chunks before the manifest exists. Exchanged
+            # below, so no rank proceeds to publication on a gap.
+            from torch.distributed.checkpoint import FileSystemReader
+            _storage_coverage(target / 'dcp', FileSystemReader(target / 'dcp').read_metadata())
             with (target / 'manifest.json').open('xb') as stream:
                 stream.write(_json_bytes(manifest))
                 stream.flush()

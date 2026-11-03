@@ -679,7 +679,47 @@ def _bounded_map(function: Callable, items: list, threads: int) -> list:
 
 
 def _build_state_tree(root: Path, *, threads: int = 1) -> dict[str, object]:
-    threads = _checkpoint_threads(threads)
+    if _checkpoint_threads(threads) > 1:
+        return _build_state_tree_parallel(root, threads)
+    # threads == 1: the original interleaved loop, verbatim (validate, hash
+    # and fsync one file before looking at the next).
+    entries: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_symlink():
+            raise ValueError("checkpoint writer must not create symlinks")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError("checkpoint writer created a non-regular file")
+        relative = path.relative_to(root).as_posix()
+        if relative in _RESERVED_FILES:
+            raise ValueError(
+                f"checkpoint writer must not create reserved file {relative!r}"
+            )
+        digest, size = _file_digest_size(path)
+        entries.append(
+            {
+                "path": relative,
+                "sha256": digest,
+                "size": size,
+            }
+        )
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if not entries:
+        raise ValueError("checkpoint writer produced no training state files")
+    return {"schema_version": 1, "files": entries}
+
+
+def _build_state_tree_parallel(root: Path, threads: int) -> dict[str, object]:
+    """Opt-in path: validate every path first, then hash+fsync with N workers.
+
+    Same files, same per-file hash+fsync and the same sorted fold as the
+    serial loop; only the per-file open/read/fsync latency is overlapped.
+    """
     files: list[tuple[str, Path]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink():
@@ -696,13 +736,7 @@ def _build_state_tree(root: Path, *, threads: int = 1) -> dict[str, object]:
         files.append((relative, path))
     if not files:
         raise ValueError("checkpoint writer produced no training state files")
-    # Same files, same per-file hash+fsync and same sorted fold either way;
-    # threads>1 only overlaps the per-file open/read/fsync latency.
-    paths = [path for _, path in files]
-    if threads == 1:
-        hashed = [_hash_and_fsync(path) for path in paths]
-    else:
-        hashed = _bounded_map(_hash_and_fsync, paths, threads)
+    hashed = _bounded_map(_hash_and_fsync, [path for _, path in files], threads)
     entries: list[dict[str, object]] = [
         {"path": relative, "sha256": digest, "size": size}
         for (relative, _), (digest, size) in zip(files, hashed)

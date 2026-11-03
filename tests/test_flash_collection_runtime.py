@@ -114,6 +114,16 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
         for bad in (0, -1, 65):
             with pytest.raises(ValueError, match='1..64'):
                 checkpoint_manager._build_state_tree(root, threads=bad)
+        # threads==1 keeps the original interleaved loop (hash+fsync file k
+        # before validating file k+1); threads>1 validates every path first.
+        reserved = root / 'state_tree.json'
+        reserved.write_bytes(b'{}')
+        for threads, expected_fsyncs in ((1, len(expected_paths)), (4, 0)):
+            fsync_threads.clear()
+            with pytest.raises(ValueError, match='reserved file'):
+                checkpoint_manager._build_state_tree(root, threads=threads)
+            assert len(fsync_threads) == expected_fsyncs
+        reserved.unlink()
         checkpoint_manager._verify_state_tree(root, tree)
         with shard.open('r+b') as stream:
             stream.write(b'X')
@@ -154,9 +164,15 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
     assert [entry['path'] for entry in json.loads((published.path / 'state_tree.json').read_text())['tree']['files']] == expected_paths
     assert parallel_manager.inspect_complete(published.path, expected_contract=contract).committed.state_tree_id == published.state_tree_id
     # Check the production writer configuration without pretending this is GPU DCP.
+    default_hook = threading.excepthook
     with monkeypatch.context() as patch:
         calls = []
-        patch.setattr(dcp, 'FileSystemWriter', lambda path, **kw: calls.append(kw))
+        class RecordingWriter:
+            def __init__(self, path, **kw):
+                calls.append(kw)
+            def write_data(self, plan, planner):
+                raise AssertionError('writer must not run under the no-op save')
+        patch.setattr(dcp, 'FileSystemWriter', RecordingWriter)
         patch.setattr(dcp, 'save', lambda *args, **kw: None)
         _save_dcp({}, root / 'dcp', None)
         _save_dcp({}, root / 'dcp', None, thread_count=4)
@@ -164,33 +180,93 @@ def test_real_controller_collects384_then_two192_and_resumes_without_scoring(mon
                               single_file_per_rank=False, thread_count=1),
                          dict(overwrite=False, sync_files=True,
                               single_file_per_rank=False, thread_count=4)]
+        assert threading.excepthook is default_hook
         with pytest.raises(TypeError, match='int'):
             _save_dcp({}, root / 'dcp', None, thread_count=True)
         with pytest.raises(ValueError, match='1..64'):
             _save_dcp({}, root / 'dcp', None, thread_count=0)
     # Real tiny CPU DCP through the same leaf: four writer threads produce the
     # same one-item-per-file set with identical item bytes and equal metadata
-    # (.metadata bytes carry DCP's per-save uuid), and the unchanged reader
-    # restores it. This is not GPU/WORLD8 evidence.
+    # keys/entries. The .metadata bytes differ between saves by DCP's per-save
+    # uuid and, for threads>1, by storage_data insertion (thread completion)
+    # order, which the key-based reader ignores. Not GPU/WORLD8 evidence.
     from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.api import CheckpointException
+    from visual_rl.artifacts.checkpoint.h3_state import _disk_schema
     def tiny_state():
         generator = torch.Generator().manual_seed(7)
         return {'model': {f'layer{i}.weight': torch.randn(16, 8, generator=generator) for i in range(6)},
-                'buffers': {'rope.inv_freq': torch.arange(4.)}}
+                'buffers': {'rope.inv_freq': torch.arange(4.)}, 'groups': [{'lr': 1e-4}]}
     serial_dcp, parallel_dcp = tmp_path / 'dcp-threads-1', tmp_path / 'dcp-threads-4'
     _save_dcp(tiny_state(), serial_dcp, None)
     _save_dcp(tiny_state(), parallel_dcp, None, thread_count=4)
     names = sorted(entry.name for entry in serial_dcp.iterdir())
-    assert names == sorted(entry.name for entry in parallel_dcp.iterdir()) and len(names) == 8 and '.metadata' in names
+    assert names == sorted(entry.name for entry in parallel_dcp.iterdir()) and len(names) == 9 and '.metadata' in names
     assert all((serial_dcp / name).read_bytes() == (parallel_dcp / name).read_bytes() for name in names if name != '.metadata')
     serial_meta, parallel_meta = (FileSystemReader(path).read_metadata() for path in (serial_dcp, parallel_dcp))
     assert serial_meta.state_dict_metadata == parallel_meta.state_dict_metadata
     assert serial_meta.storage_data == parallel_meta.storage_data
+    for path in (serial_dcp, parallel_dcp):
+        _disk_schema(path, tiny_state())  # chunk coverage accepts complete saves of either kind
     restored = tiny_state()
     for value in restored['model'].values():
         value.zero_()
     dcp.load(restored, checkpoint_id=parallel_dcp, process_group=None)
     assert all(torch.equal(restored['model'][name], value) for name, value in tiny_state()['model'].items())
+    # Restore refuses metadata whose storage entries do not cover every chunk.
+    import pickle
+    metadata_file = serial_dcp / '.metadata'
+    complete_metadata = metadata_file.read_bytes()
+    damaged = pickle.loads(complete_metadata)
+    del damaged.storage_data[next(iter(damaged.storage_data))]
+    metadata_file.write_bytes(pickle.dumps(damaged))
+    with pytest.raises(ValueError, match='do not cover'):
+        _disk_schema(serial_dcp, tiny_state())
+    metadata_file.write_bytes(complete_metadata)
+    _disk_schema(serial_dcp, tiny_state())
+    # Writer-thread failures must fail a threads>1 save loudly: torch only
+    # joins its raw writer threads, so the hook-captured OSError is raised
+    # inside write_data and exchanged by DCP like a serial-path error; no
+    # .metadata is written, the hook is restored and no writer thread outlives
+    # the call. The second case fails on the calling thread while workers are
+    # still writing, which the bounded join must absorb before returning.
+    calling = threading.get_ident()
+    real_torch_save = torch.save
+    worker_failed, calling_failed = threading.Event(), threading.Event()
+    def worker_fails(obj, stream, *args, **kwargs):
+        if threading.get_ident() == calling:
+            worker_failed.wait(5)
+        elif not worker_failed.is_set():
+            worker_failed.set()
+            raise OSError(28, 'No space left on device (injected)')
+        return real_torch_save(obj, stream, *args, **kwargs)
+    def calling_fails(obj, stream, *args, **kwargs):
+        if threading.get_ident() == calling:
+            calling_failed.set()
+            raise OSError(5, 'Input/output error (injected)')
+        calling_failed.wait(5)
+        return real_torch_save(obj, stream, *args, **kwargs)
+    for label, flaky in (('worker', worker_fails), ('calling', calling_fails)):
+        target = tmp_path / f'dcp-{label}-failure'
+        before = set(threading.enumerate())
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, 'save', flaky)
+            with pytest.raises(CheckpointException) as failure:
+                _save_dcp(tiny_state(), target, None, thread_count=4)
+        assert 'injected' in str(failure.value)
+        assert threading.excepthook is default_hook
+        assert not [thread for thread in threading.enumerate() if thread not in before and thread.is_alive()]
+        assert not (target / '.metadata').exists()
+    # Through the manager's publish path the failure leaves nothing published.
+    def failing_writer(directory):
+        worker_failed.clear()
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, 'save', worker_fails)
+            _save_dcp(tiny_state(), directory / 'dcp', None, thread_count=4)
+    with pytest.raises(CheckpointException):
+        parallel_manager.commit(2, contract, failing_writer, progress=publish_progress(2, _selection_policy()))
+    assert sorted(entry.name for entry in parallel_manager.root.iterdir()) == ['latest.json', 'step-1']
+    assert parallel_manager.latest_complete().step == 1
     # New first-five protocol: stateless group selection, no terminal noise,
     # and an explicit one-step window for the old two-transition tiny fixture.
     from visual_rl.algorithms.trainer.h3_dual_rollout import selected_step,collect,SELECTION_VERSION
