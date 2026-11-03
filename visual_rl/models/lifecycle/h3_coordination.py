@@ -31,7 +31,7 @@ T = TypeVar('T')
 AUX_RUNNING, AUX_DONE, AUX_FAILED, AUX_TIMEOUT = 0, 1, 2, 3
 AUX_BUDGET_SECONDS = 3600.
 HOST_MEDIA_CAP = 16  # decoded media in flight across the single host
-AUX_ABORT_JOIN_SECONDS = 900.  # fallback bounded local join; the H3 stage passes hps_timeout_s + margin
+AUX_ABORT_JOIN_SECONDS = 900.  # fallback; lifecycle/launcher budgets HPS, retention and margin
 
 
 class H3CoordinationError(RuntimeError):
@@ -95,6 +95,7 @@ class H3Coordination:
         self._closed = False
         self._sequence = 0
         self._in_aux = False
+        self._aux_worker = None  # retain the handle even after a timed-out join
         self._group = process_group
         self._rank = _world_rank(process_group)  # no usable WORLD means no cooperative gate
         self._identity = None
@@ -116,6 +117,11 @@ class H3Coordination:
             if error is not None:
                 raise exc from error
             raise
+
+    @property
+    def aux_worker_alive(self):
+        """Local cleanup guard, valid even when this coordinator is poisoned/closed."""
+        return self._aux_worker is not None and self._aux_worker.is_alive()
 
     def _require_live(self):
         if self._closed or self._poisoned:
@@ -186,6 +192,7 @@ class H3Coordination:
                         finally:
                             done.set()
                     worker = threading.Thread(target=execute, name=f'h3-aux-{owner}', daemon=True)
+                    self._aux_worker = worker
                     print(json.dumps(dict(event='h3_aux_begin', owner=owner,
                                           timeout_seconds=3600)), flush=True)
                     worker.start()
@@ -245,7 +252,7 @@ class H3Coordination:
         local budget expiry, malformed status or host media count above
         media_cap on ANY rank aborts every rank at that heartbeat: each rank
         sets the cooperative cancel event and joins its own worker for at most
-        abort_join_s (local only; in-flight HTTP/decode cannot be killed)
+        abort_join_s (local only; in-flight HTTP/decode/encode cannot be killed)
         before raising, so caller cleanup does not close resources underneath
         a still-running owner in the common case. Results stay rank-local.
         """
@@ -297,6 +304,7 @@ class H3Coordination:
                     finally:
                         done.set()
                 worker = threading.Thread(target=execute, name=f'h3-aux-parallel-{self._rank}', daemon=True)
+                self._aux_worker = worker
                 worker.start()  # parked on `go` until the begin gate succeeds
             except Exception as exc:
                 setup_error = exc
@@ -357,11 +365,6 @@ class H3Coordination:
                     tick += 1
                     time.sleep(interval_s)
             if verdict != 'done':
-                if cancel is not None:
-                    cancel.set()  # cooperative: no new decode / HPS request
-                worker.join(abort_join_s)  # local only, no collective
-                log(event='h3_aux_parallel_abort', rank=self._rank, verdict=verdict,
-                    worker_alive=worker.is_alive())
                 raise H3CoordinationError('parallel auxiliary phase aborted on all ranks: ' + verdict) from error
             end_error = None
             try:
@@ -378,8 +381,14 @@ class H3Coordination:
                     raise exc from end_error
                 raise
             return result
-        except BaseException:
+        except BaseException as exc:
             self._poisoned = True
+            if launch[0]:
+                if cancel is not None:
+                    cancel.set()  # no new decode, HPS request or retention encode
+                worker.join(abort_join_s)  # also on transport failure; local only, exactly one bounded join
+                log(event='h3_aux_parallel_abort', rank=self._rank, verdict=str(exc),
+                    worker_alive=self.aux_worker_alive)
             raise
         finally:
             go.set()  # a parked worker whose gate failed exits without running work

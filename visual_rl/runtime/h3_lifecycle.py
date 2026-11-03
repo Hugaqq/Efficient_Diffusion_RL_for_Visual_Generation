@@ -134,7 +134,7 @@ class _Graph:
 
 
 PARALLEL_HPS_REQUEST_BOUND_S = 90.  # conservative per-request HPS time (non-resident incl. transfers)
-PARALLEL_ABORT_JOIN_MARGIN_S = 60.  # abort join = hps_timeout_s + margin (an owner may be in one request)
+PARALLEL_ABORT_JOIN_MARGIN_S = 60.  # base join: one HPS request + margin; launchers budget score wrappers too
 
 
 class H3LifecycleBackend:
@@ -347,6 +347,10 @@ class H3LifecycleBackend:
     def transform(self, preflight, runtime, graph, prepared):
         return None  # AC/FSDP transforms are already owned by prepare, never applied twice.
 
+    def parallel_abort_join_budget(self, profile):
+        """Base local join bound; launchers must add budgets for post-score work."""
+        return min(profile.launch.hps_timeout_s + PARALLEL_ABORT_JOIN_MARGIN_S, 3600.)
+
     def bind(self, preflight, runtime, graph, prepared, transformed):
         from visual_rl.algorithms.trainer.h3_stages import H3IterationStages
         binding = self.binding
@@ -373,7 +377,7 @@ class H3LifecycleBackend:
                     video_reuse_scope=binding.video_reuse_scope if self.reuse_video_vae else None,
                     reuse_rollout_anchor=self.reuse_rollout_anchor,
                     parallel_owners=self.parallel_owners,
-                    parallel_abort_join_s=(min(graph.profile.launch.hps_timeout_s+PARALLEL_ABORT_JOIN_MARGIN_S, 3600.)
+                    parallel_abort_join_s=(self.parallel_abort_join_budget(graph.profile)
                                            if self.parallel_owners else None),
                     **(dict(rollout_batch=self.rollout_batch, predict_batch=binding.predict_batch,
                             rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance)

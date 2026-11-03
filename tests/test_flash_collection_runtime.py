@@ -2941,20 +2941,102 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             midway.reward(StageValue(midway_ctx.request.identity, midway_ctx))
         assert posted == [0, 0, 0] and not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
         assert joins == [1860.]  # stage threads the profile-derived abort join
+        # A cancel arriving DURING HPS must reach the post-score retention
+        # wrapper, not just the next decode/POST check in the stages.
+        from scripts import h3_video_retention as p2retention
+        from scripts import launch_h3_formal as p2formal
+        cancelled_stage = make_stage(0, parallel=True)
+        cancelled_ctx = rank_context(0); cancelled_ctx.coordinator = CancelMidway()
+        cancelled_stage._active = cancelled_ctx
+        cancelled_keep = p2retention.RolloutRetention(root=tmp_path / 'cancelled-retention', rank=0,
+            ffmpeg='unused', ffprobe='unused', launcher_sha='test', every=5, also=(1,), terminal_step=200, run_seed=42)
+        completed_scores = []
+        def cancel_during_score(*, sample_id, prompt, media):
+            completed_scores.append(sample_id)
+            assert cancelled_stage.reward_cancel is cancel_box[-1]
+            cancelled_stage.reward_cancel.set()
+            return p2_score(sample_id)
+        cancelled_stage.score_one = cancelled_keep.observe(cancel_during_score,
+            source=SimpleNamespace(_pending=cancelled_ctx.request), cancel=lambda: cancelled_stage.reward_cancel)
+        with patch.context() as inject:
+            inject.setattr(p2retention, 'encode_av', lambda *a, **kw: pytest.fail('new encode after cancel'))
+            with pytest.raises(RuntimeError, match='no new retention encode'):
+                cancelled_stage.reward(StageValue(cancelled_ctx.request.identity, cancelled_ctx))
+        assert len(completed_scores) == 1 and not cancelled_keep.staging.exists() and not cancelled_keep.pending
+        assert not any(t.name == 'h3-reward-consumer' for t in threading.enumerate())
         # Coordination-level bounds: local budget expiry, host media cap and a
         # rank in the serial mode all abort every rank in lock step.
+        coordinators = {}
         def coord_case(function):
             def rank_work(rank):
                 coordinator = p2coord.H3Coordination(plan, process_group=world.group, device=f'cuda:{rank}')
+                coordinators[rank] = coordinator
                 try: return function(rank, coordinator)
                 finally: holds[rank] = coordinator._poisoned
             return world.run(rank_work)
-        stop = Event()
-        expired = coord_case(lambda r, c: c.aux_concurrent(lambda: stop.wait(20) if r == 2 else r, budget_s=.05,
-                                                           abort_join_s=.05))
-        stop.set()
-        assert all(isinstance(e, p2coord.H3CoordinationError) and 'on ranks [2]' in str(e) and 'exceeded' in str(e) for e in expired)
-        assert all(c == world.calls[0] for c in world.calls.values()) and all(holds.values())
+        # An actual owner thread blocked inside retention outlives the bounded
+        # join. Formal failure cleanup must keep that rank's staging and log it.
+        import io
+        from contextlib import redirect_stdout
+        stop, encoding = Event(), Event()
+        encode_cancels = [Event() for _ in range(8)]
+        live_keep = p2retention.RolloutRetention(root=tmp_path / 'live-retention', rank=2,
+            ffmpeg='unused', ffprobe='unused', launcher_sha='test', every=5, terminal_step=200, run_seed=42)
+        tiny_media = H3AVMedia(torch.zeros(2, 3, 2, 2), torch.zeros(4, 2), 24, 32000)
+        encoded = []
+        def blocked_encode(directory, **kwargs):
+            encoded.append(directory)
+            (directory / 'inflight').write_text('owned by encoder')
+            encoding.set()
+            assert stop.wait(20)
+            (directory / 'video.mp4').write_bytes(b'finished')
+            return dict(video_sha256='test')
+        def retention_work(rank):
+            if rank == 2:
+                live_keep.stage(dict(step=5, sample_id='inflight'), media=tiny_media, reward=1., cancel=encode_cancels[rank])
+            else:
+                assert encoding.wait(20)
+        with patch.context() as inject:
+            inject.setattr(p2retention, 'encode_av', blocked_encode)
+            try:
+                expired = coord_case(lambda r, c: c.aux_concurrent(lambda: retention_work(r), cancel=encode_cancels[r],
+                                                                  budget_s=.2, abort_join_s=.05))
+                assert all(isinstance(e, p2coord.H3CoordinationError) and 'on ranks [2]' in str(e) and 'exceeded' in str(e) for e in expired)
+                assert all(c == world.calls[0] for c in world.calls.values()) and all(holds.values())
+                assert all(event.is_set() for event in encode_cancels)
+                assert coordinators[2].aux_worker_alive and live_keep.staging.exists()
+                cleanup = object.__new__(p2formal.FormalBackend)
+                cleanup.retention, cleanup.rank = live_keep, 2
+                cleanup.stages = SimpleNamespace(_active=SimpleNamespace(coordinator=coordinators[2]))
+                other_rank = live_keep.root / '.staging' / 'rank-3'
+                other_rank.mkdir(parents=True)
+                (other_rank / 'owned').write_text('other rank')
+                printed = io.StringIO()
+                with redirect_stdout(printed): cleanup.update_failed(4)
+                notice = json.loads(printed.getvalue())
+                assert notice['event'] == 'h3_formal_staging_preserved' and notice['rank'] == 2
+                assert notice['path'] == str(live_keep.staging) and live_keep.step == 5
+                assert (encoded[0] / 'inflight').read_text() == 'owned by encoder'
+            finally:
+                stop.set()
+                if 2 in coordinators and coordinators[2]._aux_worker is not None:
+                    coordinators[2]._aux_worker.join(5)
+            assert not coordinators[2].aux_worker_alive
+            assert (live_keep.pending['inflight']['directory'] / 'video.mp4').read_bytes() == b'finished'
+            # Only the in-flight encode finished; another sample cannot begin.
+            with pytest.raises(RuntimeError, match='no new retention encode'):
+                live_keep.stage(dict(step=5, sample_id='next'), media=tiny_media, reward=2., cancel=encode_cancels[2])
+            assert len(encoded) == 1
+            cleanup.update_failed(4)
+            assert not live_keep.staging.exists() and not live_keep.pending and (other_rank / 'owned').exists()
+            # Also catch cancel arriving during validation, before the encode.
+            encode_cancels[2].clear()
+            inject.setattr(p2retention, 'validate_av', lambda media: encode_cancels[2].set())
+            with pytest.raises(RuntimeError, match='no new retention encode'):
+                live_keep.stage(dict(step=5, sample_id='late'), media=tiny_media, reward=2., cancel=encode_cancels[2])
+            assert len(encoded) == 1 and not list(live_keep.staging.rglob('.encode-*'))
+            cleanup.update_failed(4)
+        tiny_media._release()
         stop = Event()
         cancels = [Event() for _ in range(8)]
         over = coord_case(lambda r, c: c.aux_concurrent(lambda: cancels[r].wait(20), cancel=cancels[r], inflight=lambda: 3))
@@ -3292,7 +3374,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match='reward pipeline'): H3LifecycleBackend(parallel_owners=True)
         parallel_backend = H3LifecycleBackend(reward_pipeline=True, parallel_owners=True)
         def p2_profile(layout='paired_4x8', timeout=900.):
-            return SimpleNamespace(training=SimpleNamespace(algorithm='dual_flash', group_layout=layout),
+            return SimpleNamespace(training=SimpleNamespace(algorithm='dual_flash', group_layout=layout, local_samples=4),
                 launch=SimpleNamespace(hps_timeout_s=timeout, seed=42, budgets=SimpleNamespace(media_bytes=1024, decode_bytes=2048)))
         parallel_backend._check_reward_pipeline(p2_profile())
         parallel_backend._check_reward_pipeline(p2_profile(timeout=720.))
@@ -3316,6 +3398,23 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 assert long_bound.stages.parallel_abort_join_s == 1860.  # production profile timeout_s 1800
                 long_bound.close()
         p2_args = dict(launcher_args, reward_pipeline=True, parallel_owners=True)
+        # Formal retention adds ALL local samples' encoder + probe timeouts to
+        # the actual lifecycle bind, rather than clipping away the extra budget.
+        from scripts import launch_h3_media as media_entry
+        assert p2retention.ENCODE_TIMEOUT_S == media_entry.FFMPEG_TIMEOUT_S + media_entry.FFPROBE_TIMEOUT_S == 240
+        formal_p2 = p2formal.FormalBackend(args=SimpleNamespace(**p2_args, audit_weights=False), manifest={})
+        formal_p2.binding = SimpleNamespace(predict=leaf, decode=leaf, score_one=leaf, coordination_factory=leaf,
+            scorer=SimpleNamespace(declared_queue_capacity=lambda: 8))
+        formal_p2.transaction = object()
+        for timeout in (900., 1800.):
+            profile = p2_profile(timeout=timeout)
+            formal_bound = H3LifecycleBackend.bind(formal_p2, None, runtime,
+                SimpleNamespace(source=source, profile=profile), object(), None)
+            assert formal_bound.stages.parallel_abort_join_s == timeout + 60 + p2retention.ENCODE_TIMEOUT_S * profile.training.local_samples
+            formal_bound.close()
+        with pytest.raises(ValueError, match='abort join'):
+            H3LifecycleBackend.bind(formal_p2, None, runtime,
+                SimpleNamespace(source=source, profile=p2_profile(timeout=2700.)), object(), None)
         assert two_update.TwoUpdateBackend(args=SimpleNamespace(**p2_args)).parallel_owners is True
         assert two_update.TwoUpdateBackend(args=SimpleNamespace(**launcher_args)).parallel_owners is False
         with pytest.raises(TypeError, match='bool'):
@@ -4412,7 +4511,15 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     before = media.video.clone()
     quiet = owners(4)  # non-export update: scored, never encoded or staged
     assert len(scored) == 32 and not video_root.exists() and all(not k.pending for k in quiet)
-    keepers = owners(5)
+    # The budget constants above are also the actual subprocess timeouts.
+    encode_timeouts, real_media_run = [], media_entry.subprocess.run
+    def observed_media_run(*a, **kw):
+        encode_timeouts.append(kw['timeout'])
+        return real_media_run(*a, **kw)
+    with monkeypatch.context() as patch:
+        patch.setattr(media_entry.subprocess, 'run', observed_media_run)
+        keepers = owners(5)
+    assert encode_timeouts == [media_entry.FFMPEG_TIMEOUT_S, media_entry.FFPROBE_TIMEOUT_S] * 32
     assert len(scored) == 64 and torch.equal(media.video, before)
     tables = [k.local_rows(5) for k in keepers]
     published = [path for k in keepers for path in k.publish(5, tables)]
@@ -4712,7 +4819,9 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
     calls = []
     class SpyRetention:
         def __init__(self, **kw): self.kw = kw; calls.append(('init', kw['rank'], kw['terminal_step'], kw['every']))
-        def observe(self, original, *, source): return original
+        def observe(self, original, *, source, cancel):
+            self.cancel = cancel
+            return original
         def is_export(self, step): return formal.retention.export_step(step, every=5, terminal_step=200, also=self.kw['also'])
         def local_rows(self, step): calls.append(('rows', step)); return [['s', 'g', 0, 1.0]]
         def publish(self, step, tables): calls.append(('publish', step, len(tables)))
@@ -4728,7 +4837,8 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             for _ in range(adam_step): optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         prepared = SimpleNamespace(optimizer=optimizer, prepared_root=model)
-        stages = SimpleNamespace(predict=lambda **kw: model.lora * 2, score_one=lambda **kw: 1.)
+        stages = SimpleNamespace(predict=lambda **kw: model.lora * 2, score_one=lambda **kw: 1.,
+                                 reward_cancel=None, _active=None)
         if rollout_batch == 4: stages.predict_batch = lambda **kw: (model.lora * 2,) * 4
         selfcheck = [rollout_batch == 4]  # S1 row self-check: first rollout of THIS process only
         def tiny_iteration(step):
@@ -4768,6 +4878,9 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         health(degraded=True, consecutive_failures=2, monotonic_ns=time.monotonic_ns())  # degraded, fresh (<30 s)
         fresh_backend, fresh_bound, fresh_graph = tiny_backend(0, False)
         assert calls[0] == ('init', 0, 200, 5) and fresh_backend.audit_weights is False
+        assert fresh_backend.retention.cancel() is None
+        fresh_bound.stages.reward_cancel = Event()
+        assert fresh_backend.retention.cancel() is fresh_bound.stages.reward_cancel
         for step in range(5): fresh_bound.trainer.run_iteration(step)
         # Start: stale staging deleted and later step dirs set aside; export only after update 5.
         assert calls[1:3] == [('discard',), ('supersede', 0)]

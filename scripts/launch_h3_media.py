@@ -16,6 +16,9 @@ import wave
 
 BASE_SHA = 'e835fe39f6d208272a28afb3555f408854e14ca2'
 ROOT = Path(__file__).resolve().parents[1]
+FFMPEG_TIMEOUT_S = 180
+FFPROBE_TIMEOUT_S = 60
+ENCODE_TIMEOUT_S = FFMPEG_TIMEOUT_S + FFPROBE_TIMEOUT_S
 
 
 def sha256_file(path):
@@ -93,10 +96,10 @@ def encode_av(staging, *, media, ffmpeg, ffprobe):
            '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-threads', '1',
            '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
            '-movflags', '+faststart', str(mp4)]
-    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=180)
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=FFMPEG_TIMEOUT_S)
     probe = subprocess.run([str(ffprobe), '-v', 'error', '-count_frames',
                             '-show_streams', '-of', 'json', str(mp4)], check=True,
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_S)
     streams = json.loads(probe.stdout)['streams']
     videos = [s for s in streams if s['codec_type']=='video']
     audios = [s for s in streams if s['codec_type']=='audio']

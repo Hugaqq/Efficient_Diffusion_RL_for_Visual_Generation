@@ -22,7 +22,7 @@ import shutil
 import tempfile
 import time
 
-from scripts.launch_h3_media import encode_av, reservation, sha256_file, validate_av
+from scripts.launch_h3_media import ENCODE_TIMEOUT_S, encode_av, reservation, sha256_file, validate_av
 
 ROLES = ('member0', 'best', 'worst')
 POLICY = ('h3-rollout-retention-v1: member0 of each prompt group plus the group max/min reward; '
@@ -100,8 +100,8 @@ class RolloutRetention:
     def is_export(self, step):
         return export_step(step, every=self.every, terminal_step=self.terminal_step, also=self.also)
 
-    def observe(self, original, *, source):
-        """Wrap score_one: original first (unchanged order/value), then stage on export updates."""
+    def observe(self, original, *, source, cancel=lambda: None):
+        """Original score first, then stage; resolve this update's cancel event after scoring."""
         def score(*, sample_id, prompt, media):
             row = reservation(source, sample_id)
             if row['prompt'] != prompt:
@@ -109,12 +109,14 @@ class RolloutRetention:
             reward = original(sample_id=sample_id, prompt=prompt, media=media)
             if self.is_export(row['step']):
                 ordinal = [sid for sid, _, _ in source._pending.samples].index(sample_id)
-                self.stage(dict(row, reservation_index=ordinal), media=media, reward=reward)
+                self.stage(dict(row, reservation_index=ordinal), media=media, reward=reward, cancel=cancel())
             return reward
         return score
 
-    def stage(self, row, *, media, reward):
+    def stage(self, row, *, media, reward, cancel=None):
         from visual_rl.runtime import h3_memory as memory
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError('parallel owners aborted; no new retention encode')
         step, sid = row['step'], row['sample_id']
         if self.step not in (None, step) or sid in self.pending:
             raise ValueError('staged samples of another update were not finalized')
@@ -128,6 +130,11 @@ class RolloutRetention:
         temporary = Path(tempfile.mkdtemp(prefix='.encode-', dir=parent))
         try:
             with memory.span('video_stage', sample_id=sid, step=step):
+                # Cancellation may arrive during validation/staging preparation.
+                # Once admitted here, this one encode finishes under its own
+                # subprocess timeouts; subsequent samples must not start one.
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError('parallel owners aborted; no new retention encode')
                 facts = encode_av(temporary, media=media, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe)
             final = parent / sample_dirname(sid)
             os.rename(temporary, final)

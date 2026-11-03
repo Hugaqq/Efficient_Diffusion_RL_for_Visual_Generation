@@ -332,6 +332,13 @@ class FormalBackend(TwoUpdateBackend):
             return committed
         self.transaction.checkpoint = checkpoint
 
+    def parallel_abort_join_budget(self, profile):
+        # Retention encodes each local sample on export updates. Budget all of
+        # them conservatively, even though cancel prevents starting new encodes.
+        # Do not clip the sum: the stages reject a total above their 3600 s cap.
+        return (super().parallel_abort_join_budget(profile)
+                + retention.ENCODE_TIMEOUT_S * profile.training.local_samples)
+
     def install_media(self, bound, graph, runtime):
         launch = graph.profile.launch
         self.retention = retention.RolloutRetention(root=launch.output_dir / 'rollout-videos', rank=runtime.rank,
@@ -339,7 +346,9 @@ class FormalBackend(TwoUpdateBackend):
             every=EXPORT_EVERY, also=EXPORT_ALSO, terminal_step=launch.max_optimizer_steps, run_seed=launch.seed,
             identity=lambda sid: self.rollout_identity(bound, graph, sid))
         self.rank = runtime.rank
-        bound.stages.score_one = self.retention.observe(bound.stages.score_one, source=graph.source)
+        self.stages = bound.stages
+        bound.stages.score_one = self.retention.observe(bound.stages.score_one, source=graph.source,
+            cancel=lambda: bound.stages.reward_cancel)
 
     def check_start(self, step, graph, prepared):
         if self.start_step == 0:
@@ -368,6 +377,14 @@ class FormalBackend(TwoUpdateBackend):
 
     def update_failed(self, step):
         if self.retention is not None:
+            ctx = self.stages._active
+            if ctx is not None and ctx.coordinator.aux_worker_alive:
+                # A bounded join may time out. The worker (including its P1
+                # consumer) still owns this rank's files; never race its encode.
+                print(json.dumps(dict(event='h3_formal_staging_preserved', step=step + 1, rank=self.rank,
+                    path=str(self.retention.staging), reason='auxiliary worker still alive; clean up after exit')),
+                    flush=True)
+                return
             try:
                 self.retention.discard()
             except OSError as exc:

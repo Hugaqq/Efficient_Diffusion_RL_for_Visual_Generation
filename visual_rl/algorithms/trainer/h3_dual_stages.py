@@ -84,6 +84,7 @@ class H3DualIterationStages(H3IterationStages):
                                                   or not 0<parallel_abort_join_s<=3600):
             raise ValueError('parallel abort join must be a positive bound <= 3600 s')
         self.parallel_owners,self.parallel_abort_join_s=parallel_owners,parallel_abort_join_s
+        self.reward_cancel=None  # current update's event, also observed by post-score retention
         self.rollout_cell_scope=rollout_cell_scope
         self.reward_pipeline=reward_pipeline
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
@@ -180,6 +181,7 @@ class H3DualIterationStages(H3IterationStages):
             _checked(ctx.coordinator,'dual/parallel-owners/host-admission',host_admission)
             import threading
             cancel,ledger=threading.Event(),MediaLedger()
+        self.reward_cancel=cancel  # installed before any worker/score callback starts
         def consume_work():
             import math
             from visual_rl.algorithms.trainer.h3_reward_pipeline import RewardSample, reward_pipeline
@@ -244,8 +246,8 @@ class H3DualIterationStages(H3IterationStages):
             with (self.video_reuse_scope() if self.reuse_video_vae else nullcontext()):
                 return consume_work()
         if parallel:
-            # A cancelled owner may still be inside one HPS request: wait up to
-            # the request timeout (+margin, from the profile) before raising.
+            # A cancelled owner may still be in HPS or retention encoding. The
+            # lifecycle/launcher supplies their combined bounded join budget.
             join=getattr(self,'parallel_abort_join_s',None)
             ctx.rewards=ctx.coordinator.aux_concurrent(work,cancel=cancel,
                 inflight=lambda:ledger.held,media_cap=HOST_MEDIA_CAP,
