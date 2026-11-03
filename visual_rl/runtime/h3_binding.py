@@ -64,12 +64,13 @@ def _unpack_id(value, namespace):
 
 
 def verify_h3_content(profile: H3Profile, *, code_root: Path, expected_code_sha256: str,
-                      process_group=None, rank=None, file_observer=None):
+                      process_group=None, rank=None, file_observer=None, directory_observer=None):
     """Always stream actual bytes; no caller-provided verified=True escape hatch."""
     if not isinstance(profile, H3Profile):
         raise TypeError("H3Profile required")
     def hash_files():
-        return (_hash_artifact(profile.launch.model, content_policy="all-files.v1", file_observer=file_observer),
+        return (_hash_artifact(profile.launch.model, content_policy="all-files.v1", file_observer=file_observer,
+                               directory_observer=directory_observer),
                 _hash_artifact(Path(code_root), content_policy="python-code.v1"))
     if process_group is not None:
         from visual_rl.runtime.h3_file_phase import file_phase
@@ -117,7 +118,7 @@ class H3RuntimeBinding:
     def __init__(self, *, profile: H3Profile, facts: H3LocalFacts, adapter: H3Adapter,
                  prepared: H3PreparedModel, source: H3PromptSource, scorer: H3HPSReward,
                  process_group, rank: int, device, gpu_uuids: tuple[str, ...],
-                 code_root: Path, expected_code_sha256: str):
+                 code_root: Path, expected_code_sha256: str, boundary_content_check='full'):
         if not all(isinstance(value, cls) for value, cls in (
             (profile, H3Profile), (facts, H3LocalFacts), (adapter, H3Adapter),
             (prepared, H3PreparedModel), (source, H3PromptSource), (scorer, H3HPSReward))):
@@ -132,15 +133,30 @@ class H3RuntimeBinding:
         self.adapter, self.prepared, self.source, self.scorer = adapter, prepared, source, scorer
         self.process_group, self.rank = process_group, rank
         self.code_root, self.expected_code_sha256 = Path(code_root), expected_code_sha256
+        from visual_rl.runtime.h3_content_sentinel import boundary_content_check_mode, content_check_gate
+        self._boundary_content_check = boundary_content_check_mode(boundary_content_check)
+        content_check_gate(self.boundary_content_check, rank=rank, process_group=process_group, phase='bind')
+        self.checkpoint_content_receipt = None
+        self._model_stat_snapshot = None
         self._closed = False
         self._active = ContextVar("h3-current-forward-policy", default=None)
         self.dynamics = H3CPSDynamics(adapter.geometry.joint_layout, H3ScheduleSnapshot.build(profile.training.num_steps))
         self.topology = dict(world_size=8, gpu_uuids=list(gpu_uuids), placement="rank-local-cuda-index",
                              sp=1, tp=1, reducer_divisor=8)
-        video_records = []
+        video_records, model_records, directories = [], [], []
+        sentinel = self.boundary_content_check == 'sentinel'
+        def observe_file(record):
+            if record.relative.startswith('vae/'):
+                video_records.append(record)
+            if sentinel:
+                model_records.append(record)
         self.content = verify_h3_content(profile, code_root=self.code_root, expected_code_sha256=expected_code_sha256,
-            process_group=self.process_group, rank=self.rank,
-            file_observer=lambda r: video_records.append(r) if r.relative.startswith('vae/') else None)
+            process_group=self.process_group, rank=self.rank, file_observer=observe_file,
+            directory_observer=(lambda relative, metadata: directories.append((relative, metadata))) if sentinel else None)
+        if sentinel:
+            from visual_rl.runtime.h3_content_sentinel import ModelStatSnapshot
+            self._model_stat_snapshot = ModelStatSnapshot.from_hash(
+                profile.launch.model, self.content['model'], model_records, directories)
         self._check_resources()
         self._source_binding = source.state_dict()["binding"]
         self._check_source()
@@ -179,6 +195,10 @@ class H3RuntimeBinding:
         adapter._bind_model_execution_numerics(self.numerics, execution_policy_provider=self._policy)
         from visual_rl.models.implementations.h3_decode_reuse import _video_files
         self._video_files = _video_files(profile.launch.model, self.content['model']['content_sha256'], video_records)
+
+    @property
+    def boundary_content_check(self):
+        return self._boundary_content_check
 
     def _check_resources(self):
         current = preflight_h3_profile(self.profile)
@@ -393,7 +413,10 @@ class H3RuntimeBinding:
                     resources=_hash(dict(content=content, cache=self.facts.cache_identity,
                                          score=asdict(self.scorer.identity))), code=content["code"]["content_sha256"])
 
-    def validate_live(self):
+    def validate_live(self, *, boundary=False):
+        """Restore/default callers always rehash; only opted-in boundaries use stats."""
+        if type(boundary) is not bool:
+            raise TypeError('boundary must be bool')
         if self._closed:
             raise RuntimeError("H3 binding closed")
         if (_world_rank(self.process_group) != self.rank
@@ -401,9 +424,22 @@ class H3RuntimeBinding:
                 or self.topology["gpu_uuids"] != list(self.profile.launch.gpu_uuids)):
             raise ValueError("live rank/device/topology changed")
         video_records = []
-        if verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256,
+        sentinel = boundary and self.boundary_content_check == 'sentinel'
+        if sentinel:
+            from visual_rl.runtime.h3_file_phase import file_phase
+            def stat_and_hash_code():
+                self._model_stat_snapshot.verify()
+                code = _hash_artifact(self.code_root, content_policy='python-code.v1')
+                if code['content_sha256'] != self.expected_code_sha256:
+                    raise ValueError('actual code content identity mismatch')
+                return dict(model=self.content['model'], code=code)
+            content = file_phase(stat_and_hash_code, rank=self.rank, group=self.process_group,
+                                 label='content-identity')
+        else:
+            content = verify_h3_content(self.profile, code_root=self.code_root, expected_code_sha256=self.expected_code_sha256,
                 process_group=self.process_group, rank=self.rank,
-                file_observer=lambda r: video_records.append(r) if r.relative.startswith('vae/') else None) != self.content:
+                file_observer=lambda r: video_records.append(r) if r.relative.startswith('vae/') else None)
+        if content != self.content:
             raise ValueError("artifact content identity changed")
         self._check_resources()
         self._check_source()
@@ -413,7 +449,8 @@ class H3RuntimeBinding:
         if self.adapter.model_execution_numerics != self.numerics:
             raise ValueError("numerics binding drift")
         from visual_rl.models.implementations.h3_decode_reuse import _video_files
-        self._video_files = _video_files(self.profile.launch.model, self.content['model']['content_sha256'], video_records)
+        if not sentinel:
+            self._video_files = _video_files(self.profile.launch.model, self.content['model']['content_sha256'], video_records)
         return self._live_ids()
 
     def _contract(self, *, live=None):
@@ -459,19 +496,32 @@ class H3RuntimeBinding:
         )
 
     def checkpoint_boundary(self, stages, trainer):
-        """Compatibility API: every call still performs fresh full validation."""
+        """Compatibility API: every call still performs fresh boundary validation."""
         boundary, _ = self.checkpoint_snapshot(stages, trainer)
         return boundary
 
-    def checkpoint_snapshot(self, stages, trainer):
-        """Validate once for immediate synchronous checkpoint publication; never cache."""
+    def checkpoint_snapshot(self, stages, trainer, *, terminal=False):
+        """Validate once for immediate synchronous checkpoint publication; never cache.
+
+        The configured training target is always terminal. A safe pause/early
+        final save must additionally pass terminal=True, even below that target.
+        """
+        self.checkpoint_content_receipt = None
+        if type(terminal) is not bool:
+            raise TypeError('terminal must be bool')
         source, prepared = self.source, self.prepared
         if stages.data is not source or stages.prepared is not prepared:
             raise ValueError("checkpoint requested for a foreign stage binding")
         state = deepcopy(stages.checkpoint_boundary(trainer))
         next_batch = source.next_global_batch_id
-        live = self.validate_live()
         step = state["next_optimizer_step"]
+        sentinel = (self.boundary_content_check == 'sentinel' and not terminal
+                    and step < self.profile.launch.max_optimizer_steps)
+        from visual_rl.runtime.h3_content_sentinel import content_check_gate
+        mode = 'sentinel' if sentinel else 'full'
+        content_check_gate(self.boundary_content_check, rank=self.rank, process_group=self.process_group,
+                           phase=f'boundary/{step}/{mode}')
+        live = self.validate_live(boundary=True) if sentinel else self.validate_live()
         for _, p in self.prepared.trainable_named_parameters():
             saved = self.prepared.optimizer.state.get(p, {})
             if not saved or saved["step"].item() != step:
@@ -503,6 +553,10 @@ class H3RuntimeBinding:
             raise ValueError("checkpoint requested for a foreign stage binding")
         if stages.checkpoint_boundary(trainer) != state or source.next_global_batch_id != next_batch:
             raise RuntimeError("checkpoint boundary changed during live validation")
+        if self.boundary_content_check == 'sentinel':
+            self.checkpoint_content_receipt = dict(self._model_stat_snapshot.receipt(mode), rank=self.rank,
+                optimizer_step=step, checkpoint_contract_id=self.contract.checkpoint_contract_id,
+                checkpoint_relative_path=f'checkpoints/step-{step}')
         return (progress, proof, data, rng), live
 
     def close(self):

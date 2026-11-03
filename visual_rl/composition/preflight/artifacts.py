@@ -192,6 +192,7 @@ def _hash_artifact(
     *,
     content_policy: str = _ALL_FILES_POLICY,
     file_observer=None,
+    directory_observer=None,
 ) -> dict[str, Any]:
     if content_policy not in {_ALL_FILES_POLICY, _PYTHON_CODE_POLICY}:
         raise ValueError(f"unsupported artifact content policy {content_policy!r}")
@@ -212,6 +213,7 @@ def _hash_artifact(
             totals,
             content_policy=content_policy,
             file_observer=file_observer,
+            directory_observer=directory_observer,
         )
 
     return {
@@ -233,6 +235,7 @@ def _hash_directory(
     *,
     content_policy: str,
     file_observer=None,
+    directory_observer=None,
 ) -> None:
     _require_directory_access(directory, metadata)
     update_filesystem_artifact_record(
@@ -270,6 +273,7 @@ def _hash_directory(
                 totals,
                 content_policy=content_policy,
                 file_observer=file_observer,
+                directory_observer=directory_observer,
             )
         else:
             _hash_file_record(
@@ -286,6 +290,11 @@ def _hash_directory(
         raise ArtifactIdentityError(
             f"artifact directory changed while it was being hashed: {directory}"
         )
+    if directory_observer is not None:
+        snapshot = _file_metadata(metadata)
+        if _file_metadata(after) != snapshot:
+            raise ArtifactIdentityError('artifact directory metadata changed during observed hash')
+        directory_observer(relative, snapshot)
 
 
 def _excluded_code_node(path: Path, *, node_type: str) -> bool:

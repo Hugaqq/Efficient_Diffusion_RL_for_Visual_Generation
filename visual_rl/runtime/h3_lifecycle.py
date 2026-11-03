@@ -135,13 +135,15 @@ class _Graph:
 
 class H3LifecycleBackend:
     def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False,
-                 reuse_rollout_anchor=False, checkpoint_threads=1):
+                 reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check='full'):
         if type(reward_pipeline) is not bool:
             raise TypeError('reward_pipeline must be bool')
         if type(reuse_video_vae) is not bool: raise TypeError('reuse_video_vae must be bool')
         if type(reuse_rollout_anchor) is not bool: raise TypeError('reuse_rollout_anchor must be bool')
         from visual_rl.artifacts.checkpoint.manager import _checkpoint_threads
         self.checkpoint_threads=_checkpoint_threads(checkpoint_threads)  # strict int; 1 keeps serial publish
+        from visual_rl.runtime.h3_content_sentinel import boundary_content_check_mode
+        self.boundary_content_check = boundary_content_check_mode(boundary_content_check)
         self.reuse_video_vae=reuse_video_vae
         self.reuse_rollout_anchor=reuse_rollout_anchor
         self.reward_pipeline=reward_pipeline
@@ -281,7 +283,8 @@ class H3LifecycleBackend:
             profile=graph.profile, facts=graph.facts, adapter=graph.adapter, prepared=prepared,
             source=graph.source, scorer=graph.scorer, process_group=runtime.process_group,
             rank=runtime.rank, device=runtime.device, gpu_uuids=runtime.gpu_uuids,
-            code_root=graph.code_root, expected_code_sha256=graph.code_hash))
+            code_root=graph.code_root, expected_code_sha256=graph.code_hash,
+            boundary_content_check=self.boundary_content_check))
         try:
             path = graph.profile.launch.resume_from
             if path is not None:
@@ -383,8 +386,19 @@ class H3LifecycleBackend:
             if pause or first_formal_flash or first_upgraded_update or (step + 1) % launch.checkpoint_every_optimizer_steps == 0 or step + 1 == launch.max_optimizer_steps:
                 from visual_rl.runtime import h3_memory as memory
                 with memory.span('checkpoint_validation',step=step+1):
+                    options = dict(terminal=pause) if self.boundary_content_check == 'sentinel' else {}
                     boundary, live = _phase(bound.graph.session, 'checkpoint-boundary', lambda:
-                        bound.binding.checkpoint_snapshot(bound.stages, bound.trainer))
+                        bound.binding.checkpoint_snapshot(bound.stages, bound.trainer, **options))
+                    if self.boundary_content_check == 'sentinel':
+                        def record_content_check():
+                            receipt = bound.binding.checkpoint_content_receipt
+                            if receipt is None:
+                                raise ValueError('missing checkpoint content verification receipt')
+                            _write_json(launch.output_dir / (
+                                f'h3-content-check-step-{step+1}-rank-{bound.graph.session.rank}.json'), receipt)
+                        # Per-rank evidence is durable BEFORE publication, outside
+                        # identity/DCP. A receipt alone does not prove a save committed.
+                        _phase(bound.graph.session, 'checkpoint-content-receipt', record_content_check)
                 progress, proof, data, _ = boundary
                 with memory.span('checkpoint_save',step=step+1):
                     committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,

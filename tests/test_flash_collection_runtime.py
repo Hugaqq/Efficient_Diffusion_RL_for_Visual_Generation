@@ -1757,6 +1757,15 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         patch.setattr(h3_loading, '_admit_host_memory', admit_tiny_cpu_weights)
         patch.setattr(torch.distributed, 'broadcast', lambda *args, **kwargs: None)
         patch.setattr(h3_file_phase, 'file_phase', lambda action, **kwargs: action())
+        world_exchange = h3_world._exchange
+        def content_exchange(kind, rank, group, payload, valid):
+            # The older tiny WORLD leaf only knows admission/reward tables.
+            # Mode receipt decoding itself is exercised below on real _exchange.
+            if kind.startswith('h3-content-check/'):
+                assert valid
+                return [payload]*8
+            return world_exchange(kind, rank, group, payload, valid)
+        patch.setattr(h3_world, '_exchange', content_exchange)
         h = binding_fixture(assets_path, patch)
         from tests.test_h3_mvp_cpu_stages import _CoordinationLeaf
         from visual_rl.models.lifecycle.h3_coordination import H3Coordination
@@ -1845,6 +1854,179 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         finally:
             trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
 
+    # C1s: initial full hash observes ALL model files in the same byte pass;
+    # only non-terminal opted-in boundaries avoid the model content stream.
+    from visual_rl.runtime import h3_binding as binding_module
+    from visual_rl.runtime.h3_content_sentinel import ModelStatSnapshot, content_check_gate
+    from visual_rl.composition.preflight import artifacts as artifact_module
+    for content_mode in ('full', 'sentinel'):
+        with monkeypatch.context() as patch:
+            root = tmp_path / ('content-check-' + content_mode); root.mkdir()
+            patch.setattr(h3_loading, '_admit_host_memory', admit_tiny_cpu_weights)
+            patch.setattr(torch.distributed, 'broadcast', lambda *args, **kwargs: None)
+            patch.setattr(h3_file_phase, 'file_phase', lambda action, **kwargs: action())
+            patch.setattr(h3_world, '_exchange', content_exchange)
+            h = binding_fixture(root, patch, bind=False)
+            patch.setattr(H3Coordination, 'aux_turns', _CoordinationLeaf.aux_turns)
+            h.adapter._aux._decoder = _decoder(h.profile.launch.model, h.adapter.geometry)
+            reads, gates = [], []
+            hash_file, exchange = artifact_module._hash_file_record, h3_world._exchange
+            def counted_hash(digest, path, relative, metadata, totals, **kwargs):
+                reads.append((path, metadata.st_size))
+                return hash_file(digest, path, relative, metadata, totals, **kwargs)
+            def observed_exchange(kind, *args):
+                gates.append(kind)
+                return exchange(kind, *args)
+            patch.setattr(artifact_module, '_hash_file_record', counted_hash)
+            patch.setattr(h3_world, '_exchange', observed_exchange)
+            b = binding_module.H3RuntimeBinding(**h.kwargs, boundary_content_check=content_mode)
+            def model_reads():
+                return [size for path, size in reads if path.is_relative_to(h.profile.launch.model)]
+            assert len(model_reads()) == b.content['model']['file_count']
+            assert sum(model_reads()) == b.content['model']['byte_count']  # no second bytes pass
+            assert f'h3-content-check/bind/{content_mode}' in gates
+            assert b.boundary_content_check == content_mode and b.checkpoint_content_receipt is None
+            full_live = b.validate_live()  # restore/default API remains full even when opted in
+            assert len(model_reads()) == 2 * b.content['model']['file_count']
+            contract, identity = b.contract, b.state_identity
+            if content_mode == 'sentinel':
+                snapshot = b._model_stat_snapshot
+                assert snapshot.file_count == b.content['model']['file_count']
+                assert {r[0] for r in snapshot.records if r[1] == 'file'} == {
+                    p.relative_to(h.profile.launch.model).as_posix()
+                    for p in h.profile.launch.model.rglob('*') if p.is_file()}
+                assert snapshot.init_content_sha256 == h.profile.expected['model_sha256']
+                with patch.context() as mode_only:
+                    mode_only.setattr(b, '_boundary_content_check', 'full')
+                    assert b._contract() == contract and b._live_ids() == full_live
+            stages = H3IterationStages(data=h.source, prepared=h.prepared, predict=b.predict,
+                decode=b.decode, score_one=b.score_one, coordination_factory=b.coordination_factory,
+                process_group=h.pg, rank=0, device='cpu', read_behavior_id=h.source.read_behavior_id)
+            trainer = stages.trainer(); trainer.prepare_run(PrepareRunContext('sentinel-test', 'h3', 0))
+            try:
+                for step in range(2):
+                    trainer.run_iteration(step)
+                    reads.clear()
+                    video_evidence = b._video_files
+                    boundary, live = b.checkpoint_snapshot(stages, trainer)
+                    assert live == full_live and b.contract == contract and b.state_identity == identity
+                    assert boundary[0].next_optimizer_step == step + 1
+                    use_sentinel = content_mode == 'sentinel' and step == 0
+                    assert len(model_reads()) == (0 if use_sentinel else b.content['model']['file_count'])
+                    assert any(path.is_relative_to(h.code_root) for path, _ in reads)  # code still streamed
+                    if content_mode == 'full':
+                        assert b.checkpoint_content_receipt is None
+                    else:
+                        receipt = b.checkpoint_content_receipt
+                        expected_mode = 'sentinel' if use_sentinel else 'full'
+                        assert receipt == dict(snapshot.receipt(expected_mode), rank=0, optimizer_step=step+1,
+                            checkpoint_contract_id=contract.checkpoint_contract_id,
+                            checkpoint_relative_path=f'checkpoints/step-{step+1}')
+                        assert f'h3-content-check/boundary/{step+1}/{expected_mode}/sentinel' in gates
+                        if use_sentinel:
+                            assert b._video_files is video_evidence  # no new decode credential semantics
+                            # A safe pause below the configured target is also terminal.
+                            reads.clear()
+                            paused, paused_live = b.checkpoint_snapshot(stages, trainer, terminal=True)
+                            assert paused == boundary and paused_live == live
+                            assert len(model_reads()) == snapshot.file_count
+                            assert b.checkpoint_content_receipt['mode'] == 'full'
+                            reads.clear()
+                            assert b.checkpoint_snapshot(stages, trainer)[1] == live
+                            assert model_reads() == []  # no sticky terminal/full fallback
+                            # Code and cache validation still execute on the sentinel path.
+                            for path in (h.code_root / 'implementation.py', h.profile.launch.text_cache / 'index.json'):
+                                original = path.read_bytes()
+                                try:
+                                    path.write_bytes(original + b' ')
+                                    with pytest.raises(ValueError): b.checkpoint_snapshot(stages, trainer)
+                                    assert b.checkpoint_content_receipt is None
+                                finally:
+                                    path.write_bytes(original)
+                            assert b.checkpoint_snapshot(stages, trainer)[1] == live
+                            # A real non-terminal binding failure never rehashes,
+                            # refreshes, or accepts even a byte-restored file.
+                            target = h.profile.launch.model / 'vae/diffusion_pytorch_model.safetensors'
+                            original = target.read_bytes(); target.write_bytes(original + b' ')
+                            reads.clear()
+                            with pytest.raises(artifact_module.ArtifactIdentityError):
+                                b.checkpoint_snapshot(stages, trainer)
+                            assert reads == [] and b.checkpoint_content_receipt is None
+                            target.write_bytes(original)
+                            with pytest.raises(artifact_module.ArtifactIdentityError):
+                                b.checkpoint_snapshot(stages, trainer)
+                            assert reads == [] and b._model_stat_snapshot is snapshot
+                            # Continue only this synthetic fixture to independently
+                            # exercise the mandatory terminal full path below.
+                # A changed base is never accepted by the terminal full hash.
+                target = h.profile.launch.model / 'vae/diffusion_pytorch_model.safetensors'
+                raw = target.read_bytes(); target.write_bytes(raw + b' ')
+                with pytest.raises(ValueError, match='model content'):
+                    b.checkpoint_snapshot(stages, trainer)
+                assert b.checkpoint_content_receipt is None
+            finally:
+                trainer.close(); b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
+
+    # Real filesystem faults, including empty directories (covered by the
+    # content codec) and preserved-mtime rewrites; no stat or hash mocks here.
+    import os
+    for fault in ('size', 'mtime', 'ctime', 'missing', 'extra', 'directory', 'symlink',
+                  'mode', 'inode', 'empty-directory', 'missing-directory', 'root-symlink'):
+        root = tmp_path / ('sentinel-fault-' + fault); root.mkdir()
+        (root / 'empty').mkdir()
+        target = root / 'base.bin'; target.write_bytes(b'frozen base')
+        files, directories = [], []
+        observed = artifact_module._hash_artifact(root, file_observer=files.append,
+            directory_observer=lambda relative, metadata: directories.append((relative, metadata)))
+        assert observed == artifact_module._hash_artifact(root)  # identical content codec
+        snapshot = ModelStatSnapshot.from_hash(root, observed, files, directories)
+        with pytest.raises(ValueError, match='complete initial full'):
+            ModelStatSnapshot.from_hash(root, observed, files[:-1], directories)
+        with pytest.raises(ValueError, match='complete initial full'):
+            ModelStatSnapshot.from_hash(root, observed, files, [])
+        with monkeypatch.context() as stat_only:
+            def no_open(*args, **kwargs): pytest.fail('stat sentinel opened file bytes')
+            stat_only.setattr(Path, 'open', no_open)
+            snapshot.verify()
+        before = target.stat()
+        if fault == 'size': target.write_bytes(b'longer frozen base')
+        elif fault == 'mtime': os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+        elif fault == 'ctime':
+            target.write_bytes(b'changedbase')  # same size and inode; restore mtime only
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            assert target.stat().st_ino == before.st_ino and target.stat().st_size == before.st_size
+        elif fault == 'missing': target.unlink()
+        elif fault == 'extra': (root / 'extra.bin').write_bytes(b'new')
+        elif fault == 'directory': target.unlink(); target.mkdir()
+        elif fault == 'symlink': target.unlink(); target.symlink_to('empty')
+        elif fault == 'mode': target.chmod(before.st_mode ^ 0o100)
+        elif fault == 'inode':
+            replacement = root / 'replacement'; replacement.write_bytes(target.read_bytes())
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns)); replacement.replace(target)
+        elif fault == 'empty-directory': (root / 'new-empty').mkdir()
+        elif fault == 'missing-directory': (root / 'empty').rmdir()
+        else:
+            moved = root.with_name(root.name + '-moved'); root.rename(moved); root.symlink_to(moved)
+        with pytest.raises(artifact_module.ArtifactIdentityError): snapshot.verify()
+        with pytest.raises(artifact_module.ArtifactIdentityError): snapshot.verify()  # never refresh-and-accept
+
+    # Real WORLD8 receipt decoder rejects mode differences, not a mocked gate.
+    with monkeypatch.context() as patch:
+        mismatch = False
+        def gather_content_modes(outputs, raw, *, group):
+            row = json.loads(raw)
+            outputs[:] = [json.dumps(row[:2] + [rank] + row[3:]).encode() for rank in range(8)]
+            if mismatch:
+                peer = json.loads(outputs[7]); peer[1] = peer[1].replace('/sentinel', '/full')
+                outputs[7] = json.dumps(peer).encode()
+        patch.setattr(h3_world.dist, 'all_gather_object', gather_content_modes)
+        for rank in range(8):
+            content_check_gate('sentinel', rank=rank, process_group=object(), phase='bind')
+        mismatch = True
+        for phase in ('bind', 'boundary/1/sentinel', 'boundary/2/full'):
+            with pytest.raises(ValueError, match='inconsistent phase'):
+                content_check_gate('sentinel', rank=0, process_group=object(), phase=phase)
+
     # Exercise the real lifecycle save branch and _phase error propagation.
     # Trainer/transaction are CPU leaves; no publication or CUDA execution.
     from visual_rl.runtime import h3_lifecycle as lifecycle
@@ -1907,6 +2089,47 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match='snapshot rejected'):
             backend.run(bound)
         assert len(saves) == 2 and exchanges[-1] == ('lifecycle/checkpoint-boundary', False)
+        # Opt-in sidecars are durable before publication, separate from the
+        # exact live/contract/data arguments. Pauses request a full check too.
+        backend = lifecycle.H3LifecycleBackend(boundary_content_check='sentinel')
+        def sentinel_snapshot(stages, trainer, *, terminal):
+            result = snapshot(stages, trainer)
+            step = trainer.next_optimizer_step
+            fake_binding.checkpoint_content_receipt = dict(schema='h3.boundary-content-check.v1',
+                configured_mode='sentinel', mode='full' if terminal or step == 2 else 'sentinel',
+                file_count=3, snapshot_sha256='a'*64, init_content_sha256='b'*64,
+                rank=0, optimizer_step=step, checkpoint_contract_id='contract',
+                checkpoint_relative_path=f'checkpoints/step-{step}')
+            return result
+        fake_binding.checkpoint_snapshot = sentinel_snapshot
+        def receipt_save(actual_prepared, **kwargs):
+            saved = save(actual_prepared, **kwargs)
+            saved.path = output / f'checkpoints/step-{saved.step}'
+            sidecar = output / f'h3-content-check-step-{saved.step}-rank-0.json'
+            assert json.loads(sidecar.read_text()) == fake_binding.checkpoint_content_receipt
+            return saved
+        bound.transaction.checkpoint = receipt_save
+        committed, _ = backend.run(bound)
+        assert committed.step == 2
+        assert json.loads((output / 'h3-content-check-step-1-rank-0.json').read_text())['mode'] == 'sentinel'
+        assert json.loads((output / 'h3-content-check-step-2-rank-0.json').read_text())['mode'] == 'full'
+        assert exchanges.count(('lifecycle/checkpoint-content-receipt', True)) == 2
+        (output / 'PAUSE_REQUESTED').write_text('pause')
+        def paused_exchange(label, rank, group, payload, ok):
+            if label == 'lifecycle/pause-request': return [True] + [None]*7
+            return exchange(label, rank, group, payload, ok)
+        patch.setattr(h3_world, '_exchange', paused_exchange)
+        # The lifecycle consumes the all-rank pause, not a rank-local decision.
+        with pytest.raises(lifecycle.H3SafeBoundaryPause): backend.run(bound)
+        assert json.loads((output / 'h3-content-check-step-1-rank-0.json').read_text())['mode'] == 'full'
+        saved_count = len(saves)
+        def no_receipt(stages, trainer, **kwargs):
+            result = snapshot(stages, trainer); fake_binding.checkpoint_content_receipt = None
+            return result
+        fake_binding.checkpoint_snapshot = no_receipt
+        with pytest.raises(ValueError, match='missing checkpoint content'):
+            backend.run(bound)
+        assert len(saves) == saved_count  # cannot publish without provenance
 
     # P1 ownership: real tiny CPU decoder, original lease locking and storage.
     from tests.test_h3_mvp_cpu_decode import _artifacts, _leaf_setup, _decoder, _terminal
@@ -2576,6 +2799,30 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         H3DualIterationStages(mode='dual_flow', seed=42, reward_pipeline=True, media_bytes=1024, decode_bytes=2048)
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=True,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False, checkpoint_threads=1)).reward_pipeline is True
     assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,profile_rollout=False,reuse_video_vae=False,reuse_rollout_anchor=False, checkpoint_threads=1)).reward_pipeline is False
+    # C1s CLI/backend mode validation and lifecycle-to-binding threading.
+    assert H3LifecycleBackend().boundary_content_check == 'full'
+    for mode in ('full', 'sentinel'):
+        assert two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,
+            profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check=mode)).boundary_content_check == mode
+    for bad in (None, True, 1, '', 'FULL', 'sentinel ', []):
+        with pytest.raises(ValueError, match='full or sentinel'):
+            H3LifecycleBackend(boundary_content_check=bad)
+        with pytest.raises(ValueError, match='full or sentinel'):
+            two_update.TwoUpdateBackend(args=SimpleNamespace(reward_pipeline=False,
+                profile_rollout=False, reuse_video_vae=False, reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check=bad))
+    with monkeypatch.context() as patch:
+        constructed = []
+        def binding_leaf(**kwargs):
+            constructed.append(kwargs)
+            return SimpleNamespace(close=lambda: None)
+        patch.setattr(binding_module, 'H3RuntimeBinding', binding_leaf)
+        patch.setattr(h3_world, '_exchange', lambda label, rank, group, payload, ok: [payload]*8)
+        backend = H3LifecycleBackend(boundary_content_check='sentinel')
+        graph = SimpleNamespace(profile=SimpleNamespace(launch=SimpleNamespace(resume_from=None)),
+            facts=object(), adapter=object(), source=object(), scorer=object(), code_root=tmp_path, code_hash='c'*64)
+        runtime = SimpleNamespace(rank=0, process_group=object(), device='cpu', gpu_uuids=())
+        backend.restore_prepared(None, runtime, graph, object())
+        assert constructed[0]['boundary_content_check'] == 'sentinel'
     # V1v flag: strict bool, default off, paired_4x8 dual_flash only, real binding scope factory required.
     assert H3LifecycleBackend().reuse_video_vae is False
     for bad in (1, 'yes', None):
@@ -2688,6 +2935,18 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--reward-pipeline', '--profile-rollout', '--reuse-video-vae', '--reuse-rollout-anchor', '--help'])
         with pytest.raises(SystemExit) as help_result: two_update.main()
         assert help_result.value.code == 0
+        import io
+        from contextlib import redirect_stdout
+        help_output = io.StringIO()
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--boundary-content-check', 'sentinel', '--help'])
+        with redirect_stdout(help_output), pytest.raises(SystemExit) as sentinel_help:
+            two_update.main()
+        assert sentinel_help.value.code == 0
+        assert '--boundary-content-check {full,sentinel}' in help_output.getvalue()
+        assert 'default: full' in help_output.getvalue()
+        patch.setattr(sys, 'argv', ['launch_h3_resolution_memory', '--boundary-content-check', 'unknown'])
+        with pytest.raises(SystemExit) as invalid_mode: two_update.main()
+        assert invalid_mode.value.code == 2
         # The parsed namespace carries the strict int default; the spy exits
         # before main()'s Git/preflight/GPU side effects.
         import argparse
