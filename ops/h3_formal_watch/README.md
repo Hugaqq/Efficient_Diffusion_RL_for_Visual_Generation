@@ -133,6 +133,106 @@ Dry-run uses a **separate state_dir**, recorded process identity and the same ch
 prints intended actions and writes only dry state; never sends signals or launches.
 Do not reuse dry status for a live service.
 
+## VPS observer / Feishu configuration
+
+Example `/home/qvanium/h3-observer/config.json` (private state mode 0700):
+
+```json
+{
+  "state_dir": "/home/qvanium/h3-observer/state",
+  "ssh_host": "ubtroot@APPROVED_GPU_SSH_ALIAS",
+  "ssh_identity_file": "/home/qvanium/.ssh/h3-observer-read-only",
+  "remote_python": "/usr/bin/python3",
+  "remote_status": "/home/ubtroot/h3-watch/state/status.json",
+  "remote_events": "/home/ubtroot/h3-watch/state/events.jsonl",
+  "remote_logs": ["/ABS/formal-run/initial-training.log", "/ABS/formal-run/monitor/exit.json"],
+  "include_training_log": true,
+  "expected_config_id": "REPLACE_WITH_STATUS_JSON_CONFIG_ID",
+  "timezone": "Asia/Shanghai",
+  "daily_time": "09:00",
+  "heartbeat_max_age_seconds": 600,
+  "unreachable_seconds": 1800,
+  "ssh_attempts": 3,
+  "ssh_timeout_seconds": 30,
+  "alert_repeat_seconds": 3600,
+  "notify_retry_seconds": 300,
+  "analysis_timeout_seconds": 180,
+  "max_analyses_per_tick": 4,
+  "pi_binary": "/ABS/pi",
+  "notifier": {
+    "binary": "/ABS/lark-cli",
+    "chat_id": "oc_REPLACE_APPROVED_CHAT",
+    "identity": "bot",
+    "timeout_seconds": 30
+  }
+}
+```
+
+* Observer's SSH command is only `python3 -c <bundled read-only snapshot reader>`.
+  No SCP, remote writes, GPU commands or training actions. Use a dedicated key,
+  preverified host key and operator-restricted account/key; ideally enforce a
+  server-side forced command with the same fixed read-only path allowlist. The
+  code requires BatchMode/StrictHostKeyChecking and makes at most three 30s
+  attempts, with 10/20s backoff. Unreachable means **unknown**, never "training dead".
+* Snapshot copies are local. Remote reads: status <=1 MiB, events last 64 KiB,
+  at most four log tails of 16 KiB. Default includes the current supervised launch
+  log derived from its validated launch ID, plus up to three explicit log paths.
+  Missing tails are reported, not silently called healthy. Status incidents and
+  resume receipts provide catch-up when the event tail has rolled past an outage.
+* Dead-man: heartbeat >10min or unreachable >=30min; duplicate alerts at most
+  hourly by default. DONE suppresses dead-man because watchdog intentionally exits.
+  New incidents, performed resumes and NEEDS_HUMAN/DONE transitions each get one
+  independent analysis. Daily summary is once per configured timezone's local
+  date, on the first successful timer tick at/after the configured time; downtime
+  does not replay old days. A file lock and systemd oneshot prevent overlap.
+* A fresh pi process uses the requested provider/model/thinking/JSON/no-session
+  options, plus **`--no-tools --no-mcp --no-skills --no-prompt-templates
+  --no-context-files`**, and `/dev/null` stdin. Thus read-only is enforced by removing
+  tools, not only requested in Chinese instructions. Briefs contain bounded
+  status/events/tails and treat logs as untrusted evidence. No session reuse, shell
+  execution of advice, or training action. Provider network access is only on VPS.
+  Validate these flags and model availability on the installed VPS pi version.
+* Each analysis is durably claimed **before** spawn, with no automatic second
+  session after timeout/crash/ambiguous outcome. Results and briefs are retained.
+  Up to four analyses/tick; extra jobs queue. Long analyses can delay the next
+  serial timer invocation. The LLM never blocks the GPU watchdog. A deterministic
+  alert goes out before analysis; the short Chinese diagnosis follows separately.
+* Pluggable notifier contract is `send(text, idempotency_key)`. Feishu uses
+  `lark-cli im +messages-send --as IDENTITY --chat-id CHAT --text TEXT
+  --idempotency-key KEY`, with **TEXT as one UTF-8 argv element**, never shell
+  interpolation. The unit test crosses a real local subprocess argv boundary with
+  Chinese, quotes, backslashes, newlines and shell metacharacters. `ok=true` is the
+  CLI success envelope, not `code=0`. Missing scope/high-risk confirmation failures
+  are saved; never auto-authorized or switched to another sender identity.
+* Notification attempts and cooldowns persist before sending. Failed delivery
+  retries after five minutes with the same idempotency key (Feishu's dedup window
+  is one hour). A crash between delivery and acknowledgment cannot guarantee
+  exactly-once beyond that upstream window. Check `observer-state.json.notices`
+  and analysis status; systemd exit 0 alone does not prove delivery or diagnosis.
+  No service can alert you if the VPS observer itself is down: retain independent
+  VPS/user-service monitoring.
+
+Before enabling the VPS timer, the operator must confirm the recipient, identity
+and disclosure of selected training logs to pi/Feishu. Check the installed CLI
+locally on that VPS (not run during development):
+
+```sh
+lark-cli im +messages-send --help
+# After approval, use the actual configured chat/identity for a delivery smoke test.
+# Do not send private logs to an unapproved recipient.
+```
+
+Offline preview, with no SSH/pi/lark execution (use a distinct dry state_dir):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.observer /ABS/observer-dry-config.json --dry-run
+# To preview alerts and briefs as well, provide a saved snapshot JSON:
+PYTHONDONTWRITEBYTECODE=1 python3 -m ops.h3_formal_watch.observer /ABS/observer-dry-config.json --dry-run --snapshot /ABS/snapshot-fixture.json
+```
+
+Dry-run prints the notifier argv including `--dry-run` but does not invoke even
+that command. It creates only local state/briefs. Live/dry state cannot be mixed.
+
 ## Install user units (GPU ubtroot; observer VPS qvanium)
 
 Do NOT run these commands from this development worktree against a real host.
@@ -174,14 +274,28 @@ systemctl --user start h3-formal-observer.service
 systemctl --user list-timers h3-formal-observer.timer
 ```
 
-Stopping/revoking (on the respective host):
+Stopping/revoking (on the respective host). **Disable the watchdog before an
+intentional manual training stop**, otherwise an unexplained death is eligible for
+the configured transient auto-resume policy:
 
 ```sh
 systemctl --user disable --now h3-formal-watchdog.service   # does NOT stop training
 systemctl --user disable --now h3-formal-observer.timer
 systemctl --user stop h3-formal-observer.service
-systemctl --user mask h3-formal-watchdog.service            # prevent accidental restart
-systemctl --user mask h3-formal-observer.service h3-formal-observer.timer
+# Archive local unit files before masking: mask cannot replace an installed
+# regular ~/.config/systemd/user/*.service file. No evidence/config is deleted.
+# GPU: UNITS='h3-formal-watchdog.service'
+# VPS: UNITS='h3-formal-observer.service h3-formal-observer.timer'
+UNITS='h3-formal-watchdog.service'  # select the appropriate host's list above
+STAMP=$(date +%Y%m%dT%H%M%S)
+for unit in $UNITS; do
+  file="$HOME/.config/systemd/user/$unit"
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    mv "$file" "$file.revoked-$STAMP"
+  fi
+  systemctl --user mask "$unit"
+done
+systemctl --user daemon-reload
 ```
 
 Preserve all state/evidence. Revoke the observer's read-only SSH key and Feishu

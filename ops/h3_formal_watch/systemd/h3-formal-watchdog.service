@@ -1,6 +1,5 @@
 [Unit]
 Description=H3 deterministic GPU-host training watchdog (user ubtroot)
-After=default.target
 
 [Service]
 Type=simple
