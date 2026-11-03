@@ -1757,15 +1757,6 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
         patch.setattr(h3_loading, '_admit_host_memory', admit_tiny_cpu_weights)
         patch.setattr(torch.distributed, 'broadcast', lambda *args, **kwargs: None)
         patch.setattr(h3_file_phase, 'file_phase', lambda action, **kwargs: action())
-        world_exchange = h3_world._exchange
-        def content_exchange(kind, rank, group, payload, valid):
-            # The older tiny WORLD leaf only knows admission/reward tables.
-            # Mode receipt decoding itself is exercised below on real _exchange.
-            if kind.startswith('h3-content-check/'):
-                assert valid
-                return [payload]*8
-            return world_exchange(kind, rank, group, payload, valid)
-        patch.setattr(h3_world, '_exchange', content_exchange)
         h = binding_fixture(assets_path, patch)
         from tests.test_h3_mvp_cpu_stages import _CoordinationLeaf
         from visual_rl.models.lifecycle.h3_coordination import H3Coordination
@@ -1865,7 +1856,6 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
             patch.setattr(h3_loading, '_admit_host_memory', admit_tiny_cpu_weights)
             patch.setattr(torch.distributed, 'broadcast', lambda *args, **kwargs: None)
             patch.setattr(h3_file_phase, 'file_phase', lambda action, **kwargs: action())
-            patch.setattr(h3_world, '_exchange', content_exchange)
             h = binding_fixture(root, patch, bind=False)
             patch.setattr(H3Coordination, 'aux_turns', _CoordinationLeaf.aux_turns)
             h.adapter._aux._decoder = _decoder(h.profile.launch.model, h.adapter.geometry)
@@ -1876,6 +1866,11 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 return hash_file(digest, path, relative, metadata, totals, **kwargs)
             def observed_exchange(kind, *args):
                 gates.append(kind)
+                if kind.startswith('h3-content-check/'):
+                    # Only opted-in fixtures need the new transport leaf;
+                    # default full must use the original WORLD stub unchanged.
+                    assert content_mode == 'sentinel' and args[-1]
+                    return [args[-2]]*8
                 return exchange(kind, *args)
             patch.setattr(artifact_module, '_hash_file_record', counted_hash)
             patch.setattr(h3_world, '_exchange', observed_exchange)
@@ -1884,7 +1879,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                 return [size for path, size in reads if path.is_relative_to(h.profile.launch.model)]
             assert len(model_reads()) == b.content['model']['file_count']
             assert sum(model_reads()) == b.content['model']['byte_count']  # no second bytes pass
-            assert f'h3-content-check/bind/{content_mode}' in gates
+            assert gates == (['h3-content-check/bind/sentinel'] if content_mode == 'sentinel' else [])
             assert b.boundary_content_check == content_mode and b.checkpoint_content_receipt is None
             full_live = b.validate_live()  # restore/default API remains full even when opted in
             assert len(model_reads()) == 2 * b.content['model']['file_count']
@@ -1916,6 +1911,7 @@ def test_approved140_manifest_counts(tmp_path, monkeypatch):
                     assert any(path.is_relative_to(h.code_root) for path, _ in reads)  # code still streamed
                     if content_mode == 'full':
                         assert b.checkpoint_content_receipt is None
+                        assert not any(kind.startswith('h3-content-check/') for kind in gates)
                     else:
                         receipt = b.checkpoint_content_receipt
                         expected_mode = 'sentinel' if use_sentinel else 'full'

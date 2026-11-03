@@ -135,7 +135,8 @@ class H3RuntimeBinding:
         self.code_root, self.expected_code_sha256 = Path(code_root), expected_code_sha256
         from visual_rl.runtime.h3_content_sentinel import boundary_content_check_mode, content_check_gate
         self._boundary_content_check = boundary_content_check_mode(boundary_content_check)
-        content_check_gate(self.boundary_content_check, rank=rank, process_group=process_group, phase='bind')
+        if self.boundary_content_check == 'sentinel':
+            content_check_gate(self.boundary_content_check, rank=rank, process_group=process_group, phase='bind')
         self.checkpoint_content_receipt = None
         self._model_stat_snapshot = None
         self._closed = False
@@ -519,8 +520,9 @@ class H3RuntimeBinding:
                     and step < self.profile.launch.max_optimizer_steps)
         from visual_rl.runtime.h3_content_sentinel import content_check_gate
         mode = 'sentinel' if sentinel else 'full'
-        content_check_gate(self.boundary_content_check, rank=self.rank, process_group=self.process_group,
-                           phase=f'boundary/{step}/{mode}')
+        if self.boundary_content_check == 'sentinel':
+            content_check_gate(self.boundary_content_check, rank=self.rank, process_group=self.process_group,
+                               phase=f'boundary/{step}/{mode}')
         live = self.validate_live(boundary=True) if sentinel else self.validate_live()
         for _, p in self.prepared.trainable_named_parameters():
             saved = self.prepared.optimizer.state.get(p, {})
