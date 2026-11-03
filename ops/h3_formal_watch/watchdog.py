@@ -76,7 +76,7 @@ def checkpoint(path, verify_files=False, report=lambda **kw: None):
         for file in path.rglob('*'):
             if file.is_symlink():
                 raise ValueError('symlink in checkpoint')
-            if file.is_file() and file.name not in {k + '.json' for k in blobs}:
+            if file.is_file() and file.relative_to(path).as_posix() not in {k + '.json' for k in blobs}:
                 actual.append(file.relative_to(path).as_posix())
         if names != sorted(set(names)) or sorted(actual) != names:
             raise ValueError('state tree does not cover exact files')
@@ -123,7 +123,10 @@ def hps_check(url, expected, timeout=8):
     identity = health.get('service_identity')
     changed = isinstance(identity, str) and bool(re.fullmatch('[0-9a-f]{64}', identity)) and identity != expected
     facts = health.get('identity_facts')
-    if facts is not None and digest(dict(identity_facts=facts, video_contract=health.get('video_contract'))) != identity:
+    # Match flash_hpsv3.canonical_json exactly (including default ensure_ascii=True).
+    canonical = json.dumps(dict(identity_facts=facts, video_contract=health.get('video_contract')),
+                           sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+    if facts is not None and hashlib.sha256(canonical).hexdigest() != identity:
         changed = True
     return dict(ok=response.code == 200 and health.get('status') == 'ready' and identity == expected
                 and not changed, identity_changed=changed, health=health)
@@ -302,7 +305,7 @@ class Watchdog:
             p['seconds_without_progress'] = self.mono() - self.s['last_progress_mono']
         if checks['monitor'].get('degraded', False) != self.s['last_checks'].get('monitor', {}).get('degraded', False):
             self.event('monitor_degraded', degraded=checks['monitor'].get('degraded', False))
-        for name in ('monitor', 'disk', 'progress', 'hps'):
+        for name in ('process', 'monitor', 'disk', 'progress', 'hps'):
             if checks[name]['ok'] is True:
                 self.s['debounce'].pop(name, None)
             else:
@@ -411,12 +414,28 @@ class Watchdog:
         text = tail(log, 256 * 1024).lower() if log.is_file() else ''
         # Correctness evidence takes precedence over EVERY transient pattern.
         permanent = ('audit failed', 'graph/count/release', 'adam counter', 'gradient not finite',
-            'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged', 'identity',
+            'non-finite', 'nonfinite', 'frozen base changed', 'lora shard unchanged',
             'different h3 run', 'out of memory', 'insufficient disk', 'refusing resume', 'digest mismatch')
-        if (any(word in text for word in permanent) or re.search(
-                r'(?:graph|adam|gradient|audit)[^\n]*(?:error|failed|mismatch|not finite)|'
-                r'(?:error|assertion)[^\n]*(?:graph|adam|gradient|audit)', text)):
-            return 'correctness_or_permanent_error'
+        nccl = r'nccl[^\n]*watchdog[^\n]*(?:timed out|timeout)|watchdog[^\n]*(?:timed out|timeout)[^\n]*nccl'
+        monitor = r'card(?:/process)? monitor[^\n]*(?:unhealthy|stale)'
+        for line in text.splitlines():
+            # Normal structured launcher metadata is not a failure record.
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+            if isinstance(row, dict):
+                if not (row.get('error') or row.get('exception') or
+                        row.get('level') in ('error', 'critical', 'fatal')):
+                    continue
+            if any(word in line for word in permanent):
+                return 'correctness_or_permanent_error'
+            failure = re.search(r'\b[\w.]*(?:error|exception)\s*:|\b(?:error|fatal|critical)\b|'
+                                r'\b(?:audit|graph|gradient|identity)[^\n]*(?:failed|mismatch)', line)
+            # Elastic's aggregate wrapper is not an additional application failure.
+            wrapper = re.search(r'\b(?:torch\.distributed\.elastic\.multiprocessing\.errors\.)?childfailederror:\s*$', line)
+            if failure and not wrapper and not re.search(nccl + '|' + monitor + '|h3safeboundarypause', line):
+                return 'correctness_or_permanent_error'
         stop = self.s.get('stop') or {}
         if stop.get('cause') == 'hps_identity_change':
             return 'hps_identity_change'
@@ -446,6 +465,7 @@ class Watchdog:
                 return
             self.worker, self.worker_result = None, {}
             self.s['recovery_since'] = self.mono()
+            self.s.pop('verification_started', None)  # new incident, not a verifier restart
             self.state('RECOVERING')
 
     def resume_allowed(self, ckpt):
@@ -472,7 +492,11 @@ class Watchdog:
 
     def verify_async(self):
         if self.worker is None:
-            self.s.update(recovery_phase='verifying', verification_started=self.mono())
+            self.s['recovery_phase'] = 'verifying'
+            self.s.setdefault('verification_started', self.mono())
+            self.persist()  # deadline durable before the read-only worker starts
+            if self.mono() - self.s['verification_started'] >= self.thresholds['verification_wait_seconds']:
+                raise ValueError('checkpoint verification deadline exceeded; worker has no action authority')
             def report(**kw):
                 with self.worker_lock:
                     self.worker_result['progress'] = kw
@@ -488,7 +512,7 @@ class Watchdog:
         with self.worker_lock:
             result = dict(self.worker_result)
         self.s['verification_progress'] = result.get('progress', {})
-        if self.mono() - self.s['verification_started'] >= self.thresholds['verification_wait_seconds']:
+        if not result.get('done') and self.mono() - self.s['verification_started'] >= self.thresholds['verification_wait_seconds']:
             raise ValueError('checkpoint verification deadline exceeded; worker has no action authority')
         if result.get('error'):
             raise ValueError('checkpoint verification failed: ' + result['error'])
@@ -588,7 +612,8 @@ class Watchdog:
                     self.human('launch outcome unknown; no automatic replay')
                 return self.s
             if checks['process']['ok'] is not True:
-                self.human('cannot prove training ownership; no signal/resume')
+                if self.s['debounce'].get('process', {}).get('count', 0) >= self.thresholds['bad_ticks']:
+                    self.human('cannot prove training ownership for consecutive ticks; no signal/resume')
                 return self.s
             alive = checks['process']['alive']
             if self.operator_pause():

@@ -1172,6 +1172,95 @@ def test_report_atomic_append_bounded_sections_and_crash_replay(tmp_path):
     assert replacements
 
 
+@pytest.mark.parametrize('failure', [
+    'ValueError: sampled/replayed old score mismatch beyond the declared batched-rollout tolerance',
+    'RuntimeError: novel application invariant violated', 'AssertionError: audit/graph invalid',
+    'RuntimeError: nonfinite result'])
+def test_failure_records_veto_transient_retry(box, failure):
+    box.log('[rank0]: ' + failure + '\nNCCL watchdog timed out')
+    assert box.watch.death_cause() == 'correctness_or_permanent_error'
+
+
+def test_launcher_identity_json_does_not_veto_nccl(box):
+    box.log('{"identity": "approved", "status": "ready"}\n'
+            '[rank1]: RuntimeError: NCCL watchdog timed out')
+    assert box.watch.death_cause() == 'nccl_watchdog_timeout'
+
+
+@pytest.mark.parametrize('listed', [False, True])
+def test_exact_tree_nested_metadata_names(box, listed):
+    import hashlib
+    from ops.h3_formal_watch.common import digest
+    out = box.root / 'output'
+    fake_checkpoint(out)
+    store = Store(out / 'checkpoints' / 'step-1')
+    Store(store.root / 'nested').text('progress.json', 'nested data')
+    if listed:
+        tree = store.load('state_tree.json')['tree']
+        tree['files'].append(dict(path='nested/progress.json', size=11,
+                                 sha256=hashlib.sha256(b'nested data').hexdigest()))
+        store.save('state_tree.json', dict(tree=tree, state_tree_id=digest(tree)))
+        marker = store.load('complete.json')
+        marker['state_tree_id'] = digest(tree)
+        store.save('complete.json', marker)
+        assert latest_checkpoint(out, True)['step'] == 1
+    else:
+        with pytest.raises(ValueError, match='exact files'):
+            latest_checkpoint(out, True)
+
+
+def test_hps_unicode_producer_digest():
+    import hashlib
+    payload = dict(identity_facts={'path': '/模型/权重'}, video_contract={'frames': 124})
+    identity = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                                        allow_nan=False).encode('utf-8')).hexdigest()
+    class Response:
+        code = 200
+        def read(self, n): return json.dumps(dict(payload, status='ready', service_identity=identity)).encode()
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    with patch('urllib.request.OpenerDirector.open', return_value=Response()):
+        assert hps_check('http://unused', identity)['ok']
+
+
+def test_proc_scan_skips_disappearing_pid():
+    paths = [Path('/proc/111/stat'), Path('/proc/222/stat')]
+    raw = '222 (fake) S 1 222 222 ' + '0 ' * 15 + '123 0'
+    with patch.object(Path, 'exists', return_value=True), patch.object(Path, 'glob', return_value=paths), \
+            patch.object(Path, 'read_text', side_effect=[ProcessLookupError('gone'), raw]):
+        assert list(process.processes()) == [222]
+
+
+def test_ownership_unknown_is_debounced(box):
+    box.tick()
+    with patch.object(process, 'inspect', side_effect=OSError('temporary scan failure')), \
+            patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'WATCHING'
+        assert box.tick()['state'] == 'WATCHING'
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        send.assert_not_called()
+
+
+def test_verification_deadline_survives_restart(box):
+    box.tick()
+    box.watch.s.update(state='RECOVERING', verification_started=box.watch.mono() - 7200)
+    box.watch.persist()
+    restored = Watchdog(box.config, clock=lambda: box.now, monotonic_ns=lambda: box.ns)
+    with patch('threading.Thread'):
+        with pytest.raises(ValueError, match='deadline'):
+            restored.verify_async()
+    assert restored.s['verification_started'] == box.watch.s['verification_started']
+
+
+def test_verification_done_on_deadline_is_accepted(box):
+    watch = box.watch
+    watch.worker = SimpleNamespace(is_alive=lambda: False, join=lambda **kw: None)
+    watch.worker_result = dict(done=True, checkpoint={'step': 1})
+    watch.s['verification_started'] = watch.mono() - watch.thresholds['verification_wait_seconds']
+    assert watch.verify_async()['done']
+    watch.worker = None
+
+
 def test_user_unit_contract():
     units = Path(__file__).resolve().parents[1] / 'ops/h3_formal_watch/systemd'
     watchdog = (units / 'h3-formal-watchdog.service').read_text()

@@ -34,8 +34,8 @@ def processes():
                 pid = int(path.parent.name)
                 rows[pid] = dict(pid=pid, ppid=int(fields[1]), pgid=int(fields[2]), sid=int(fields[3]),
                                  token=fields[19], zombie=fields[0] in ('Z', 'X'))
-            except FileNotFoundError:
-                pass
+            except (FileNotFoundError, ProcessLookupError):
+                pass  # ENOENT/ESRCH: this PID exited during the scan; other IO errors stay unknown
     else:
         result = subprocess.run(['ps', '-axo', 'pid=,ppid=,pgid=,lstart=,stat='],
                                 check=True, capture_output=True, text=True, timeout=10)

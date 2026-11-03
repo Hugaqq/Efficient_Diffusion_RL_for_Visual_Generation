@@ -22,6 +22,9 @@ need separately authorized acceptance. All development tests/drills are offline.
   Unreachable/read failures share that grace. Verified identity changes after
   arming are immediately fatal. HTTP uses `ProxyHandler({})`, never ambient proxies.
 * Monitor unhealthy/stale and low disk require `bad_ticks=3` consecutive bad ticks.
+  Runtime ownership read failures also debounce for `bad_ticks` without any action;
+  initial/restart arming still fails closed immediately. Per-PID ENOENT/ESRCH races
+  are skipped; permission/other IO failures remain unknown.
   Read/parse failures and unavailable inode capacity are UNKNOWN, never inferred
   no-progress or low-disk. Persistent unknown checks latch NEEDS_HUMAN without
   signalling. `inode_floor=0` explicitly disables the inode requirement.
@@ -43,13 +46,18 @@ need separately authorized acceptance. All development tests/drills are offline.
   successful checkpoint and H3SafeBoundaryPause/log or matching TERM exit receipt.
   Generic death, unknown exits, HPS failure/identity change, graph/Adam/gradient
   audits and integrity errors require humans. Permanent evidence wins over
-  transient patterns. Log matching is conservative and bounded to the attempt's
+  transient patterns. Unrecognized exception/error records veto recovery, while
+  normal launcher JSON (including identity metadata) is not failure evidence.
+  Log matching is conservative and bounded to the attempt's
   last 256 KiB; missing evidence never authorizes retry.
 * Resume requires healthy prerequisites, latest complete checkpoint metadata and
   **full exact-tree/shard hashing**. No rollback past a corrupt publication. Hashing
   runs in a daemon worker with no signalling/launch authority; the main loop keeps
   reporting RECOVERING/verifying plus byte/file progress and honest heartbeats.
-  Default verification deadline 2h, prerequisite recovery window 30min.
+  Default verification deadline 2h, persisted once per recovery incident across
+  restarts; a completed result on the deadline tick is accepted. Prerequisite
+  recovery window 30min. Exact-tree exclusions are root metadata paths only.
+  HPS identity verification uses the producer's ASCII-escaped canonical JSON.
 * At most 2 attempted auto-resumes per boot-bound rolling 24h; no same-checkpoint
   retry without a new high-water step. Only `launch.resume_from` changes. All
   artifacts/config paths must remain absolute and exist immediately before launch;
