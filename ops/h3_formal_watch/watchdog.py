@@ -278,7 +278,11 @@ class Watchdog:
                 checks[name] = work()
             except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
                 checks[name] = dict(ok=None, error=repr(exc)[:2000])
-        check('process', lambda: dict(ok=True, **process.inspect(self.s['process'])))
+        def ownership():
+            if not self.s.get('process') and self.config.get('training_unit'):
+                self.s['process'] = process.capture_unit(self.config['training_unit'])
+            return dict(ok=True, **process.inspect(self.s['process']))
+        check('process', ownership)
         if checks['process'].get('alive') and self.s['process'].get('kind') != 'cgroup':
             self.s['process']['members'] = checks['process']['members']
         check('monitor', lambda: monitor_check(self.config['monitor_dir'], self.monotonic_ns,
@@ -562,8 +566,6 @@ class Watchdog:
         try:
             if self.s['state'] == 'DONE':
                 return self.s
-            if not self.s.get('process') and self.config.get('training_unit'):
-                self.s['process'] = process.capture_unit(self.config['training_unit'])
             checks = self.collect()  # even NEEDS_HUMAN keeps read-only evidence current
             if self.s['state'] == 'NEEDS_HUMAN':
                 self.event('human_observation', checks=bounded(checks))

@@ -463,6 +463,23 @@ def test_human_state_keeps_checks_and_acknowledgement_rearms_only(box):
     assert box.tick()['state'] == 'WATCHING'
 
 
+def test_failed_unit_adoption_does_not_suppress_human_observations(box):
+    box.watch.s['process'] = None
+    box.config['training_unit'] = 'h3-training-unavailable.service'
+    with patch.object(process, 'capture_unit', side_effect=RuntimeError('manager unavailable')), \
+            patch.object(process, 'signal_group') as send:
+        assert box.tick()['state'] == 'NEEDS_HUMAN'
+        box.advance(60); box.monitor(degraded=True)
+        box.health = dict(ok=False, identity_changed=True)
+        state = box.tick()
+        assert state['state'] == 'NEEDS_HUMAN' and state['heartbeat_at'] == box.now
+        assert state['last_checks']['process']['ok'] is None
+        assert state['last_checks']['monitor']['degraded']
+        assert state['last_checks']['hps']['identity_changed']
+        assert state['last_checks']['progress']['ok']
+        send.assert_not_called()
+
+
 def test_checkpoint_worker_does_not_block_heartbeat(box):
     import threading
     entered, release = threading.Event(), threading.Event()
