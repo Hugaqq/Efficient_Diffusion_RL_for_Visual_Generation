@@ -57,9 +57,12 @@ class TwoUpdateBackend(H3LifecycleBackend):
         super().__init__(reward_pipeline=args.reward_pipeline, reuse_video_vae=args.reuse_video_vae,
                          reuse_rollout_anchor=args.reuse_rollout_anchor,
                          checkpoint_threads=args.checkpoint_threads,
-                         boundary_content_check=getattr(args, 'boundary_content_check', 'full'))
-        # 4 samples x 10 rollout transitions, plus 4 anchor forwards unless the rollout anchor is reused.
-        self.nograd_forwards_per_update=40 if self.reuse_rollout_anchor else 44
+                         boundary_content_check=getattr(args, 'boundary_content_check', 'full'),
+                         rollout_batch=getattr(args, 'rollout_batch', 1),
+                         rollout_batch_replay_tolerance=getattr(args, 'rollout_batch_replay_tolerance', 1e-4))
+        # 10 rollout transitions x 4 samples (S1: x 1 batched forward), plus 4 B=1 anchor
+        # forwards unless the rollout anchor is reused (rejected with S1): 44 / 40 / 14.
+        self.nograd_forwards_per_update=(10 if self.rollout_batch==4 else 40)+(0 if self.reuse_rollout_anchor else 4)
         from visual_rl.runtime.h3_rollout_profile import configuration
         configuration(args.profile_rollout)  # strict bool; no CUDA probe when off
         self.profile_rollout=args.profile_rollout;self.rollout_profile=None
@@ -87,6 +90,8 @@ class TwoUpdateBackend(H3LifecycleBackend):
                 bound.stages.rollout_cell_scope=self.rollout_profile.cell
             self.predict_audit=PredictAudit(bound.stages.predict)
             bound.stages.predict=self.predict_audit
+            if getattr(bound.stages,'predict_batch',None) is not None:
+                bound.stages.predict_batch=self.predict_audit.batched(bound.stages.predict_batch)
             def exporter(**kwargs):
                 ctx=bound.stages._active;sid=kwargs['metadata']['sample_id'];request=ctx.request
                 kwargs['metadata']=dict(kwargs['metadata'],stochastic_index=ctx.dual_selection[sid],
@@ -168,6 +173,11 @@ def main():
                         'only before non-terminal saves; terminal/restore still fully hash')
     p.add_argument('--profile-rollout',action='store_true',
                    help='opt-in one-cell CPU/CUDA trace; requires separately approved experiment')
+    p.add_argument('--rollout-batch',type=int,choices=(1,4),default=1,
+                   help='opt-in S1: 4 = one batched no-grad rollout forward for the four local samples '
+                        '(different run identity; batched bf16 is not bitwise B1); requires approved experiment')
+    p.add_argument('--rollout-batch-replay-tolerance',type=float,default=1e-4,
+                   help='declared max |rollout - B1 anchor| old-score delta under --rollout-batch 4 (run identity)')
     p.add_argument('--checkpoint-threads',type=int,default=1,
                    help='opt-in DCP writer and rank0 state-tree hashing threads (1 = unchanged serial path); requires approved experiment')
     args=p.parse_args()

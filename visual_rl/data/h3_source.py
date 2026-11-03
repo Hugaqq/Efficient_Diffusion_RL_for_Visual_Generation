@@ -78,7 +78,8 @@ class H3PromptSource:
     def __init__(self, *, train_path, eval_path, train_sha256: str, eval_sha256: str,
                  adapter: H3Adapter, dynamics: H3CPSDynamics, rank: int, world_size: int,
                  group_size: int, base_seed: int, device, max_samples: int,
-                 max_cells: int, max_trajectory_bytes: int, group_layout: str = 'rank_local'):
+                 max_cells: int, max_trajectory_bytes: int, group_layout: str = 'rank_local',
+                 rollout_microbatch: int = 1):
         if not isinstance(adapter, H3Adapter) or not isinstance(dynamics, H3CPSDynamics):
             raise TypeError("loaded H3Adapter and exact H3CPSDynamics required")
         if type(world_size) is not int or world_size != 8 or type(rank) is not int or not 0 <= rank < 8:
@@ -102,6 +103,9 @@ class H3PromptSource:
         if group_layout not in ('rank_local', 'paired_4x8') or (group_layout == 'paired_4x8' and group_size != 8):
             raise ValueError('invalid prompt group layout')
         self._group_layout = group_layout
+        if (type(rollout_microbatch) is not int or rollout_microbatch not in (1, 4)
+                or (rollout_microbatch == 4 and group_layout != 'paired_4x8')):
+            raise ValueError('rollout microbatch must be 1, or 4 only for paired_4x8')
         local_samples = 4 if group_layout == 'paired_4x8' else group_size
         self._groups_per_step = 4 if group_layout == 'paired_4x8' else 8
         required_bytes = local_samples * (steps * (4 * width + 4) + 2 * width)
@@ -128,7 +132,7 @@ class H3PromptSource:
                              source_id=self._source_id, train_sha256=train_sha256, eval_sha256=eval_sha256,
                              train_count=len(train), eval_count=len(heldout), geometry=geometry,
                              world_size=8, placement="global-occurrence-mod-world", sp=1, tp=1,
-                             rollout_microbatch=1, replay_microbatch=1, group_size=group_size,
+                             rollout_microbatch=rollout_microbatch, replay_microbatch=1, group_size=group_size,
                              num_steps=steps, video_sigmas=dynamics.schedule.video_sigmas.tolist(),
                              audio_sigmas=dynamics.schedule.audio_sigmas.tolist(), eta=dynamics.eta,
                              base_seed=base_seed, device_type=device.type, budgets=list(self._budgets),

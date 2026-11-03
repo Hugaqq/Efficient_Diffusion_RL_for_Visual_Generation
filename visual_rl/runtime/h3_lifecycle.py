@@ -135,7 +135,8 @@ class _Graph:
 
 class H3LifecycleBackend:
     def __init__(self, *, code_root=None, code_upgrade=None, inspection_only=False, reward_pipeline=False, reuse_video_vae=False,
-                 reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check='full'):
+                 reuse_rollout_anchor=False, checkpoint_threads=1, boundary_content_check='full',
+                 rollout_batch=1, rollout_batch_replay_tolerance=1e-4):
         if type(reward_pipeline) is not bool:
             raise TypeError('reward_pipeline must be bool')
         if type(reuse_video_vae) is not bool: raise TypeError('reuse_video_vae must be bool')
@@ -146,6 +147,19 @@ class H3LifecycleBackend:
         self.boundary_content_check = boundary_content_check_mode(boundary_content_check)
         self.reuse_video_vae=reuse_video_vae
         self.reuse_rollout_anchor=reuse_rollout_anchor
+        # S1: strict int 1|4 and a strict float tolerance, validated by the same
+        # training contract that later records them in the semantic identity.
+        from visual_rl.composition.config.h3_profile import H3Training
+        if type(rollout_batch) is not int or rollout_batch not in (1, 4):
+            raise ValueError('rollout_batch must be the integer 1 or 4')
+        if rollout_batch == 4:
+            if reuse_rollout_anchor:
+                raise ValueError('batched rollout requires the B=1 anchor forward; rollout anchor reuse is rejected')
+            H3Training(group_size=8, algorithm='dual_flash', group_layout='paired_4x8', rollout_batch=4,
+                       rollout_batch_replay_tolerance=rollout_batch_replay_tolerance)
+        else:
+            H3Training(rollout_batch_replay_tolerance=rollout_batch_replay_tolerance)
+        self.rollout_batch,self.rollout_batch_replay_tolerance=rollout_batch,rollout_batch_replay_tolerance
         self.reward_pipeline=reward_pipeline
         self.inspection_only=inspection_only
         self.code_upgrade = code_upgrade
@@ -156,12 +170,22 @@ class H3LifecycleBackend:
     def compile(self, source):
         try:
             profile=compile_h3_profile(source)
+            if self.rollout_batch != 1:
+                # Batched rollout is part of the run's math payload -> semantic ID,
+                # owner/resume admission and checkpoint contract all differ from B1.
+                from dataclasses import replace
+                profile=replace(profile, training=replace(profile.training, rollout_batch=self.rollout_batch,
+                    rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance))
             self._check_reward_pipeline(profile)
             return profile
         except (ValueError, TypeError, OSError) as exc:
             raise ConfigError(str(exc)) from exc
 
     def _check_reward_pipeline(self,profile):
+        if getattr(profile.training,'rollout_batch',1)!=self.rollout_batch or (self.rollout_batch!=1 and (
+                profile.training.algorithm!='dual_flash' or profile.training.group_layout!='paired_4x8'
+                or profile.training.rollout_batch_replay_tolerance!=self.rollout_batch_replay_tolerance)):
+            raise ValueError('batched rollout requires paired_4x8 dual_flash and the compiled rollout batch')
         if self.reuse_rollout_anchor and profile.training.algorithm!='dual_flash':
             raise ValueError('rollout anchor reuse requires dual_flash')
         if self.reuse_video_vae and (profile.training.algorithm!='dual_flash'
@@ -252,7 +276,8 @@ class H3LifecycleBackend:
                     base_seed=launch.seed, device=_execution_device(runtime),
                     max_samples=profile.training.local_samples,
                     max_cells=profile.training.local_samples * profile.training.num_steps,
-                    max_trajectory_bytes=launch.budgets.trajectory_bytes)
+                    max_trajectory_bytes=launch.budgets.trajectory_bytes,
+                    rollout_microbatch=profile.training.rollout_batch)
                 scorer = _hps(profile, runtime)
                 resources.callback(scorer.close)
                 scorer.acquire()
@@ -323,7 +348,10 @@ class H3LifecycleBackend:
                     decode_bytes=graph.profile.launch.budgets.decode_bytes,
                     reuse_video_vae=self.reuse_video_vae,
                     video_reuse_scope=binding.video_reuse_scope if self.reuse_video_vae else None,
-                    reuse_rollout_anchor=self.reuse_rollout_anchor,**options)
+                    reuse_rollout_anchor=self.reuse_rollout_anchor,
+                    **(dict(rollout_batch=self.rollout_batch, predict_batch=binding.predict_batch,
+                            rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance)
+                       if self.rollout_batch != 1 else {}),**options)
             trainer = stages.trainer()
             return SimpleNamespace(graph=graph, prepared=prepared, binding=binding, stages=stages,
                 trainer=trainer, transaction=self.transaction, close=trainer.close)

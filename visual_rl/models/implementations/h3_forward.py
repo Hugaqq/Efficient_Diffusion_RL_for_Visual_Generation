@@ -19,12 +19,17 @@ if TYPE_CHECKING:
 def h3_t2va_forward(
     prepared_forward: Callable, *, x: torch.Tensor, geometry: H3T2VAGeometry,
     text_embeddings: torch.Tensor, video_sigma: torch.Tensor, audio_sigma: torch.Tensor,
+    batch_size: int = 1,
 ) -> torch.Tensor:
     """Return noise-ward joint prediction, preserving both output graphs.
 
     The caller supplies its sole prepared/guarded callable, and owns grad mode.
     No unwrapping, parameter casting, autocast, CFG, or scheduler lookup here.
     State is FP16 B1; projection dtype alignment belongs to the H3 model.
+    Opt-in batch_size>1 (no-grad rollout only) stacks states that share ONE
+    [1,L,D] condition and both sigmas: the model's batch axis is a pure
+    replication axis (shared packed layout/positions/timestep rows, one
+    attention document per item), so only the state rows differ per item.
     """
     import torch
 
@@ -32,10 +37,14 @@ def h3_t2va_forward(
         raise TypeError("prepared_forward must be callable")
     if not isinstance(geometry, H3T2VAGeometry):
         raise TypeError("geometry must be H3T2VAGeometry")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if batch_size != 1 and torch.is_grad_enabled():
+        raise ValueError("batched H3 forward is no-grad rollout only")
     layout = geometry.joint_layout
     video, audio = layout.unpack(x)
-    if x.shape[0] != 1 or x.dtype != torch.float16:
-        raise ValueError("x must be FP16 microbatch B1")
+    if x.shape[0] != batch_size or x.dtype != torch.float16:
+        raise ValueError("x must be FP16 microbatch B1" if batch_size == 1 else "x must be FP16 with the declared batch")
     if x.device.type not in ("cpu", "cuda") or not bool(torch.isfinite(x).all()):
         raise ValueError("x must be finite on CPU or CUDA")
     if not isinstance(text_embeddings, torch.Tensor):
@@ -60,6 +69,9 @@ def h3_t2va_forward(
                       dtype=torch.float32, device=x.device)
     rows[attention["audio_indices"]] = 1 - audio_sigma.item()
     timestep, indices = torch.unique(rows, sorted=True, return_inverse=True)
+    if batch_size != 1:
+        # One shared condition replicated per item (owned, contiguous; never a stride-0 view).
+        text_embeddings = text_embeddings.expand(batch_size, -1, -1).contiguous()
     outputs = prepared_forward(
         hidden_states=video, audio_hidden_states=audio,
         encoder_hidden_states=text_embeddings, timestep=timestep,

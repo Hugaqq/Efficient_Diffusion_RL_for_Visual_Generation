@@ -209,14 +209,20 @@ def admit_h3_world(
     try:
         if local_error is not False:
             raise ValueError('caller preflight failed')
-        if any(type(v) is not int or v != 1 for v in (sp, tp, rollout_microbatch, replay_microbatch, chunk_size)):
+        if any(type(v) is not int or v != 1 for v in (sp, tp, replay_microbatch, chunk_size)):
             raise ValueError('H3 requires SP1/TP1/B1/chunk1')
+        # Opt-in S1: only the no-grad rollout forward may batch the four paired_4x8 samples.
+        if (type(rollout_microbatch) is not int or rollout_microbatch not in (1, 4)
+                or (rollout_microbatch == 4 and group_layout != 'paired_4x8')):
+            raise ValueError('H3 rollout requires B1, or B4 only for paired_4x8')
         if (type(guidance) not in (float, int) or guidance != 1
                 or type(beta) not in (float, int) or beta != 0):
             raise ValueError('H3 requires guidance1/beta0')
         profile = _profile(collection_id, behavior_id, group_size, num_steps, geometry_id, schedule_id, score_profile)
         if group_layout != 'rank_local':
             profile = (*profile, group_layout)
+        if rollout_microbatch != 1:  # every rank must agree; B1 tables are unchanged
+            profile = (*profile, f'rollout-microbatch-{rollout_microbatch}')
         payload = [profile, _samples(samples, group_size, group_layout)]
         valid = True
     except (ValueError, TypeError, OverflowError):
@@ -225,10 +231,11 @@ def admit_h3_world(
     if any(type(table) is not list or len(table) != 2 for table in tables):
         raise ValueError('invalid admission table')
     profile = tables[0][0]
-    if type(profile) is not list or len(profile) not in (7,8) or any(table[0] != profile for table in tables):
+    if (type(profile) is not list or len(profile) not in (7,8,9) or (len(profile) == 9 and profile[7] != 'paired_4x8')
+            or any(table[0] != profile for table in tables)):
         raise ValueError('collection/behavior/schedule/geometry/score profile mismatch')
     return H3WorldPlan(*profile[:7], samples_by_rank=tuple(table[1] for table in tables),
-                       group_layout=profile[7] if len(profile) == 8 else 'rank_local')
+                       group_layout=profile[7] if len(profile) >= 8 else 'rank_local')
 
 
 def _reward_rows(plan, rank, rows):

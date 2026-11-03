@@ -7,10 +7,23 @@ from visual_rl.algorithms.trainer.h3_dual_rollout import H3DualRecord
 
 
 class H3DualReplayAnchor:
-    def __init__(self, *, dynamics, behavior_id, expected_keys, max_records, reuse_rollout=False):
+    def __init__(self, *, dynamics, behavior_id, expected_keys, max_records, reuse_rollout=False,
+                 batched_rollout_tolerance=None):
         if not isinstance(dynamics,H3DualFlowSDE) or not isinstance(behavior_id,str) or not behavior_id:
             raise ValueError('dual dynamics and behavior identity required')
         if type(reuse_rollout) is not bool: raise TypeError('reuse_rollout must be bool')
+        # S1: records came from a batched rollout forward. The anchor stays a B=1
+        # forward (the ratio's old score has current-forward numerics); the
+        # rollout-vs-anchor replay delta is checked against the run's DECLARED
+        # tolerance instead of the B=1 bit-replay limit 1e-4.
+        if batched_rollout_tolerance is not None:
+            import math
+            if (type(batched_rollout_tolerance) is not float or not math.isfinite(batched_rollout_tolerance)
+                    or not 0 < batched_rollout_tolerance <= 1e-2):
+                raise ValueError('batched rollout replay tolerance must be a float in (0, 1e-2]')
+            if reuse_rollout:
+                raise ValueError('batched rollout requires the B=1 anchor forward; rollout anchor reuse is rejected')
+        self.batched_rollout_tolerance=batched_rollout_tolerance
         if type(expected_keys) is not tuple or not expected_keys or type(max_records) is not int or max_records<1 or len(expected_keys)>max_records:
             raise ValueError('bounded explicit expected keys required')
         if len(set(expected_keys))!=len(expected_keys):
@@ -71,9 +84,18 @@ class H3DualReplayAnchor:
                     if record.old_joint is not None:
                         import json
                         delta=float((joint.detach().cpu()-record.old_joint).abs().max())
-                        if delta>1e-4:raise ValueError('sampled/replayed old score mismatch')
-                        print(json.dumps(dict(event='h3_rollout_replay_score_check',sample_id=record.sample_id,
-                                              index=record.index,max_abs_delta=delta)),flush=True)
+                        batched=self.batched_rollout_tolerance
+                        if batched is None:
+                            if delta>1e-4:raise ValueError('sampled/replayed old score mismatch')
+                            print(json.dumps(dict(event='h3_rollout_replay_score_check',sample_id=record.sample_id,
+                                                  index=record.index,max_abs_delta=delta)),flush=True)
+                        else:
+                            print(json.dumps(dict(event='h3_rollout_replay_score_check',sample_id=record.sample_id,
+                                                  index=record.index,max_abs_delta=delta,rollout_batch=4,
+                                                  declared_tolerance=batched,old_score_source='b1_anchor_forward',
+                                                  within_tolerance=delta<=batched)),flush=True)
+                            if delta>batched:
+                                raise ValueError('sampled/replayed old score mismatch beyond the declared batched-rollout tolerance')
                     pending[(record.sample_id,record.index)]=(joint.detach().cpu().clone(),tuple(v.detach().cpu().clone() for v in coeff))
                 except Exception:
                     gate(f'anchor/{ordinal}/result', local_error=True)
