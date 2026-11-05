@@ -10,7 +10,7 @@ from tests.test_h3_mvp_cpu_hps import _request, _health, _Transport
 from visual_rl.algorithms.rewards.clients.hpsv3 import Hpsv3VideoClient, Hpsv3MultiOriginClient, Hpsv3VideoResourceFactory, jpeg_frames
 from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
 from visual_rl.core.immutable import FrozenMapping
-from visual_rl.core.protocols.flash_hpsv3 import VideoContract
+from visual_rl.core.protocols.flash_hpsv3 import VideoContract, digest, scoring_identity
 
 ORIGINS = ('http://127.0.0.1:18888', 'http://127.0.0.1:18889')
 
@@ -29,7 +29,8 @@ def test_multi_origin_scores_identity_and_failure_no_fallback(tmp_path):
         transports.append((origin,item))
         return item
     single = Hpsv3VideoClient(origin=ORIGINS[0], transport=transport(ORIGINS[0]), **options)
-    pool = Hpsv3MultiOriginClient(origins=ORIGINS, transport_factory=transport, **options)
+    pool = Hpsv3MultiOriginClient(origins=ORIGINS, expected_scoring_identity=scoring_identity(health, contract),
+                                transport_factory=transport, **options)
     assert pool.healthcheck() == health
     assert sum(len(t.calls) for _,t in transports) == 2
     args = dict(sample_id='sample', prompt='prompt', frames_base64=frames)
@@ -75,6 +76,105 @@ def test_all_origins_live_admitted_and_single_factory_unchanged(tmp_path, monkey
     with pytest.raises(ValueError):
         Hpsv3VideoResourceFactory()(multi_request)
     assert all(t.close_count == 1 for t in made)
+
+
+def _resident_health(contract, uuid):
+    health = _health(contract)
+    health['identity_facts']['gpu_residency_policy'] = dict(
+        version='resident.v1', enabled=True, expected_gpu_uuid=uuid, ttl=60)
+    return _rehash(health)
+
+
+def _rehash(health):
+    health['service_identity'] = digest(dict(identity_facts=health['identity_facts'],
+                                            video_contract=health['video_contract']))
+    return health
+
+
+def test_placement_independent_pool_pins_each_endpoint_and_run_identity(tmp_path, monkeypatch):
+    from visual_rl.algorithms.rewards.clients import hpsv3
+    from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
+    from visual_rl.core.protocols.flash_hpsv3 import canonical_json
+    contract = VideoContract(124, 32, 32)
+    healths = [_resident_health(contract, uuid) for uuid in ('GPU-a', 'GPU-b')]
+    original = canonical_json(healths)
+    assert scoring_identity(healths[0], contract) == scoring_identity(healths[1], contract)
+    assert canonical_json(healths) == original  # 不原地删 UUID
+    request, _ = _request(tmp_path, contract, manifest=healths[0])
+    request = replace(request, descriptor=replace(request.descriptor, semantic_factory_config=FrozenMapping(
+        dict(service_identity=healths[0]['service_identity'], video_contract=contract.payload(), origins=list(ORIGINS)))))
+    calls = []
+    class Transport(_Transport):
+        def request(self, method, url, **kwargs):
+            self.health = healths[ORIGINS.index(url.rsplit('/', 1)[0])]
+            if method == 'POST':
+                assert json.loads(kwargs['data'])['service_identity'] == self.health['service_identity']
+                calls.append(url)
+            return super().request(method, url, **kwargs)
+    monkeypatch.setattr(hpsv3, 'requests_session', lambda: Transport(healths[0]))
+    owner = H3HPSReward(request, video_contract=contract).acquire()
+    identity = owner.identity_payload()
+    assert 'service_identity' not in identity and 'manifest_sha256' not in identity
+    assert identity['scoring_identity'] == scoring_identity(healths[0], contract)
+    pool = owner._client
+    frames = jpeg_frames(torch.zeros(124,3,32,32), 'BFCHW', contract)
+    args = dict(sample_id='s', prompt='p', frames_base64=frames)
+    assert pool.score_video(**args) == pool.score_video(**args)
+    assert calls == [o+'/score' for o in ORIGINS]
+    # 错端点的完整响应 identity 即使 scoring identity 相同也必须拒绝。
+    original_request = Transport.request
+    def wrong_score(self, method, url, **kwargs):
+        self.score_mutation = lambda p: dict(p, service_identity=healths[1]['service_identity'])
+        return original_request(self, method, url, **kwargs)
+    monkeypatch.setattr(Transport, 'request', wrong_score)
+    with pytest.raises(ValueError, match='identity/order'):
+        pool.score_video(**args)
+    owner.close()
+    monkeypatch.setattr(Transport, 'request', original_request)
+    # artifact 与线上卡 UUID 都换了，运行身份仍相同。
+    for i, health in enumerate(healths):
+        health['identity_facts']['gpu_residency_policy']['expected_gpu_uuid'] = f'GPU-new-{i}'
+        _rehash(health)
+    request.artifact_location.write_bytes(canonical_json(healths[0]))
+    request = replace(request, descriptor=replace(request.descriptor, semantic_factory_config=FrozenMapping(
+        dict(service_identity=healths[0]['service_identity'], video_contract=contract.payload(), origins=list(ORIGINS)))))
+    owner = H3HPSReward(request, video_contract=contract).acquire()
+    assert owner.identity_payload() == identity
+    owner.close()
+
+
+def test_scoring_identity_rejects_every_other_leaf():
+    from copy import deepcopy
+    contract = VideoContract(124, 32, 32)
+    health = _resident_health(contract, 'GPU-a')
+    expected = scoring_identity(health, contract)
+    # 遍历全部其余叶字段：包括 residency 的 version/enabled/TTL，协议与精度。
+    def paths(value, prefix=()):
+        for key, item in value.items():
+            if isinstance(item, dict):
+                yield from paths(item, (*prefix, key))
+            else:
+                yield (*prefix, key)
+    for path in paths(health):
+        if path in [('service_identity',), ('identity_facts','gpu_residency_policy','expected_gpu_uuid')]:
+            continue
+        changed = deepcopy(health)
+        target = changed
+        for key in path[:-1]:
+            target = target[key]
+        old = target[path[-1]]
+        target[path[-1]] = not old if type(old) is bool else old+1 if type(old) is int else old+'-changed'
+        _rehash(changed)
+        def transport(origin):
+            return _Transport(health if origin == ORIGINS[0] else changed)
+        pool = Hpsv3MultiOriginClient(origins=ORIGINS, expected_scoring_identity=expected,
+            transport_factory=transport, service_identity=health['service_identity'], contract=contract,
+            timeout_s=2.5, max_response_bytes=65536)
+        try:
+            with pytest.raises(ValueError):
+                pool.healthcheck()
+        finally:
+            pool.close()
 
 
 def test_cross_rank_least_inflight_file_leases_and_fail_closed(tmp_path):

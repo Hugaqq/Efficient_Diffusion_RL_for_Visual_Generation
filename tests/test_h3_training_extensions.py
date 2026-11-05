@@ -38,6 +38,27 @@ def test_default_profile_exact_legacy_identity(tmp_path):
         assert H3Training(**options).payload() == old.H3Training(**options).payload()
 
 
+def test_multi_origin_semantics_use_scoring_not_placement_identity(tmp_path):
+    from visual_rl.core.protocols.flash_hpsv3 import decode_json, canonical_json, digest
+    from visual_rl.core.immutable import FrozenMapping
+    path, _ = _fixture(tmp_path)
+    profile = compile_h3_profile(path)
+    profile = replace(profile, launch=replace(profile.launch,
+        hps_origins=(profile.launch.hps_origin, 'http://127.0.0.1:18889')))
+    health = decode_json(profile.launch.hps_manifest.read_bytes())
+    ids = []
+    for uuid in ('GPU-a', 'GPU-b'):
+        health['identity_facts']['gpu_residency_policy'] = dict(expected_gpu_uuid=uuid, enabled=True)
+        health['service_identity'] = digest(dict(identity_facts=health['identity_facts'], video_contract=health['video_contract']))
+        profile.launch.hps_manifest.write_bytes(canonical_json(health))
+        profile = replace(profile, expected=FrozenMapping(dict(profile.expected, hps_service_identity=health['service_identity'])))
+        facts = preflight_h3_profile(profile)
+        assert 'hps_service_identity' not in facts.semantic_payload
+        assert 'hps_scoring_identity' in facts.semantic_payload
+        ids.append((facts.semantic_id, facts.binding_id))
+    assert ids[0] == ids[1]
+
+
 def test_nondefault_profile_identity_and_validation(tmp_path):
     path, raw = _fixture(tmp_path)
     raw['overrides']['training'] = dict(algorithm='dual_flash')

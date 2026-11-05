@@ -389,7 +389,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
     """Read-only local content check; no model construction, acquire or checkpoint restore."""
     from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
     from visual_rl.data import h3_source
-    from visual_rl.core.protocols.flash_hpsv3 import MAX_HEALTH_BYTES, VideoContract, decode_json, validate_health
+    from visual_rl.core.protocols.flash_hpsv3 import MAX_HEALTH_BYTES, VideoContract, decode_json, validate_health, scoring_identity
     from visual_rl.models.implementations.h3_decode import H3CPUDecoder
     from visual_rl.models.implementations.h3_loading import _weight_headers, _TARGETS, _FP32_ROOTS, _state_read_budget
     from visual_rl.models.implementations.h3_text_cache import H3TextCache
@@ -473,7 +473,9 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
             {name: {"shape": header["shape"], "dtype": header["dtype"]} for name, header in headers.items()})
             for component, headers in header_sets.items()},
         cache_identity=cache.identity_sha256, cache_provenance=to_plain_dict(expected["cache_identity"]),
-        hps_service_identity=expected["hps_service_identity"], video_contract=contract.payload(),
+        **(dict(hps_service_identity=expected["hps_service_identity"]) if len(launch.origins) == 1 else
+           dict(hps_scoring_identity=scoring_identity(decode_json(raw_hps, MAX_HEALTH_BYTES), contract))),
+        video_contract=contract.payload(),
         video_sigmas=schedule.video_sigmas.tolist(), audio_sigmas=schedule.audio_sigmas.tolist(),
         resume_policy=_RESUME, **launch.extension_payload()))
     return H3LocalFacts(canonical_identity("h3.semantic.v1", payload), payload, launch.binding_id,

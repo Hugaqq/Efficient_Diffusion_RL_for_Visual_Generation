@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from visual_rl.core.protocols.flash_hpsv3 import (
     PROTOCOL, VERSION, MAX_HEALTH_BYTES, MAX_REQUEST_BYTES, VideoContract,
-    canonical_json, decode_json, digest, sha256_id, validate_health, validate_score,
+    canonical_json, decode_json, digest, sha256_id, validate_health, validate_score, scoring_identity,
 )
 from visual_rl.runtime.flash140_logging import progress
 from visual_rl.algorithms.rewards.clients.input import (
@@ -198,7 +198,8 @@ class Hpsv3VideoClient:
             metadata.append(record)
         return pointwise_reward_output(resolved, scores, shared_metadata={
             'reward': 'hpsv3', 'protocol': PROTOCOL, 'protocol_version': VERSION,
-            'service_identity': self.service_identity,
+            **({'scoring_identity': self.scoring_identity} if isinstance(self, Hpsv3MultiOriginClient)
+               else {'service_identity': self.service_identity}),
             'aggregation': 'all_frames_then_top30percent_mean',
             'video_contract': self.contract.payload(),
         }, sample_metadata=metadata)
@@ -206,7 +207,7 @@ class Hpsv3VideoClient:
 
 class Hpsv3MultiOriginClient(Hpsv3VideoClient):
     """相同协议的多个实例；每次请求独享 Session，跨线程不共享可变 transport。"""
-    def __init__(self, *, origins, dispatcher=None, transport_factory=None, **kwargs):
+    def __init__(self, *, origins, expected_scoring_identity, dispatcher=None, transport_factory=None, **kwargs):
         from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
         self.origins = tuple(loopback_origin(origin) for origin in origins)
         if not 2 <= len(self.origins) <= 8 or len(set(self.origins)) != len(self.origins):
@@ -215,6 +216,8 @@ class Hpsv3MultiOriginClient(Hpsv3VideoClient):
         if self.dispatcher.origins != self.origins:
             raise ValueError('HPS dispatcher origins differ from client origins')
         self.options, self.transport_factory = kwargs, transport_factory
+        self.scoring_identity = sha256_id(expected_scoring_identity)
+        self.endpoint_identities = None
         self.clients = []
         self.closed = False
         try:
@@ -227,20 +230,34 @@ class Hpsv3MultiOriginClient(Hpsv3VideoClient):
         self.service_identity, self.contract = self.clients[0].service_identity, self.clients[0].contract
 
     def _client(self, origin):
-        return Hpsv3VideoClient(origin=origin, **self.options,
+        options = dict(self.options)
+        if self.endpoint_identities is not None:
+            options['service_identity'] = self.endpoint_identities[self.origins.index(origin)]
+        return Hpsv3VideoClient(origin=origin, **options,
             **({} if self.transport_factory is None else dict(transport=self.transport_factory(origin))))
 
     def healthcheck(self):
         if self.closed:
             raise RuntimeError('HPSv3 client is closed')
-        observed = [client.healthcheck() for client in self.clients]
-        if any(value != observed[0] for value in observed):
-            raise ValueError('HPS instances have different service identities/manifests')
+        observed = []
+        for index, client in enumerate(self.clients):
+            payload = client._request('GET', '/healthz')
+            # 首次发现每端点完整 identity；评分身份由已校验的本地 artifact 锚定。
+            expected = payload.get('service_identity') if self.endpoint_identities is None else self.endpoint_identities[index]
+            validate_health(payload, expected, self.contract)
+            if scoring_identity(payload, self.contract) != self.scoring_identity:
+                raise ValueError('HPS instances have different scoring identities')
+            observed.append(payload)
+        self.endpoint_identities = tuple(value['service_identity'] for value in observed)
+        for client, identity in zip(self.clients, self.endpoint_identities):
+            client.service_identity = identity
         return observed[0]
 
     def score_video(self, **kwargs):
         if self.closed:
             raise RuntimeError('HPSv3 client is closed')
+        if self.endpoint_identities is None:
+            raise RuntimeError('HPS pool requires health admission before scoring')
         with self.dispatcher.lease() as index:
             client = self._client(self.origins[index])
             try:
@@ -307,13 +324,14 @@ class Hpsv3VideoResourceFactory:
                 raise ValueError('single-origin HPS must not use a multi-origin dispatcher')
             resource = Hpsv3VideoClient(origin=origin, **options)
         else:
-            resource = Hpsv3MultiOriginClient(origins=origins, dispatcher=self.dispatcher, **options)
+            resource = Hpsv3MultiOriginClient(origins=origins, dispatcher=self.dispatcher,
+                expected_scoring_identity=scoring_identity(artifact, contract), **options)
         try:
             observed = resource.healthcheck()
-            if observed != artifact:
+            if len(origins) == 1 and observed != artifact:
                 raise ValueError('live HPSv3 identity differs from materialized artifact')
             endpoint_id = digest({'origin': origin, 'observed': observed}) if len(origins) == 1 else digest(
-                {'origins': origins, 'observed': observed, 'dispatch': 'least-inflight.v1'})
+                {'origins': origins, 'scoring_identity': resource.scoring_identity, 'dispatch': 'least-inflight.v1'})
             return AcquiredRewardResource(resource=resource, binding_facts=RewardResourceBindingFacts(
                 endpoint_identity=endpoint_id, protocol=PROTOCOL, protocol_version=VERSION,
                 device='cpu', dtype='fp32', worker_domain='remote',

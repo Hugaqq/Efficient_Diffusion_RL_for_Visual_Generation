@@ -115,6 +115,19 @@ def validate_health(payload: dict, expected_identity: str, contract: VideoContra
     return payload
 
 
+def scoring_identity(payload: dict, contract: VideoContract) -> str:
+    """完整服务身份先自证；评分身份只忽略 GPU UUID 这个放置叶字段。"""
+    validate_health(payload, payload['service_identity'], contract)
+    facts = json.loads(canonical_json(payload['identity_facts']))
+    policy = facts.get('gpu_residency_policy')
+    if isinstance(policy, dict):
+        policy.pop('expected_gpu_uuid', None)
+    return digest(dict(schema='hps.scoring-identity.v1', identity_facts=facts,
+        video_contract=contract.payload(), protocol=payload['protocol'],
+        protocol_version=payload['protocol_version'], result_device=payload['result_device'],
+        result_dtype=payload['result_dtype']))
+
+
 def validate_score(payload: dict, *, sample_id: str, identity: str, contract: VideoContract) -> tuple[float, tuple[int, ...]]:
     if set(payload) != {'protocol', 'protocol_version', 'service_identity', 'sample_id', 'frame_scores', 'video_score'}:
         raise ValueError('invalid HPSv3 score response fields')

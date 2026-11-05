@@ -7,7 +7,7 @@ No HTTP/JPEG/top-k reimplementation, retries, model imports or fallback reward.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import math
 
@@ -135,6 +135,15 @@ class H3HPSReward:
         if self._identity is None:
             raise RuntimeError("H3 HPS identity is not live-admitted yet")
         return self._identity
+
+    def identity_payload(self) -> dict:
+        """单端点保留旧契约；多端点运行身份用评分身份，不混入某张卡的 manifest。"""
+        payload = asdict(self.identity)
+        if len(getattr(self._client, 'origins', (self._client.origin,))) > 1:
+            payload.pop('service_identity')
+            payload.pop('manifest_sha256')
+            payload['scoring_identity'] = self._client.scoring_identity
+        return payload
 
     def close(self) -> None:
         if not self._closed:

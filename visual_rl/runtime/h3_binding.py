@@ -492,10 +492,10 @@ class H3RuntimeBinding:
         content = self.content if code_content is None else dict(self.content, code=code_content)
         return dict(model=self.content["model"]["content_sha256"], topology=_hash(self.topology),
                     semantics=_hash(semantics), data=_unpack_id(self.source.data_identity, "h3-data"),
-                    cache=self.facts.cache_identity, score=_hash(asdict(self.scorer.identity)),
+                    cache=self.facts.cache_identity, score=_hash(self.scorer.identity_payload()),
                     dynamics=_hash({k: self._source_binding[k] for k in ("num_steps", "video_sigmas", "audio_sigmas", "eta")}),
                     resources=_hash(dict(content=content, cache=self.facts.cache_identity,
-                                         score=asdict(self.scorer.identity))), code=content["code"]["content_sha256"])
+                                         score=self.scorer.identity_payload())), code=content["code"]["content_sha256"])
 
     def validate_live(self, *, boundary=False):
         """Restore/default callers always rehash; only opted-in boundaries use stats."""
@@ -561,7 +561,7 @@ class H3RuntimeBinding:
             resolved_fingerprint=_id("resolved-recipe.v2", to_plain_dict(self.facts.semantic_payload)),
             algorithm_materialization_spec_id=_id("algorithm-materialization-spec.v1", algorithm),
             execution_policy_id=_id("execution-policy.v1", dict(stages=policy_payload, topology=self.topology)),
-            reward_plan_id=_id("reward-plan-spec.v1", asdict(self.scorer.identity)),
+            reward_plan_id=_id("reward-plan-spec.v1", self.scorer.identity_payload()),
             source_content_binding_id=_id("source-content-binding.v1", self._source_binding),
             component_artifact_binding_set_id=_id("component-artifact-binding-set.v1", artifact_payload),
             runtime_bound_contract_id=runtime_id, immutable_model_revision=live["model"], code_identity=live["code"],
