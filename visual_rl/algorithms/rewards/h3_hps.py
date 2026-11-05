@@ -47,7 +47,7 @@ class H3HPSReward:
     an 81-frame Flash manifest. close() is idempotent; no automatic reacquisition.
     """
 
-    def __init__(self, request: RewardResourceAcquireRequest, *, video_contract: VideoContract):
+    def __init__(self, request: RewardResourceAcquireRequest, *, video_contract: VideoContract, dispatcher=None):
         if not isinstance(request, RewardResourceAcquireRequest):
             raise TypeError("H3 HPS requires a real RewardResourceAcquireRequest")
         if not isinstance(video_contract, VideoContract) or video_contract.frames != 124:
@@ -62,11 +62,13 @@ class H3HPSReward:
         if (descriptor.protocol, descriptor.protocol_version) != (PROTOCOL, VERSION):
             raise ValueError("H3 HPS protocol mismatch")
         semantic = to_plain_dict(descriptor.semantic_factory_config)
-        if set(semantic) != {"service_identity", "video_contract"} or semantic["video_contract"] != video_contract.payload():
+        if (set(semantic) not in ({'service_identity', 'video_contract'}, {'service_identity', 'video_contract', 'origins'})
+                or semantic['video_contract'] != video_contract.payload()):
             raise ValueError("H3 HPS declared video contract mismatch")
         self._service_identity = sha256_id(semantic["service_identity"])
         self._contract = video_contract
         self._request = request
+        self._dispatcher = dispatcher
         raw = self._manifest_bytes()
         validate_health(decode_json(raw, MAX_HEALTH_BYTES), self._service_identity, self._contract)
         self._manifest_sha256 = hashlib.sha256(raw).hexdigest()
@@ -110,7 +112,8 @@ class H3HPSReward:
         self._check_manifest()
         # This real factory validates binding/trusted loopback, local manifest,
         # live health and exact observed==artifact before returning a client.
-        acquired = Hpsv3VideoResourceFactory()(self._request)
+        factory = Hpsv3VideoResourceFactory(**({} if self._dispatcher is None else dict(dispatcher=self._dispatcher)))
+        acquired = factory(self._request)
         client = acquired.resource
         try:
             self._check_manifest()

@@ -116,6 +116,8 @@ def _hps(profile, session):
     launch, config = profile.launch, profile.model.config
     contract = VideoContract(config.frames, config.height, config.width)
     semantic = dict(service_identity=profile.expected["hps_service_identity"], video_contract=contract.payload())
+    if launch.hps_origins:
+        semantic['origins'] = list(launch.origins)
     with launch.hps_manifest.open("rb") as stream:
         raw = stream.read(MAX_HEALTH_BYTES + 1)
     if len(raw) > MAX_HEALTH_BYTES:
@@ -125,7 +127,7 @@ def _hps(profile, session):
         FrozenMapping(semantic), RewardRuntimePolicy(("cpu",), ("fp32",), ("remote",)))
     runtime_binding = RewardRuntimeBindingSpec(artifact_ref="h3-hps", execution_domain="remote", device="cpu",
         dtype="fp32", endpoint=launch.hps_origin, timeout_s=launch.hps_timeout_s,
-        trusted_hosts=(urlsplit(launch.hps_origin).hostname,), ca_bundle=None,
+        trusted_hosts=tuple(dict.fromkeys(urlsplit(origin).hostname for origin in launch.origins)), ca_bundle=None,
         max_response_bytes=launch.hps_max_response_bytes)
     request = RewardResourceAcquireRequest(
         reward_resource_spec_id=canonical_identity("reward-resource-spec.v1", semantic), descriptor=descriptor,
@@ -133,7 +135,11 @@ def _hps(profile, session):
         artifact_location=launch.hps_manifest,
         runtime_facts=RuntimeFacts("fsdp", session.rank, session.rank, 8, str(session.device), "bf16", "nccl"),
         runtime_binding=runtime_binding)
-    return H3HPSReward(request, video_contract=contract)
+    options = {}
+    if launch.hps_origins:
+        from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
+        options['dispatcher'] = HpsDispatcher(launch.origins, path=launch.output_dir / 'hps-dispatch.json')
+    return H3HPSReward(request, video_contract=contract, **options)
 
 
 @dataclass
@@ -298,6 +304,10 @@ class H3LifecycleBackend:
             _phase(runtime, "output-lock", acquire_output_lock)
             _phase(runtime, "output", admit_output)
             run_id = _phase(runtime, "read-run", lambda: json.loads((output / "h3-run.json").read_text())["run_id"])
+            if launch.hps_origins:
+                from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
+                _phase(runtime, 'hps-dispatch', lambda: HpsDispatcher.initialize(
+                    output / 'hps-dispatch.json', launch.origins) if runtime.rank == 0 else None)
             def local_graph():
                 adapter = H3Adapter.from_config(profile.model.config, runtime_context=dict(
                     artifact_paths={"h3-model": launch.model, "h3-text": launch.text_cache},

@@ -234,6 +234,11 @@ class H3RuntimeBinding:
             raise ValueError("HPS must already be acquired and open")
         identity = self.scorer.identity
         launch = self.profile.launch
+        declared_origins = to_plain_dict(self.scorer._request.descriptor.semantic_factory_config).get(
+            'origins', [launch.hps_origin])
+        if (declared_origins != list(launch.origins)
+                or tuple(getattr(self.scorer._client, 'origins', (self.scorer._client.origin,))) != launch.origins):
+            raise ValueError('acquired HPS origins differ from profile')
         if (identity.profile != "h3_hpsv3_video_only_v1" or identity.weight != 1
                 or identity.service_identity != self.profile.expected["hps_service_identity"]
                 or identity.manifest_sha256 != current.hps_manifest_sha256

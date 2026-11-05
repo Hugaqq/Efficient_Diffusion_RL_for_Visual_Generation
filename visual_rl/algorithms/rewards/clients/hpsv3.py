@@ -204,8 +204,63 @@ class Hpsv3VideoClient:
         }, sample_metadata=metadata)
 
 
+class Hpsv3MultiOriginClient(Hpsv3VideoClient):
+    """相同协议的多个实例；每次请求独享 Session，跨线程不共享可变 transport。"""
+    def __init__(self, *, origins, dispatcher=None, transport_factory=None, **kwargs):
+        from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
+        self.origins = tuple(loopback_origin(origin) for origin in origins)
+        if not 2 <= len(self.origins) <= 8 or len(set(self.origins)) != len(self.origins):
+            raise ValueError('multi-origin HPS requires 2..8 distinct loopback origins')
+        self.dispatcher = dispatcher or HpsDispatcher(self.origins)
+        if self.dispatcher.origins != self.origins:
+            raise ValueError('HPS dispatcher origins differ from client origins')
+        self.options, self.transport_factory = kwargs, transport_factory
+        self.clients = []
+        self.closed = False
+        try:
+            for origin in self.origins:
+                self.clients.append(self._client(origin))
+        except BaseException:
+            self.close()
+            raise
+        self.origin = self.origins[0]
+        self.service_identity, self.contract = self.clients[0].service_identity, self.clients[0].contract
+
+    def _client(self, origin):
+        return Hpsv3VideoClient(origin=origin, **self.options,
+            **({} if self.transport_factory is None else dict(transport=self.transport_factory(origin))))
+
+    def healthcheck(self):
+        observed = [client.healthcheck() for client in self.clients]
+        if any(value != observed[0] for value in observed):
+            raise ValueError('HPS instances have different service identities/manifests')
+        return observed[0]
+
+    def score_video(self, **kwargs):
+        if self.closed:
+            raise RuntimeError('HPSv3 client is closed')
+        with self.dispatcher.lease() as index:
+            client = self._client(self.origins[index])
+            try:
+                return client.score_video(**kwargs)
+            finally:
+                client.close()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                for client in self.clients:
+                    client.close()
+            finally:
+                self.clients = []
+
+
 class Hpsv3VideoResourceFactory:
     """Explicit module:Class factory supported by DefaultRewardResourceFactory."""
+    def __init__(self, *, dispatcher=None):
+        self.dispatcher = dispatcher
+
     def __call__(self, request):
         from visual_rl.core.serialization import to_plain_dict
         from visual_rl.runtime.reward_resources import AcquiredRewardResource, RewardResourceBindingFacts
@@ -219,7 +274,7 @@ class Hpsv3VideoResourceFactory:
         if urlsplit(origin).hostname not in binding.trusted_hosts or binding.ca_bundle is not None:
             raise ValueError('HPSv3 loopback host must be trusted; TLS settings are not accepted for HTTP')
         semantic = to_plain_dict(descriptor.semantic_factory_config)
-        if set(semantic) != {'service_identity', 'video_contract'}:
+        if set(semantic) not in ({'service_identity', 'video_contract'}, {'service_identity', 'video_contract', 'origins'}):
             raise ValueError('HPSv3 semantic config fields mismatch')
         identity = sha256_id(semantic['service_identity'])
         video = semantic['video_contract']
@@ -234,13 +289,25 @@ class Hpsv3VideoResourceFactory:
             raise ValueError('HPSv3 artifact manifest too large')
         artifact = decode_json(path.read_bytes(), MAX_HEALTH_BYTES)
         validate_health(artifact, identity, contract)
-        resource = Hpsv3VideoClient(origin=origin, service_identity=identity, contract=contract,
-                                  timeout_s=binding.timeout_s, max_response_bytes=binding.max_response_bytes)
+        options = dict(service_identity=identity, contract=contract,
+                       timeout_s=binding.timeout_s, max_response_bytes=binding.max_response_bytes)
+        origins = semantic.get('origins', [origin])
+        if (type(origins) is not list or not origins or origins[0] != origin
+                or any(loopback_origin(item) != item or urlsplit(item).hostname not in binding.trusted_hosts
+                       for item in origins)):
+            raise ValueError('HPS origins must be canonical trusted loopbacks, first equal to endpoint')
+        if len(origins) == 1:
+            if self.dispatcher is not None:
+                raise ValueError('single-origin HPS must not use a multi-origin dispatcher')
+            resource = Hpsv3VideoClient(origin=origin, **options)
+        else:
+            resource = Hpsv3MultiOriginClient(origins=origins, dispatcher=self.dispatcher, **options)
         try:
             observed = resource.healthcheck()
             if observed != artifact:
                 raise ValueError('live HPSv3 identity differs from materialized artifact')
-            endpoint_id = digest({'origin': origin, 'observed': observed})
+            endpoint_id = digest({'origin': origin, 'observed': observed}) if len(origins) == 1 else digest(
+                {'origins': origins, 'observed': observed, 'dispatch': 'least-inflight.v1'})
             return AcquiredRewardResource(resource=resource, binding_facts=RewardResourceBindingFacts(
                 endpoint_identity=endpoint_id, protocol=PROTOCOL, protocol_version=VERSION,
                 device='cpu', dtype='fp32', worker_domain='remote',
