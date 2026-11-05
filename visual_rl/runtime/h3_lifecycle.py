@@ -406,7 +406,8 @@ class H3LifecycleBackend:
                 from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
                 stages = H3DualIterationStages(mode=graph.profile.training.algorithm,
                     seed=graph.profile.launch.seed,reward_pipeline=self.reward_pipeline,
-                    **(dict(kl_beta=graph.profile.training.kl_beta, predict_reference=binding.predict_reference)
+                    **(dict(kl_beta=graph.profile.training.kl_beta, predict_reference=binding.predict_reference,
+                            reference_update_scope=binding.reference_update_scope)
                        if getattr(graph.profile.training, 'kl_beta', 0.) else {}),
                     media_bytes=graph.profile.launch.budgets.media_bytes,
                     decode_bytes=graph.profile.launch.budgets.decode_bytes,

@@ -105,6 +105,49 @@ def test_real_peft_reference_binding_restores_rng_flags_grads_buffers_and_failur
     _equal(warm, h.prepared.optimizer.state_dict())
     assert all(torch.equal(p,w) for p,w in zip(params,weights))
     assert all(p.grad is None for p in params)
+    # 三个 cell 共用一次 RNG/buffer 快照与两次边界全模型检查。
+    counts = dict(rng=0, buffers=0, observe=0)
+    capture = RankRNGSnapshot.capture_current
+    buffers = h.adapter.meta_model.model.buffers
+    observe = b._observe_model
+    def counted_capture(rank):
+        counts['rng'] += 1
+        return capture(rank)
+    def counted_buffers(*args, **kwargs):
+        counts['buffers'] += 1
+        return buffers(*args, **kwargs)
+    def counted_observe():
+        counts['observe'] += 1
+        return observe()
+    monkeypatch.setattr(RankRNGSnapshot, 'capture_current', counted_capture)
+    monkeypatch.setattr(h.adapter.meta_model.model, 'buffers', counted_buffers)
+    monkeypatch.setattr(b, '_observe_model', counted_observe)
+    with b.reference_update_scope():
+        for _ in range(3):
+            assert torch.equal(b.predict_reference(h.prepared, **args), reference)
+    assert counts == dict(rng=1, buffers=1, observe=2)
+    assert capture(0).state_identity == rng.state_identity
+    buffer = next(buffers())
+    saved_buffer = buffer.clone()
+    def mutate(*args, **kwargs):
+        torch.rand(3)
+        buffer.add_(1)
+        return reference
+    monkeypatch.setattr(b, 'predict', mutate)
+    with pytest.raises(RuntimeError, match='mutated a model buffer'):
+        with b.reference_update_scope():
+            b.predict_reference(h.prepared, **args)
+    assert torch.equal(buffer, saved_buffer)
+    assert not b.reference.active and b.reference._flags is None
+    assert capture(0).state_identity == rng.state_identity
+    assert flags == [p.requires_grad for p in params]
+    monkeypatch.setattr(b, 'predict', fail)
+    with pytest.raises(RuntimeError, match='injected'):
+        with b.reference_update_scope():
+            b.predict_reference(h.prepared, **args)
+    assert capture(0).state_identity == rng.state_identity
+    assert not b.reference.active and b.reference._flags is None
+    assert flags == [p.requires_grad for p in params]
     b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
 
 
@@ -118,7 +161,15 @@ def test_stage_reference_call_count_and_beta_zero_no_call(tmp_path, monkeypatch,
     def commit(request):
         h.data.commits += 1; h.data.position += 2; h.data.behavior = request.next_behavior_id
     monkeypatch.setattr(h.data, 'commit', commit)
-    calls = []
+    from contextlib import contextmanager
+    calls, scopes = [], []
+    @contextmanager
+    def update_scope():
+        scopes.append('enter')
+        try:
+            yield
+        finally:
+            scopes.append('exit')
     def reference(*args, **kwargs):
         calls.append((kwargs['sample_id'], kwargs['index']))
         assert not torch.is_grad_enabled()
@@ -126,8 +177,9 @@ def test_stage_reference_call_count_and_beta_zero_no_call(tmp_path, monkeypatch,
     stage = H3DualIterationStages(mode='dual_flow', seed=42, data=h.data, prepared=h.prepared,
         predict=h.predict, decode=h.decode, score_one=h.score_one, coordination_factory=h.coordination_factory,
         process_group=h.group, rank=0, device='cpu', read_behavior_id=lambda:h.data.behavior,
-        kl_beta=beta, predict_reference=reference)
+        kl_beta=beta, predict_reference=reference, reference_update_scope=update_scope)
     trainer = stage.trainer(); trainer.prepare_run(PrepareRunContext('kl-test', 'h3', 0))
     trainer.run_iteration(0)
+    assert scopes == (['enter', 'exit'] if beta else [])
     assert len(calls) == (6 if beta else 0)
     assert stage.kl_metrics == (dict(kl=0., kl_video=0., kl_audio=0.) if beta else None)

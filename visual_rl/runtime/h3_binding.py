@@ -383,13 +383,14 @@ class H3RuntimeBinding:
                 or (policy.parameter_view is ParameterView.REFERENCE) != reference):
             raise ValueError('wrong parameter-view stage/grad scope')
         if self.reference is not None:
-            self.reference.validate()
+            self.reference.validate(full=False)
         if torch.is_autocast_enabled(self.device.type):
             raise ValueError("H3 root autocast must be disabled")
-        self._observe_model()
-        self.parameter_state.named_trainable_parameters()
-        if any(module.training for module in self.adapter.meta_model.model.modules()):
-            raise ValueError("H3 forward must preserve EVAL mode")
+        if not reference:
+            self._observe_model()
+            self.parameter_state.named_trainable_parameters()
+            if any(module.training for module in self.adapter.meta_model.model.modules()):
+                raise ValueError("H3 forward must preserve EVAL mode")
         if self.adapter.model_execution_numerics != self.numerics:
             raise ValueError("bound numerics evidence changed")
         return policy
@@ -409,6 +410,18 @@ class H3RuntimeBinding:
                 yield
         finally:
             self._active.reset(token)
+
+    @contextmanager
+    def reference_update_scope(self):
+        if self._closed or self.reference is None:
+            raise RuntimeError('reference update requires enabled KL and an open binding')
+        self._observe_model()
+        self.parameter_state.named_trainable_parameters()
+        try:
+            with self.reference.update_scope():
+                yield
+        finally:
+            self._observe_model()
 
     def predict_reference(self, prepared, **kwargs):
         if self._closed or self.reference is None:
