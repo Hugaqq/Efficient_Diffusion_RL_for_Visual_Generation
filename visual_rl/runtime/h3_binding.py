@@ -218,7 +218,7 @@ class H3RuntimeBinding:
     def diagnostics_enabled(self):
         return bool(self.profile.training.extension_payload() or self.profile.launch.extension_payload())
 
-    def training_diagnostics(self, stages):
+    def training_diagnostics(self, stages, *, loss):
         from visual_rl.runtime.h3_training_metrics import local_metrics
         if self._closed or not self.diagnostics_enabled or stages.prepared is not self.prepared:
             raise ValueError('training diagnostics require an open enabled binding')
@@ -228,7 +228,7 @@ class H3RuntimeBinding:
         kl = getattr(stages, 'kl_metrics', None)
         if self.profile.training.kl_beta and kl is None:
             raise ValueError('KL enabled but no completed reference diagnostics')
-        return local_metrics(parameters, rank=self.rank, process_group=self.process_group, kl=kl, ema=self.ema)
+        return local_metrics(parameters, rank=self.rank, process_group=self.process_group, kl=kl, ema=self.ema, loss=loss)
 
     @property
     def boundary_content_check(self):

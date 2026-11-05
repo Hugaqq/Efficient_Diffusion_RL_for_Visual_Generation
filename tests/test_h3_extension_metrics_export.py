@@ -15,12 +15,15 @@ def test_world_diagnostics_shard_sum_not_mean(monkeypatch):
     for p, ema in owners:
         p.data.add_(1); ema.commit(1)
         rows.append(local_metrics(ema.named_parameters(), rank=ema.rank, process_group=None,
-                                  kl=dict(kl_video=.3, kl_audio=.1, kl=.2), ema=ema))
+                                  kl=dict(kl_video=.3, kl_audio=.1, kl=.2, policy_loss=-.5, kl_loss=.01), ema=ema, loss=-.49))
     result = world_metrics(rows, step=0, ema_config=owners[0][1].config)
     assert set(result) == metric_keys(ema=True)
     assert result['ema_live_distance'] == math.sqrt(8*6)
     assert result['lora_norm'] == math.sqrt(sum(float(p.double().square().sum()) for p,_ in owners))
     assert result['ema_committed_steps'] == 1 and result['ema_updates'] == 0
+    assert result['policy_loss'] == -.5 and result['kl_loss'] == .01
+    disabled = local_metrics(owners[0][1].named_parameters(), rank=0, process_group=None, kl=None, ema=None, loss=-.7)
+    assert disabled['policy_loss'] == -.7 and disabled['kl_loss'] == disabled['kl'] == 0.
     for bad in (float('nan'), float('inf'), -.1, True):
         broken = [dict(row) for row in rows]; broken[3]['kl'] = bad
         with pytest.raises(ValueError):

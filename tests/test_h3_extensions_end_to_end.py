@@ -40,6 +40,8 @@ def test_extensions_full_controller_checkpoint_resume_and_changed_config_rejecti
     assert metrics['ema_committed_steps'] == metrics['ema_updates'] == 2
     assert all(math.isfinite(metrics[k]) and metrics[k] >= 0 for k in ('kl_video','kl_audio','kl','lora_norm','ema_live_distance'))
     assert metrics['lora_norm'] > 0 and metrics['ema_live_distance'] > 0
+    assert metrics['policy_loss'] + metrics['kl_loss'] == pytest.approx(metrics['loss'], abs=1e-8)
+    assert metrics['kl_loss'] == pytest.approx(.1*metrics['kl'], rel=1e-6, abs=1e-10)
     interrupted = tmp_path/'interrupted'
     path = config('extensions-interrupted', interrupted)
     original = h3_transaction.H3CheckpointTransaction.checkpoint

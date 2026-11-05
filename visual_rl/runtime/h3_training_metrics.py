@@ -4,13 +4,14 @@ import math
 import torch
 
 KL_KEYS = ('kl_video', 'kl_audio', 'kl')
+LOSS_KEYS = ('policy_loss', 'kl_loss')
 
 
 def metric_keys(*, ema):
-    return {*KL_KEYS, 'lora_norm'} | ({'ema_live_distance', 'ema_committed_steps', 'ema_updates'} if ema else set())
+    return {*KL_KEYS, *LOSS_KEYS, 'lora_norm'} | ({'ema_live_distance', 'ema_committed_steps', 'ema_updates'} if ema else set())
 
 
-def local_metrics(named_parameters, *, rank, process_group, kl, ema):
+def local_metrics(named_parameters, *, rank, process_group, kl, ema, loss):
     from visual_rl.algorithms.trainer.h3_ema import local_parameter
     squared_norm = distance = 0.
     for name, parameter in named_parameters:
@@ -19,7 +20,8 @@ def local_metrics(named_parameters, *, rank, process_group, kl, ema):
         squared_norm += float(value.square().sum())
         if ema is not None:
             distance += float((value - ema.shadow[name].double()).square().sum())
-    result = dict(kl or dict.fromkeys(KL_KEYS, 0.), lora_squared_norm=squared_norm)
+    result = dict(kl if kl is not None else dict(dict.fromkeys(KL_KEYS, 0.), policy_loss=loss, kl_loss=0.),
+                  lora_squared_norm=squared_norm)
     if ema is not None:
         ema.validate()
         result.update(ema_live_squared_distance=distance, ema_committed_steps=ema.committed_steps, ema_updates=ema.updates)
@@ -28,7 +30,7 @@ def local_metrics(named_parameters, *, rank, process_group, kl, ema):
 
 def world_metrics(rows, *, step, ema_config):
     enabled = ema_config.enabled
-    keys = {*KL_KEYS, 'lora_squared_norm'} | (
+    keys = {*KL_KEYS, *LOSS_KEYS, 'lora_squared_norm'} | (
         {'ema_live_squared_distance', 'ema_committed_steps', 'ema_updates'} if enabled else set())
     if len(rows) != 8 or any(type(row) is not dict or set(row) != keys for row in rows):
         raise ValueError('H3 diagnostics must cover all eight ranks with exact fields')
@@ -38,9 +40,9 @@ def world_metrics(rows, *, step, ema_config):
                 expected = step+1 if key == 'ema_committed_steps' else (step+1)//ema_config.update_interval
                 if type(value) is not int or value != expected:
                     raise ValueError('EMA diagnostic counter differs from committed progress')
-            elif type(value) is not float or not math.isfinite(value) or value < 0:
-                raise ValueError('H3 diagnostics must be finite nonnegative floats')
-    result = {key: sum(row[key] for row in rows)/8 for key in KL_KEYS}
+            elif type(value) is not float or not math.isfinite(value) or (key != 'policy_loss' and value < 0):
+                raise ValueError('H3 diagnostics must be finite floats; only policy_loss may be negative')
+    result = {key: sum(row[key] for row in rows)/8 for key in (*KL_KEYS, *LOSS_KEYS)}
     result['lora_norm'] = math.sqrt(sum(row['lora_squared_norm'] for row in rows))
     if enabled:
         result.update(ema_live_distance=math.sqrt(sum(row['ema_live_squared_distance'] for row in rows)),

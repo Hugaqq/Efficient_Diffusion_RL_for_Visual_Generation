@@ -473,7 +473,7 @@ class H3LifecycleBackend:
                 local_loss = dict(loss=local_loss,replay=getattr(bound.stages,'rollout_replay_score_summary',None))
                 if diagnostics:
                     local_loss['diagnostics'] = _phase(bound.graph.session, 'diagnostics-local',
-                        lambda: bound.binding.training_diagnostics(bound.stages))
+                        lambda: bound.binding.training_diagnostics(bound.stages, loss=float(update.scaled_loss)))
             losses = _exchange('lifecycle/loss', bound.graph.session.rank,
                                bound.graph.session.process_group, local_loss, True)
             replay_rows = diagnostic_rows = None

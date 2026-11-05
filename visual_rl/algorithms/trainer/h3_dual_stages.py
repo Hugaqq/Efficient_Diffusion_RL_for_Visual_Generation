@@ -333,7 +333,8 @@ class H3DualIterationStages(H3IterationStages):
                 memory.event('prediction_released_after_backward',sample_id=rec.sample_id,selected_index=rec.index,
                              released=prediction_ref() is None)
         if self.kl_beta:
-            self.kl_metrics = {key: sum(row[key] for row in kl_rows)/len(kl_rows) for key in kl_rows[0]}
+            self.kl_metrics = {key: sum(row[key] for row in kl_rows) /
+                (1 if key in ('policy_loss', 'kl_loss') else len(kl_rows)) for key in kl_rows[0]}
             print(json.dumps(dict(event='h3_reference_kl', rank=self.rank,
                 optimizer_step=r.identity.optimizer_step, **self.kl_metrics)), flush=True)
         self._version(ctx,'dual/current/complete')

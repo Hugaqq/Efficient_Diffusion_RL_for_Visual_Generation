@@ -36,6 +36,8 @@ def test_kl_two_stream_formula_zero_gradient_and_no_tgr():
             kl_beta=.3, reference_prediction=reference, kl_metrics=rows.append)
         gradients.append(torch.autograd.grad(loss, p)[0])
         assert rows[0]['kl'] == kl.item()
+        assert rows[0]['policy_loss'] == 0.
+        assert rows[0]['kl_loss'] == loss.item()
         assert torch.equal(loss, kl.mean()*.3*.25)
     assert torch.equal(*gradients)
     with pytest.raises(ValueError, match='detached'):
@@ -179,7 +181,11 @@ def test_stage_reference_call_count_and_beta_zero_no_call(tmp_path, monkeypatch,
         process_group=h.group, rank=0, device='cpu', read_behavior_id=lambda:h.data.behavior,
         kl_beta=beta, predict_reference=reference, reference_update_scope=update_scope)
     trainer = stage.trainer(); trainer.prepare_run(PrepareRunContext('kl-test', 'h3', 0))
-    trainer.run_iteration(0)
+    result = trainer.run_iteration(0)
     assert scopes == (['enter', 'exit'] if beta else [])
     assert len(calls) == (6 if beta else 0)
-    assert stage.kl_metrics == (dict(kl=0., kl_video=0., kl_audio=0.) if beta else None)
+    if beta:
+        assert stage.kl_metrics == dict(kl=0., kl_video=0., kl_audio=0., kl_loss=0.,
+                                       policy_loss=result.value.payload.scaled_loss)
+    else:
+        assert stage.kl_metrics is None

@@ -73,14 +73,17 @@ def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, wor
         policy_stats=SimpleNamespace(current_log_probs=current.reshape(1,1)),loss_inputs=inputs)
     if type(kl_beta) not in (int, float) or not math.isfinite(kl_beta) or kl_beta < 0:
         raise ValueError('kl_beta must be finite and nonnegative')
-    loss=output.loss*scale
+    policy_component=output.loss*scale
+    loss=policy_component
     if kl_beta:
         kl, streams = dynamics.reference_kl(record.x.to(prediction.device), prediction,
                                             reference_prediction, record.index)
-        loss = loss + (kl_beta * kl.mean()) * scale
+        kl_component = (kl_beta * kl.mean()) * scale
+        loss = loss + kl_component
         if kl_metrics is not None:
             kl_metrics(dict(kl_video=float(streams[0].detach().mean()),
-                            kl_audio=float(streams[1].detach().mean()), kl=float(kl.detach().mean())))
+                            kl_audio=float(streams[1].detach().mean()), kl=float(kl.detach().mean()),
+                            policy_loss=float(policy_component.detach()), kl_loss=float(kl_component.detach())))
     elif reference_prediction is not None:
         raise ValueError('reference prediction supplied with beta=0')
     if not bool(torch.isfinite(loss)):
