@@ -211,7 +211,8 @@ class H3IterationStages:
             except Exception:
                 local_error = True
             batched = {} if self.rollout_batch == 1 else dict(rollout_microbatch=self.rollout_batch)
-            plan = admit_h3_world(process_group=self.process_group, **admission, **batched, local_error=local_error)
+            kl = {} if not getattr(self, 'kl_beta', 0.) else dict(beta=self.kl_beta)
+            plan = admit_h3_world(process_group=self.process_group, **admission, **batched, **kl, local_error=local_error)
             if local_error:
                 raise RuntimeError("world admission accepted an invalid local request")
             coordinator = self.coordination_factory(plan)

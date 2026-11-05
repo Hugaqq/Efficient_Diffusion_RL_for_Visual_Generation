@@ -186,9 +186,18 @@ class H3RuntimeBinding:
                                      projection.standalone_parameter_names, projection.projection_id, False)
         # compute_dtype describes the root scope; BF16 subblocks are separately
         # observed above. Disabled root autocast must not turn FP32 islands BF16.
+        views = (view,)
+        self.reference = None
+        if profile.training.kl_beta:
+            from visual_rl.models.lifecycle.h3_reference import H3LoRAReference
+            self.reference = H3LoRAReference(model, rank=rank)
+            self.execution_policies += (StageExecutionPolicy.canonical(ExecutionMode.TRAIN,
+                parameter_view=ParameterView.REFERENCE),)
+            views += (ParameterViewEvidence(ParameterView.REFERENCE, ParameterViewMode.LORA_DISABLE,
+                ('transformer',), projection.standalone_parameter_names, projection.projection_id, False),)
         self.numerics = ModelExecutionNumericsEvidence(ParameterDTypePolicy("float32"), tuple(
-            ForwardAutocastPolicy(p.stage, ParameterView.CURRENT, self.device.type, "float32", False)
-            for p in self.execution_policies), (view,))
+            ForwardAutocastPolicy(p.stage, p.parameter_view, self.device.type, "float32", False)
+            for p in self.execution_policies), views)
         self.contract = self._contract()
         live = self._live_ids()
         self.state_identity = H3StateIdentity(live["topology"], live["model"], live["semantics"],
@@ -340,9 +349,12 @@ class H3RuntimeBinding:
         policy = self._active.get()
         if policy is None:
             return None  # base port rejects missing scope
-        if (policy.parameter_view is not ParameterView.CURRENT or policy not in self.execution_policies
-                or policy.grad_enabled != torch.is_grad_enabled()):
-            raise ValueError("wrong current-view stage/grad scope")
+        reference = self.reference is not None and self.reference.active
+        if (policy not in self.execution_policies or policy.grad_enabled != torch.is_grad_enabled()
+                or (policy.parameter_view is ParameterView.REFERENCE) != reference):
+            raise ValueError('wrong parameter-view stage/grad scope')
+        if self.reference is not None:
+            self.reference.validate()
         if torch.is_autocast_enabled(self.device.type):
             raise ValueError("H3 root autocast must be disabled")
         self._observe_model()
@@ -355,8 +367,9 @@ class H3RuntimeBinding:
 
     @contextmanager
     def scope(self, stage, *, parameter_view=ParameterView.CURRENT):
-        if self._closed or self._active.get() is not None or parameter_view is not ParameterView.CURRENT:
-            raise ValueError("only one open CURRENT scope is permitted")
+        if (self._closed or self._active.get() is not None
+                or (parameter_view is not ParameterView.CURRENT and self.reference is None)):
+            raise ValueError('only one admitted CURRENT/reference scope is permitted')
         policy = StageExecutionPolicy.canonical(stage, parameter_view=parameter_view)
         if policy not in self.execution_policies:
             raise ValueError("unsupported H3 model stage")
@@ -368,7 +381,13 @@ class H3RuntimeBinding:
         finally:
             self._active.reset(token)
 
-    def predict(self, prepared, *, sample_id, x, index, condition, dynamics):
+    def predict_reference(self, prepared, **kwargs):
+        if self._closed or self.reference is None:
+            raise RuntimeError('reference prediction requires enabled KL and an open binding')
+        with self.reference.scope():
+            return self.predict(prepared, parameter_view=ParameterView.REFERENCE, **kwargs).detach()
+
+    def predict(self, prepared, *, sample_id, x, index, condition, dynamics, parameter_view=ParameterView.CURRENT):
         if prepared is not self.prepared or dynamics != self.dynamics:
             raise ValueError("prediction uses foreign prepared/dynamics binding")
         typed = self.source.conditioning_for(sample_id)
@@ -378,9 +397,11 @@ class H3RuntimeBinding:
         vs, _, aus, _ = dynamics.schedule.transition(index)
         model_input = H3ModelInput(x, vs.to(x.device), typed, None, spec, typed.condition_identity,
                                   (H3_GUIDANCE_ID,), audio_sigma=aus.to(x.device))
-        mode = ExecutionMode.TRAIN if torch.is_grad_enabled() else ExecutionMode.ROLLOUT
-        with self.scope(mode):
-            return self.adapter.predict(model_input).value
+        mode = (ExecutionMode.TRAIN if torch.is_grad_enabled() or parameter_view is ParameterView.REFERENCE
+                else ExecutionMode.ROLLOUT)
+        options = {} if parameter_view is ParameterView.CURRENT else dict(parameter_view=parameter_view)
+        with self.scope(mode, **options):
+            return self.adapter.predict(model_input, **options).value
 
     def predict_batch(self, prepared, *, sample_ids, x, index, conditions, dynamics):
         """Opt-in S1 rollout: per-sample checks of ``predict``, then ONE no-grad forward."""
@@ -514,7 +535,9 @@ class H3RuntimeBinding:
             gradient_accumulation_steps=1, data_sharding_version=SAMPLING_VERSION, sampler_state_schema="h3.prompt-source.v1",
             rng_policy=STREAM_VERSION, dynamics_state_schema=("h3.dual-flow-sde.v1" if dual else "h3.cps-dual-all-n.v1"),
             progress_state_schema=f"checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}",
-            ema_state_schema="none", reference_state_schema="none", execution_transform_plan_id=transform_id,
+            ema_state_schema="none",
+            reference_state_schema=('h3.lora-disabled-base.v1' if self.profile.training.kl_beta else 'none'),
+            execution_transform_plan_id=transform_id,
             execution_transform_chain=(("h3.world8-ac-fsdp2.v1", transform_id),), world_size=8, world_size_policy="strict",
             state_schema_versions=(("model", 2), ("optimizer", 1), ("data", 1), ("rng", 1)),
         )

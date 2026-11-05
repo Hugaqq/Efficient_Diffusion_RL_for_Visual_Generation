@@ -40,7 +40,8 @@ class H3DualIterationStages(H3IterationStages):
     def __init__(self, *, mode, seed, reward_pipeline=False, media_bytes=None, decode_bytes=None,
                  rollout_cell_scope=None, reuse_video_vae=False, video_reuse_scope=None,
                  reuse_rollout_anchor=False, rollout_batch=1, rollout_batch_replay_tolerance=1e-4,
-                 predict_batch=None, parallel_owners=False, parallel_abort_join_s=None, **kwargs):
+                 predict_batch=None, parallel_owners=False, parallel_abort_join_s=None,
+                 kl_beta=0., predict_reference=None, **kwargs):
         if mode not in ('dual_flow','dual_flash') or type(seed) is not int or not 0 <= seed < 2**63:
             raise ValueError('dual mode and uint63 seed required')
         if type(reward_pipeline) is not bool:
@@ -90,6 +91,12 @@ class H3DualIterationStages(H3IterationStages):
         self.media_bytes,self.decode_bytes=media_bytes,decode_bytes
         self.mode=mode
         self.seed=seed
+        if type(kl_beta) not in (int, float) or not math.isfinite(kl_beta) or kl_beta < 0:
+            raise ValueError('kl_beta must be finite and nonnegative')
+        if kl_beta and not callable(predict_reference):
+            raise ValueError('nonzero KL requires a reference prediction capability')
+        self.kl_beta, self.predict_reference = kl_beta, predict_reference
+        self.kl_metrics = None
         super().__init__(**kwargs)
 
     @_timed
@@ -291,8 +298,17 @@ class H3DualIterationStages(H3IterationStages):
         global_count=len(ctx.plan.samples)*policy_steps
         scale=h3_slot_loss_scale(n_slot=1,global_count=global_count,reducer_divisor=self.prepared.reducer_divisor)
         total=0.
+        kl_rows = []
         for ordinal,rec in enumerate(records):
             state=_checked(c,f'dual/current/{ordinal}/prepare',lambda:rec.x.to(self.device))
+            reference_prediction = None
+            if self.kl_beta:
+                # 先完成参考前向并恢复 adapter，再建立当前策略的 AC/FSDP 反向图。
+                c.gate(f'dual/reference/{ordinal}/forward')
+                with torch.no_grad(), memory.span('reference_forward', synchronize=True,
+                        sample_id=rec.sample_id, selected_index=rec.index):
+                    reference_prediction = self.predict_reference(self.prepared, sample_id=rec.sample_id,
+                        x=state, index=rec.index, condition=r.conditions[rec.sample_id], dynamics=r.dynamics)
             c.gate(f'dual/current/{ordinal}/forward')
             with memory.span('current_forward',synchronize=True,sample_id=rec.sample_id,selected_index=rec.index):
                 prediction=self._predict(ctx,rec.sample_id,state,rec.index)
@@ -304,14 +320,20 @@ class H3DualIterationStages(H3IterationStages):
                         optimizer_step=r.identity.optimizer_step,index=rec.index,max_abs_logprob_delta=delta,ratio=ratio)),flush=True)
                 return policy_loss(dynamics=ctx.dual,record=rec,prediction=prediction,old_joint=old,
                     advantage=ctx.advantages[rec.sample_id],mode=('flow' if self.mode=='dual_flow' else 'flash'),
-                    world_means=means,clip_range=.005,scale=scale,audit=audit)
+                    world_means=means,clip_range=.005,scale=scale,audit=audit,
+                    **(dict(kl_beta=self.kl_beta, reference_prediction=reference_prediction,
+                            kl_metrics=kl_rows.append) if self.kl_beta else {}))
             loss=_checked(c,f'dual/current/{ordinal}/backward',local_loss)
             total+=loss.detach().item()
             with memory.span('backward',synchronize=True,sample_id=rec.sample_id,selected_index=rec.index):loss.backward()
             prediction_ref=weakref.ref(prediction)
-            del loss,prediction,state
+            del loss,prediction,state,reference_prediction
             memory.event('prediction_released_after_backward',sample_id=rec.sample_id,selected_index=rec.index,
                          released=prediction_ref() is None)
+        if self.kl_beta:
+            self.kl_metrics = {key: sum(row[key] for row in kl_rows)/len(kl_rows) for key in kl_rows[0]}
+            print(json.dumps(dict(event='h3_reference_kl', rank=self.rank,
+                optimizer_step=r.identity.optimizer_step, **self.kl_metrics)), flush=True)
         self._version(ctx,'dual/current/complete')
         with memory.span('gradient_clipping',synchronize=True):
             norm=c.clip_grad_norm(self.prepared,max_norm=1.)

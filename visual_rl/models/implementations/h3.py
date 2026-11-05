@@ -180,7 +180,7 @@ class H3Adapter(ModelAdapter):
         # Deliberately no root autocast: the H3 projections own FP32 alignment.
         return self._forward_prepared("transformer", **kwargs)
 
-    def predict(self, model_input: H3ModelInput) -> ModelPrediction:
+    def predict(self, model_input: H3ModelInput, *, parameter_view=None) -> ModelPrediction:
         self._require_loaded()
         if not isinstance(model_input, H3ModelInput):
             raise TypeError("H3 predict requires independent-sigma H3ModelInput")
@@ -189,7 +189,14 @@ class H3Adapter(ModelAdapter):
             raise ModelPortError("H3 conditioning cache identity differs from bound cache")
         self.prepared_components  # fail before any model call if not prepared
         from visual_rl.models.implementations.h3_forward import h3_t2va_forward
-        value = h3_t2va_forward(self._prepared_forward, x=model_input.latents, geometry=self.geometry,
+        forward = self._prepared_forward
+        if parameter_view is not None:
+            from functools import partial
+            from visual_rl.models.numerics.execution import ParameterView
+            if parameter_view is not ParameterView.REFERENCE:
+                raise ModelPortError('H3 explicit prediction view must be REFERENCE')
+            forward = partial(self._forward_prepared, 'transformer', parameter_view=parameter_view)
+        value = h3_t2va_forward(forward, x=model_input.latents, geometry=self.geometry,
             text_embeddings=model_input.conditioning.embeddings.to(model_input.latents.device),
             video_sigma=model_input.timestep, audio_sigma=model_input.audio_sigma)
         result = ModelPrediction(value, PredictionType.FLOW, model_input.condition_identity, model_input.guidance_identity)

@@ -43,7 +43,8 @@ def global_stream_means(coefficients, *, process_group, device):
     return means
 
 
-def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, world_means, clip_range, scale, audit=None):
+def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, world_means, clip_range, scale,
+                audit=None, kl_beta=0., reference_prediction=None, kl_metrics=None):
     """A single globally-scaled cell, with independent Flash stream gradients."""
     if mode not in ('flow','flash'):
         raise ValueError('explicit flow or flash mode required')
@@ -70,7 +71,18 @@ def policy_loss(*, dynamics, record, prediction, old_joint, advantage, mode, wor
     inputs=PolicyLossInputs(adv,torch.ones_like(adv),torch.ones_like(adv,dtype=torch.bool),clip_range,0.)
     output=ClippedSurrogateObjective().compute(old_log_probs=old_joint.to(current.device).reshape(1,1),
         policy_stats=SimpleNamespace(current_log_probs=current.reshape(1,1)),loss_inputs=inputs)
+    if type(kl_beta) not in (int, float) or not math.isfinite(kl_beta) or kl_beta < 0:
+        raise ValueError('kl_beta must be finite and nonnegative')
     loss=output.loss*scale
+    if kl_beta:
+        kl, streams = dynamics.reference_kl(record.x.to(prediction.device), prediction,
+                                            reference_prediction, record.index)
+        loss = loss + (kl_beta * kl.mean()) * scale
+        if kl_metrics is not None:
+            kl_metrics(dict(kl_video=float(streams[0].detach().mean()),
+                            kl_audio=float(streams[1].detach().mean()), kl=float(kl.detach().mean())))
+    elif reference_prediction is not None:
+        raise ValueError('reference prediction supplied with beta=0')
     if not bool(torch.isfinite(loss)):
         raise ValueError('nonfinite dual-SDE loss')
     return loss

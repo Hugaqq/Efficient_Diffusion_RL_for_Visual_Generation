@@ -127,6 +127,22 @@ class H3DualFlowSDE:
             raise ValueError('nonfinite joint density')
         return joint, tuple(components), tuple(s[2].detach() for s in stats)
 
+    def reference_kl(self, x, prediction, reference_prediction, index):
+        """每流使用自己的 transition std；不经过 Flash 时间梯度校正。"""
+        if (not isinstance(reference_prediction, torch.Tensor) or reference_prediction.requires_grad
+                or reference_prediction.grad_fn is not None):
+            raise ValueError('reference prediction must be a detached tensor')
+        current = self._parts(x, prediction, index)
+        with torch.no_grad():
+            reference = self._parts(x, reference_prediction, index)
+        components = tuple(((mean - ref_mean).square() / (2 * std.square())).reshape(x.shape[0], -1).mean(1)
+                           for (mean, std, _), (ref_mean, _, _) in zip(current, reference))
+        sizes = (self.layout.video_rows*self.layout.video_channels, self.layout.audio_rows*self.layout.audio_channels)
+        joint = sum(value * (size/sum(sizes)) for value, size in zip(components, sizes))
+        if not bool(torch.isfinite(joint).all()):
+            raise ValueError('nonfinite dual reference KL')
+        return joint, components
+
     def rectified_score(self, joint, components, coefficients, world_means):
         """Keep joint score/ratio value unchanged while scaling each stream gradient.
 
