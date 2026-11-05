@@ -9,6 +9,17 @@ from tests.test_h3_mvp_cpu_stages import _setup
 @pytest.mark.parametrize('mode,cells', [('dual_flow',6),('dual_flash',2)])
 def test_dual_full_iteration_and_optimizer_step(tmp_path,monkeypatch,mode,cells):
     h=_setup(tmp_path,monkeypatch)
+    if mode == 'dual_flash':
+        # The formal first-five contract now excludes terminal: use ten steps.
+        from dataclasses import replace
+        from visual_rl.algorithms.dynamics.h3_cps import H3CPSDynamics
+        from visual_rl.algorithms.dynamics.h3_schedule import H3ScheduleSnapshot
+        reserve = h.data.reserve
+        def request(step):
+            r = reserve(step)
+            d = H3CPSDynamics(r.dynamics.layout, H3ScheduleSnapshot.build(10))
+            return replace(r, dynamics=d, max_cells=20, max_trajectory_bytes=r.max_trajectory_bytes*4)
+        monkeypatch.setattr(h.data, 'reserve', request)
     # This simulates eight identical local ranks, not an NCCL test.
     monkeypatch.setattr(torch.distributed,'all_reduce',lambda tensor,**kw:tensor.mul_(8))
     def commit(request):

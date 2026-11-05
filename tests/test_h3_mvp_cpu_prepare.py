@@ -50,6 +50,13 @@ def _cpu_leaves(meta, monkeypatch, *, rank=0, broadcast_state=None):
 
     events, meshes, setter_keys, optimizers = [], [], [], []
     pg, mesh = object(), object()
+    # The CPU fixture simulates the owner's completed file-load heartbeat.
+    # prepare still joins the real loader thread and checks its error.
+    monkeypatch.setattr(h3_fsdp.dist, 'broadcast', lambda signal, **kw: signal.fill_(1))
+    from visual_rl.models.implementations import h3_loading
+    def admit_cpu_fixture(budget):
+        assert 0 < budget < 2**30
+    monkeypatch.setattr(h3_loading, '_admit_host_memory', admit_cpu_fixture)
     monkeypatch.setattr(h3_fsdp.dist, 'group', SimpleNamespace(WORLD=pg))
     monkeypatch.setattr(h3_fsdp.dist, 'is_available', lambda: True)
     monkeypatch.setattr(h3_fsdp.dist, 'is_initialized', lambda: True)

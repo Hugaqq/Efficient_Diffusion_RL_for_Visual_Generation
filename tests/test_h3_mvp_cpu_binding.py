@@ -45,6 +45,13 @@ from visual_rl.runtime.h3_binding import H3RuntimeBinding, verify_h3_content
 
 
 def _fixture(tmp_path, monkeypatch, *, bind=True):
+    # CPU leaves for the file-IO heartbeats introduced after this fixture.
+    from visual_rl.runtime import h3_file_phase
+    from tests.test_h3_mvp_cpu_stages import _CoordinationLeaf
+    monkeypatch.setattr(torch.distributed, 'broadcast', lambda *a, **kw: None)
+    monkeypatch.setattr(h3_file_phase, 'file_phase', lambda action, **kw: action())
+    monkeypatch.setattr(h3_loading, '_admit_host_memory', lambda budget: None)
+    monkeypatch.setattr(h3_coordination.H3Coordination, 'aux_turns', _CoordinationLeaf.aux_turns)
     path, raw = _profile_files(tmp_path)
     raw['overrides'] = dict(model=dict(params=dict(height=32, width=32, lora_rank=2, lora_alpha=4)),
                             training=dict(group_size=2, num_steps=2))
@@ -129,6 +136,8 @@ def _fixture(tmp_path, monkeypatch, *, bind=True):
     monkeypatch.setattr(hpsv3, 'requests_session', lambda: transport)
     scorer = H3HPSReward(request, video_contract=contract).acquire()
     _leaf_setup(monkeypatch, adapter.geometry)
+    from tests.test_h3_mvp_cpu_decode import _decoder
+    adapter._aux._decoder = _decoder(profile.launch.model, adapter.geometry)
     code_root = tmp_path / 'code'
     code_root.mkdir()
     (code_root / 'implementation.py').write_text('def forward(x):\n    return x\n')

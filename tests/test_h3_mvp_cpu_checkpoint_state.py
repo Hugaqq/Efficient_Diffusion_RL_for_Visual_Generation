@@ -153,8 +153,9 @@ def test_h3_codec_real_disk_save_purity_fresh_adam_restore_and_next_step(tmp_pat
     assert fresh.optimizer.state == {} and fresh.scheduler.last_epoch == 0
     with torch.no_grad():
         fresh_model = fresh.prepared_root.component('transformer')
-        fresh_model.context_embedder.weight.add_(123.)  # frozen base must be restored too
-        fresh_model.time_embedder.scale.add_(17.)  # persistent buffer is part of full model
+        # adapter.v2 intentionally omits immutable frozen parameters; the binding
+        # verifies their artifact identity. Persistent buffers remain restorable.
+        fresh_model.time_embedder.scale.add_(17.)
     original_fresh_step = fresh.optimizer.step
     monkeypatch.setattr(fresh.optimizer, 'step', forbidden)
     # Also prove non-owner enters actual disk load/getter/model/Adam setters.

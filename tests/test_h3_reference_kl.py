@@ -95,6 +95,16 @@ def test_real_peft_reference_binding_restores_rng_flags_grads_buffers_and_failur
     assert flags == [p.requires_grad for p in params]
     monkeypatch.setattr(b, 'predict', predict)
     assert torch.equal(b.predict(h.prepared, **args), current)
+    # Warm Adam moments and changed live LoRA must also remain untouched.
+    from copy import deepcopy
+    from tests.test_h3_mvp_cpu_checkpoint_state import _equal
+    h.prepared.optimizer.step(); h.prepared.scheduler.step(); h.prepared.optimizer.zero_grad(set_to_none=True)
+    warm = deepcopy(h.prepared.optimizer.state_dict())
+    weights = [p.detach().clone() for p in params]
+    assert torch.equal(b.predict_reference(h.prepared, **args), reference)
+    _equal(warm, h.prepared.optimizer.state_dict())
+    assert all(torch.equal(p,w) for p,w in zip(params,weights))
+    assert all(p.grad is None for p in params)
     b.close(); h.scorer.close(); h.adapter.close(); h.manager.close()
 
 

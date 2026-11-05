@@ -42,7 +42,10 @@ class H3LoRAEMA:
         self.validate()
 
     def _inventory(self):
-        parameters = dict(self.named_parameters())
+        items = tuple(self.named_parameters())
+        parameters = dict(items)
+        if len(parameters) != len(items) or len({id(p) for p in parameters.values()}) != len(parameters):
+            raise ValueError('EMA parameter names/objects must be unique')
         if not parameters or any(not p.requires_grad or p.dtype != torch.float32 for p in parameters.values()):
             raise ValueError('EMA requires nonempty FP32 LoRA masters')
         ids = {name: id(p) for name,p in parameters.items()}

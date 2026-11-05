@@ -556,7 +556,7 @@ class H3LifecycleBackend:
                 value = metrics.get(key)
                 if key in ('ema_committed_steps', 'ema_updates'):
                     expected = count if key == 'ema_committed_steps' else count // training.ema.update_interval
-                    if type(value) is not int or value != expected:
+                    if type(value) is not float or value != expected:
                         raise ValueError('terminal EMA counters differ from checkpoint')
                 elif type(value) is not float or not math.isfinite(value) or value < 0:
                     raise ValueError('terminal H3 diagnostics must be finite nonnegative floats')

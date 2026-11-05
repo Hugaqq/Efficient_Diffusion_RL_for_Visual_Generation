@@ -106,3 +106,46 @@ def test_cross_rank_least_inflight_file_leases_and_fail_closed(tmp_path):
     with pytest.raises(ValueError, match='generation'):
         with owners[0].lease():
             pass
+
+
+def test_dispatch_shared_across_eight_real_cpu_processes(tmp_path):
+    import subprocess
+    import sys
+    path = tmp_path/'dispatch.json'
+    HpsDispatcher.initialize(path, ORIGINS)
+    script = '''
+import json, sys
+from visual_rl.algorithms.rewards.clients.hps_dispatch import HpsDispatcher
+with HpsDispatcher(json.loads(sys.argv[2]), path=sys.argv[1]).lease() as index:
+    print(index, flush=True)
+    sys.stdin.readline()
+'''
+    processes = [subprocess.Popen([sys.executable, '-c', script, str(path), json.dumps(ORIGINS)],
+                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(8)]
+    try:
+        # All children hold their leases until the parent releases them together.
+        import selectors
+        selector = selectors.DefaultSelector()
+        for process in processes:
+            selector.register(process.stdout, selectors.EVENT_READ)
+        selected = []
+        while selector.get_map():
+            events = selector.select(timeout=15)
+            assert events, 'dispatcher child did not acquire a lease'
+            for key,_ in events:
+                selected.append(int(key.fileobj.readline()))
+                selector.unregister(key.fileobj)
+        selector.close()
+        assert selected.count(0) == selected.count(1) == 4
+        assert json.loads(path.read_text())['counts'] == [4,4]
+        for process in processes:
+            process.stdin.write('\n'); process.stdin.flush()
+        for process in processes:
+            out,err = process.communicate(timeout=15)
+            assert process.returncode == 0, err
+        assert json.loads(path.read_text())['counts'] == [0,0]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=15)

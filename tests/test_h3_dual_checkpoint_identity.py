@@ -9,7 +9,7 @@ def test_dual_checkpoint_contract_has_separate_dynamics_and_algorithm_identity(t
     assert original.dynamics_state_schema=='h3.cps-dual-all-n.v1'
     b.profile=replace(b.profile,training=replace(b.profile.training,algorithm='dual_flow'))
     flow=b._contract()
-    b.profile=replace(b.profile,training=replace(b.profile.training,algorithm='dual_flash'))
+    b.profile=replace(b.profile,training=replace(b.profile.training,algorithm='dual_flash',num_steps=10))
     flash=b._contract()
     assert flow.dynamics_state_schema==flash.dynamics_state_schema=='h3.dual-flow-sde.v1'
     assert len({original.algorithm_materialization_spec_id,flow.algorithm_materialization_spec_id,flash.algorithm_materialization_spec_id})==3

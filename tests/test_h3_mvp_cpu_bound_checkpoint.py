@@ -52,6 +52,41 @@ class _World:
         monkeypatch.setattr(torch.distributed, 'get_rank', lambda group=None: self.tls.rank)
         monkeypatch.setattr(torch.distributed, 'all_gather_object', self.gather)
         monkeypatch.setattr(torch.distributed, 'all_reduce', self.reduce)
+        from visual_rl.runtime import h3_file_phase
+        monkeypatch.setattr(h3_file_phase, 'file_phase', lambda action, **kw: action())
+        def cpu_aux_turns(coordinator, work):
+            result = None
+            for owner in range(8):
+                coordinator.gate(f'aux/cpu/{owner}/before')
+                error = None
+                try:
+                    if self.tls.rank == owner:
+                        result = work()
+                except Exception as exc:
+                    error = exc
+                coordinator.gate(f'aux/cpu/{owner}/after', local_error=error is not None)
+                if error is not None:
+                    raise error
+            return result
+        monkeypatch.setattr(h3_coordination.H3Coordination, 'aux_turns', cpu_aux_turns)
+        from visual_rl.models.implementations.h3 import _H3Aux
+        from tests.test_h3_mvp_cpu_decode import _decoder
+        def cpu_decoder(aux):
+            aux.require_open()
+            if aux._decoder is None:
+                aux._decoder = _decoder(aux.model_path, aux.config.geometry)
+            return aux._decoder
+        monkeypatch.setattr(_H3Aux, 'decoder', property(cpu_decoder))
+        zeros = torch.zeros
+        def cpu_zeros(*args, **kw):
+            if 'device' in kw and torch.device(kw['device']).type == 'cuda':
+                kw['device'] = 'cpu'
+            return zeros(*args, **kw)
+        monkeypatch.setattr(torch, 'zeros', cpu_zeros)
+        def broadcast(signal, *, src, group):
+            assert group is self.group
+            signal.fill_(self.exchange(self.tls.rank, 'broadcast', int(signal.item()))[src])
+        monkeypatch.setattr(torch.distributed, 'broadcast', broadcast)
         for module in (h3_world, h3_binding, h3_coordination, codec, transaction):
             monkeypatch.setattr(module, '_world_rank', lambda group: self.tls.rank)
         for module in (h3_binding, h3_coordination):
@@ -82,7 +117,7 @@ class _World:
                 elif kind.startswith('clip-shards:'):
                     slot['result'] = torch.cat(values, dim=0)
                 elif kind == 'sum':
-                    slot['result'] = torch.stack(values).sum()
+                    slot['result'] = torch.stack(values).sum(0)
                 else:
                     slot['result'] = values
                 self.lock.notify_all()
@@ -233,9 +268,17 @@ def _cohort(case, label, *, use_initial=False):
         world.tls.rank = rank
         binding = H3RuntimeBinding(**(h.kwargs | dict(adapter=adapter, prepared=prepared, source=source, scorer=scorer,
             process_group=world.group, rank=rank, device=f'cuda:{rank}')))
-        stages = H3IterationStages(data=source, prepared=prepared, predict=binding.predict, decode=binding.decode,
+        options = dict(data=source, prepared=prepared, predict=binding.predict, decode=binding.decode,
             score_one=binding.score_one, coordination_factory=binding.coordination_factory,
-            process_group=world.group, rank=rank, device='cpu', read_behavior_id=source.read_behavior_id)
+            process_group=world.group, rank=rank, device='cpu', read_behavior_id=source.read_behavior_id,
+            ema=binding.ema, advantage_std_domain=binding.profile.training.advantage_std_domain)
+        if binding.profile.training.algorithm == 'cps':
+            stages = H3IterationStages(**options)
+        else:
+            from visual_rl.algorithms.trainer.h3_dual_stages import H3DualIterationStages
+            stages = H3DualIterationStages(mode=binding.profile.training.algorithm,
+                seed=binding.profile.launch.seed, kl_beta=binding.profile.training.kl_beta,
+                predict_reference=binding.predict_reference, **options)
         trainer = stages.trainer()
         owner = SimpleNamespace(rank=rank, adapter=adapter, manager=manager, prepared=prepared, scorer=scorer,
                                 transport=transport, source=source, binding=binding, stages=stages, trainer=trainer,
@@ -331,7 +374,7 @@ def test_bound_source_tail_publish_fresh_restore_and_real_next_iteration(tmp_pat
         assert RankRNGSnapshot.capture_current(0) == before_rng
         assert all(o.before_tail == [] for o in fresh)  # no dummy optimizer.step during restore
         assert sum(label == 'get-adam' for label, _ in case.calls) == 8  # warm SAVE only
-        for label in ('load', 'set-model'):
+        for label in ('load',):
             assert sorted(r for name, r in case.calls if name == label) == list(range(8))
         for r, o in enumerate(fresh):
             _equal(_snapshot(o.prepared), saved[r])

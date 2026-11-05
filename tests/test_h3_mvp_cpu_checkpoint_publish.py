@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import random
 import shutil
+import threading
 
 import numpy as np
 import pytest
@@ -36,7 +37,7 @@ def _contract_for(prepared):
     projection = ParameterStateManager(components).state_projection
     numerics = _numerics(projection)
     parameters = tuple(ParameterContract(name, tuple(p.shape), str(p.dtype)) for name, p in prepared.trainable_named_parameters())
-    return replace(_contract(world_size=8), model_state_projection=projection,
+    return replace(_contract(world_size=8), ema_state_schema='none', reference_state_schema='none', model_state_projection=projection,
                    model_state_projection_id=projection.projection_id, model_execution_numerics=numerics,
                    model_execution_numerics_id=numerics.execution_numerics_id, trainable_parameters=parameters,
                    optimizer_groups=(OptimizerGroupContract('lora', tuple(p.name for p in parameters), _sha('lr-contract')),))
@@ -80,6 +81,18 @@ def _setup(tmp_path, monkeypatch):
     monkeypatch.setattr(codec, '_world_rank', lambda pg: sim.tls.rank)
     monkeypatch.setattr(codec, '_local', lambda value, pg, sharded=False: value.detach())
     monkeypatch.setattr(tx, '_capture_rng', _private_rng)
+    from visual_rl.runtime import h3_file_phase
+    monkeypatch.setattr(h3_file_phase, 'file_phase', lambda action, **kw: action())
+    zeros = torch.zeros
+    def cpu_zeros(*args, **kw):
+        if 'device' in kw and torch.device(kw['device']).type == 'cuda':
+            kw['device'] = 'cpu'
+        return zeros(*args, **kw)
+    monkeypatch.setattr(torch, 'zeros', cpu_zeros)
+    def broadcast(signal, *, src, group):
+        assert group is sim.group
+        signal.fill_(sim._exchange('gather', int(signal.item()))[src])
+    monkeypatch.setattr(torch.distributed, 'broadcast', broadcast)
     managers = [AtomicCheckpointManager(tmp_path / 'checkpoints') for _ in range(8)]
     owners = sim.run(lambda r: tx.H3CheckpointTransaction(managers[r], process_group=sim.group))
     assert all(isinstance(owner, tx.H3CheckpointTransaction) for owner in owners)
@@ -223,8 +236,8 @@ def test_h3_allrank_publish_private_rng_full_tree_and_prepared_restore(tmp_path,
         _equal(_snapshot(fresh[r]), before[r])
         assert value['rng'].state_identity == _private_rng(r).state_identity
         assert value['data'] == _data(r, progress)
-    for label in ('load', 'model-set'):
-        assert sorted(r for name, r in calls if name == label) == list(range(8))
+    assert sorted(r for name, r in calls if name == 'load') == list(range(8))
+    assert not any(name == 'model-set' for name, _ in calls)  # adapter.v2 copies only its admitted subset
     # Global RNG is process-wide in this CPU simulation. For the eight-worker
     # bound gate replace ONLY its final restore observation with private-process
     # state storage; a separate case below calls real restore_current sequentially.
@@ -440,7 +453,7 @@ def test_h3_rank_directory_fsync_after_all_attachments_before_publication(tmp_pa
 
     def sync(path):
         if path.name == 'h3-ranks':
-            assert sim.tls.rank == 0
+            assert threading.current_thread().name == 'h3-checkpoint-publisher'
             assert sorted(written) == sorted(verified) == list(range(8))
             assert sorted(p.name for p in path.iterdir()) == [f'rank-{r}.pt' for r in range(8)]
             assert not (path.parent / 'h3_transaction.json').exists()
@@ -484,7 +497,7 @@ def test_h3_rank_directory_fsync_failure_refuses_all_ranks_without_publication(t
 
     def sync(path):
         if path.name == 'h3-ranks':
-            assert sim.tls.rank == 0
+            assert threading.current_thread().name == 'h3-checkpoint-publisher'
             assert sorted(p.name for p in path.iterdir()) == [f'rank-{r}.pt' for r in range(8)]
             failed.append(path)
             raise original

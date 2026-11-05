@@ -44,7 +44,7 @@ def world_metrics(rows, *, step, ema_config):
     result['lora_norm'] = math.sqrt(sum(row['lora_squared_norm'] for row in rows))
     if enabled:
         result.update(ema_live_distance=math.sqrt(sum(row['ema_live_squared_distance'] for row in rows)),
-                      ema_committed_steps=step+1, ema_updates=(step+1)//ema_config.update_interval)
+                      ema_committed_steps=float(step+1), ema_updates=float((step+1)//ema_config.update_interval))
     if any(not math.isfinite(value) for value in result.values()):
         raise ValueError('H3 world diagnostics overflow')
     return result

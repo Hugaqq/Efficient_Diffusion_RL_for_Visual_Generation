@@ -2,7 +2,8 @@
 
 Root: schema_version:2, recipe:h3_t2va_mvp_v1, overrides, launch.
 Overrides (optional groups): model.params (height,width,frames,fps,guidance_scale,
-  lora_rank,lora_alpha); training (group_size,num_steps). All other math is fixed.
+  lora_rank,lora_alpha); training (group_size,num_steps,algorithm,group_layout,
+  kl_beta,ema,advantage_std_domain). Unspecified extension fields preserve the legacy identity.
 Launch (all keys required): output_dir,resume_from,artifacts,expected,execution,
   seed,max_optimizer_steps,checkpoint_every_optimizer_steps,resume_policy,budgets,hps.
 Artifacts: model,text_cache,train,eval,hps_manifest (local paths, YAML-relative).
@@ -11,7 +12,8 @@ Execution: world_size:8,sp:1,tp:1,gpu_uuids (eight ordered distinct GPU UUIDs).
 Budgets: host_weight_bytes,trajectory_bytes,media_bytes,decode_bytes,condition_bytes,
   max_tokens,embedding_bytes,prompt_file_bytes (positive integers, explicit).
   Prompt reads use min(prompt_file_bytes, H3PromptSource's hard file limit).
-Hps: origin,timeout_s,max_response_bytes. Resume policy must be
+Hps: origin,timeout_s,max_response_bytes; optional origins (ordered loopback list,
+  first equal to origin). EMA: enabled,decay,update_interval,counting. Resume policy must be
   complete_collection_same_topology; null resume_from means a fresh run.
 
 compile_h3_profile validates declarations/paths only. preflight_h3_profile reads

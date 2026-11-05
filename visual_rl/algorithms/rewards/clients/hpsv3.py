@@ -231,6 +231,8 @@ class Hpsv3MultiOriginClient(Hpsv3VideoClient):
             **({} if self.transport_factory is None else dict(transport=self.transport_factory(origin))))
 
     def healthcheck(self):
+        if self.closed:
+            raise RuntimeError('HPSv3 client is closed')
         observed = [client.healthcheck() for client in self.clients]
         if any(value != observed[0] for value in observed):
             raise ValueError('HPS instances have different service identities/manifests')
@@ -249,11 +251,15 @@ class Hpsv3MultiOriginClient(Hpsv3VideoClient):
     def close(self):
         if not self.closed:
             self.closed = True
-            try:
-                for client in self.clients:
+            error = None
+            for client in self.clients:
+                try:
                     client.close()
-            finally:
-                self.clients = []
+                except Exception as exc:
+                    error = error or exc
+            self.clients = []
+            if error is not None:
+                raise error
 
 
 class Hpsv3VideoResourceFactory:
