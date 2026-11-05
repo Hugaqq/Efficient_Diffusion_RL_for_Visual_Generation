@@ -54,13 +54,21 @@ def _profile_identity(profile, facts):
     for key in ("max_tokens", "max_embedding_bytes", "max_media_bytes", "max_decode_bytes"):
         model.pop(key)
     payload = facts.semantic_payload
+    hps_key, hps_identity = 'hps_service_identity', profile.expected['hps_service_identity']
+    if len(profile.launch.origins) > 1:
+        from visual_rl.core.protocols.flash_hpsv3 import MAX_HEALTH_BYTES, VideoContract, decode_json, validate_health, scoring_identity
+        from visual_rl.composition.config.h3_profile import _read
+        health = decode_json(_read(profile.launch.hps_manifest, MAX_HEALTH_BYTES), MAX_HEALTH_BYTES)
+        contract = VideoContract(profile.model.config.frames, profile.model.config.height, profile.model.config.width)
+        validate_health(health, hps_identity, contract)
+        hps_key, hps_identity = 'hps_scoring_identity', scoring_identity(health, contract)
     if (payload.get("model") != FrozenMapping(model)
             or payload.get("math") != FrozenMapping(profile.training.payload())
             or payload.get("seed") != profile.launch.seed
             or payload.get("max_optimizer_steps") != profile.launch.max_optimizer_steps
             or payload.get("declared_model_sha256") != profile.expected["model_sha256"]
             or payload.get("cache_provenance") != profile.expected["cache_identity"]
-            or payload.get("hps_service_identity") != profile.expected["hps_service_identity"]
+            or payload.get(hps_key) != hps_identity
             or payload.get("data") != FrozenMapping(dict(train_sha256=facts.train_sha256,
                 eval_sha256=facts.eval_sha256, parse=PARSE_VERSION))
             or payload.get("cache_identity") != facts.cache_identity

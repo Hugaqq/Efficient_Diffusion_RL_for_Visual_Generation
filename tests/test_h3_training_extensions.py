@@ -55,6 +55,13 @@ def test_multi_origin_semantics_use_scoring_not_placement_identity(tmp_path):
         facts = preflight_h3_profile(profile)
         assert 'hps_service_identity' not in facts.semantic_payload
         assert 'hps_scoring_identity' in facts.semantic_payload
+        from visual_rl.runtime.h3_session import _profile_identity
+        from visual_rl.core.identity import canonical_identity
+        assert _profile_identity(profile, facts)[-1] == facts.semantic_id
+        wrong = FrozenMapping(dict(facts.semantic_payload, hps_scoring_identity='f'*64))
+        with pytest.raises(ValueError, match='do not describe'):
+            _profile_identity(profile, replace(facts, semantic_payload=wrong,
+                semantic_id=canonical_identity('h3.semantic.v1', wrong)))
         ids.append((facts.semantic_id, facts.binding_id))
     assert ids[0] == ids[1]
 
