@@ -44,6 +44,10 @@ def _worker(rank, rendezvous, root):
         owner.commit(1)
         for name, p in parameters.items():
             assert torch.equal(owner.shadow[name], initial[name].lerp(p.to_local().detach(), .9))
+        from visual_rl.runtime.h3_training_metrics import local_metrics
+        metrics = local_metrics(parameters.items(), rank=rank, process_group=group, kl=None, ema=owner, loss=-1.)
+        expected_norm = sum(float(p.to_local().detach().double().square().sum()) for p in parameters.values())
+        assert metrics['lora_squared_norm'] == expected_norm
         save_ema(owner, root, step=1)
         dist.barrier()  # 所有 rank 文件持久化后，才进入完整 checkpoint 的 restore。
         restored = H3LoRAEMA(lambda: parameters.items(), config=config, rank=rank, process_group=group)

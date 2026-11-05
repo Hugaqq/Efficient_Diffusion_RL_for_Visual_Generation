@@ -16,7 +16,9 @@ def local_parameter(parameter, *, rank, process_group):
     from torch.distributed.tensor import DTensor
     if not isinstance(parameter, DTensor) or parameter.device_mesh.get_rank() != rank:
         raise ValueError('EMA requires this rank\'s prepared WORLD8 DTensor')
-    local = _local(parameter, process_group, sharded=True, device=parameter.device)
+    # CUDA 保留原 current_device 校验；只有 CPU 分布式验收显式指定设备。
+    local = _local(parameter, process_group, sharded=True,
+                   **({'device': 'cpu'} if parameter.device.type == 'cpu' else {}))
     shape = list(parameter.shape)
     chunk = math.ceil(shape[0] / 8)
     offset = min(rank * chunk, shape[0])
