@@ -113,7 +113,7 @@ def test_h3_world_cooperative_local_rejection_before_model(monkeypatch):
     bad = [dict(samples=()), dict(samples=_samples(3)[:-1]),
            dict(samples=(_samples(3)[0],) * 4), dict(samples=(("x", "g", True),) * 2),
            dict(group_size=1), dict(num_steps=0), dict(rollout_microbatch=2), dict(replay_microbatch=2),
-           dict(chunk_size=2), dict(sp=2), dict(tp=2), dict(guidance=4.5), dict(beta=.1),
+           dict(chunk_size=2), dict(sp=2), dict(tp=2), dict(guidance=4.5), dict(beta=-.1),
            dict(local_error=True), dict(geometry_id='x' * 257), dict(schedule_id=torch.ones(1)),
            dict(samples=_samples(3, k=2, groups=257))]
     for changes in bad:

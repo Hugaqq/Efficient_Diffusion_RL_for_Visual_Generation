@@ -14,6 +14,8 @@ monitor's remaining lifetime/bytes or the output filesystem's space/inodes canno
 cover the remaining updates. Adds reward-ranked rollout
 video retention at update 1, every 5 updates and the terminal one, a disk preflight, a
 per-launch manifest, and optional (default off) per-update weight hashing.
+KL/EMA/advantage std and HPS origins are configured in the YAML H3 profile;
+the lifecycle semantic/checkpoint contract enforces them on every resume.
 """
 from pathlib import Path
 import argparse

@@ -80,6 +80,23 @@ class H3Budgets:
 
 
 @dataclass(frozen=True)
+class H3EMAConfig:
+    enabled: bool = False
+    decay: float = .9
+    update_interval: int = 8
+    counting: str = 'committed_optimizer_steps.v1'
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError('EMA enabled must be bool')
+        if type(self.decay) not in (int, float) or not math.isfinite(self.decay) or not 0 <= self.decay < 1:
+            raise ValueError('EMA decay must be finite in [0,1)')
+        positive_int('EMA update_interval', self.update_interval)
+        if self.counting != 'committed_optimizer_steps.v1':
+            raise ValueError('EMA counting must be committed_optimizer_steps.v1')
+
+
+@dataclass(frozen=True)
 class H3Training:
     group_size: int = 8
     num_steps: int = 10
@@ -91,6 +108,9 @@ class H3Training:
     # different run identity (payload below) and declares its replay tolerance.
     rollout_batch: int = 1
     rollout_batch_replay_tolerance: float = 1e-4
+    kl_beta: float = 0.
+    ema: H3EMAConfig = H3EMAConfig()
+    advantage_std_domain: str = 'batch'
 
     @property
     def local_samples(self):
@@ -101,6 +121,14 @@ class H3Training:
         return 8 * self.local_samples
 
     def __post_init__(self):
+        if type(self.kl_beta) not in (int, float) or not math.isfinite(self.kl_beta) or self.kl_beta < 0:
+            raise ValueError('kl_beta must be finite and nonnegative')
+        if self.kl_beta and self.algorithm == 'cps':
+            raise ValueError('reference KL requires dual_flow or dual_flash Gaussian transitions')
+        if not isinstance(self.ema, H3EMAConfig):
+            raise TypeError('ema must be H3EMAConfig')
+        if self.advantage_std_domain not in ('batch', 'group'):
+            raise ValueError('advantage_std_domain must be batch or group')
         if type(self.group_size) is not int or not 2 <= self.group_size <= 64:
             raise ValueError("group_size must be an integer in [2,64]")
         if type(self.num_steps) is not int or not 1 <= self.num_steps <= 100:
@@ -161,6 +189,19 @@ class H3Training:
             from visual_rl.algorithms.trainer.h3_dual_rollout import ROLLOUT_BATCH_VERSION
             result.update(rollout_microbatch=self.rollout_batch, rollout_batch=ROLLOUT_BATCH_VERSION,
                           rollout_batch_replay_tolerance=self.rollout_batch_replay_tolerance)
+        result.update(self.extension_payload())
+        return result
+
+    def extension_payload(self):
+        # 默认不增加任何键，保留旧 semantic id；关闭 EMA 时修改参数也必须入身份。
+        result = {}
+        if self.kl_beta:
+            result.update(beta=float(self.kl_beta), reference='lora_disabled_base.v1',
+                          kl='dual_gaussian_element_mean.v1')
+        if self.ema != H3EMAConfig():
+            result.update(ema=self.ema.enabled, ema_config=asdict(self.ema))
+        if self.advantage_std_domain != 'batch':
+            result['advantage_std_domain'] = self.advantage_std_domain
         return result
 
 
@@ -181,10 +222,32 @@ class H3Launch:
     hps_origin: str
     hps_timeout_s: float
     hps_max_response_bytes: int
+    hps_origins: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        from visual_rl.algorithms.rewards.clients.hpsv3 import loopback_origin
+        if type(self.hps_origins) is not tuple:
+            raise ValueError('HPS origins must be an ordered tuple')
+        origins = self.hps_origins or (self.hps_origin,)
+        normalized = tuple(loopback_origin(origin) for origin in origins)
+        if (normalized != origins or len(set(origins)) != len(origins)
+                or not 1 <= len(origins) <= 8 or origins[0] != self.hps_origin):
+            raise ValueError('HPS origins must be 1..8 distinct canonical loopback origins, first equal to origin')
+        if len(origins) == 1:
+            object.__setattr__(self, 'hps_origins', ())
+
+    @property
+    def origins(self):
+        return self.hps_origins or (self.hps_origin,)
+
+    def extension_payload(self):
+        return {} if not self.hps_origins else dict(hps_origins=self.hps_origins)
 
     @property
     def binding_id(self):
         payload = asdict(self)
+        if not self.hps_origins:
+            payload.pop('hps_origins')
         for key in ("output_dir", "resume_from", "model", "text_cache", "train", "eval", "hps_manifest"):
             payload[key] = None if payload[key] is None else str(payload[key])
         return canonical_identity("h3.launch.v1", payload)
@@ -228,7 +291,10 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
     model_group = _exact(overrides.get("model", {"params": {}}), ("params",), "H3 model")
     model_params = strict_values(model_group["params"], allowed=frozenset(("height", "width", "frames", "fps", "guidance_scale", "lora_rank", "lora_alpha")),
                                  required=frozenset(), label="H3 model params")
-    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps", "algorithm", "group_layout")), required=frozenset(), label="H3 training")
+    train_params = strict_values(overrides.get("training", {}), allowed=frozenset(("group_size", "num_steps", "algorithm", "group_layout", "kl_beta", "ema", "advantage_std_domain")), required=frozenset(), label="H3 training")
+    if 'ema' in train_params:
+        train_params['ema'] = H3EMAConfig(**strict_values(train_params['ema'],
+            allowed=frozenset(f.name for f in fields(H3EMAConfig)), required=frozenset(), label='H3 EMA'))
     training = H3Training(**train_params)
     launch = _exact(raw["launch"], ("output_dir", "resume_from", "artifacts", "expected", "execution", "seed",
         "max_optimizer_steps", "checkpoint_every_optimizer_steps", "resume_policy", "budgets", "hps"), "H3 launch")
@@ -279,11 +345,16 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
             or cache["add_special_tokens"] is not False or type(cache["feature_dim"]) is not int or cache["feature_dim"] != 5120
             or cache["dtype"] not in ("float32", "float16", "bfloat16")):
         raise ValueError("invalid layer50/raw/5120 cache identity")
-    hps = _exact(launch["hps"], ("origin", "timeout_s", "max_response_bytes"), "H3 HPS")
+    hps = strict_values(launch['hps'], allowed=frozenset(('origin', 'origins', 'timeout_s', 'max_response_bytes')),
+                        required=frozenset(('origin', 'timeout_s', 'max_response_bytes')), label='H3 HPS')
+    origins = hps.get('origins', [hps['origin']])
+    if type(origins) is not list or not origins:
+        raise ValueError('HPS origins must be a nonempty list')
+    origins = tuple(loopback_origin(origin) for origin in origins)
     bound = H3Launch(output_dir=path(launch["output_dir"]), resume_from=None if launch["resume_from"] is None else path(launch["resume_from"]),
         **paths, gpu_uuids=tuple(uuids), seed=launch["seed"], max_optimizer_steps=steps, checkpoint_every_optimizer_steps=cadence,
         budgets=budgets, hps_origin=loopback_origin(hps["origin"]), hps_timeout_s=_positive_float(hps["timeout_s"], "HPS timeout"),
-        hps_max_response_bytes=positive_int("HPS response bound", hps["max_response_bytes"]))
+        hps_max_response_bytes=positive_int("HPS response bound", hps["max_response_bytes"]), hps_origins=origins)
     if bound.output_dir in paths.values() or bound.output_dir == bound.resume_from:
         raise ValueError("output_dir cannot be an input artifact or resume checkpoint")
     return H3Profile(model, training, bound, FrozenMapping(expected), source.config_source_id)
@@ -402,7 +473,7 @@ def preflight_h3_profile(profile: H3Profile) -> H3LocalFacts:
         cache_identity=cache.identity_sha256, cache_provenance=to_plain_dict(expected["cache_identity"]),
         hps_service_identity=expected["hps_service_identity"], video_contract=contract.payload(),
         video_sigmas=schedule.video_sigmas.tolist(), audio_sigmas=schedule.audio_sigmas.tolist(),
-        resume_policy=_RESUME))
+        resume_policy=_RESUME, **launch.extension_payload()))
     return H3LocalFacts(canonical_identity("h3.semantic.v1", payload), payload, launch.binding_id,
         train_hash, eval_hash, cache.identity_sha256, FrozenMapping(configs), hashlib.sha256(raw_hps).hexdigest(),
         host_bytes, trajectory_bytes, condition_bytes)
