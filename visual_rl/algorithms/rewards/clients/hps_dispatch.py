@@ -49,6 +49,12 @@ class HpsDispatcher:
 
     @contextmanager
     def _state(self):
+        """文件态仅在 with 正常退出并校验后回写/flush（不承诺 fsync 持久性）。
+
+        with 体抛异常不回写；内存态直接借出对象，不提供回滚。崩溃只按
+        fail-closed 处理，不做 lease 回收、计数修复或实例剔除；遗留在途
+        计数不能解释为可安全重试，必须由生命周期终止该 attempt。
+        """
         with self.lock:
             if self.path is None:
                 self._validate(self.state)
