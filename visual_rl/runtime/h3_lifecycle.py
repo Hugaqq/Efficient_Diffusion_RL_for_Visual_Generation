@@ -383,6 +383,8 @@ class H3LifecycleBackend:
                 rank=runtime.rank, device=_execution_device(runtime), read_behavior_id=graph.source.read_behavior_id)
             if getattr(binding, 'ema', None) is not None:
                 options['ema'] = binding.ema
+            if getattr(graph.profile.training, 'advantage_std_domain', 'batch') != 'batch':
+                options['advantage_std_domain'] = graph.profile.training.advantage_std_domain
             if self.parallel_owners:
                 from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
                 capacity = binding.scorer.declared_queue_capacity()

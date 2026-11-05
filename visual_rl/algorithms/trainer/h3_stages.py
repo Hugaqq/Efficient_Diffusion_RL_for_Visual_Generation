@@ -95,7 +95,7 @@ class H3IterationStages:
 
     def __init__(self, *, data, prepared, predict, decode, score_one,
                  coordination_factory, process_group, rank: int, device,
-                 read_behavior_id, ema=None):
+                 read_behavior_id, ema=None, advantage_std_domain='batch'):
         for obj, method in ((data, "reserve"), (data, "commit"), (data, "abort")):
             if not callable(getattr(obj, method, None)):
                 raise TypeError(f"data must implement {method}")
@@ -108,6 +108,9 @@ class H3IterationStages:
         self.process_group, self.rank, self.device = process_group, rank, torch.device(device)
         self.read_behavior_id = read_behavior_id
         self.ema = ema
+        if advantage_std_domain not in ('batch', 'group'):
+            raise ValueError('advantage_std_domain must be batch or group')
+        self.advantage_std_domain = advantage_std_domain
         self._active = None
         self._poisoned = False
         self._expected_behavior = None
@@ -298,7 +301,9 @@ class H3IterationStages:
         r = ctx.request
         ctx.advantages = gather_h3_credit(ctx.plan, process_group=self.process_group,
                                           collection_id=r.collection_id, behavior_id=r.behavior_id,
-                                          rewards=ctx.rewards)
+                                          rewards=ctx.rewards,
+                                          **(dict(advantage_std_domain=self.advantage_std_domain)
+                                             if self.advantage_std_domain != 'batch' else {}))
         return StageValue(value.identity, ctx)
 
     def credit(self, value):

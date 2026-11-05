@@ -269,7 +269,7 @@ def _reward_rows(plan, rank, rows):
 
 
 def gather_h3_credit(plan: H3WorldPlan, *, process_group, collection_id, behavior_id,
-                     rewards, local_error=False) -> dict[str, torch.Tensor]:
+                     rewards, local_error=False, advantage_std_domain='batch') -> dict[str, torch.Tensor]:
     """Gather only already-composed scalar rewards; return owned CPU FP32 scalars.
 
     Uses group means and the full unique world's population std in float64.
@@ -281,16 +281,21 @@ def gather_h3_credit(plan: H3WorldPlan, *, process_group, collection_id, behavio
     try:
         if local_error is not False or not isinstance(plan, H3WorldPlan):
             raise ValueError('caller preflight/plan invalid')
+        if advantage_std_domain not in ('batch', 'group'):
+            raise ValueError('advantage_std_domain must be batch or group')
         if (collection_id, behavior_id) != (plan.collection_id, plan.behavior_id):
             raise ValueError('reward collection/behavior identity mismatch')
         payload = [plan.plan_id, collection_id, behavior_id, _reward_rows(plan, rank, rewards)]
+        if advantage_std_domain != 'batch':
+            payload.append(advantage_std_domain)
         valid = True
     except (ValueError, TypeError, OverflowError):
         pass
     tables = _exchange('credit', rank, process_group, payload, valid)
     rows = []
     for peer, table in enumerate(tables):
-        if (type(table) is not list or len(table) != 4
+        suffix = [] if advantage_std_domain == 'batch' else [advantage_std_domain]
+        if (type(table) is not list or len(table) != 4 + len(suffix) or table[4:] != suffix
                 or table[:3] != [plan.plan_id, plan.collection_id, plan.behavior_id]):
             raise ValueError('reward plan/collection/behavior mismatch')
         rows.extend(_reward_rows(plan, peer, table[3]))
@@ -299,6 +304,23 @@ def gather_h3_credit(plan: H3WorldPlan, *, process_group, collection_id, behavio
     # which an unnecessary sum/mean would overflow float64.
     if bool((values == values[0]).all()):
         return {sid: torch.zeros((), dtype=torch.float32, device='cpu') for sid, _, _ in plan.samples}
+    if advantage_std_domain == 'group':
+        credit = torch.zeros_like(values)
+        groups = {}
+        for index, (_, group_id, _) in enumerate(plan.samples):
+            groups.setdefault(group_id, []).append(index)
+        for indices in groups.values():
+            group = values[indices]
+            if bool((group == group[0]).all()):
+                continue  # 全等组严格为零，也避免极大同值组不必要的 mean 溢出。
+            std = group.std(correction=0)
+            credit[indices] = (group - group.mean()) / (std + 1e-4)
+            if not bool(torch.isfinite(std)):
+                raise ValueError('group reward statistics/credit overflow')
+        credit = credit.to(torch.float32).detach()
+        if not bool(torch.isfinite(credit).all()):
+            raise ValueError('group reward statistics/credit overflow')
+        return {sid: credit[index].clone() for index, (sid, _, _) in enumerate(plan.samples)}
     std = values.std(correction=0)
     centered = torch.empty_like(values)
     groups = {}
