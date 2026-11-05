@@ -13,17 +13,26 @@ def metric_keys(*, ema):
 
 def local_metrics(named_parameters, *, rank, process_group, kl, ema, loss):
     from visual_rl.algorithms.trainer.h3_ema import local_parameter
+    parameters = tuple(named_parameters)
+    if ema is None:
+        shards = {name: local_parameter(p, rank=rank, process_group=process_group)[0] for name,p in parameters}
+    else:
+        shards = ema.validate()
+        if ({name: id(p) for name,p in parameters} != ema._ids
+                or len(parameters) != len(shards) or rank != ema.rank or process_group is not ema.group):
+            raise ValueError('diagnostic parameters differ from EMA ownership')
+    # 一次设备到 CPU 拷贝；在 CPU 保留原逐张量 double 求和顺序，避免改变诊断数值。
+    packed = torch.cat([p.detach().reshape(-1) for p in shards.values()]).to(device='cpu', dtype=torch.float64)
     squared_norm = distance = 0.
-    for name, parameter in named_parameters:
-        local, _ = local_parameter(parameter, rank=rank, process_group=process_group)
-        value = local.detach().to(device='cpu', dtype=torch.float64)
+    values = packed.split([p.numel() for p in shards.values()])
+    for (name, local), flat in zip(shards.items(), values):
+        value = flat.reshape(local.shape)
         squared_norm += float(value.square().sum())
         if ema is not None:
             distance += float((value - ema.shadow[name].double()).square().sum())
     result = dict(kl if kl is not None else dict(dict.fromkeys(KL_KEYS, 0.), policy_loss=loss, kl_loss=0.),
                   lora_squared_norm=squared_norm)
     if ema is not None:
-        ema.validate()
         result.update(ema_live_squared_distance=distance, ema_committed_steps=ema.committed_steps, ema_updates=ema.updates)
     return result
 

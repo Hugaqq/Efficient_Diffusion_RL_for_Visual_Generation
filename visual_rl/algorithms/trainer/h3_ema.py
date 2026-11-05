@@ -71,7 +71,8 @@ class H3LoRAEMA:
                 or type(self.updates) is not int or self.updates != self.committed_steps // self.config.update_interval):
             raise ValueError('EMA update counter mismatch')
         self._validate_tensors(self.shadow)
-        if any(not bool(torch.isfinite(p).all()) for p in local.values()):
+        # 各 shard 在同一设备，仅将合并后的有限性标量同步到 CPU。
+        if not bool(torch.stack([torch.isfinite(p).all() for p in local.values()]).all()):
             raise ValueError('nonfinite live LoRA shard')
         return local
 

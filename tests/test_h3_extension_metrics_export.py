@@ -33,6 +33,45 @@ def test_world_diagnostics_shard_sum_not_mean(monkeypatch):
         world_metrics(broken, step=0, ema_config=owners[0][1].config)
 
 
+def test_packed_diagnostics_exact_legacy_numbers_single_inventory_and_copy(monkeypatch):
+    from visual_rl.algorithms.trainer import h3_ema
+    from tests.test_h3_ema import cpu_local
+    tensors = [torch.empty(0,3), torch.arange(6).reshape(2,3).float(),
+               torch.tensor([[1e10, 1e-10, -2e10, -3., 4., 5., -6.]])]
+    parameters = [(f'transformer_blocks.{i}.attn.to_q.lora_A.default.weight', torch.nn.Parameter(t))
+                  for i,t in enumerate(tensors)]
+    monkeypatch.setattr(h3_ema, 'local_parameter', cpu_local)
+    ema = h3_ema.H3LoRAEMA(lambda: parameters, config=H3EMAConfig(enabled=True), rank=0, process_group=None)
+    for _,p in parameters:
+        p.data.add_(.25)
+    expected_norm = expected_distance = 0.
+    for name,p in parameters:
+        value = p.detach().to(device='cpu', dtype=torch.float64)
+        expected_norm += float(value.square().sum())
+        expected_distance += float((value-ema.shadow[name].double()).square().sum())
+    counts = dict(inventory=0, copy=0)
+    def counted_local(*args, **kwargs):
+        counts['inventory'] += 1
+        return cpu_local(*args, **kwargs)
+    to = torch.Tensor.to
+    def counted_to(self, *args, **kwargs):
+        if kwargs.get('device') == 'cpu' and kwargs.get('dtype') == torch.float64:
+            counts['copy'] += 1
+        return to(self, *args, **kwargs)
+    monkeypatch.setattr(h3_ema, 'local_parameter', counted_local)
+    monkeypatch.setattr(torch.Tensor, 'to', counted_to)
+    for owner in (ema, None):
+        counts.update(inventory=0, copy=0)
+        result = local_metrics(parameters, rank=0, process_group=None, kl=None, ema=owner, loss=-1.)
+        assert result['lora_squared_norm'] == expected_norm
+        if owner is not None:
+            assert result['ema_live_squared_distance'] == expected_distance
+        assert counts == dict(inventory=len(parameters), copy=1)
+    parameters[-1][1].data.fill_(float('nan'))
+    with pytest.raises(ValueError, match='nonfinite'):
+        local_metrics(parameters, rank=0, process_group=None, kl=None, ema=ema, loss=-1.)
+
+
 def test_complete_cpu_checkpoint_ema_export_and_conversion(tmp_path):
     import torch.distributed.checkpoint as dcp
     from scripts.convert_h3_lora_to_comfyui import TARGETS, load_dcp_lora, main, load_training_file, normalize_training, convert
