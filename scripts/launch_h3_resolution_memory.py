@@ -122,6 +122,10 @@ class TwoUpdateBackend(H3LifecycleBackend):
                 bound.stages.rollout_cell_scope=self.rollout_profile.cell
             self.predict_audit=PredictAudit(bound.stages.predict)
             bound.stages.predict=self.predict_audit
+            self.reference_audit = None
+            if getattr(bound.stages, 'kl_beta', 0.):
+                self.reference_audit = PredictAudit(bound.stages.predict_reference)
+                bound.stages.predict_reference = self.reference_audit
             if getattr(bound.stages,'predict_batch',None) is not None:
                 bound.stages.predict_batch=self.predict_audit.batched(bound.stages.predict_batch)
             self.install_media(bound,graph,runtime)
@@ -157,6 +161,12 @@ class TwoUpdateBackend(H3LifecycleBackend):
                     if (len(graph_audit['grad_forward_indices'])!=4*done or graph_audit['nograd_forwards']!=self.nograd_forwards_per_update*done+self.nograd_forwards_once
                             or not graph_audit['final_prediction_released']):
                         raise ValueError('single-cell graph/count/release audit failed')
+                    if self.reference_audit is not None:
+                        reference = self.reference_audit.payload()
+                        if (reference['grad_forward_indices'] or reference['nograd_forwards'] != 4*done
+                                or not reference['final_prediction_released']):
+                            raise ValueError('reference graph/count/release audit failed')
+                        graph_audit['reference'] = reference
                     if not prepared.optimizer.state or any(int(s['step'].item())!=step+1 for s in prepared.optimizer.state.values()):
                         raise ValueError('Adam counter differs from actual step')
                     import math

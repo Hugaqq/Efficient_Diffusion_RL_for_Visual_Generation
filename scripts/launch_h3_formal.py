@@ -92,8 +92,12 @@ def checkpoint_steps(*, total, after=0):
 
 
 def disk_need(*, total, log_bytes, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
-              checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN):
+              checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN, ema=False):
     """Bytes and inodes for the checkpoints/exports AFTER update `after`, plus logs, times margin."""
+    if ema:
+        # 固定 formal 几何：EMA 仅一份 LoRA，却保守追加整份 live+Adam 的预算。
+        checkpoint_bytes *= 2
+        checkpoint_files += 8
     checkpoints = len(checkpoint_steps(total=total, after=after))
     exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after, also=EXPORT_ALSO))
     raw = checkpoints * checkpoint_bytes + exports * VIDEOS_PER_EXPORT * video_bytes + log_bytes
@@ -115,7 +119,8 @@ def disk_free(path, *, statvfs=os.statvfs):
 
 def disk_preflight(profile, *, after=0, statvfs=os.statvfs, **sizes):
     """Refuse to start when the output filesystem cannot hold the remaining run."""
-    need = disk_need(total=profile.launch.max_optimizer_steps, after=after, **sizes)
+    need = disk_need(total=profile.launch.max_optimizer_steps, after=after,
+                     ema=getattr(getattr(getattr(profile, 'training', None), 'ema', None), 'enabled', False), **sizes)
     report = dict(need, **disk_free(profile.launch.output_dir, statvfs=statvfs))
     short = report['free_bytes'] < need['need_bytes']
     short_inodes = report['free_inodes'] is not None and report['free_inodes'] < need['need_inodes']
@@ -316,7 +321,8 @@ class FormalBackend(TwoUpdateBackend):
                 free = disk_free(launch.output_dir)
                 need = disk_need(total=launch.max_optimizer_steps, after=after, log_bytes=0,
                                  checkpoint_bytes=self.args.checkpoint_bytes, video_bytes=self.args.video_bytes,
-                                 checkpoint_files=self.args.checkpoint_files)
+                                 checkpoint_files=self.args.checkpoint_files,
+                                 ema=getattr(getattr(getattr(graph.profile, 'training', None), 'ema', None), 'enabled', False))
                 row = dict(free, when=when, step=step, remaining_checkpoints=need['checkpoints'],
                            remaining_need_bytes=need['need_bytes'], remaining_need_inodes=need['need_inodes'],
                            sufficient_for_remaining=free['free_bytes'] >= need['need_bytes'] and (
@@ -452,7 +458,7 @@ def main():
                              seconds_per_update=args.monitor_seconds_per_update, row_bytes=args.monitor_row_bytes)
     disk = disk_preflight(profile, after=done, checkpoint_bytes=args.checkpoint_bytes,
                           checkpoint_files=args.checkpoint_files, video_bytes=args.video_bytes,
-                          log_bytes=JOURNAL_PROCESSES * journal_bytes + monitor['max_bytes'] + args.other_log_bytes)
+                          log_bytes=(8 + len(profile.launch.origins)) * journal_bytes + monitor['max_bytes'] + args.other_log_bytes)
     mode = 'fresh' if start is None else ('finalize' if start == profile.launch.max_optimizer_steps else 'resume')
     manifest = dict(schema='h3.formal-launch.v1', started_utc=started, launch_stamp=stamp, git_sha=args.expected_sha,
                     mode=mode, resume_from=str(profile.launch.resume_from), monitor_budget=monitor,

@@ -215,6 +215,22 @@ class H3RuntimeBinding:
         self._video_files = _video_files(profile.launch.model, self.content['model']['content_sha256'], video_records)
 
     @property
+    def diagnostics_enabled(self):
+        return bool(self.profile.training.extension_payload() or self.profile.launch.extension_payload())
+
+    def training_diagnostics(self, stages):
+        from visual_rl.runtime.h3_training_metrics import local_metrics
+        if self._closed or not self.diagnostics_enabled or stages.prepared is not self.prepared:
+            raise ValueError('training diagnostics require an open enabled binding')
+        model = self.adapter.meta_model
+        parameters = tuple((name,p) for name,p in _canonical_parameter_names(model.model, model.block_names).items()
+                           if p.requires_grad)
+        kl = getattr(stages, 'kl_metrics', None)
+        if self.profile.training.kl_beta and kl is None:
+            raise ValueError('KL enabled but no completed reference diagnostics')
+        return local_metrics(parameters, rank=self.rank, process_group=self.process_group, kl=kl, ema=self.ema)
+
+    @property
     def boundary_content_check(self):
         return self._boundary_content_check
 

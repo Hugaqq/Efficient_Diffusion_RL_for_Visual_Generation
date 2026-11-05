@@ -1,8 +1,8 @@
 """Export an H3 training LoRA and convert it to the ComfyUI MiniMax-H3 LoRA format.
 
-CPU only. Never imports CUDA kernels or framecode training code; it reads the
-step-N DCP model entries (LoRA tensors only) through torch.distributed.checkpoint
-with no process group.
+CPU only. Live export reads step-N DCP LoRA tensors with no process group.
+--weights ema validates the complete checkpoint tree, then reconstructs the
+rank-local CPU FP32 EMA shards; it never substitutes live weights if EMA is absent.
 
 Training side (framecode, PEFT, Diffusers MiniMaxH3Transformer3DModel):
   transformer_blocks.{i}.{attn.to_q, attn.to_k, attn.to_v, attn.to_out.0,
@@ -184,9 +184,14 @@ def verify(blocks, rank, alpha, comfy_state, indices):
 
 # ---------------------------------------------------------------- IO
 
-def load_dcp_lora(checkpoint):
-    """Read only the model.* LoRA tensors of an H3 step-N DCP on CPU (no process group)."""
+def load_dcp_lora(checkpoint, *, weights='live'):
+    """Read the requested LoRA view on CPU; never fall back between live and EMA."""
     torch = _torch()
+    if weights == 'ema':
+        from visual_rl.artifacts.checkpoint.h3_ema import export_ema_lora
+        return export_ema_lora(checkpoint)
+    if weights != 'live':
+        raise ValueError('weights must be live or ema')
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint import FileSystemReader
     path = checkpoint
@@ -321,6 +326,7 @@ def main(argv=None):
     e.add_argument("--checkpoint", required=True)
     e.add_argument("--output", required=True)
     e.add_argument("--lora-alpha", type=float, default=64.0)
+    e.add_argument('--weights', choices=('live', 'ema'), default='live')
     c = sub.add_parser("convert", help="training LoRA -> ComfyUI LoRA safetensors")
     src = c.add_mutually_exclusive_group(required=True)
     src.add_argument("--input", help="training-key LoRA safetensors (from export)")
@@ -328,6 +334,8 @@ def main(argv=None):
     c.add_argument("--output", required=True)
     c.add_argument("--lora-alpha", type=float, help="training alpha; default: export metadata, else 64")
     c.add_argument("--dtype", choices=("fp32", "bf16"), default="fp32")
+    c.add_argument('--weights', choices=('live', 'ema'), default=None,
+                   help='checkpoint: default live; input file: infer its declared view')
     c.add_argument("--verify-blocks", default="first,last", help="'all', 'none' or comma list / first,last")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -338,9 +346,9 @@ def main(argv=None):
     torch = _torch()
     started = time.time()
     if args.mode == "export":
-        state, dcp_path = load_dcp_lora(args.checkpoint)
+        state, dcp_path = load_dcp_lora(args.checkpoint, weights=args.weights)
         blocks, rank = normalize_training(state)
-        meta = dict(format="h3-training-lora.v1", source_checkpoint=os.path.abspath(args.checkpoint),
+        meta = dict(format="h3-training-lora.v1", weights=args.weights, source_checkpoint=os.path.abspath(args.checkpoint),
                     source_dcp=os.path.abspath(dcp_path), identity=_checkpoint_identity(args.checkpoint),
                     lora_rank=str(rank), lora_alpha=str(args.lora_alpha), blocks=str(len(blocks)),
                     dtype=str(next(iter(state.values())).dtype))
@@ -350,11 +358,15 @@ def main(argv=None):
         return 0
     if args.input:
         state, meta = load_training_file(args.input)
+        weights = meta.get('weights', 'live')
+        if weights not in ('live', 'ema') or (args.weights is not None and args.weights != weights):
+            raise ValueError('requested weights differ from the input LoRA view')
         source = dict(source_file=os.path.abspath(args.input), source_sha256=_sha_file(args.input),
                       source_meta=meta)
         alpha = args.lora_alpha if args.lora_alpha is not None else float(meta.get("lora_alpha", 64))
     else:
-        state, dcp_path = load_dcp_lora(args.checkpoint)
+        weights = args.weights or 'live'
+        state, dcp_path = load_dcp_lora(args.checkpoint, weights=weights)
         source = dict(source_checkpoint=os.path.abspath(args.checkpoint), identity=_checkpoint_identity(args.checkpoint))
         alpha = args.lora_alpha if args.lora_alpha is not None else 64.0
     blocks, rank = normalize_training(state)
@@ -370,7 +382,7 @@ def main(argv=None):
     worst, rows = verify(blocks, rank, alpha, comfy, indices) if indices else (None, [])
     if indices and args.dtype == "fp32" and worst > 1e-6:
         raise SystemExit(f"verification failed: relative delta-W error {worst}")
-    meta = dict(format="comfyui-minimax-h3-lora", converter="framecode scripts/convert_h3_lora_to_comfyui.py",
+    meta = dict(format="comfyui-minimax-h3-lora", weights=weights, converter="framecode scripts/convert_h3_lora_to_comfyui.py",
                 training_rank=str(rank), training_alpha=str(alpha), scaling=str(alpha / rank),
                 qkv="A=cat(A_q,A_k,A_v); B=blockdiag(B_q,B_k,B_v); alpha=scaling*3r",
                 fc1="B rows [value;gate]->[gate;value]", dtype=args.dtype, source=source)

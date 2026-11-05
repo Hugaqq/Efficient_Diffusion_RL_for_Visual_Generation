@@ -466,20 +466,32 @@ class H3LifecycleBackend:
             update = result.value.payload
             from visual_rl.algorithms.optimization.h3_world import _exchange
             local_loss = float(update.scaled_loss)
-            if self.rollout_batch != 1:
-                # Piggyback on the existing exchange; B=1 still sends the same float.
+            diagnostics = getattr(bound.binding, 'diagnostics_enabled', False)
+            if self.rollout_batch != 1 or diagnostics:
+                # 默认仍发送同一个 float；扩展指标复用既有交换，不增加归约顺序。
                 local_loss = dict(loss=local_loss,replay=getattr(bound.stages,'rollout_replay_score_summary',None))
+                if diagnostics:
+                    local_loss['diagnostics'] = _phase(bound.graph.session, 'diagnostics-local',
+                        lambda: bound.binding.training_diagnostics(bound.stages))
             losses = _exchange('lifecycle/loss', bound.graph.session.rank,
                                bound.graph.session.process_group, local_loss, True)
-            replay_rows = None
-            if self.rollout_batch != 1:
-                replay_rows = losses
-                losses = [row['loss'] for row in replay_rows]
+            replay_rows = diagnostic_rows = None
+            if self.rollout_batch != 1 or diagnostics:
+                if self.rollout_batch != 1:
+                    replay_rows = losses
+                if diagnostics:
+                    diagnostic_rows = [row['diagnostics'] for row in losses]
+                losses = [row['loss'] for row in losses]
             metrics = dict(step=step, sample_count=bound.graph.profile.training.global_samples,
                 active_transition_count=8 * update.local_cells,
                 loss=sum(losses) / 8, gradient_norm=float(update.grad_norm))
             # Persist diagnostics before publishing the checkpoint that can depend on them.
             def record_metrics():
+                if diagnostic_rows is not None:
+                    from visual_rl.runtime.h3_training_metrics import world_metrics
+                    metrics.update(world_metrics(diagnostic_rows, step=step, ema_config=bound.graph.profile.training.ema))
+                    if bound.graph.session.rank == 0:
+                        print(json.dumps(dict(event='h3_training_metrics', **metrics)), flush=True)
                 if replay_rows is not None:
                     summary = _rollout_replay_totals([row['replay'] for row in replay_rows],
                         step=step,tolerance=self.rollout_batch_replay_tolerance)
@@ -536,7 +548,19 @@ class H3LifecycleBackend:
         policy_steps = 1 if training.algorithm == "dual_flash" else training.num_steps
         expected_counts = dict(step=count - 1, sample_count=training.global_samples,
             active_transition_count=training.global_samples * policy_steps)
-        if (set(metrics) != {*expected_counts, 'loss', 'gradient_norm'}
+        diagnostic_keys = set()
+        if getattr(bound.binding, 'diagnostics_enabled', False):
+            from visual_rl.runtime.h3_training_metrics import metric_keys
+            diagnostic_keys = metric_keys(ema=training.ema.enabled)
+            for key in diagnostic_keys:
+                value = metrics.get(key)
+                if key in ('ema_committed_steps', 'ema_updates'):
+                    expected = count if key == 'ema_committed_steps' else count // training.ema.update_interval
+                    if type(value) is not int or value != expected:
+                        raise ValueError('terminal EMA counters differ from checkpoint')
+                elif type(value) is not float or not math.isfinite(value) or value < 0:
+                    raise ValueError('terminal H3 diagnostics must be finite nonnegative floats')
+        if (set(metrics) != {*expected_counts, 'loss', 'gradient_norm', *diagnostic_keys}
                 or any(type(metrics[k]) is not int or metrics[k] != v for k, v in expected_counts.items())
                 or any(type(metrics[k]) is not float or not math.isfinite(metrics[k])
                        for k in ('loss', 'gradient_norm'))):
