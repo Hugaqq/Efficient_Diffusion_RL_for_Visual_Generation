@@ -95,7 +95,7 @@ class H3IterationStages:
 
     def __init__(self, *, data, prepared, predict, decode, score_one,
                  coordination_factory, process_group, rank: int, device,
-                 read_behavior_id):
+                 read_behavior_id, ema=None):
         for obj, method in ((data, "reserve"), (data, "commit"), (data, "abort")):
             if not callable(getattr(obj, method, None)):
                 raise TypeError(f"data must implement {method}")
@@ -107,6 +107,7 @@ class H3IterationStages:
         self.coordination_factory = coordination_factory
         self.process_group, self.rank, self.device = process_group, rank, torch.device(device)
         self.read_behavior_id = read_behavior_id
+        self.ema = ema
         self._active = None
         self._poisoned = False
         self._expected_behavior = None
@@ -123,6 +124,8 @@ class H3IterationStages:
                            close_hooks=(self,))
 
     def _validate(self, request, step):
+        if self.ema is not None:
+            self.ema.validate(step=step)  # swapped EMA weights can never enter training rollout
         if not isinstance(request, H3IterationRequest) or not isinstance(request.identity, IterationIdentity):
             raise TypeError("reserve must return H3IterationRequest with IterationIdentity")
         if request.identity.optimizer_step != step:
@@ -230,6 +233,10 @@ class H3IterationStages:
             binding = (optimizer_step, request.identity.source_id, request.identity.phase_id,
                        request.next_behavior_id)
             coordinator.gate("prelude/binding/" + hashlib.sha256(json.dumps(binding).encode()).hexdigest())
+            if self.ema is not None:
+                from dataclasses import asdict
+                coordinator.gate('prelude/ema/' + hashlib.sha256(json.dumps(asdict(self.ema.config),
+                    sort_keys=True).encode()).hexdigest())
             self._active = _Iteration(request, pool, plan, coordinator)
             return StageValue(request.identity, self._active)
         except BaseException:
@@ -373,6 +380,8 @@ class H3IterationStages:
             if self.read_behavior_id() != r.next_behavior_id:
                 raise ValueError("data tail did not advance behavior version")
         _checked(ctx.coordinator, "tail/complete", commit)
+        if self.ema is not None:
+            _checked(ctx.coordinator, 'tail/ema', lambda: self.ema.commit(r.identity.optimizer_step + 1))
         ctx.pool.release()
         self._last_collection, self._expected_behavior = r.collection_id, r.next_behavior_id
         self._active = None

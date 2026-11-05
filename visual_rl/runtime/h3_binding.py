@@ -198,6 +198,14 @@ class H3RuntimeBinding:
         self.numerics = ModelExecutionNumericsEvidence(ParameterDTypePolicy("float32"), tuple(
             ForwardAutocastPolicy(p.stage, p.parameter_view, self.device.type, "float32", False)
             for p in self.execution_policies), views)
+        self.ema = None
+        if profile.training.ema.enabled:
+            from visual_rl.algorithms.trainer.h3_ema import H3LoRAEMA
+            def lora_parameters():
+                return tuple((name, p) for name, p in _canonical_parameter_names(model,
+                    adapter.meta_model.block_names).items() if p.requires_grad)
+            self.ema = H3LoRAEMA(lora_parameters, config=profile.training.ema, rank=rank,
+                                process_group=process_group)
         self.contract = self._contract()
         live = self._live_ids()
         self.state_identity = H3StateIdentity(live["topology"], live["model"], live["semantics"],
@@ -437,6 +445,16 @@ class H3RuntimeBinding:
             raise RuntimeError("H3 binding closed")
         return self.scorer.score_one(**kwargs)
 
+    @contextmanager
+    def ema_weights(self):
+        """仅评估/导出边界使用；所有 rank 必须同步进入和退出。"""
+        if self._closed or self.ema is None or self._active.get() is not None:
+            raise RuntimeError('EMA evaluation requires an enabled idle binding')
+        state = self.source.state_dict()  # source refuses an open rollout reservation
+        self.ema.validate(step=state['next_optimizer_step'])
+        with self.ema.evaluation_weights():
+            yield
+
     def video_reuse_scope(self):
         if self._closed: raise RuntimeError('H3 binding closed')
         return self.adapter.video_reuse_scope(self._video_files)
@@ -489,6 +507,8 @@ class H3RuntimeBinding:
         self._check_resources()
         self._check_source()
         self._observe_model()
+        if self.ema is not None:
+            self.ema.validate(step=self.prepared.scheduler.last_epoch)
         self.parameter_state.named_trainable_parameters()
         self.parameter_state.state_projection
         if self.adapter.model_execution_numerics != self.numerics:
@@ -535,7 +555,7 @@ class H3RuntimeBinding:
             gradient_accumulation_steps=1, data_sharding_version=SAMPLING_VERSION, sampler_state_schema="h3.prompt-source.v1",
             rng_policy=STREAM_VERSION, dynamics_state_schema=("h3.dual-flow-sde.v1" if dual else "h3.cps-dual-all-n.v1"),
             progress_state_schema=f"checkpoint-progress.v{CHECKPOINT_PROGRESS_SCHEMA_VERSION}",
-            ema_state_schema="none",
+            ema_state_schema=('h3.lora-ema.local-shards.v1' if self.profile.training.ema.enabled else 'none'),
             reference_state_schema=('h3.lora-disabled-base.v1' if self.profile.training.kl_beta else 'none'),
             execution_transform_plan_id=transform_id,
             execution_transform_chain=(("h3.world8-ac-fsdp2.v1", transform_id),), world_size=8, world_size_policy="strict",
@@ -562,6 +582,8 @@ class H3RuntimeBinding:
         state = deepcopy(stages.checkpoint_boundary(trainer))
         next_batch = source.next_global_batch_id
         step = state["next_optimizer_step"]
+        if self.ema is not None:
+            self.ema.validate(step=step)
         sentinel = (self.boundary_content_check == 'sentinel' and not terminal
                     and step < self.profile.launch.max_optimizer_steps)
         from visual_rl.runtime.h3_content_sentinel import content_check_gate

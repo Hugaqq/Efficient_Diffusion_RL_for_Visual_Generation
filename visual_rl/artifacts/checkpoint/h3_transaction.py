@@ -289,7 +289,7 @@ class H3CheckpointTransaction:
         return rows[0]
 
     def checkpoint(self, prepared, *, contract, progress, safe_point, identity, bindings, data_state,
-                   fault_injector=None) -> CommittedCheckpoint:
+                   fault_injector=None, ema=None) -> CommittedCheckpoint:
         with self._attempt():
             data = rng = binding = None
             def preflight():
@@ -297,6 +297,10 @@ class H3CheckpointTransaction:
                 if self._prepared_attempted and not self._bound_attempted:
                     raise ValueError('cannot save between restore gates')
                 binding = _binding(contract, identity, bindings)
+                from visual_rl.artifacts.checkpoint.h3_ema import check_ema_contract
+                check_ema_contract(ema, contract)
+                if ema is not None:
+                    ema.validate(step=progress.global_step)
                 if not isinstance(progress, CheckpointProgress) or progress.global_step <= 0:
                     raise ValueError('positive complete progress required')
                 if not isinstance(safe_point, CheckpointSafePoint):
@@ -350,6 +354,9 @@ class H3CheckpointTransaction:
                 print(json.dumps(dict(event='h3_checkpoint_codec_end',
                                       seconds=time.monotonic()-codec_started)), flush=True)
             self._same(self._phase('codec-complete', lambda: codec))
+            if ema is not None:
+                from visual_rl.artifacts.checkpoint.h3_ema import save_ema
+                self._same(self._phase('ema-written', lambda: save_ema(ema, path, step=progress.global_step)))
             payload = dict(schema=_SCHEMA, rank=self.rank, world_size=8,
                            identity_id=_payload_digest(identity.payload()), progress_id=progress.progress_id,
                            codec_id=_payload_digest(codec), safe_point=safe_point.to_payload(),
@@ -422,7 +429,7 @@ class H3CheckpointTransaction:
         data, rng = self._validate_ranks(inspection.committed.path, manifest, identity, inspection.progress)
         return inspection, data, rng, manifest
 
-    def restore_prepared(self, prepared, path, *, expected_contract, identity, bindings):
+    def restore_prepared(self, prepared, path, *, expected_contract, identity, bindings, ema=None):
         """Refresh complete/tree/contract, load fresh model/Adam, but NOT data/RNG."""
         with self._attempt():
             if self._prepared_attempted:
@@ -431,7 +438,11 @@ class H3CheckpointTransaction:
             inspected = None
             def inspect():
                 nonlocal inspected
+                from visual_rl.artifacts.checkpoint.h3_ema import check_ema_contract, DIRECTORY
+                check_ema_contract(ema, expected_contract)
                 inspected = self._inspect(path, expected_contract, identity, bindings)
+                if ema is None and (Path(path) / DIRECTORY).exists():
+                    raise ValueError('EMA attachment present in an EMA-disabled checkpoint')
                 receipt = inspected[0].committed
                 return dict(path=str(receipt.path), tree=receipt.state_tree_id, progress=receipt.progress_id)
             self._same(self._phase('restore-prepared/inspect', inspect))
@@ -443,6 +454,10 @@ class H3CheckpointTransaction:
                     raise ValueError('restored codec receipt mismatch')
                 return codec
             self._same(self._phase('restore-prepared/loaded', validate))
+            if ema is not None:
+                from visual_rl.artifacts.checkpoint.h3_ema import load_ema
+                self._same(self._phase('restore-prepared/ema', lambda: load_ema(ema,
+                    inspection.committed.path, step=inspection.progress.global_step)))
             self._pending = inspection.committed
             return dict(checkpoint=inspection.committed, data=deepcopy(data), rng=rng)
 

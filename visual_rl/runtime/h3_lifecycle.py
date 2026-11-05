@@ -358,7 +358,8 @@ class H3LifecycleBackend:
                     self.restore_contract, self.restore_live = self.code_upgrade.restore_contract(
                         self.binding, path)
                 self.transaction.restore_prepared(prepared, path, expected_contract=self.restore_contract,
-                    identity=self.binding.state_identity, bindings=self.restore_live)
+                    identity=self.binding.state_identity, bindings=self.restore_live,
+                    **(dict(ema=self.binding.ema) if self.binding.ema is not None else {}))
             return self.binding  # existing controller ledger owns close even if later binding fails
         except BaseException:
             self.binding.close()
@@ -380,6 +381,8 @@ class H3LifecycleBackend:
                 predict=binding.predict, decode=binding.decode, score_one=binding.score_one,
                 coordination_factory=binding.coordination_factory, process_group=runtime.process_group,
                 rank=runtime.rank, device=_execution_device(runtime), read_behavior_id=graph.source.read_behavior_id)
+            if getattr(binding, 'ema', None) is not None:
+                options['ema'] = binding.ema
             if self.parallel_owners:
                 from visual_rl.algorithms.optimization.h3_world import WORLD_SIZE
                 capacity = binding.scorer.declared_queue_capacity()
@@ -499,7 +502,8 @@ class H3LifecycleBackend:
                 with memory.span('checkpoint_save',step=step+1):
                     committed = bound.transaction.checkpoint(bound.prepared, contract=bound.binding.contract,
                         progress=progress, safe_point=proof, identity=bound.binding.state_identity,
-                        bindings=live, data_state=data)
+                        bindings=live, data_state=data,
+                        **(dict(ema=bound.binding.ema) if getattr(bound.binding, 'ema', None) is not None else {}))
                 if pause and step+1<launch.max_optimizer_steps:
                     raise H3SafeBoundaryPause(committed)
         if committed is None:
