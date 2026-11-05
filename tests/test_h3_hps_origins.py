@@ -91,6 +91,49 @@ def _rehash(health):
     return health
 
 
+def test_reported_health_structure_accepts_distinct_gpu_uuids():
+    from copy import deepcopy
+    contract = VideoContract(124, 256, 384)
+    health = _health(contract)
+    health['identity_facts'] = dict(
+        checkpoint_file_sha256='1'*64, config_file_sha256='2'*64,
+        loaded_model_state_sha256='3'*64, loaded_processor_sha256='4'*64,
+        hps_package_source_sha256='5'*64, service_source_sha256='6'*64,
+        wire_source_sha256='7'*64, torch_version='test', transformers_version='test',
+        use_special_tokens=True,
+        data_config=dict(confidence_threshold=.95, max_pixels=200704, min_pixels=200704,
+                         soft_label=False, test_json_list=[['Valid Set 1', ['example_set_1_part1.json', 'example_set_1_part2.json']],
+                                                          ['Valid Set 2', ['example_set_2_part1.json']]],
+                         tied_threshold=None, train_json_list=['example_train.json'],
+                         val_json_list=['/path/to/dataset/meta_data.json'], with_instruction=True),
+        gpu_residency_policy=dict(version='hps.dedicated-idle-residency.v1', enabled=True,
+                                  expected_gpu_uuid='GPU-test-a', idle_ttl_seconds=60.0),
+        request_queue_policy=dict(version='hps.bounded-fifo-queue.v1', full='503-retry-after-before-scoring',
+                                  max_queue=8, order='admission', scoring_concurrency=1))
+    _rehash(health)
+    other = deepcopy(health)
+    other['identity_facts']['gpu_residency_policy']['expected_gpu_uuid'] = 'GPU-test-b'
+    _rehash(other)
+    def make_pool(second):
+        return Hpsv3MultiOriginClient(origins=ORIGINS, expected_scoring_identity=scoring_identity(health, contract),
+            transport_factory=lambda origin: _Transport(health if origin == ORIGINS[0] else second),
+            service_identity=health['service_identity'], contract=contract, timeout_s=2.5, max_response_bytes=65536)
+    pool = make_pool(other)
+    try:
+        pool.healthcheck()
+        assert pool.clients[0].service_identity != pool.clients[1].service_identity
+    finally:
+        pool.close()
+    other['identity_facts']['request_queue_policy']['max_queue'] = 9
+    _rehash(other)
+    pool = make_pool(other)
+    try:
+        with pytest.raises(ValueError):
+            pool.healthcheck()
+    finally:
+        pool.close()
+
+
 def test_placement_independent_pool_pins_each_endpoint_and_run_identity(tmp_path, monkeypatch):
     from visual_rl.algorithms.rewards.clients import hpsv3
     from visual_rl.algorithms.rewards.h3_hps import H3HPSReward
