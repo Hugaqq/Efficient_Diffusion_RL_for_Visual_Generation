@@ -83,14 +83,17 @@ def _apis():
     return dcp, options, get_model_state_dict, get_optimizer_state_dict, set_model_state_dict
 
 
-def _local(value, process_group, *, sharded=False):
-    """Only CUDA/WORLD/DTensor observation; replaced by a CPU leaf in tests."""
+def _local(value, process_group, *, sharded=False, device=None):
+    """Checkpoint 默认严格 CUDA；EMA 可显式指定 CPU，以复用相同 WORLD8 几何校验。"""
+    device = torch.device('cuda') if device is None else torch.device(device)
+    if device.type not in ('cuda', 'cpu'):
+        raise ValueError('state requires a CUDA or CPU device')
     from torch.distributed.tensor import DTensor, Shard
     if not isinstance(value, torch.Tensor) or value.is_meta:
         raise ValueError('state must contain materialized tensors')
     if isinstance(value, DTensor):
         mesh = value.device_mesh
-        if (mesh.device_type != 'cuda' or mesh.ndim != 1 or mesh.mesh.tolist() != list(range(8))
+        if (mesh.device_type != device.type or mesh.ndim != 1 or mesh.mesh.tolist() != list(range(8))
                 or mesh.get_group(0) is not process_group or value.placements != (Shard(0),)):
             raise ValueError('state DTensor must use the same ordered WORLD8 Shard(0)')
         local = value.to_local().detach()
@@ -98,7 +101,9 @@ def _local(value, process_group, *, sharded=False):
         if sharded:
             raise ValueError('trainable/moment state must remain genuinely sharded')
         local = value.detach()
-    if local.device != torch.device('cuda', torch.cuda.current_device()) or local.layout != torch.strided:
+    if device.type == 'cuda' and device.index is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+    if local.device != device or local.layout != torch.strided:
         raise ValueError('state tensor is on the wrong device/layout')
     return local
 
