@@ -117,3 +117,51 @@ def test_complete_cpu_checkpoint_ema_export_and_conversion(tmp_path):
     (checkpoint/'h3-ema'/'rank-7.pt').unlink()
     with pytest.raises(Exception):
         load_dcp_lora(checkpoint, weights='ema')
+
+
+def test_live_export_matches_baseline_in_independent_interpreters(tmp_path):
+    import json
+    import struct
+    import subprocess
+    import sys
+    import tarfile
+    from pathlib import Path
+    import torch.distributed.checkpoint as dcp
+    from scripts.convert_h3_lora_to_comfyui import TARGETS, load_training_file
+
+    root = Path(__file__).resolve().parents[1]
+    archive = tmp_path/'baseline.tar'
+    with archive.open('wb') as output:
+        subprocess.run(['git', 'archive', '7c85751'], cwd=root, stdout=output, check=True)
+    baseline = tmp_path/'baseline'
+    baseline.mkdir()
+    with tarfile.open(archive) as source:
+        source.extractall(baseline, filter='data')
+    checkpoint = tmp_path/'checkpoint'
+    model = {f'transformer_blocks.0.{target}.lora_{side}.default.weight':
+             torch.arange(8).reshape((2, 4) if side == 'A' else (4, 2)).float()
+             for target in TARGETS for side in ('A', 'B')}
+    dcp.save({'model': model}, checkpoint_id=checkpoint, no_dist=True)
+    def header(path):
+        raw = path.read_bytes()
+        size = struct.unpack('<Q', raw[:8])[0]
+        return json.loads(raw[8:8+size])
+
+    for mode in ('export', 'convert', 'convert-input'):
+        outputs = [tmp_path/f'{mode}-{name}.safetensors' for name in ('old', 'old-repeat', 'current')]
+        arguments = ['--input', str(tmp_path/'export-old.safetensors')] if mode == 'convert-input' else [
+            '--checkpoint', str(checkpoint)]
+        for source, output in zip((baseline, baseline, root), outputs):
+            subprocess.run([sys.executable, str(source/'scripts/convert_h3_lora_to_comfyui.py'),
+                            mode.split('-')[0], *arguments, '--output', str(output)],
+                           cwd=source, check=True, timeout=60)
+        old_state, old_meta = load_training_file(str(outputs[0]))
+        assert 'weights' not in old_meta
+        for output in outputs[1:]:
+            state, meta = load_training_file(str(output))
+            # 基线自身 metadata 键的序列化顺序不稳定；比较完整 header，而非文件 SHA。
+            assert header(outputs[0]) == header(output)
+            assert old_meta == meta
+            assert old_state.keys() == state.keys()
+            assert all(old_state[key].dtype == state[key].dtype and torch.equal(old_state[key], state[key])
+                       for key in old_state)

@@ -348,10 +348,12 @@ def main(argv=None):
     if args.mode == "export":
         state, dcp_path = load_dcp_lora(args.checkpoint, weights=args.weights)
         blocks, rank = normalize_training(state)
-        meta = dict(format="h3-training-lora.v1", weights=args.weights, source_checkpoint=os.path.abspath(args.checkpoint),
+        meta = dict(format="h3-training-lora.v1", source_checkpoint=os.path.abspath(args.checkpoint),
                     source_dcp=os.path.abspath(dcp_path), identity=_checkpoint_identity(args.checkpoint),
                     lora_rank=str(rank), lora_alpha=str(args.lora_alpha), blocks=str(len(blocks)),
                     dtype=str(next(iter(state.values())).dtype))
+        if args.weights == 'ema':
+            meta['weights'] = 'ema'
         sha = save({k: v.contiguous() for k, v in sorted(state.items())}, args.output, meta)
         print(json.dumps(dict(output=args.output, sha256=sha, tensors=len(state), rank=rank, blocks=len(blocks),
                               seconds=round(time.time() - started, 1), identity=meta["identity"])))
@@ -382,10 +384,12 @@ def main(argv=None):
     worst, rows = verify(blocks, rank, alpha, comfy, indices) if indices else (None, [])
     if indices and args.dtype == "fp32" and worst > 1e-6:
         raise SystemExit(f"verification failed: relative delta-W error {worst}")
-    meta = dict(format="comfyui-minimax-h3-lora", weights=weights, converter="framecode scripts/convert_h3_lora_to_comfyui.py",
+    meta = dict(format="comfyui-minimax-h3-lora", converter="framecode scripts/convert_h3_lora_to_comfyui.py",
                 training_rank=str(rank), training_alpha=str(alpha), scaling=str(alpha / rank),
                 qkv="A=cat(A_q,A_k,A_v); B=blockdiag(B_q,B_k,B_v); alpha=scaling*3r",
                 fc1="B rows [value;gate]->[gate;value]", dtype=args.dtype, source=source)
+    if weights == 'ema':
+        meta['weights'] = 'ema'
     sha = save(comfy, args.output, meta)
     print(json.dumps(dict(output=args.output, sha256=sha, tensors=len(comfy), rank=rank, alpha=alpha,
                           verified_blocks=indices, worst_rel_err=worst, dtype=args.dtype,

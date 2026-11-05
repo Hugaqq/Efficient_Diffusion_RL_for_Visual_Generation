@@ -51,7 +51,9 @@ python -m scripts.convert_h3_lora_to_comfyui export --checkpoint CHECKPOINT --ou
 python -m scripts.convert_h3_lora_to_comfyui convert --checkpoint CHECKPOINT --output COMFY_FILE --weights ema
 ```
 
-`--weights live` 为 checkpoint 导出的默认值；EMA 缺失时明确拒绝，不回退 live。转换已有 safetensors 时从元数据继承 live/EMA 标识；显式选择冲突会拒绝。EMA 导出先校验 complete/tree，再按 rank/offset 重建完整 LoRA。
+`--weights live` 为 checkpoint 导出的默认值；EMA 缺失时明确拒绝，不回退 live。默认 live 不写入 `weights` 元数据，保持 7c85751 的张量与完整 safetensors header 键集合及值；只有 EMA 写入 `weights=ema`，读取缺失标识解释为 live。转换已有 safetensors 时从元数据继承 live/EMA 标识；显式选择冲突会拒绝。EMA 导出先校验 complete/tree，再按 rank/offset 重建完整 LoRA。
+
+独立解释器重复执行 7c85751 的 export/convert 已观察到文件 SHA 不同：原始 header 的 `__metadata__` 键序不同，而解析后的完整 header 与 tensor payload 字节一致。因此回归门禁比较 header 内容与张量，不要求文件 SHA；不修改基线的序列化行为。
 
 非默认扩展开启时，既有 `h3-last-metrics.json`、终端 `metrics.jsonl` 及每步 `h3_training_metrics` 事件增加 `kl_video/kl_audio/kl/policy_loss/kl_loss/lora_norm`；EMA 开启还增加 `ema_live_distance/ema_committed_steps/ema_updates`。`lora_norm` 和距离是全 rank LoRA A/B 参数的 L2，不是 ΔW 范数。`kl_video/kl_audio/kl` 是未乘 beta、scale 的原始 KL，先按本 rank 的 cell 取平均，再按 rank 平均（当前 plan 强制各 rank 等长）。`policy_loss` 与 `kl_loss` 是真正进入 loss 的两分量：每 cell 都包含 scale，KL 分量还包含 beta；rank 内求和、rank 间平均，与总 `loss` 同口径，二者之和在浮点舍入误差内等于总 loss。beta=0 的非默认扩展记录 `policy_loss=loss, kl_loss=0`；全默认仍无新字段。通用日志契约要求附加数值为 float，EMA 文件中的计数仍是严格整数。默认指标格式不变。
 
