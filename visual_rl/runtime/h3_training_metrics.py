@@ -37,6 +37,12 @@ def local_metrics(named_parameters, *, rank, process_group, kl, ema, loss):
     return result
 
 
+def validate_diagnostic(key, value):
+    """有符号 policy loss；KL、范数和距离均不得为负。计数由调用方严格检查。"""
+    if type(value) is not float or not math.isfinite(value) or (key != 'policy_loss' and value < 0):
+        raise ValueError('H3 diagnostics must be finite floats; only policy_loss may be negative')
+
+
 def world_metrics(rows, *, step, ema_config):
     enabled = ema_config.enabled
     keys = {*KL_KEYS, *LOSS_KEYS, 'lora_squared_norm'} | (
@@ -49,8 +55,8 @@ def world_metrics(rows, *, step, ema_config):
                 expected = step+1 if key == 'ema_committed_steps' else (step+1)//ema_config.update_interval
                 if type(value) is not int or value != expected:
                     raise ValueError('EMA diagnostic counter differs from committed progress')
-            elif type(value) is not float or not math.isfinite(value) or (key != 'policy_loss' and value < 0):
-                raise ValueError('H3 diagnostics must be finite floats; only policy_loss may be negative')
+            else:
+                validate_diagnostic(key, value)
     result = {key: sum(row[key] for row in rows)/8 for key in (*KL_KEYS, *LOSS_KEYS)}
     result['lora_norm'] = math.sqrt(sum(row['lora_squared_norm'] for row in rows))
     if enabled:

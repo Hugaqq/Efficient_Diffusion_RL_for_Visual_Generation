@@ -551,7 +551,7 @@ class H3LifecycleBackend:
             active_transition_count=training.global_samples * policy_steps)
         diagnostic_keys = set()
         if getattr(bound.binding, 'diagnostics_enabled', False):
-            from visual_rl.runtime.h3_training_metrics import metric_keys
+            from visual_rl.runtime.h3_training_metrics import metric_keys, validate_diagnostic
             diagnostic_keys = metric_keys(ema=training.ema.enabled)
             for key in diagnostic_keys:
                 value = metrics.get(key)
@@ -559,8 +559,8 @@ class H3LifecycleBackend:
                     expected = count if key == 'ema_committed_steps' else count // training.ema.update_interval
                     if type(value) is not float or value != expected:
                         raise ValueError('terminal EMA counters differ from checkpoint')
-                elif type(value) is not float or not math.isfinite(value) or value < 0:
-                    raise ValueError('terminal H3 diagnostics must be finite nonnegative floats')
+                else:
+                    validate_diagnostic(key, value)
         if (set(metrics) != {*expected_counts, 'loss', 'gradient_norm', *diagnostic_keys}
                 or any(type(metrics[k]) is not int or metrics[k] != v for k, v in expected_counts.items())
                 or any(type(metrics[k]) is not float or not math.isfinite(metrics[k])
