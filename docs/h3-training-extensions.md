@@ -95,7 +95,7 @@ P2 每个 rank 有独立请求线程，因此调度不能仅依赖进程内计�
 
 正式入口默认仍是 200 更新；显式 `--target-updates N`（1..199）要求 profile 的 `launch.max_optimizer_steps=N`，其他正式几何/数据/优化器/cadence 约束不变，不与 `--max-optimizer-steps` 混用。N 已属于原有 semantic payload 和 formal-run identity：不同 N 恢复同一 run 必须拒绝。因此 2+1 测试 fresh/resume 均设 N=3，step-2 用 PAUSE，在 step-3 正常完成（终点不会抛 SafeBoundaryPause）。不能 fresh 用 N=2、resume 改 N=3。
 
-短测磁盘按剩余每个更新都可能 PAUSE 保存预算，覆盖 step-1、step-2 暂停和 step-3 终点；视频仍按原 retention。监控按剩余更新数检查寿命/字节，不改每步秒数、磁盘 1.2 倍余量或运行时安全阈值。目标在既有 launch identity/argv/log 中记录；未传新参数时 parser 字段、身份、EMA 关闭预算与 7c85751 相同。
+有界运行（N<200）的磁盘按常规存档节奏（step-1、每 5 步、终点）再加一次 PAUSE 保存预算，且不超过剩余更新数；3 步短测因此覆盖 step-1、step-2 暂停和 step-3 终点，100 步运行按 22 份 checkpoint 预算；视频仍按原 retention。监控按剩余更新数检查寿命/字节，不改每步秒数、磁盘 1.2 倍余量或运行时安全阈值。目标在既有 launch identity/argv/log 中记录；未传新参数时 parser 字段、身份、EMA 关闭预算与 7c85751 相同。
 
 EMA 预算只读实际 transformer safetensors header 的六个 LoRA target，推导 A/B shape 与 WORLD8 Shard(0) 的每 rank 元素数。每个 checkpoint 增量为各 rank `numel*4 + tensor_count*8192 + 65536` 总和（与 load/export 文件上界一致），inode 增量为八文件加一个目录，不再翻倍整个 checkpoint。真实八进程 CPU 保存的文件总字节由测试确认不超过预算；CPU 数据不代表 GPU 验收。
 

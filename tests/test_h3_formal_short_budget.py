@@ -93,3 +93,14 @@ def test_header_ema_budget_and_target_semantics(tmp_path):
     for shape in ([], [(0,3)], [(True,3)], [(3,)], [(3,-1)]):
         with pytest.raises(ValueError, match='LoRA shapes'):
             formal.ema_attachment_budget(shape)
+
+
+def test_bounded_run_budget_uses_cadence_plus_one_pause():
+    from scripts import launch_h3_formal as formal
+    # 100 更新：step-1、5…100 共 21 份常规存档，加一次 PAUSE 预留。
+    assert formal.disk_need(total=100, after=0, log_bytes=0)['checkpoints'] == 22
+    assert formal.disk_need(total=100, after=20, log_bytes=0)['checkpoints'] == 17
+    assert formal.disk_need(total=1, after=0, log_bytes=0)['checkpoints'] == 1
+    # 正式 200 路径不变。
+    assert formal.disk_need(total=200, after=0, log_bytes=0)['checkpoints'] == len(
+        formal.checkpoint_steps(total=200, after=0))

@@ -139,11 +139,14 @@ def profile_ema_bytes(profile):
 
 def disk_need(*, total, log_bytes, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
               checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN, ema_bytes=0):
-    """Remaining saves/exports + logs. Short tests reserve a save at EVERY pause boundary."""
+    """Remaining saves/exports + logs. Bounded runs reserve the cadence saves plus one PAUSE save."""
     if ema_bytes:
         checkpoint_bytes += ema_bytes
         checkpoint_files += 9  # 八个附件和 h3-ema 目录
-    checkpoints = total - after if total < 200 else len(checkpoint_steps(total=total, after=after))
+    checkpoints = len(checkpoint_steps(total=total, after=after))
+    if total < 200:
+        # 有界运行：常规节奏存档 + 至多一次 PAUSE 边界保存，且不超过剩余更新数。
+        checkpoints = min(checkpoints + 1, total - after)
     exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after, also=EXPORT_ALSO))
     raw = checkpoints * checkpoint_bytes + exports * VIDEOS_PER_EXPORT * video_bytes + log_bytes
     files = checkpoints * checkpoint_files + exports * FILES_PER_EXPORT
