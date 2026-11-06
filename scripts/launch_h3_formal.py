@@ -38,7 +38,7 @@ from visual_rl.algorithms.optimization.h3_world import _exchange
 from visual_rl.composition.config.h3_profile import compile_h3_profile
 
 ROOT = Path(__file__).resolve().parents[1]
-FORMAL_UPDATES = (200,)          # the only authorized target; kept a validated parameter
+FORMAL_UPDATES = (200,)          # formal target; short tests require explicit --target-updates
 FORMAL_GEOMETRY = (384, 256, 124, 24, 32, 64)  # width, height, frames, fps, LoRA rank, alpha
 CHECKPOINT_EVERY = 5
 EXPORT_EVERY = 5
@@ -58,8 +58,12 @@ DISK_MARGIN = 1.2
 IDENTITY_FILE = 'formal-run.json'
 
 
-def validate_formal(profile, *, max_optimizer_steps=200):
-    if type(max_optimizer_steps) is not int or max_optimizer_steps not in FORMAL_UPDATES:
+def validate_formal(profile, *, max_optimizer_steps=200, target_updates=None):
+    if target_updates is not None:
+        if (type(target_updates) is not int or not 1 <= target_updates < 200
+                or type(max_optimizer_steps) is not int or max_optimizer_steps != target_updates):
+            raise ValueError('short test requires matching --target-updates in [1, 199]')
+    elif type(max_optimizer_steps) is not int or max_optimizer_steps not in FORMAL_UPDATES:
         raise ValueError(f'formal run accepts max_optimizer_steps in {FORMAL_UPDATES} only')
     t, l, c = profile.training, profile.launch, profile.model.config
     math_payload = t.payload()
@@ -91,18 +95,60 @@ def checkpoint_steps(*, total, after=0):
     return [s for s in range(after + 1, total + 1) if s == 1 or s % CHECKPOINT_EVERY == 0 or s == total]
 
 
+def ema_attachment_budget(shapes):
+    """WORLD8 Shard(0) FP32 数据 + 每 tensor 8 KiB、每文件 64 KiB 元数据上界。
+
+    与 EMA load/export 的文件大小上界一致；包含空 shard 的归档开销。
+    """
+    shapes = tuple(shapes)
+    if not shapes or any(len(s) != 2 or any(type(n) is not int or n <= 0 for n in s) for s in shapes):
+        raise ValueError('EMA budget requires positive 2D LoRA shapes')
+    sizes = []
+    for rank in range(8):
+        elements = sum(min(math.ceil(s[0] / 8), max(0, s[0] - rank * math.ceil(s[0] / 8))) * s[1]
+                       for s in shapes)
+        sizes.append(elements * 4 + len(shapes) * 8192 + 65536)
+    return sum(sizes)
+
+
+def profile_ema_bytes(profile):
+    if not getattr(getattr(getattr(profile, 'training', None), 'ema', None), 'enabled', False):
+        return 0
+    # 仅读实际权重 header；与 profile preflight 的六个 LoRA target 一致，不加载模型。
+    from visual_rl.models.implementations.h3_loading import _TARGETS, _weight_headers
+    from visual_rl.core.protocols.flash_hpsv3 import decode_json
+    directory = profile.launch.model / 'transformer'
+    with (directory / 'config.json').open('rb') as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    config = decode_json(raw, 1024 * 1024)
+    layers = config.get('num_layers')
+    if type(layers) is not int or layers <= 0:
+        raise ValueError('invalid transformer num_layers for EMA budget')
+    _, headers = _weight_headers(directory.resolve())
+    shapes = []
+    for block in range(layers):
+        for target in _TARGETS:
+            header = headers.get(f'transformer_blocks.{block}.{target}.weight')
+            if header is None or len(header['shape']) != 2:
+                raise ValueError('transformer header missing main-block LoRA target')
+            out_features, in_features = header['shape']
+            shapes.extend(((profile.model.config.lora_rank, in_features),
+                           (out_features, profile.model.config.lora_rank)))
+    return ema_attachment_budget(shapes)
+
+
 def disk_need(*, total, log_bytes, after=0, checkpoint_bytes=CHECKPOINT_BYTES, video_bytes=VIDEO_BYTES,
-              checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN, ema=False):
-    """Bytes and inodes for the checkpoints/exports AFTER update `after`, plus logs, times margin."""
-    if ema:
-        # 固定 formal 几何：EMA 仅一份 LoRA，却保守追加整份 live+Adam 的预算。
-        checkpoint_bytes *= 2
-        checkpoint_files += 8
-    checkpoints = len(checkpoint_steps(total=total, after=after))
+              checkpoint_files=CHECKPOINT_FILES, margin=DISK_MARGIN, ema_bytes=0):
+    """Remaining saves/exports + logs. Short tests reserve a save at EVERY pause boundary."""
+    if ema_bytes:
+        checkpoint_bytes += ema_bytes
+        checkpoint_files += 9  # 八个附件和 h3-ema 目录
+    checkpoints = total - after if total < 200 else len(checkpoint_steps(total=total, after=after))
     exports = len(retention.export_steps(every=EXPORT_EVERY, terminal_step=total, after=after, also=EXPORT_ALSO))
     raw = checkpoints * checkpoint_bytes + exports * VIDEOS_PER_EXPORT * video_bytes + log_bytes
     files = checkpoints * checkpoint_files + exports * FILES_PER_EXPORT
-    return dict(checkpoints=checkpoints, export_updates=exports, checkpoint_bytes=checkpoint_bytes,
+    return dict(**(dict(ema_bytes=ema_bytes) if ema_bytes else {}),
+                checkpoints=checkpoints, export_updates=exports, checkpoint_bytes=checkpoint_bytes,
                 checkpoint_files=checkpoint_files, video_bytes=video_bytes, log_bytes=log_bytes, margin=margin,
                 need_bytes=math.ceil(margin * raw), need_inodes=math.ceil(margin * files))
 
@@ -120,7 +166,7 @@ def disk_free(path, *, statvfs=os.statvfs):
 def disk_preflight(profile, *, after=0, statvfs=os.statvfs, **sizes):
     """Refuse to start when the output filesystem cannot hold the remaining run."""
     need = disk_need(total=profile.launch.max_optimizer_steps, after=after,
-                     ema=getattr(getattr(getattr(profile, 'training', None), 'ema', None), 'enabled', False), **sizes)
+                     ema_bytes=profile_ema_bytes(profile), **sizes)
     report = dict(need, **disk_free(profile.launch.output_dir, statvfs=statvfs))
     short = report['free_bytes'] < need['need_bytes']
     short_inodes = report['free_inodes'] is not None and report['free_inodes'] < need['need_inodes']
@@ -274,7 +320,8 @@ class FormalBackend(TwoUpdateBackend):
         self.retention = None
 
     def validate_profile(self, profile):
-        return validate_formal(profile, max_optimizer_steps=self.args.max_optimizer_steps)
+        return validate_formal(profile, max_optimizer_steps=self.args.max_optimizer_steps,
+                               target_updates=getattr(self.args, 'target_updates', None))
 
     def construct_graph(self, preflight, runtime):
         graph = super().construct_graph(preflight, runtime)
@@ -322,7 +369,7 @@ class FormalBackend(TwoUpdateBackend):
                 need = disk_need(total=launch.max_optimizer_steps, after=after, log_bytes=0,
                                  checkpoint_bytes=self.args.checkpoint_bytes, video_bytes=self.args.video_bytes,
                                  checkpoint_files=self.args.checkpoint_files,
-                                 ema=getattr(getattr(getattr(graph.profile, 'training', None), 'ema', None), 'enabled', False))
+                                 ema_bytes=self.manifest.get('disk_preflight', {}).get('ema_bytes', 0))
                 row = dict(free, when=when, step=step, remaining_checkpoints=need['checkpoints'],
                            remaining_need_bytes=need['need_bytes'], remaining_need_inodes=need['need_inodes'],
                            sufficient_for_remaining=free['free_bytes'] >= need['need_bytes'] and (
@@ -414,6 +461,8 @@ def build_parser():
     p = add_common_arguments(argparse.ArgumentParser(description=__doc__))
     p.add_argument('--max-optimizer-steps', type=int, default=FORMAL_UPDATES[0],
                    help=f'must equal the profile; accepted values {FORMAL_UPDATES}')
+    p.add_argument('--target-updates', type=int, default=argparse.SUPPRESS,
+                   help='explicit short test (1..199); profile target must match; immutable across resume')
     p.add_argument('--audit-weights', action='store_true',
                    help='hash all local weight shards before/after every update (slow; default off)')
     p.add_argument('--journal-max-mib', type=int, default=512, help='per-rank memory journal budget (default 512)')
@@ -441,7 +490,13 @@ def main():
     def git(*argv): return subprocess.check_output(['git', '-C', str(ROOT), *argv], text=True).strip()
     if git('status', '--porcelain') or git('rev-parse', 'HEAD') != args.expected_sha:
         raise ValueError('requires exact clean deployed Git SHA')
-    profile = validate_formal(compile_h3_profile(args.config), max_optimizer_steps=args.max_optimizer_steps)
+    target = getattr(args, 'target_updates', None)
+    if target is not None:
+        if args.max_optimizer_steps != 200:
+            raise ValueError('use --target-updates alone for short tests, not --max-optimizer-steps')
+        args.max_optimizer_steps = target
+    profile = validate_formal(compile_h3_profile(args.config), max_optimizer_steps=args.max_optimizer_steps,
+                              target_updates=target)
     if not memory.enabled() or not args.ffmpeg.is_file() or not args.ffprobe.is_file():
         raise ValueError('requires memory journal and real media tools')
     start = resume_step(profile)

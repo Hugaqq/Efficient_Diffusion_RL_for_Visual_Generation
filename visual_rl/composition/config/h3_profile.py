@@ -322,9 +322,12 @@ def compile_h3_profile(source: str | Path | SourceRecipe) -> H3Profile:
         raise ValueError("seed must be integer in [0,2**63)")
     steps = positive_int("max_optimizer_steps", launch["max_optimizer_steps"])
     cadence = positive_int("checkpoint_every_optimizer_steps", launch["checkpoint_every_optimizer_steps"])
-    # Authorized one/two-update diagnostics retain formal cadence5;
-    # first paired-layout and terminal boundary saves cover steps1/2.
-    if cadence > steps and not (steps in (1,2) and cadence==5):
+    # 保留原 1/2 步诊断；新增 3/4 步只接受 formal 几何/Flash，首步与终点仍保存。
+    short_formal = (steps in (3, 4) and training.algorithm == 'dual_flash'
+                    and training.group_layout == 'paired_4x8' and training.num_steps == 10
+                    and (config.width, config.height, config.frames, config.fps, config.lora_rank, config.lora_alpha)
+                    == (384, 256, 124, 24, 32, 64))
+    if cadence > steps and not (cadence == 5 and (steps in (1, 2) or short_formal)):
         raise ValueError("checkpoint cadence exceeds target without the short-test/cadence5 terminal exception")
     def path(value):
         if not isinstance(value, str) or not value or value.strip() != value or "://" in value:

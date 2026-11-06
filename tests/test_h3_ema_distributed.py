@@ -50,6 +50,9 @@ def _worker(rank, rendezvous, root):
         assert metrics['lora_squared_norm'] == expected_norm
         save_ema(owner, root, step=1)
         dist.barrier()  # 所有 rank 文件持久化后，才进入完整 checkpoint 的 restore。
+        from scripts.launch_h3_formal import ema_attachment_budget
+        actual = sum((root / 'h3-ema' / f'rank-{r}.pt').stat().st_size for r in range(8))
+        assert actual <= ema_attachment_budget([(rows, 3) for rows in (2, 3, 9, 10)])
         restored = H3LoRAEMA(lambda: parameters.items(), config=config, rank=rank, process_group=group)
         load_ema(restored, root, step=1)
         live = {n: p.to_local().detach().clone() for n,p in parameters.items()}
