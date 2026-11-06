@@ -84,7 +84,8 @@ def test_extensions_full_controller_checkpoint_resume_and_changed_config_rejecti
     assert (checkpoint/'complete.json').is_file()
 
 
-def test_disabled_flash_full_cpu_path_matches_7c85751(tmp_path, monkeypatch):
+def test_disabled_flash_stage_math_matches_legacy_methods(tmp_path, monkeypatch):
+    # 局部旧方法替换只证明阶段数学；完整提交对照见 test_h3_default_subprocess_parity.py。
     from copy import deepcopy
     from tests.test_h3_training_extensions import legacy_module
     from visual_rl.algorithms.trainer import h3_stages, h3_dual_stages

@@ -77,6 +77,20 @@ P2 每个 rank 有独立请求线程，因此调度不能仅依赖进程内计�
 
 **冻结基座不由 checkpoint 恢复、依赖 `verify_h3_content` 的模型 artifact 内容校验，是 7c85751 已有的 adapter.v2 缺口，不是本分支引入。** 本轮不修改生产恢复逻辑去修这个缺口；后续应独立核查 LoRA 子集 restore 与冻结基座运行时内容保证的边界。
 
+## 默认路径独立提交回归
+
+`tests/test_h3_default_subprocess_parity.py` 从 `git archive 7c85751` 和运行时的 `git archive HEAD` 提取两份完整源码，各用一个 `python -I -B` 子进程执行默认 dual-Flash 两次真实 CPU AdamW 更新。比较的是 **HEAD，不是未提交生产修改**。每侧运行自己的 profile、binding/predict、HPS client、lifecycle、stages、checkpoint transaction/codec；逐模块验证 `visual_rl` 导入来源属于该侧 archive。没有向旧实现注入新版生产方法。旧的局部方法对照现明确命名为 stage-math 测试，不再作为完整提交证明。
+
+两侧使用同一份固定 CPU 测试 fixture 模块：小模型/decoder、HTTP 响应、CUDA/FSDP 观察、线程内八 rank 通信、独立 rank RNG 观察与 DCP no-dist 传输叶。仅测试输入 safetensors 的 header 键序做规范化，输入文件内容哈希必须完全一致；生产导出和 checkpoint 序列化不改动。HTTP 叶根据实际请求 JPEG 像素给确定分数，并非真实 HPS 模型。
+
+逐项比较默认 semantic payload/id、训练配置、每步 rollout 的状态/action/old_joint/终态、reward/advantage、loss/grad norm、梯度、每步参数/Adam、最终 scheduler/buffer、两步完整 checkpoint 逻辑内容、两步指标字段及值、32 个 HPS POST 请求字节。张量比较 dtype/shape 和原始字节。checkpoint 每侧先独立 `inspect_complete` 校验真实磁盘树，再比较所有 JSON、八 rank 状态及从真实 DCP 读取的全部状态；不是只比较写入函数的参数。
+
+必然变化字段显式单列于测试输出 `separate-fields.json`：真实源码 hash/file_count/byte_count，以及由源码派生的 resources、recipe、algorithm、runtime-bound、checkpoint-contract 身份；派生哈希由测试用标准 JSON/SHA256 独立重算。物理文件差异仅分离 DCP `.metadata`（保存 UUID 等）、`h3_transaction.json` 的 SHA 与 state-tree 身份，仍比较文件集合/大小、完整逻辑内容并校验各自 tree。其余身份（含 semantic、progress、RNG/data、manifest）不忽略。完整提交 SHA 另存 `source-revisions.json`。
+
+无法在这个 CPU 小模型中比较的层：CUDA/WORLD 准入、真实 FSDP 分片/通信、file-phase heartbeat/aux-turn 调度和进程全局 RNG 恢复。fixture 对这些层使用相同替身（RNG checkpoint 为固定的逐 rank 观察值，不是八线程共享的全局 RNG）；实际 rollout 仍使用生产代码创建的独立 generator。DCP 使用真实磁盘格式，但替换分布式传输为校验八份副本一致后的 no-dist 保存。替代证据是实际两步参数/Adam、rollout/action、落盘状态与请求字节对照，不把被替换的层计入完整实现回归。
+
+这证明限定 CPU 叶下的默认回归，不证明真实 H3/FSDP2/NCCL、GPU 数值/性能或真实 HPS。八进程 gloo EMA 测试另行覆盖真实 DTensor 分片、空 shard、保存/恢复及异常换回，不替代完整训练的 GPU 验收，也不将这里的八线程通信冒称真实分布式训练。
+
 ## GPU 验收清单（这里只列出，不执行）
 
 - `kl_beta>0` 首个参考前向必须成功；确认真实 H3 forward 没有懒写 rope/cache/counter buffer。变化时应恢复并拒绝，而非放宽保护。
